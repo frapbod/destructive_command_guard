@@ -131,6 +131,15 @@ const ALLOW: &[&str] = &[
     r"foreach($n in @(1)) { foreach($m in @(2)) { echo $m } }; & python -v",
     r"foreach($n in @(1)) { $s=1 }; python -m unittest -v",
     r"if (1) { $s=1 }; & python -v",
+    // PowerShell allows line breaks inside the header (LF, CRLF and lone CR).
+    "foreach(\n$n in @(1)) { $s=1 }; & python -v",
+    "foreach(\r\n$n in @(1)) { $s=1 }; & python -v",
+    "foreach(\r$n in @(1)) { $s=1 }; & python -v",
+    "foreach\n($n in @(1)) { $s=1 }; & python -v",
+    "foreach\r\n(\r\n  $n\r\n  in\r\n  @(1)\r\n) { $s=1 }; & python -v",
+    "foreach($n\nin @(1)) { $s=1 }; & python -v",
+    "foreach($n in\n@(1)) { $s=1 }; & python -v",
+    "foreach(\n  $n in @(1)\n) {\n  $s=1\n}\n& 'C:\\x\\python.exe' -m unittest discover -v",
 ];
 const DENY: &[&str] = &[
     r"foreach($n in @(1)) { Remove-Item -Recurse -Force ./victim }; & python -v",
@@ -142,6 +151,14 @@ const DENY: &[&str] = &[
     r"& $cmd @args",
     r"& $cmd @('-r','./victim')",
     r"& $cmd -r ./victim",
+    "foreach(\n$n in @(Remove-Item -Recurse -Force ./victim)) { echo $n }; & python -v",
+    "foreach\r\n(\r\n$n in @(1)) {\r\n& $cmd -r ./victim\r\n}",
+    "foreach($n\nin @(1)) { Remove-Item -Recurse -Force ./victim }",
+    "foreach(\n$n in\n$(& $cmd -r ./victim)) { echo $n }",
+    "foreach(\n$(& $cmd -r ./victim) in @(1)) { echo 1 }",
+    // The body of a foreach whose header spans lines must still be judged.
+    "foreach(\n$n in @(1)) { Remove-Item -Recurse -Force ./victim }; & python -v",
+    "foreach\n($n in @(1)) { git reset --hard }; & python -v",
 ];
 #[test]
 fn powershell_foreach_and_invocations_in_both_protocols() {

@@ -4262,9 +4262,13 @@ pub(crate) fn split_command_segments_in_dialect(
     }
 
     let tokens = crate::normalize::tokenize_for_shell_dialect(cmd, dialect);
+    let foreach_declarations = if dialect == crate::normalize::ShellDialect::PowerShell {
+        powershell_foreach_declarations(cmd, &tokens)
+    } else {
+        Vec::new()
+    };
     let mut segments = Vec::new();
     let mut segment_start = 0usize;
-    let mut foreach_header = false;
     for token in tokens
         .iter()
         .filter(|token| token.kind == crate::normalize::NormalizeTokenKind::Separator)
@@ -4289,35 +4293,19 @@ pub(crate) fn split_command_segments_in_dialect(
         {
             continue;
         }
-        let prefix = &cmd[segment_start..token.byte_range.start];
-        let start = if foreach_header {
-            powershell_foreach_expression_start(prefix)
-                .map_or(segment_start, |offset| segment_start + offset)
-        } else {
-            segment_start
-        };
+        let end = token.byte_range.start;
+        let start = after_foreach_declaration(segment_start, &foreach_declarations).min(end);
         // `@(` is PowerShell's array expression, not an executable named `@`.
         // Keep the contents visible after the opening parenthesis.
         let array_opener = dialect == crate::normalize::ShellDialect::PowerShell
             && token.text(cmd) == Some("(")
-            && cmd[start..token.byte_range.start].trim_start() == "@";
+            && cmd[start..end].trim_start() == "@";
         if !array_opener {
-            push_trimmed_segment(cmd, start, token.byte_range.start, &mut segments);
+            push_trimmed_segment(cmd, start, end, &mut segments);
         }
-        foreach_header = dialect == crate::normalize::ShellDialect::PowerShell
-            && token.text(cmd) == Some("(")
-            && prefix
-                .split_whitespace()
-                .last()
-                .is_some_and(|word| word.eq_ignore_ascii_case("foreach"));
         segment_start = token.byte_range.end;
     }
-    let start = if foreach_header {
-        powershell_foreach_expression_start(&cmd[segment_start..])
-            .map_or(segment_start, |offset| segment_start + offset)
-    } else {
-        segment_start
-    };
+    let start = after_foreach_declaration(segment_start, &foreach_declarations).min(cmd.len());
     push_trimmed_segment(cmd, start, cmd.len(), &mut segments);
 
     if segments.is_empty() {
@@ -4329,23 +4317,66 @@ pub(crate) fn split_command_segments_in_dialect(
     segments
 }
 
-// The first two words inside a foreach header declare the loop variable; they
-// are not an invocation. Leave the collection expression and its nested
-// executable segments visible to all pack readers.
-fn powershell_foreach_expression_start(header: &str) -> Option<usize> {
-    use crate::normalize::{NormalizeTokenKind, ShellDialect, tokenize_for_shell_dialect};
+// `foreach ($n in <collection>)`: the loop variable and `in` declare, they do
+// not invoke. PowerShell allows line breaks after `foreach`, after `(` and
+// between the two words, so read them across line-break separators. Return the
+// byte ranges from the opening parenthesis to the end of `in`; the collection
+// expression and every nested executable segment stay visible to all readers.
+fn powershell_foreach_declarations(
+    cmd: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Vec<std::ops::Range<usize>> {
+    use crate::normalize::NormalizeTokenKind::{Separator, Word};
 
-    let tokens = tokenize_for_shell_dialect(header, ShellDialect::PowerShell);
-    let mut words = tokens
-        .iter()
-        .filter(|token| token.kind != NormalizeTokenKind::Separator);
-    let variable = words.next()?;
-    let keyword = words.next()?;
-    if variable.text(header)?.starts_with('$') && keyword.text(header)?.eq_ignore_ascii_case("in") {
-        Some(keyword.byte_range.end)
-    } else {
-        None
+    let line_break = |token: &&crate::normalize::NormalizeToken| {
+        token.kind == Separator
+            && token
+                .text(cmd)
+                .is_some_and(|text| text.bytes().all(|byte| matches!(byte, b'\r' | b'\n')))
+    };
+    let word = |token: &crate::normalize::NormalizeToken, accept: fn(&str) -> bool| {
+        token.kind == Word && token.text(cmd).is_some_and(accept)
+    };
+    let mut declarations = Vec::new();
+    for (index, keyword) in tokens.iter().enumerate() {
+        if !word(keyword, |text| text.eq_ignore_ascii_case("foreach")) {
+            continue;
+        }
+        let mut header = tokens[index + 1..]
+            .iter()
+            .filter(|token| !line_break(token));
+        let (Some(open), Some(variable), Some(keyword_in)) =
+            (header.next(), header.next(), header.next())
+        else {
+            continue;
+        };
+        if open.kind == Separator
+            && open.text(cmd) == Some("(")
+            && word(variable, powershell_simple_variable)
+            && word(keyword_in, |text| text.eq_ignore_ascii_case("in"))
+        {
+            declarations.push(open.byte_range.end..keyword_in.byte_range.end);
+        }
     }
+    declarations
+}
+
+// Only a plain `$name` (optionally scope-qualified) is skipped; a word with
+// quotes, subexpressions or other syntax stays visible as before.
+fn powershell_simple_variable(word: &str) -> bool {
+    word.strip_prefix('$').is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+    })
+}
+
+fn after_foreach_declaration(position: usize, declarations: &[std::ops::Range<usize>]) -> usize {
+    declarations
+        .iter()
+        .find(|declaration| declaration.start <= position && position < declaration.end)
+        .map_or(position, |declaration| declaration.end)
 }
 
 fn shell_operator_is_escaped(
@@ -6002,6 +6033,27 @@ destructive_patterns:
                 "& $cmd -r ./victim",
                 "{ echo $n }",
                 "& python -v"
+            ]
+        );
+        assert_eq!(
+            split_command_segments_in_dialect(
+                "foreach\r\n(\n$n\r\nin\n@(& $cmd -r ./victim)) { echo $n }",
+                ShellDialect::PowerShell,
+            ),
+            vec!["foreach", "& $cmd -r ./victim", "{ echo $n }"]
+        );
+        assert_eq!(
+            split_command_segments_in_dialect(
+                "foreach(\n$(& $cmd -r ./victim) in @(1)) { echo 1 }",
+                ShellDialect::PowerShell,
+            ),
+            vec![
+                "foreach",
+                "$",
+                "& $cmd -r ./victim",
+                "in @",
+                "1",
+                "{ echo 1 }"
             ]
         );
         assert_eq!(
