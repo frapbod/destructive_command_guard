@@ -407,6 +407,9 @@ impl ContextClassifier {
         };
 
         let mut i = 0;
+        // A removed backslash-newline does not end a word. Track this while
+        // scanning rather than guessing from the byte immediately before '#'.
+        let mut word_start = true;
         while i < len {
             let byte = bytes[i];
             let Some(current_state) = stack.last().copied() else {
@@ -420,6 +423,9 @@ impl ContextClassifier {
                     TokenizerState::Comment | TokenizerState::PowerShellBlockComment
                 );
                 if effective {
+                    if current_state == TokenizerState::Normal && bytes.get(i + 1) != Some(&b'\n') {
+                        word_start = false;
+                    }
                     // Consume the backslash and the next character
                     i += 1; // Skip \
                     if i < len {
@@ -433,6 +439,9 @@ impl ContextClassifier {
 
             match current_state {
                 TokenizerState::Normal => {
+                    let at_word_start = word_start;
+                    word_start = matches!(byte, b' ' | b'\t' | b'\n' | b'|' | b';')
+                        || (byte == b'&' && !is_ampersand_redirection_byte(bytes, i, len));
                     match byte {
                         b'\'' | b'$' if byte == b'\'' || ansi_c_quote_starts_at(bytes, i) => {
                             let ansi_c = byte == b'$';
@@ -577,14 +586,9 @@ impl ContextClassifier {
                             i = consume_braced_parameter(command, i).0;
                             continue;
                         }
-                        // A carriage return or form feed is no blank to the
-                        // shell: a `#` right after one is part of a word.
-                        b'#' if i == 0
-                            || matches!(
-                                bytes[i - 1],
-                                b' ' | b'\t' | b'\n' | b'|' | b'&' | b';'
-                            ) =>
-                        {
+                        // Only an actual word boundary opens a comment. Removed
+                        // continuations and escaped blanks do not create one.
+                        b'#' if at_word_start => {
                             // Comment start if start of word (including after separators).
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
@@ -758,6 +762,7 @@ impl ContextClassifier {
                             spans.push(Span::new(SpanKind::Comment, span_start, i + 1));
                             span_start = i + 1;
                             current_kind = SpanKind::Executed;
+                            word_start = true;
                         }
                     }
                 }
@@ -1593,7 +1598,23 @@ fn plain_sanitize_mask_ranges(command: &str) -> Option<SmallVec<[Range<usize>; 8
     if !SAFE_COMMANDS_MATCHER.is_match(command) && !has_comment_char && !may_have_flowctl_data {
         return Some(SmallVec::new());
     }
-    token_mask_ranges(command, &tokenize_command(command), may_have_flowctl_data)
+    let posix = token_mask_ranges(
+        command,
+        &tokenize_command(command, true),
+        may_have_flowctl_data,
+    )?;
+    if command.bytes().any(|b| matches!(b, b'\r' | b'\x0c')) {
+        // This reader also serves PowerShell, where CR can end a statement.
+        // Mask only what both whitespace readings agree is inert.
+        let other = token_mask_ranges(
+            command,
+            &tokenize_command(command, false),
+            may_have_flowctl_data,
+        )?;
+        Some(intersect_ranges(&posix, &other))
+    } else {
+        Some(posix)
+    }
 }
 
 /// The masking pass of [`plain_sanitize_mask_ranges`] over `command`'s tokens.
@@ -2828,7 +2849,7 @@ impl SanitizeToken {
 
 type SanitizeTokens = SmallVec<[SanitizeToken; 16]>;
 
-fn tokenize_command(command: &str) -> SanitizeTokens {
+fn tokenize_command(command: &str, posix_blanks: bool) -> SanitizeTokens {
     let bytes = command.as_bytes();
     let len = bytes.len();
 
@@ -2836,8 +2857,14 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
     let mut i = 0;
 
     while i < len {
-        // Skip whitespace, but STOP at newline (it's a separator)
-        while i < len && bytes[i].is_ascii_whitespace() && bytes[i] != b'\n' {
+        // Preserve both POSIX and the pre-existing shared whitespace views.
+        while i < len
+            && if posix_blanks {
+                matches!(bytes[i], b' ' | b'\t')
+            } else {
+                bytes[i].is_ascii_whitespace() && bytes[i] != b'\n'
+            }
+        {
             i += 1;
         }
         if i >= len {
@@ -2889,10 +2916,10 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
             continue;
         }
 
-        // Check for comment start. A carriage return or form feed is skipped
-        // above like a blank, but the shell does not read either as one: a
-        // `#` right after it is part of a word.
-        if i < len && bytes[i] == b'#' && (i == 0 || !matches!(bytes[i - 1], b'\r' | b'\x0c')) {
+        // This point is a word boundary: continuations within a word were
+        // consumed as part of that word, not as whitespace.
+        if bytes[i] == b'#' && (posix_blanks || i == 0 || !matches!(bytes[i - 1], b'\r' | b'\x0c'))
+        {
             // Consume until newline
             let start = i;
             while i < len && bytes[i] != b'\n' {
@@ -2907,7 +2934,7 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
         }
 
         let start = i;
-        let (end, has_inline_code) = consume_word_token(command, bytes, i, len);
+        let (end, has_inline_code) = consume_word_token(command, bytes, i, len, posix_blanks);
         i = end;
 
         if start < i {
@@ -2972,13 +2999,23 @@ fn consume_separator_token(
 }
 
 #[must_use]
-fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> (usize, bool) {
+fn consume_word_token(
+    command: &str,
+    bytes: &[u8],
+    mut i: usize,
+    len: usize,
+    posix_blanks: bool,
+) -> (usize, bool) {
     let mut has_inline_code = false;
 
     while i < len {
         let b = bytes[i];
 
-        if b.is_ascii_whitespace() {
+        if if posix_blanks {
+            matches!(b, b' ' | b'\t' | b'\n')
+        } else {
+            b.is_ascii_whitespace()
+        } {
             break;
         }
 

@@ -1644,14 +1644,14 @@ pub(crate) fn starts_with_shell_redirection(s: &str) -> bool {
 
 #[must_use]
 pub fn consume_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
-    consume_word_token_inner(bytes, i, len, false)
+    consume_word_token_inner(bytes, i, len, false, false)
 }
 
 /// Consume one POSIX argv word, excluding adjacent local redirections.
 /// Normalization deliberately keeps redirections in its token view; program
 /// extraction needs the argv boundary, but must use the same quote walker.
 pub(crate) fn consume_posix_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
-    consume_word_token_inner(bytes, i, len, true)
+    consume_word_token_inner(bytes, i, len, true, true)
 }
 
 fn consume_word_token_inner(
@@ -1659,11 +1659,16 @@ fn consume_word_token_inner(
     mut i: usize,
     len: usize,
     stop_at_redirect: bool,
+    posix_blanks: bool,
 ) -> usize {
     while i < len {
         let b = bytes[i];
 
-        if b.is_ascii_whitespace() {
+        if if posix_blanks {
+            matches!(b, b' ' | b'\t' | b'\n')
+        } else {
+            b.is_ascii_whitespace()
+        } {
             break;
         }
 
@@ -3548,7 +3553,13 @@ fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> Normaliz
     let mut i = 0;
 
     while i < len {
-        i = skip_ascii_whitespace(bytes, i, len);
+        if posix_comments {
+            while i < len && matches!(bytes[i], b' ' | b'\t') {
+                i += 1;
+            }
+        } else {
+            i = skip_ascii_whitespace(bytes, i, len);
+        }
         if i >= len {
             break;
         }
@@ -3581,7 +3592,7 @@ fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> Normaliz
         }
 
         let start = i;
-        let end = consume_word_token(bytes, i, len);
+        let end = consume_word_token_inner(bytes, i, len, false, posix_comments);
         i = end;
 
         if start < i {
