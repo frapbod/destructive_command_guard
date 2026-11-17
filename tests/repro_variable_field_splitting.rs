@@ -100,15 +100,18 @@ fn hook_decision(protocol: Protocol, command: &str) -> String {
 }
 
 fn assert_both(decision: &str, commands: &[&str]) {
+    let mut failures = Vec::new();
     for command in commands {
         for protocol in [Protocol::Claude, Protocol::Codex] {
-            assert_eq!(
-                hook_decision(protocol, command),
-                decision,
-                "{protocol:?}: {command:?}"
-            );
+            let actual = hook_decision(protocol, command);
+            if actual != decision {
+                failures.push(format!(
+                    "{protocol:?}: {command:?}: expected {decision}, got {actual}"
+                ));
+            }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -212,11 +215,17 @@ fn variable_executables_respect_actual_override_kinds() {
             r"git() { :; }; unset -f git; git reset --hard",
         ],
     );
+}
+
+#[test]
+fn executable_overrides_and_non_git_values_keep_harmless_commands() {
     assert_both(
         "allow",
         &[
             r#"Y=git; X=$Y; hash -p /usr/bin/printf git; "$X" reset --hard"#,
             r#"git() { :; }; Y=git; X=$Y; "$X" reset --hard"#,
+            r#"X=echo; sudo "$X" reset --hard"#,
+            r#"X=not_git; "${X}t" reset --hard"#,
         ],
     );
 }
