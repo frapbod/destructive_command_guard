@@ -3298,10 +3298,11 @@ fn start_process_target_is_shell(file: &str) -> bool {
     )
 }
 
-/// The dialect that reads a line rebuilt from `Start-Process <file>
-/// -ArgumentList …` (an [`ExtractedContent`] with target `start-process`,
-/// whose first word is the file). The line is the target's own command
-/// line: cmd.exe reads it as cmd does (its operators, its CR removal, a
+/// The dialect that reads a line rebuilt from `Start-Process`.
+///
+/// The line is an [`ExtractedContent`] with target `start-process`, whose
+/// first word is the file. It is the target's own command line: cmd.exe
+/// reads it as cmd does (its operators, its CR removal, a
 /// `C:\…\cmd.exe` path kept as written), a PowerShell host as
 /// PowerShell, and anything else as POSIX, as before.
 #[must_use]
