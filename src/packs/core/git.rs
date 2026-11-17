@@ -5259,6 +5259,57 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
     Some(crate::normalize::normalize_command(&decoded).into_owned())
 }
 
+/// Possible argv fields of an unquoted `${NAME...}` argument, as two readings:
+/// `[unset or empty, set]`. A set parameter's value is unknown, so it reads as
+/// one opaque word. Returns `None` for any other dynamic word, and for operands
+/// that hold further expansions; those keep the conservative raw view.
+fn posix_parameter_argument_readings(word: &GitSemanticWord) -> Option<[Vec<String>; 2]> {
+    const VALUE: &str = "__dcg_parameter_value__";
+    if !(word.dynamic
+        && word.may_split
+        && git_dynamic_fragments(&word.decoded, ShellDialect::Posix)
+            .iter()
+            .all(String::is_empty))
+    {
+        return None;
+    }
+    let inner = word.decoded.strip_prefix("${")?.strip_suffix('}')?;
+    let name_len = inner
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    if name_len == 0 || !inner.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let operator = &inner[name_len..];
+    let value = vec![VALUE.to_string()];
+    // A bare parameter and pattern substitution or removal yield nothing or
+    // an unknown value.
+    if operator.is_empty() || operator.starts_with(['/', '%', '#']) {
+        return Some([Vec::new(), value]);
+    }
+    let (alternate, operand) = if let Some(operand) = operator
+        .strip_prefix(":+")
+        .or_else(|| operator.strip_prefix('+'))
+    {
+        (true, operand)
+    } else {
+        let operand = [":-", ":=", "-", "="]
+            .iter()
+            .find_map(|prefix| operator.strip_prefix(prefix))?;
+        (false, operand)
+    };
+    if operand.contains(['$', '`']) {
+        return None;
+    }
+    let fields = shell_words::split(operand).ok()?;
+    Some(if alternate {
+        [Vec::new(), fields]
+    } else {
+        [fields, value]
+    })
+}
+
 /// Build the decoded Git regex view without reintroducing inert argv data.
 ///
 /// `command` is the exact caller-proven shell source used by the semantic
@@ -5310,48 +5361,43 @@ pub(crate) fn syntax_view_for_pattern_matching(
         .skip(executable_index + 1)
         .any(|word| word.dynamic)
     {
-        // An unquoted parameter-only argument can disappear when its value is
-        // empty. The raw regex view cannot walk punctuation inside `${...}`;
-        // try that possible argv without ever using it as a safe exemption.
-        // Keep all other dynamic words on the existing conservative path.
+        // An unquoted parameter-only argument is a choice of argv: it can
+        // vanish, give its operand's fields (`${X:-HEAD --hard}`,
+        // `${X:+--force}`) or give an unknown value. The raw regex view cannot
+        // walk punctuation inside `${...}` and would let operand text such as
+        // `--dry-run` act as a safe flag. Try each reading, deny-only: a
+        // reading is presented only when this pack denies it, never as a safe
+        // exemption. Keep all other dynamic words on the existing
+        // conservative path.
         let args = &decoded.words[executable_index + 1..];
-        let can_drop = |word: &GitSemanticWord| {
-            word.dynamic
-                && word.may_split
-                && word.decoded.starts_with("${")
-                && word.decoded.ends_with('}')
-                && git_dynamic_fragments(&word.decoded, ShellDialect::Posix)
-                    .iter()
-                    .all(String::is_empty)
-                && {
-                    // Recognize only operators which can produce no fields:
-                    // a bare parameter, `+`/`:+`, or pattern substitution /
-                    // removal. Defaults, assignment and errors need a value
-                    // model instead of guessing that the result can vanish.
-                    let inner = &word.decoded[2..word.decoded.len() - 1];
-                    let name_len = inner
-                        .bytes()
-                        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                        .count();
-                    name_len > 0
-                        && inner.as_bytes()[0].is_ascii_alphabetic()
-                        && (inner[name_len..].is_empty()
-                            || inner[name_len..].starts_with(['+', '/', '%', '#'])
-                            || inner[name_len..].starts_with(":+"))
-                }
-        };
+        let readings: Option<Vec<[Vec<String>; 2]>> = args
+            .iter()
+            .filter(|word| word.dynamic)
+            .map(posix_parameter_argument_readings)
+            .collect();
         if dialect == ShellDialect::Posix
-            && args.iter().any(can_drop)
-            && args.iter().all(|word| !word.dynamic || can_drop(word))
+            && let Some(readings) = readings
         {
-            let mut candidate = String::from("git");
-            for word in args.iter().filter(|word| !can_drop(word)) {
-                candidate.push(' ');
-                candidate.push_str(&shell_words::quote(&word.decoded));
-            }
-            let sanitized = crate::context::sanitize_for_pattern_matching(&candidate);
-            if AMBIGUITY_ARBITER.check(sanitized.as_ref()).is_some() {
-                return syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix);
+            for choice in 0..2 {
+                let mut candidate = String::from("git");
+                let mut dynamic = readings.iter();
+                for word in args {
+                    let fields = if word.dynamic {
+                        dynamic
+                            .next()
+                            .map_or(&[][..], |reading| &reading[choice][..])
+                    } else {
+                        std::slice::from_ref(&word.decoded)
+                    };
+                    for field in fields {
+                        candidate.push(' ');
+                        candidate.push_str(&shell_words::quote(field));
+                    }
+                }
+                let sanitized = crate::context::sanitize_for_pattern_matching(&candidate);
+                if AMBIGUITY_ARBITER.check(sanitized.as_ref()).is_some() {
+                    return syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix);
+                }
             }
         }
         return sanitized_view;
@@ -5398,6 +5444,16 @@ pub(crate) fn syntax_view_for_pattern_matching(
     let executable_unbounded = git_semantic_executable_is_unbounded(executable, dialect);
     let mut args = String::new();
     for word in decoded.words.iter().skip(executable_index + 1) {
+        // Windows PowerShell 5.1 does not escape a `"` inside an argument when
+        // it builds a native command line, so the program splits that argument
+        // again at its blanks. Keep those blanks as argv boundaries.
+        if dialect == ShellDialect::PowerShell && word.decoded.contains('"') {
+            for field in word.decoded.split_whitespace() {
+                args.push(' ');
+                args.push_str(&shell_words::quote(field));
+            }
+            continue;
+        }
         args.push(' ');
         args.push_str(&shell_words::quote(&word.decoded));
     }

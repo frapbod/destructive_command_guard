@@ -7,6 +7,9 @@
 //! separator after it (`"git" reset --hard;`) was allowed in every dialect
 //! but the union, which also hid a block body ending in `;`.
 
+// Shell parameter expansions such as `${X:-word}` are case data here.
+#![allow(clippy::literal_string_with_formatting_args)]
+
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
 use destructive_command_guard::packs::REGISTRY;
@@ -536,6 +539,8 @@ fn optional_expansion_cannot_grant_git_clean_dry_run_exemption() {
     let safe_commands = [
         "git clean -n -fdx ${X:-foo}",
         "git clean --dry-run -fdx ${X:-foo}",
+        "git clean -n ${FILES}",
+        "git status ${X:-HEAD --hard}",
     ];
     let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
     assert_all(&unsafe_commands, "Deny", posix, "optional safe flag");
@@ -568,5 +573,33 @@ fn quoted_argument_with_spaces_stays_one_word() {
             assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT_POSIX, "allow", decide, &label);
         }
         assert_all(GIT_NEXT_TO_QUOTED_TEXT, "deny", decide, &label);
+    }
+}
+
+/// An unquoted `${X:-word}`, `${X:=word}` or `${X:+word}` argument can give
+/// its operand's fields as argv. Only dcg reads these strings.
+#[test]
+fn parameter_operand_fields_are_possible_git_argv() {
+    let unsafe_commands = [
+        "git clean ${X:--fdx}",
+        "git clean ${X:--f -d -x}",
+        "git push ${X:+--force} origin main",
+        "git clean ${X:+-f -d -x}",
+        "git stash ${X:-x clear}",
+        "git checkout ${X:--- .}",
+        "git reset ${X:-x} ${Y:-HEAD --hard}",
+    ];
+    let safe_commands = [
+        "git push ${X:+--dry-run} origin main",
+        "git checkout ${BRANCH:-main}",
+        "git log ${X:-\"--grep=reset --hard\"}",
+    ];
+    let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
+    assert_all(&unsafe_commands, "Deny", posix, "operand fields");
+    assert_all(&safe_commands, "Allow", posix, "harmless operand fields");
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        let bash = |command: &str| hook_decision(protocol, "Bash", command);
+        assert_all(&unsafe_commands, "deny", bash, "operand fields");
+        assert_all(&safe_commands, "allow", bash, "harmless operand fields");
     }
 }
