@@ -15407,6 +15407,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         && let Some(masked) = crate::normalize::mask_powershell_comments(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
+        // The copy's incomplete analyses count only if its result is used.
+        let alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
         let alternate = if deadline_exceeded(deadline) {
             EvaluationResult::indeterminate_due_to_budget()
         } else {
@@ -15438,6 +15440,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             }
         };
         if adopt {
+            drop(alternate_scope);
             result = alternate;
             if let Some(info) = result.pattern_info.as_mut() {
                 if masked.len() == command.len()
@@ -15453,6 +15456,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                     info.matched_text_preview = None;
                 }
             }
+        } else {
+            alternate_scope.discard();
         }
     }
     // A program name in another case runs the same program on a

@@ -44,6 +44,15 @@ impl RegexEvaluationScope {
     pub(crate) fn has_failed(&self) -> bool {
         EVALUATION_FAILURES.with(|stack| stack.borrow().last().copied().unwrap_or(false))
     }
+
+    /// Leave without passing this scope's failures to its parent: for an
+    /// extra deny-only reading whose result the caller does not use.
+    pub(crate) fn discard(self) {
+        EVALUATION_FAILURES.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for RegexEvaluationScope {
