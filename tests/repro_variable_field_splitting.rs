@@ -656,3 +656,16 @@ fn permission_lifting_proofs_keep_refusing_group_and_child_bindings() {
         ],
     );
 }
+
+#[test]
+fn a_binding_in_a_branch_is_still_one_value_the_shell_may_hold() {
+    // 0.16.0 denies these: when the branch runs, Bash runs `git reset
+    // --hard`. Reading the parse must not lose that denial.
+    assert_both(
+        "deny",
+        &[
+            r#"X=a; if test -n "$C"; then :; X=' '; fi; git${X}reset${X}--hard"#,
+            r#"X=a; while test -n "$C"; do :; X=' '; done; git${X}reset${X}--hard"#,
+        ],
+    );
+}

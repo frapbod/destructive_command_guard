@@ -30086,22 +30086,28 @@ fn resolve_variable_bindings(
             // below, where `segment_text_may_assign` refuses the proof outright —
             // which is the right answer, because an unprovable binding is exactly
             // the case the exemption must not cover.
-            let binds_in_parent = match &scope {
-                Some((scope, _)) => *scope == crate::heredoc::ShellScope::Always,
-                None => {
-                    !nested
-                        && (segment_binding_reaches_parent_shell(source, start, end)
-                            || (matches!(mode, VariableResolution::Redirect { .. })
-                                && source
-                                    .get(..start)
-                                    .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
-                                && conditional_binding_dominates_redirect(
-                                    source,
-                                    end,
-                                    segment_start,
-                                )))
-                }
-            }
+            //
+            // Deny-only also binds a statement the parse shows the use's shell
+            // always runs first, such as the first one in a brace group
+            // (`{ X=' '`). The text rule stays for the rest: a binding it takes
+            // from a branch is one value the shell may hold, which is enough
+            // to deny.
+            let parsed_statement = match &scope {
+                Some((crate::heredoc::ShellScope::Always, statement)) => Some(statement.clone()),
+                _ => None,
+            };
+            let binds_in_parent = (parsed_statement.is_some()
+                || (!nested
+                    && (segment_binding_reaches_parent_shell(source, start, end)
+                        || (matches!(mode, VariableResolution::Redirect { .. })
+                            && source
+                                .get(..start)
+                                .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
+                            && conditional_binding_dominates_redirect(
+                                source,
+                                end,
+                                segment_start,
+                            )))))
                 // A heredoc is input to another command, not a parent-shell
                 // assignment scope. Keep its segments in the hazard checks below:
                 // an expanding body can still mutate the caller's shell state.
@@ -30110,12 +30116,9 @@ fn resolve_variable_bindings(
                     .any(|(body, _)| body.start < end && start < body.end);
             if binds_in_parent {
                 // The statement without the `{` that opens its group.
-                let segment = match &scope {
-                    Some((_, statement)) => {
-                        source.get(statement.clone()).map_or(segment, str::trim)
-                    }
-                    None => segment,
-                };
+                let segment = parsed_statement
+                    .and_then(|statement| source.get(statement))
+                    .map_or(segment, str::trim);
                 let assignments = strip_assignment_declaration(segment);
                 let binding = match assignment_only_segment_binding(assignments, name) {
                     AssignmentOnlyBinding::NotAssignmentOnly => assignments
