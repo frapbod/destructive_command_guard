@@ -1236,9 +1236,6 @@ fn only_redirections_follow(segment: &str, tokens: &[crate::normalize::Normalize
         true
     }) && !target_pending
 }
-    }
-    command
-}
 
 fn command_after_posix_control_prefixes_bounded(
     segment: &str,
