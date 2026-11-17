@@ -15388,6 +15388,47 @@ fn evaluate_command_in_dialect_union(
         return primary;
     }
 
+    // A proven variable value is field-split and quote-removed where it is
+    // used, so `X=" "; git${X}reset${X}--hard` and `X=gi; "${X}t" reset
+    // --hard` run `git reset --hard`. When the command is otherwise allowed,
+    // evaluate the reconstruction with those values spliced in. Running it
+    // last keeps every existing denial's rule and span; only a denial (or an
+    // incomplete evaluation, which fails closed) is adopted.
+    let primary = if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && primary.decision == EvaluationDecision::Allow
+        && primary.allowlist_override.is_none()
+        && let Some(expanded) = posix_proven_variable_view(command, deadline)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &expanded,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            ShellDialect::Posix,
+            nested_command_depth + 1,
+            inherited_automated_stdin,
+        );
+        if result.decision == EvaluationDecision::Allow {
+            primary
+        } else {
+            // The nested span indexes the reconstructed text.
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.matched_span = None;
+                info.matched_text_preview = None;
+            }
+            result
+        }
+    } else {
+        primary
+    };
+
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
         || primary.decision != EvaluationDecision::Allow
@@ -17479,6 +17520,97 @@ impl IfsValue {
     fn default_value() -> Self {
         Self::Set(DEFAULT_POSIX_IFS.to_string())
     }
+}
+
+/// A reconstruction of `command` with every statically proven variable value
+/// spliced in, for the evaluator to check alongside the original.
+///
+/// Field splitting and quote removal happen after parameter expansion, so a
+/// proven value can change which command runs even when no word of the
+/// source spells it: `X=" "; git${X}reset${X}--hard` and
+/// `X=gi; "${X}t" reset --hard` both run `git reset --hard`, and
+/// `X=--hard; git reset $X` passes the flag only through the variable. The
+/// executable model ([`model_literal_posix_executable_assignments`]) only
+/// reads a command word that is exactly one reference, and the rm classifier
+/// was the only consumer of the deny-only splice. This view applies that
+/// splice ([`resolve_proven_variables_in_segment_with_ifs`]) to every
+/// top-level segment, with the binding proofs of
+/// [`resolve_variable_bindings`]: an assignment the parent shell performs
+/// before the use, no later mutation, values free of shell metacharacters.
+/// Segments that only assign are left alone; their values reach the uses.
+///
+/// The IFS in force is the default unless an earlier segment assigns it; then
+/// the latest literal assignment before the segment, with default
+/// whitespace still splitting. Unknown references stay as written. The
+/// original command is still evaluated, so this only adds denials.
+fn posix_proven_variable_view(command: &str, deadline: Option<&Deadline>) -> Option<String> {
+    if !command.contains('$')
+        || !command.contains('=')
+        || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+    {
+        return None;
+    }
+    let ranges = command_segment_ranges(command);
+    if ranges.len() < 2 || ranges.len() > MAX_POSIX_EXECUTABLE_SEGMENTS {
+        return None;
+    }
+    let ifs_literals = if segment_text_may_assign(command, "IFS") {
+        Some(parsed_ifs_literals(command).map_or_else(Vec::new, |parse| parse.assignments))
+    } else {
+        None
+    };
+    let mut out = String::with_capacity(command.len());
+    let mut copied = 0usize;
+    for &(start, end) in &ranges {
+        if deadline_exceeded(deadline) {
+            return None;
+        }
+        if start < copied || segment_range_is_nested(&ranges, start, end) {
+            continue;
+        }
+        let Some(segment) = command.get(start..end) else {
+            continue;
+        };
+        let assignments = strip_assignment_declaration(segment.trim());
+        if !segment.contains('$')
+            || posix_executable_assignment_parts(assignments).is_some()
+            || !matches!(
+                assignment_only_segment_binding(assignments, ""),
+                AssignmentOnlyBinding::NotAssignmentOnly
+            )
+        {
+            // Assignment words are not field-split; their values reach the
+            // uses through the binding proof instead.
+            continue;
+        }
+        let ifs = match &ifs_literals {
+            None => DEFAULT_POSIX_IFS.to_string(),
+            Some(literals) => match literals.iter().rev().find(|(end, _)| *end <= start) {
+                Some((_, value)) if value.is_empty() => String::new(),
+                Some((_, value)) => format!("{DEFAULT_POSIX_IFS}{value}"),
+                None => DEFAULT_POSIX_IFS.to_string(),
+            },
+        };
+        let Some(resolved) = resolve_proven_variables_in_segment_with_ifs(
+            command,
+            &ranges,
+            start,
+            segment,
+            ResolutionDirection::DenyOnly,
+            &ifs,
+            true,
+        ) else {
+            continue;
+        };
+        out.push_str(&command[copied..start]);
+        out.push_str(&resolved);
+        copied = end;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&command[copied..]);
+    (out != command).then_some(out)
 }
 
 /// How an IFS reference produces its text.
@@ -28888,7 +29020,9 @@ enum VariableResolution {
     Literal,
     /// Keep established literal candidates when propagation can only add a
     /// denial. A possibly stale candidate must never authorize an exemption.
-    DenyOnlyLiteral,
+    /// A copy of an earlier scalar (`X=$IFS`, `Y=${X}t`) consumes one level
+    /// of `copy_depth`.
+    DenyOnlyLiteral { copy_depth: usize },
     /// Redirect-only extension; a copied value consumes one level of depth.
     Redirect { remaining_depth: usize },
 }
@@ -29387,21 +29521,20 @@ fn resolve_variable_bindings(
     // change them without an assignment word (cd updates PWD, for example).
     // Every proof needs ordinary scalar bindings, including the literal proof
     // that can exempt rm or run before the extended redirect proof.
-    if (!matches!(mode, VariableResolution::DenyOnlyLiteral)
-        && shell_maintained_posix_variable(name))
+    let deny_only = matches!(mode, VariableResolution::DenyOnlyLiteral { .. });
+    if (!deny_only && shell_maintained_posix_variable(name))
         || matches!(mode, VariableResolution::Redirect { remaining_depth: 0 })
     {
         return None;
     }
-    let heredoc_bodies =
-        if !matches!(mode, VariableResolution::DenyOnlyLiteral) && source.contains("<<") {
-            if source.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
-                return None;
-            }
-            crate::heredoc::heredoc_bodies_with_operators(source)
-        } else {
-            Vec::new()
-        };
+    let heredoc_bodies = if !deny_only && source.contains("<<") {
+        if source.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+            return None;
+        }
+        crate::heredoc::heredoc_bodies_with_operators(source)
+    } else {
+        Vec::new()
+    };
     let mut values: Option<Vec<String>> = None;
     for &(start, end) in segment_ranges {
         if end > segment_start {
@@ -29450,14 +29583,27 @@ fn resolve_variable_bindings(
                 AssignmentOnlyBinding::Ambiguous => return None,
             };
             if let Some(raw) = binding {
-                if values.is_some() {
+                // A second unconditional parent-shell binding replaces the
+                // first: `X=a; X=" "; git${X}reset${X}--hard` runs
+                // `git reset --hard`. Permission-lifting proofs keep refusing
+                // the ambiguity; the deny-only view follows the shell.
+                if values.is_some() && !deny_only {
                     return None;
                 }
                 values = Some(match mode {
-                    VariableResolution::Literal | VariableResolution::DenyOnlyLiteral => vec![
+                    VariableResolution::Literal => vec![
                         literal_assignment_value(raw)
                             .or_else(|| mktemp_scratch_assignment_value(raw))?,
                     ],
+                    VariableResolution::DenyOnlyLiteral { copy_depth } => {
+                        vec![deny_only_assignment_value(
+                            source,
+                            segment_ranges,
+                            start,
+                            raw,
+                            copy_depth,
+                        )?]
+                    }
                     VariableResolution::Redirect { remaining_depth } => redirect_assignment_values(
                         source,
                         segment_ranges,
@@ -29496,8 +29642,15 @@ fn resolve_variable_bindings(
             // not a parent-shell wrapper. It cannot mutate another scalar.
             continue;
         }
+        // A nameref declaration binds only its own name; reads through it are
+        // redirected by [`deny_only_nameref_target`].
+        if deny_only
+            && posix_nameref_declaration(segment).is_some_and(|(declared, _)| declared != name)
+        {
+            continue;
+        }
         let first = hazard_first_word(segment);
-        if !matches!(mode, VariableResolution::DenyOnlyLiteral)
+        if !deny_only
             && (first.contains(['$', '`'])
                 || first.starts_with('-')
                 || matches!(first.as_ref(), "command" | "builtin" | "time"))
@@ -29526,7 +29679,7 @@ fn resolve_variable_bindings(
             // These invalidate permission-lifting proofs. The deny-only
             // pass retains the earlier literal as a conservative candidate,
             // so adding this guard cannot hide an existing sensitive target.
-            "trap" | "alias" => !matches!(mode, VariableResolution::DenyOnlyLiteral),
+            "trap" | "alias" => !deny_only,
             other => matches!(
                 other,
                 "readonly"
@@ -29546,10 +29699,12 @@ fn resolve_variable_bindings(
             ),
         };
         // A changed IFS alters how an unquoted use word-splits, which the
-        // substitution proof cannot reproduce (v0.9.1 review).
+        // substitution proof cannot reproduce (v0.9.1 review). The deny-only
+        // splice renders the separators itself
+        // ([`resolve_proven_variables_in_segment_with_ifs`]).
         if may_mutate_shell_variables
             || segment_text_may_assign(segment, name)
-            || segment_text_may_assign(segment, "IFS")
+            || (!deny_only && segment_text_may_assign(segment, "IFS"))
         {
             return None;
         }
@@ -30425,6 +30580,150 @@ fn mktemp_explicit_tmp_assignment_value(raw: &str) -> Option<String> {
     Some(path)
 }
 
+/// How many scalar copies (`Y=$X`) a deny-only binding proof follows.
+const MAX_DENY_ONLY_COPY_DEPTH: usize = 4;
+
+/// `declare -n NAME=TARGET` (also `typeset`/`local`, any option cluster
+/// holding `n`): Bash makes every later read of `NAME` read `TARGET`.
+fn posix_nameref_declaration(segment: &str) -> Option<(&str, &str)> {
+    let mut words = segment.split_ascii_whitespace();
+    if !matches!(words.next()?, "declare" | "typeset" | "local") {
+        return None;
+    }
+    let mut nameref = false;
+    for word in words {
+        if let Some(flags) = word.strip_prefix('-') {
+            nameref |= flags.contains('n');
+            continue;
+        }
+        let (name, raw) = word.split_once('=')?;
+        let target = raw
+            .strip_prefix(['"', '\''])
+            .and_then(|rest| rest.strip_suffix(['"', '\'']))
+            .unwrap_or(raw);
+        let valid = |text: &str| {
+            text.bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        };
+        return (nameref && valid(name) && valid(target)).then_some((name, target));
+    }
+    None
+}
+
+/// The variable a deny-only read of `name` reaches: the latest earlier
+/// top-level nameref declaration redirects it, up to the copy depth.
+fn deny_only_nameref_target<'a>(
+    source: &'a str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &'a str,
+) -> &'a str {
+    let mut current = name;
+    for _ in 0..MAX_DENY_ONLY_COPY_DEPTH {
+        // Segment ranges are in source order, so the first match from the
+        // end is the latest declaration.
+        let target = segment_ranges
+            .iter()
+            .rev()
+            .filter(|&&(start, end)| {
+                end <= segment_start && !segment_range_is_nested(segment_ranges, start, end)
+            })
+            .filter_map(|&(start, end)| posix_nameref_declaration(source.get(start..end)?.trim()))
+            .find(|(declared, _)| *declared == current)
+            .map(|(_, target)| target);
+        match target {
+            Some(target) if target != current => current = target,
+            _ => break,
+        }
+    }
+    current
+}
+
+/// The single literal value a deny-only read of `name` has at
+/// `segment_start`, including the default value of an `IFS` that no earlier
+/// segment assigns.
+fn deny_only_variable_value(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+) -> Option<String> {
+    let name = deny_only_nameref_target(source, segment_ranges, segment_start, name);
+    if name == "IFS" && !segment_text_may_assign(source.get(..segment_start)?, "IFS") {
+        return Some(DEFAULT_POSIX_IFS.to_string());
+    }
+    let values = resolve_variable_bindings(
+        source,
+        segment_ranges,
+        segment_start,
+        name,
+        VariableResolution::DenyOnlyLiteral {
+            copy_depth: MAX_DENY_ONLY_COPY_DEPTH,
+        },
+    )?;
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    Some(value.clone())
+}
+
+/// The value a deny-only proof may take from one assignment.
+///
+/// Beyond [`literal_assignment_value`], this decodes any fully literal word
+/// (`' '`, `$'\x20'`, `a"b c"`) and follows a copy of one earlier scalar
+/// between literal affixes (`X=$IFS`, `Y="${X}t"`). An assignment word is
+/// never field-split, so the copy is the exact string. An `IFS` that no
+/// earlier segment assigns holds the shell's default.
+fn deny_only_assignment_value(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    assignment_start: usize,
+    raw: &str,
+    copy_depth: usize,
+) -> Option<String> {
+    if let Some(value) =
+        literal_assignment_value(raw).or_else(|| mktemp_scratch_assignment_value(raw))
+    {
+        return Some(value);
+    }
+    let raw = raw.trim();
+    if let Some(value) = crate::normalize::decode_posix_literal_word(raw) {
+        return Some(value.into_owned());
+    }
+    if copy_depth == 0 {
+        return None;
+    }
+    let token = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(raw);
+    let (prefix, name, suffix) = parse_posix_variable_with_literal_affixes(token)?;
+    let name = deny_only_nameref_target(source, segment_ranges, assignment_start, name);
+    let copied =
+        if name == "IFS" && !segment_text_may_assign(source.get(..assignment_start)?, "IFS") {
+            DEFAULT_POSIX_IFS.to_string()
+        } else {
+            let values = resolve_variable_bindings(
+                source,
+                segment_ranges,
+                assignment_start,
+                name,
+                VariableResolution::DenyOnlyLiteral {
+                    copy_depth: copy_depth - 1,
+                },
+            )?;
+            let [value] = values.as_slice() else {
+                return None;
+            };
+            value.clone()
+        };
+    Some(format!("{prefix}{copied}{suffix}"))
+}
+
 /// A whole-segment assignment value that is one literal shell word.
 fn literal_assignment_value(raw: &str) -> Option<String> {
     let raw = raw.trim();
@@ -30551,9 +30850,51 @@ fn resolve_proven_variables_in_segment(
     segment: &str,
     direction: ResolutionDirection,
 ) -> Option<String> {
+    resolve_proven_variables_in_segment_with_ifs(
+        source,
+        segment_ranges,
+        segment_start,
+        segment,
+        direction,
+        DEFAULT_POSIX_IFS,
+        false,
+    )
+}
+
+/// [`resolve_proven_variables_in_segment`] with the IFS value in force at
+/// the segment.
+///
+/// Under [`ResolutionDirection::DenyOnly`] the walk also tracks double
+/// quotes, and renders each value the way the shell expands it there: inside
+/// double quotes it stays one word; unquoted, every IFS character (and any
+/// newline or tab, which would otherwise end the command or stay invisible)
+/// becomes a space, so `X=" "; git${X}reset${X}--hard` reads as
+/// `git reset --hard` and `X=gi; "${X}t" reset --hard` as `"git" reset
+/// --hard`. With an empty IFS an unquoted value holding blanks is not split,
+/// so it is left as written. Over-splitting can only add a denial.
+///
+/// `composite_only` splices only what the variable-aware analyses cannot
+/// see: a reference inside a larger word (`git${X}reset`, `"${X}t"`), or an
+/// unquoted whole word whose value yields other than one field
+/// (`X="reset --hard"; git $X`, an empty `$E`). A whole single-field
+/// reference such as `tee "$f"` stays as written, because the destination,
+/// executable and rm proofs already judge it with its shell context
+/// (command-cache rebinding, unknown option fields, quoted heredoc data)
+/// that a literal spelling would lose.
+fn resolve_proven_variables_in_segment_with_ifs(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    direction: ResolutionDirection,
+    ifs: &str,
+    composite_only: bool,
+) -> Option<String> {
+    let deny_only = direction == ResolutionDirection::DenyOnly;
     let mut out = String::with_capacity(segment.len());
     let mut rest = segment;
     let mut substituted = false;
+    let mut in_double_quote = false;
     // Only a `$` the shell would actually expand may be replaced. Inside single
     // quotes, and after a backslash, a dollar is literal text — `rm -rf '$D'`
     // deletes a file named `$D`, so resolving it would describe a different
@@ -30566,10 +30907,63 @@ fn resolve_proven_variables_in_segment(
     // allow. The converse (resolving something the shell would not expand) is
     // what must never happen.
     let mut in_single_quote = false;
-    while let Some(index) = rest.find(['$', '\'', '\\']) {
+    let specials: &[char] = if deny_only {
+        &['$', '\'', '\\', '"', '(', ')']
+    } else {
+        &['$', '\'', '\\']
+    };
+    // DenyOnly: each open `$(`, with the double-quote state outside it and
+    // its count of unmatched inner `(`. Quotes inside a substitution start
+    // fresh: in `"$(tee "$f")"` the inner `"$f"` is its own quoted word.
+    let mut substitutions: Vec<(bool, usize)> = Vec::new();
+    while let Some(index) = rest.find(specials) {
         out.push_str(&rest[..index]);
         let tail = &rest[index..];
         match tail.as_bytes()[0] {
+            // `(` and `)` are only reached under DenyOnly.
+            b'(' => {
+                if !in_single_quote
+                    && !in_double_quote
+                    && let Some((_, depth)) = substitutions.last_mut()
+                {
+                    *depth += 1;
+                }
+                out.push('(');
+                rest = &tail[1..];
+            }
+            b')' => {
+                if !in_single_quote
+                    && !in_double_quote
+                    && let Some((outer_double, depth)) = substitutions.last_mut()
+                {
+                    if *depth > 0 {
+                        *depth -= 1;
+                    } else {
+                        in_double_quote = *outer_double;
+                        substitutions.pop();
+                    }
+                }
+                out.push(')');
+                rest = &tail[1..];
+            }
+            b'$' if deny_only && !in_single_quote && tail.starts_with("$(") => {
+                substitutions.push((in_double_quote, 0));
+                in_double_quote = false;
+                out.push_str("$(");
+                rest = &tail[2..];
+            }
+            b'"' => {
+                // Only reached under DenyOnly.
+                if !in_single_quote {
+                    in_double_quote = !in_double_quote;
+                }
+                out.push('"');
+                rest = &tail[1..];
+            }
+            b'\'' if in_double_quote => {
+                out.push('\'');
+                rest = &tail[1..];
+            }
             b'\'' => {
                 in_single_quote = !in_single_quote;
                 out.push('\'');
@@ -30593,12 +30987,38 @@ fn resolve_proven_variables_in_segment(
                     rest = &tail[1..];
                     continue;
                 }
-                let Some((name, consumed)) = parse_leading_posix_variable(tail) else {
-                    // Not a plain variable reference (`$(`, `$'`, a bare `$`):
-                    // leave it and let the caller's proof fail if it mattered.
-                    out.push('$');
-                    rest = &tail[1..];
-                    continue;
+                // DenyOnly also reads Bash's indirect `${!NAME}`: the value of
+                // the variable that NAME's proven value names.
+                let indirect = if deny_only {
+                    tail.strip_prefix("${!").and_then(|body| {
+                        let close = body.find('}')?;
+                        let pointer = &body[..close];
+                        let (_, parsed) = parse_leading_posix_variable(&format!("${pointer}"))?;
+                        (parsed == pointer.len() + 1).then_some((pointer, close + 4))
+                    })
+                } else {
+                    None
+                };
+                let indirect_target = indirect.and_then(|(pointer, _)| {
+                    let target =
+                        deny_only_variable_value(source, segment_ranges, segment_start, pointer)?;
+                    parse_leading_posix_variable(&format!("${target}"))
+                        .is_some_and(|(_, parsed)| parsed == target.len() + 1)
+                        .then_some(target)
+                });
+                let (name, consumed): (&str, usize) = match (indirect, indirect_target.as_deref()) {
+                    (Some((_, consumed)), Some(target)) => (target, consumed),
+                    _ => {
+                        let Some(parsed) = parse_leading_posix_variable(tail) else {
+                            // Not a plain variable reference (`$(`, `$'`, a bare
+                            // `$`): leave it and let the caller's proof fail if it
+                            // mattered.
+                            out.push('$');
+                            rest = &tail[1..];
+                            continue;
+                        };
+                        parsed
+                    }
                 };
                 // `keep` leaves the reference exactly as the author wrote it, so
                 // the resolved text still describes that word as unresolved.
@@ -30606,34 +31026,105 @@ fn resolve_proven_variables_in_segment(
                     out.push_str(&tail[..consumed]);
                     &tail[consumed..]
                 };
-                let mode = match direction {
-                    ResolutionDirection::MayAllow => VariableResolution::Literal,
-                    ResolutionDirection::DenyOnly => VariableResolution::DenyOnlyLiteral,
+                let deny_only_value;
+                let may_allow_values;
+                let value: &String = if deny_only {
+                    deny_only_value =
+                        deny_only_variable_value(source, segment_ranges, segment_start, name);
+                    let Some(value) = deny_only_value.as_ref() else {
+                        rest = keep(&mut out);
+                        continue;
+                    };
+                    value
+                } else {
+                    may_allow_values = resolve_variable_bindings(
+                        source,
+                        segment_ranges,
+                        segment_start,
+                        name,
+                        VariableResolution::Literal,
+                    )?;
+                    let [value] = may_allow_values.as_slice() else {
+                        return None;
+                    };
+                    value
                 };
-                let values = match resolve_variable_bindings(
-                    source,
-                    segment_ranges,
-                    segment_start,
-                    name,
-                    mode,
-                ) {
-                    Some(values) => values,
-                    None if direction == ResolutionDirection::DenyOnly => {
+                let rendered: Cow<'_, str> = if !deny_only {
+                    Cow::Borrowed(value.as_str())
+                } else if in_double_quote {
+                    // One word either way; a newline would only change bytes.
+                    Cow::Owned(value.replace('\n', " "))
+                } else if ifs.is_empty() {
+                    if value.contains([' ', '\t', '\n']) {
                         rest = keep(&mut out);
                         continue;
                     }
-                    None => return None,
+                    Cow::Borrowed(value.as_str())
+                } else {
+                    Cow::Owned(
+                        value
+                            .chars()
+                            .map(|ch| {
+                                if ifs.contains(ch) || matches!(ch, '\n' | '\t') {
+                                    ' '
+                                } else {
+                                    ch
+                                }
+                            })
+                            .collect(),
+                    )
                 };
-                let [value] = values.as_slice() else {
-                    if direction == ResolutionDirection::DenyOnly {
+                if composite_only {
+                    let before = &segment[..segment.len() - tail.len()];
+                    let after = &tail[consumed..];
+                    let boundary = |ch: Option<char>| {
+                        ch.is_none_or(|ch| {
+                            ch.is_ascii_whitespace()
+                                || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`')
+                        })
+                    };
+                    let whole = if in_double_quote {
+                        before
+                            .strip_suffix('"')
+                            .is_some_and(|text| boundary(text.chars().next_back()))
+                            && after
+                                .strip_prefix('"')
+                                .is_some_and(|text| boundary(text.chars().next()))
+                    } else {
+                        boundary(before.chars().next_back()) && boundary(after.chars().next())
+                    };
+                    let fields = if in_double_quote {
+                        1
+                    } else {
+                        rendered
+                            .split(' ')
+                            .filter(|field| !field.is_empty())
+                            .count()
+                    };
+                    let word_start = before
+                        .rfind(|ch: char| {
+                            ch.is_ascii_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')')
+                        })
+                        .map_or(0, |index| index + 1);
+                    // A whole single-field reference keeps its variable-aware
+                    // analyses; an assignment-shaped word is not split; an
+                    // earlier assignment in this segment (`$((f=0))`) can
+                    // change the value before this use.
+                    if (whole && fields == 1)
+                        || posix_word_is_assignment_prefix(&before[word_start..])
+                        || segment_text_may_assign(before, name)
+                    {
                         rest = keep(&mut out);
                         continue;
                     }
-                    return None;
-                };
+                }
                 let splicable = match direction {
-                    ResolutionDirection::MayAllow => value_is_inert_when_substituted(value),
-                    ResolutionDirection::DenyOnly => value_is_safe_to_splice_for_denial(value),
+                    ResolutionDirection::MayAllow => value_is_inert_when_substituted(&rendered),
+                    // An empty or blank value vanishes from the word.
+                    ResolutionDirection::DenyOnly => {
+                        (composite_only && rendered.trim_matches(' ').is_empty())
+                            || value_is_safe_to_splice_for_denial(&rendered)
+                    }
                 };
                 if !splicable {
                     if direction == ResolutionDirection::DenyOnly {
@@ -30642,7 +31133,7 @@ fn resolve_proven_variables_in_segment(
                     }
                     return None;
                 }
-                out.push_str(value);
+                out.push_str(&rendered);
                 rest = &tail[consumed..];
                 substituted = true;
             }
@@ -38960,12 +39451,14 @@ mod tests {
         }
     }
 
-    /// Ambiguity still refuses, in every spelling (#479).
+    /// A second binding never lifts a denial, in every spelling (#479).
     ///
     /// The strip makes a declaration segment an ordinary binding, so a second
-    /// one has to make the value ambiguous exactly as two bare assignments do.
-    /// Without this the fix would turn "two possible values" into "the last one
-    /// I recognised".
+    /// one makes a permission-lifting proof refuse exactly as two bare
+    /// assignments do. In the deny-only direction the shell is not ambiguous:
+    /// sequential parent-shell assignments leave the last value, so
+    /// `T=/tmp/build; T=/home/user/.ssh/id_rsa; rm $T` removes the key and is
+    /// judged as `rm /home/user/.ssh/id_rsa`.
     #[test]
     fn two_bindings_still_refuse_the_proof_issue_479() {
         for command in [
@@ -38974,9 +39467,18 @@ mod tests {
             "export T=/tmp/build; declare T=/home/user/.ssh/id_rsa; rm $T",
         ] {
             assert!(
-                evaluate_with_pack_ids(command, &["core.filesystem"]).is_allowed(),
-                "{command:?}: two bindings make the value ambiguous, and an \
-                 unprovable binding must not resolve to either one"
+                evaluate_with_pack_ids(command, &["core.filesystem"]).is_denied(),
+                "{command:?}: the last parent-shell binding is the value rm receives"
+            );
+        }
+        // The reverse order must not borrow the temporary path's exemption.
+        for command in [
+            "T=/home/user/.ssh/id_rsa; T=/tmp/build; rm -rf $T",
+            "T=/tmp/a; T=/tmp/b; rm -rf \"$T\"",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["core.filesystem"]).is_denied(),
+                "{command:?}: two bindings must not prove a temporary path"
             );
         }
     }
@@ -40269,6 +40771,90 @@ mod tests {
         ] {
             let result = evaluate_with_pack_ids(command, &packs);
             assert!(result.is_allowed(), "{command} -> {result:?}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn posix_proven_variable_view_renders_shell_expansion() {
+        for (command, expected) in [
+            (
+                r#"X=" "; git${X}reset${X}--hard"#,
+                Some(r#"X=" "; git reset --hard"#),
+            ),
+            // Each default-IFS character separates.
+            (
+                r"X=$IFS; git${X}reset${X}--hard",
+                Some(r"X=$IFS; git   reset   --hard"),
+            ),
+            (
+                r#"X=gi; "${X}t" reset --hard"#,
+                Some(r#"X=gi; "git" reset --hard"#),
+            ),
+            (
+                r#"X=gi; "$X"t reset --hard"#,
+                Some(r#"X=gi; "gi"t reset --hard"#),
+            ),
+            // An unquoted whole word that splits, or that vanishes.
+            (
+                r#"X="reset --hard"; git $X"#,
+                Some(r#"X="reset --hard"; git reset --hard"#),
+            ),
+            (r"E=; $E git reset", Some(r"E=;  git reset")),
+            // Bash indirection and namerefs read the variable they name.
+            (r"v=IFS; git${!v}reset", Some(r"v=IFS; git   reset")),
+            (
+                r#"X=" "; v=X; git${!v}reset"#,
+                Some(r#"X=" "; v=X; git reset"#),
+            ),
+            (
+                r"declare -n r=IFS; git${r}reset",
+                Some(r"declare -n r=IFS; git   reset"),
+            ),
+            (
+                r#"X=" "; declare -n r=X; git${r}reset"#,
+                Some(r#"X=" "; declare -n r=X; git reset"#),
+            ),
+            // `$(` starts fresh quoting; `$((f=0))` rebinds before the use.
+            (
+                r#"X=" "; echo "$(git${X}reset)""#,
+                Some(r#"X=" "; echo "$(git reset)""#),
+            ),
+            (r#"X=" "; echo "$((X=1))" a${X}b"#, None),
+            // A whole single-field reference keeps its own analyses.
+            (r#"PY=/usr/bin/python3; "$PY" -c 'print(1)'"#, None),
+            (r#"f=/etc/sudoers; tee "$f""#, None),
+            (r"X=--hard; git reset $X", None),
+            (
+                r#"X=a; X=" "; git${X}reset"#,
+                Some(r#"X=a; X=" "; git reset"#),
+            ),
+            (r"IFS=x; X=x; git${X}reset", Some(r"IFS=x; X=x; git reset")),
+            // Inside double quotes the value stays inside the same word.
+            (r#"X=" "; "git${X}reset""#, Some(r#"X=" "; "git reset""#)),
+            // An apostrophe inside double quotes does not open a quote.
+            (
+                r#"X=" "; A="'" git${X}reset"#,
+                Some(r#"X=" "; A="'" git reset"#),
+            ),
+            // Single quotes and escapes do not expand.
+            (r#"X=" "; echo 'a${X}b'"#, None),
+            (r#"X=" "; echo a\${X}b"#, None),
+            // An empty IFS does not split, so a blank value stays as written.
+            (r#"IFS=; X=" "; git${X}reset"#, None),
+            // Assignment words are not split.
+            (r#"X=" "; Y=a${X}b"#, None),
+            // A conditional or unknown binding proves nothing.
+            (r#"X=" "; false && X=a; git${X}reset"#, None),
+            (r"git${X}reset", None),
+            // Values carrying shell syntax are never spliced.
+            (r#"X="a;b"; git${X}reset"#, None),
+        ] {
+            assert_eq!(
+                posix_proven_variable_view(command, None).as_deref(),
+                expected,
+                "{command:?}"
+            );
         }
     }
 
