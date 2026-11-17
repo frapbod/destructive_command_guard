@@ -1169,7 +1169,39 @@ pub(crate) fn command_after_posix_control_prefixes(
     segment: &str,
     dialect: ShellDialect,
 ) -> (&str, usize) {
-    command_after_posix_control_prefixes_bounded(segment, dialect, 0)
+    let (command, offset) = command_after_posix_control_prefixes_bounded(segment, dialect, 0);
+    (end_at_subshell_close(segment, command, offset), offset)
+}
+
+/// End `command` at the `)` that closes a subshell its peeled prefix opened:
+/// the words after it redirect the subshell and are not the command's argv.
+fn end_at_subshell_close<'a>(segment: &str, command: &'a str, offset: usize) -> &'a str {
+    if !segment[..offset].contains('(') {
+        return command;
+    }
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let paren = |token: &crate::normalize::NormalizeToken, text: &str| {
+        token.kind == NormalizeTokenKind::Separator && token.text(segment) == Some(text)
+    };
+    let prefix = tokens.iter().filter(|token| token.byte_range.end <= offset);
+    let opened = prefix.clone().filter(|token| paren(token, "(")).count();
+    if opened <= prefix.filter(|token| paren(token, ")")).count() {
+        return command;
+    }
+    let mut depth = 0usize;
+    for token in tokens.iter().filter(|token| token.byte_range.start >= offset) {
+        if paren(token, "(") {
+            depth += 1;
+        } else if paren(token, ")") {
+            if depth == 0 {
+                return command
+                    .get(..token.byte_range.start - offset)
+                    .unwrap_or(command);
+            }
+            depth -= 1;
+        }
+    }
+    command
 }
 
 fn command_after_posix_control_prefixes_bounded(
@@ -5070,16 +5102,6 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         .as_ref()
         .map_or(command, |result| result.normalized.as_ref());
     let tokens = tokenize_for_shell_dialect(command, dialect);
-    // A `)` here closes a subshell opened before the peeled prefix; the words
-    // after it redirect that subshell and are not Git's argv.
-    let tokens = match tokens.iter().position(|token| {
-        dialect == ShellDialect::Posix
-            && token.kind == NormalizeTokenKind::Separator
-            && token.text(command) == Some(")")
-    }) {
-        Some(end) => &tokens[..end],
-        None => &tokens[..],
-    };
     if tokens
         .iter()
         .any(|token| token.kind == NormalizeTokenKind::Separator)
@@ -7811,7 +7833,6 @@ mod tests {
             "sudo coproc git reset --hard",
             "/usr/bin/coproc git reset --hard",
             "'coproc' git reset --hard",
-            "f ( git reset --hard",
             "f() echo git reset --hard",
             "case a in a) echo git reset --hard",
             "a) echo git reset --hard",

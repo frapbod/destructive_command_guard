@@ -395,7 +395,7 @@ fn tar_helper_review_rule_does_not_grant_nested_destructive_rules() {
 }
 
 /// With confidence scoring on, the first occurrence of a rule can be in doubt
-/// (`watch …`, a function body) and downgrade to warn, while the same rule
+/// (`watch …`) and downgrade to warn, while the same rule
 /// fires again directly later on the line. The evaluator reports only the
 /// first occurrence, and the look-past grants the rule for the whole line, so
 /// the direct repeat was never judged.
@@ -404,7 +404,9 @@ fn a_confidence_downgrade_does_not_hide_a_confident_repeat_of_the_rule() {
     let lab = Lab::new(
         "[general]\ncolor = \"never\"\n\n[confidence]\nenabled = true\nwarn_threshold = 0.7\n",
     );
-    for command in ["watch rm -rf ./build", "f() { git branch -D main; }"] {
+    // A function body is judged like a brace group: the peeled command is in
+    // command position (frapbod fork, quoted command words in groups).
+    for command in ["watch rm -rf ./build", "watch git branch -D main"] {
         assert!(
             !lab.claude_hook_denies(command),
             "premise: {command:?} is downgraded on its own"
@@ -413,13 +415,13 @@ fn a_confidence_downgrade_does_not_hide_a_confident_repeat_of_the_rule() {
     for command in [
         "watch rm -rf ./build; rm -rf ./build",
         "f() { rm -rf ./build; }; rm -rf ./build",
-        "f() { git branch -D main; }; git branch -D main",
+        "watch git branch -D main; git branch -D main",
         "case a in a) git branch -D main;; esac; git branch -D main",
     ] {
         assert!(lab.claude_hook_denies(command), "{command:?}");
     }
     // Two doubtful occurrences stay doubtful.
-    assert!(!lab.claude_hook_denies("watch rm -rf ./build; f() { rm -rf ./build; }"));
+    assert!(!lab.claude_hook_denies("watch rm -rf ./build; watch rm -rf ./build"));
 }
 
 /// Second review of #498: the confident-repeat check searched the rule's regex
@@ -443,7 +445,7 @@ fn a_confidence_downgrade_does_not_hide_a_repeat_only_the_evaluator_sees() {
             assert!(lab.claude_hook_denies(&command), "{command:?}");
         }
     }
-    assert!(!lab.claude_hook_denies("watch rm -rf ./build; f() { rm -rf ./build; }"));
+    assert!(!lab.claude_hook_denies("watch rm -rf ./build; watch rm -rf ./build"));
 }
 
 /// Found reviewing #498: `git` run by `watch`, `xargs`, `parallel` or
