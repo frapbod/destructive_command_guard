@@ -322,15 +322,93 @@ fn copy_chains_are_proven_in_linear_time() {
     );
 }
 
-/// Statements in front of the use do not hide it: 128 used to end the view
-/// without a verdict, and more than the view reads is denied for review.
+/// Statements in front of the use do not hide it: 128, and later 1,024,
+/// used to end the view without a verdict. Every statement is read; the
+/// evaluation deadline bounds the cost.
 #[test]
 fn padding_does_not_hide_a_use() {
-    let padding = ": ; ".repeat(300);
-    let command = format!("{padding}X=' '; git${{X}}reset${{X}}--hard");
+    for count in [300, 1100] {
+        let padding = ": ; ".repeat(count);
+        let command = format!("{padding}X=' '; git${{X}}reset${{X}}--hard");
+        assert_both("deny", &[&command]);
+        let harmless = format!("{padding}X=' '; git${{X}}status");
+        assert_both("allow", &[&harmless]);
+    }
+}
+
+/// Large file writes are data, however many lines they have (t_416fd788
+/// review 3: a 1,100-line quoted heredoc was denied by the statement cap).
+#[test]
+fn large_heredoc_file_writes_allow() {
+    let lines = |line: &dyn Fn(usize) -> String| (0..1100).map(line).collect::<Vec<_>>().concat();
+    let typescript = lines(&|i| format!("const v{i} = `${{a{i}}}` + b;\n"));
+    let script = lines(&|i| format!("x{i}=$((x{i}+1)); echo \"$x{i}\" > /tmp/out{i}\n"));
+    let data = lines(&|i| format!("a=$HOME/x{i}\n"));
+    assert_both(
+        "allow",
+        &[
+            &format!("cat > src/gen.ts <<'EOF'\n{typescript}EOF"),
+            &format!("cat > run.sh <<'EOF'\n{script}EOF\nchmod +x run.sh"),
+            &format!("cat > big.txt <<EOF\n{data}EOF"),
+        ],
+    );
+}
+
+/// A whole-word command name whose value only the deny-only proof knows
+/// (copies, appends, `printf -v`, arrays, operators, indirection, namerefs,
+/// rebinding, eval) is judged as that program (t_416fd788 review 3). Bash
+/// runs `git reset --hard` for each.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn whole_word_command_names_use_the_proven_value() {
+    assert_both(
+        "deny",
+        &[
+            "Y=git; X=$Y; \"$X\" reset --hard",
+            "X=g; X+=it; \"$X\" reset --hard",
+            "printf -v X git; \"$X\" reset --hard",
+            "X=(git x); \"$X\" reset --hard",
+            "X=' git'; \"${X:1}\" reset --hard",
+            "X=$(date); X=git; \"$X\" reset --hard",
+            "v=X; X=git; \"${!v}\" reset --hard",
+            "declare -n r=X; X=git; \"$r\" reset --hard",
+            "X=a; \"${X:+git}\" reset --hard",
+            "X=git eval '\"$X\" reset --hard'",
+            "Y=git; X=$Y; $X reset --hard",
+        ],
+    );
+    // Earlier state that binds the name to another program keeps it, and a
+    // harmless subcommand stays allowed.
+    assert_both(
+        "allow",
+        &[
+            "Y=git; X=$Y; hash -p /usr/bin/printf git; \"$X\" reset --hard",
+            "git() { :; }; Y=git; X=$Y; \"$X\" reset --hard",
+            "Y=git; X=$Y; \"$X\" status",
+            "X=python3; \"$X\" -c 'print(1)'",
+            "PY=/usr/bin/python3; \"$PY\" -c 'print(1)'",
+        ],
+    );
+}
+
+/// Every reference re-read the statements before it, so 3,000 statements
+/// that read one variable took over a second and timed out (t_416fd788
+/// review 3 follow-up). Each read now resumes where the previous read of
+/// the same name stopped.
+#[test]
+fn many_references_to_one_name_are_read_in_linear_time() {
+    let uses = (0..2000)
+        .map(|i| format!("echo \"${{X}}{i}\"\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    let mut command = format!("X=a\n{uses}");
+    let started = std::time::Instant::now();
+    assert_both("allow", &[&command]);
+    command.push_str("Y=' '; git${Y}reset${Y}--hard");
     assert_both("deny", &[&command]);
-    let harmless = format!("{padding}X=' '; git${{X}}status");
-    assert_both("allow", &[&harmless]);
-    let beyond = format!("{}X=' '; git${{X}}status", ": ; ".repeat(1100));
-    assert_both("deny", &[&beyond]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "four hook runs took {:?}",
+        started.elapsed()
+    );
 }
