@@ -381,3 +381,89 @@ fn start_process_lines_read_in_the_target_dialect() {
         }
     }
 }
+
+/// A `cmd /c` payload found inside another command (a subshell, `if`, `for`,
+/// `xargs`, `wsl`) is cmd's own command text: cmd removes the CR, so
+/// `gi<CR>t reset --hard` runs `git reset --hard`. The POSIX reading ends the
+/// word at the CR; the payload is also read as Cmd.
+#[test]
+fn cmd_payloads_inside_other_commands_are_read_as_cmd() {
+    for command in [
+        "(cmd.exe /c gi\rt reset --hard)",
+        "if true; then cmd.exe /c gi\rt reset --hard; fi",
+        "for i in 1; do cmd.exe /c gi\rt reset --hard; done",
+        "xargs cmd.exe /c gi\rt reset --hard < /dev/null",
+        "wsl cmd.exe /c gi\rt reset --hard",
+        "wsl.exe -e cmd.exe /c gi\rt reset --hard",
+        "wsl -- cmd.exe /c gi\rt reset --hard",
+    ] {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    for command in [
+        "Start-Process wsl -ArgumentList 'cmd.exe /c gi\rt reset --hard'",
+        "Start-Process wsl -ArgumentList '-e cmd.exe /c gi\rt reset --hard'",
+        "Start-Process wsl -ArgumentList '-e', 'cmd.exe /c gi\rt reset --hard'",
+    ] {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    for command in [
+        "(cmd.exe /c gi\rt status)",
+        "for i in 1; do cmd.exe /c gi\rt status; done",
+    ] {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    let command = "Start-Process wsl -ArgumentList 'cmd.exe /c gi\rt status'";
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        assert_eq!(
+            decision_in(command, dialect),
+            EvaluationDecision::Allow,
+            "{dialect:?}: {command:?}"
+        );
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        assert_eq!(
+            hook_decision(protocol, "PowerShell", command),
+            "allow",
+            "{protocol:?}: {command:?}"
+        );
+    }
+}
