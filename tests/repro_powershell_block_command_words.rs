@@ -471,6 +471,58 @@ fn unknown_dialect_judges_deeply_nested_blocks() {
     }
 }
 
+/// Expansions may produce several argv words, unlike a quoted literal. These
+/// are shell source sent as hook data: this test never runs the commands.
+#[test]
+fn split_expansions_and_powershell_native_quote_boundaries() {
+    let split = [
+        "git reset ${X:-HEAD --hard}",
+        "git reset ${X=HEAD --hard}",
+        "git reset ${X:=HEAD --hard}",
+        "git reset ${X:-HEAD  --hard}",
+        "git reset ${X:-HEAD\t--hard}",
+        "git reset ${X:-x} ${Y:-HEAD --hard}",
+        "git push ${X:-origin main --force}",
+        "git push origin ${X:-main --force}",
+        "git checkout ${X:-HEAD -- .}",
+        "cd /tmp && git reset ${X:-HEAD --hard}",
+        "( git reset ${X:-HEAD --hard} )",
+        "f() { git reset ${X:-HEAD --hard}; }; f",
+        "git reset ${X:-\"HEAD\" --hard}",
+        "git reset ${X:-'HEAD' --hard}",
+        "git reset ${X:+HEAD --hard}",
+        "git push ${X:+origin main --force}",
+    ];
+    let fixed_arguments = [
+        r#"git reset "${X:-HEAD --hard}""#,
+        r#"git commit -m "${X:-reset --hard}""#,
+        r#"git commit -m "x" "reset --hard""#,
+        r#"git log ${X:-"--grep=reset --hard"}"#,
+    ];
+    let powershell = [
+        r#"git reset 'HEAD" --hard "--'"#,
+        r#"git clean 'x" -fdx "y'"#,
+        r#"git push 'origin" --force "main'"#,
+        "git reset \"HEAD`\" --hard `\"--\"",
+        r#"& git reset 'HEAD" --hard "--'"#,
+        "git reset 'HEAD\" --hard \"--'; echo \"`$(\"",
+    ];
+    let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
+    assert_all(&split, "Deny", posix, "POSIX expansion");
+    assert_all(&fixed_arguments, "Allow", posix, "fixed POSIX argument");
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        let bash = |command: &str| hook_decision(protocol, "Bash", command);
+        let ps = |command: &str| hook_decision(protocol, "PowerShell", command);
+        assert_all(&split, "deny", bash, "unquoted POSIX expansion");
+        assert_all(&fixed_arguments, "allow", bash, "fixed POSIX argument");
+        assert_all(&powershell, "deny", ps, "PowerShell native argument");
+        let nested = "bash -c 'git reset ${X:-HEAD --hard}'";
+        assert_all(&[nested], "deny", ps, "nested POSIX under PowerShell");
+        let cmd = |command: &str| hook_decision(protocol, "cmd", command);
+        assert_all(&[nested], "deny", cmd, "nested POSIX under cmd");
+    }
+}
+
 /// A quoted argument with spaces stays one argument in the POSIX reading, and
 /// in the union that adds it.
 #[test]

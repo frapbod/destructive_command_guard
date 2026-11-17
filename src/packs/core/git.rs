@@ -5199,18 +5199,23 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         return None;
     }
 
-    // A decoded word is one argv element. Quote removal followed by
-    // `join(" ")` split `"git reset --hard"` back into three tokens, and the
-    // rules' `\S+\s+` walks then read argument text as Git syntax. Joining
-    // inside a word with U+001F keeps the word one `\S+` token: the regex
-    // engine and `char::is_whitespace` do not treat it as space, so no walk
-    // can step inside, and a literal U+001F in the input is also inside one
-    // word. The cost is conservative: `--hard<US>extra` still ends `--h\b`,
-    // so `git reset "--hard extra"` denies (Git rejects that option).
+    // Fixed decoded argv elements must remain one regex word. Expansions that
+    // can undergo field splitting are not fixed argv: keep their whitespace
+    // visible to the destructive patterns. Windows PowerShell 5.1 may also
+    // reparse an embedded double quote when it invokes a native program.
+    // Keeping whitespace visible for a whole uncertain word is deliberately
+    // conservative, including any literal quoted whitespace in that word.
     let preserve_word = |word: &str| {
         word.chars()
             .map(|ch| if ch.is_whitespace() { '\u{1f}' } else { ch })
             .collect::<String>()
+    };
+    let regex_word = |decoded: &str, may_split: bool| {
+        if may_split || (dialect == ShellDialect::PowerShell && decoded.contains('"')) {
+            decoded.to_string()
+        } else {
+            preserve_word(decoded)
+        }
     };
     let mut decoder = ShellTokenDecoder::new(dialect);
     let mut words = Vec::with_capacity(tokens.len());
@@ -5220,7 +5225,10 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
     {
         let raw = token.text(command)?;
         if let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) {
-            words.push(preserve_word(&decoded));
+            words.push(regex_word(
+                &decoded,
+                git_token_expansion_may_split(raw, dialect),
+            ));
         }
     }
     if words.is_empty() {
@@ -5241,7 +5249,7 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         let mut words: Vec<_> = semantic
             .words
             .iter()
-            .map(|word| preserve_word(&word.decoded))
+            .map(|word| regex_word(&word.decoded, word.may_split))
             .collect();
         words[executable_index] = "git".to_string();
         return Some(crate::normalize::normalize_command(&words.join(" ")).into_owned());
