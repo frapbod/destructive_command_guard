@@ -2786,10 +2786,23 @@ pub(crate) fn tokenize_for_shell_dialect(command: &str, dialect: ShellDialect) -
 }
 
 fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
+    tokenize_powershell_with_comments(command).0
+}
+
+/// Return a same-length PowerShell view with comments replaced by spaces.
+/// Line comments retain their line ending; line breaks in block comments are
+/// spaces because a block comment is whitespace, not a statement boundary.
+/// Word and quote boundaries are shared with the PowerShell tokenizer.
+pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
+    tokenize_powershell_with_comments(command).1
+}
+
+fn tokenize_powershell_with_comments(command: &str) -> (NormalizeTokens, Option<String>) {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
     let mut tokens = NormalizeTokens::new();
+    let mut masked: Option<Vec<u8>> = None;
     let mut i = 0usize;
     let mut literal_mode = false;
 
@@ -2818,6 +2831,33 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
             // PowerShell's stop-parsing mode ends at the physical newline.
             literal_mode = false;
             i = end;
+            continue;
+        }
+
+        if !literal_mode && bytes[i] == b'#' {
+            let start = i;
+            while i < len && !matches!(bytes[i], b'\r' | b'\n') {
+                i += 1;
+            }
+            masked.get_or_insert_with(|| bytes.to_vec())[start..i].fill(b' ');
+            continue;
+        }
+        if !literal_mode && bytes.get(i..i + 2) == Some(b"<#") {
+            let start = i;
+            i += 2;
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                if bytes.get(i..i + 2) == Some(b"<#") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes.get(i..i + 2) == Some(b"#>") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            masked.get_or_insert_with(|| bytes.to_vec())[start..i].fill(b' ');
             continue;
         }
 
@@ -2860,7 +2900,10 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
         }
     }
 
-    tokens
+    let masked = masked.map(|bytes| {
+        String::from_utf8(bytes).expect("masking whole comment bytes preserves UTF-8")
+    });
+    (tokens, masked)
 }
 
 #[inline]
@@ -3038,6 +3081,19 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
                 }
                 match byte {
                     b'`' => i = consume_shell_escape(bytes, i, len),
+                    b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                        // Braced variable names may contain spaces and `#`.
+                        // Neither starts a comment until the closing brace.
+                        i += 2;
+                        while i < len && bytes[i] != b'}' {
+                            i = if bytes[i] == b'`' {
+                                consume_shell_escape(bytes, i, len)
+                            } else {
+                                i + 1
+                            };
+                        }
+                        i = (i + 1).min(len);
+                    }
                     b'@' => {
                         i = consume_powershell_here_string(bytes, i, len).unwrap_or(i + 1);
                     }

@@ -237,6 +237,70 @@ fn powershell_and_unknown_dialects_read_powershell_quotes() {
     }
 }
 
+/// Comments are syntax, not quotes or executable text.
+#[test]
+fn powershell_comments_do_not_hide_following_commands() {
+    let dangerous = [
+        "# it's here\ngit reset --hard",
+        "# it's here\rgit reset --hard",
+        "echo a # it's\ngit reset --hard",
+        "echo a # say \"hi\ngit reset --hard",
+        "<# it's here #>git reset --hard",
+        "<# say \"hi\" #> git reset --hard",
+        "Write-Output `a; # it's here\ngit reset --hard",
+        "& {# it's here\ngit reset --hard\n}",
+        "Write-Output $(# it's here\ngit reset --hard)",
+        "Write-Output \"$(# it's here\ngit reset --hard)\"",
+        "Write-Output x\u{00a0}# it's here\ngit reset --hard",
+    ];
+    let harmless = [
+        "Write-Output \"#1 it's\"",
+        "git commit -m \"fix #12: it's done\"",
+        "# note",
+        "echo a # it's\ngit status",
+        "Write-Output hi#there",
+    ];
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        for command in dangerous {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for command in harmless {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in dangerous {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+        for command in harmless {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_comment_codex_bash_label() {
+    let command = "Write-Output `a; # it's here\ngit reset --hard";
+    assert_eq!(hook_decision(Protocol::Codex, "Bash", command), "deny");
+}
+
 /// Bash reads `\"` inside double quotes as an escaped quote, so on a proven
 /// POSIX shell these print text and run nothing.
 #[test]
