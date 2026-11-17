@@ -38978,7 +38978,7 @@ fn evaluate_heredoc(
                 && (literal_shell_source
                     || literal_bash_source_range_with_flags(command, &content, &["-lc", "-cl"])
                         .is_some());
-            let evaluate_source = |source: &str| {
+            let evaluate_source_as = |source: &str, dialect: ShellDialect| {
                 evaluate_command_with_pack_order_deadline_at_path_inner(
                     source,
                     context.enabled_keywords,
@@ -38990,11 +38990,12 @@ fn evaluate_heredoc(
                     context.allow_once_audit,
                     context.project_path,
                     context.deadline,
-                    line_dialect,
+                    dialect,
                     context.nested_command_depth + 1,
                     inline_automated_stdin,
                 )
             };
+            let evaluate_source = |source: &str| evaluate_source_as(source, line_dialect);
             let mut complete_source_result = None;
             let mut inner_commands = if !whole_body {
                 crate::heredoc::extract_shell_commands(&content.content)
@@ -39039,10 +39040,29 @@ fn evaluate_heredoc(
                     },
                 );
             }
-            for (index, inner) in inner_commands.into_iter().enumerate() {
+            // A `cmd /c` / `cmd /k` payload is cmd.exe's own command text,
+            // whatever shell found it (`(cmd.exe /c …)`, `xargs cmd.exe /c …`,
+            // `wsl cmd.exe /c …`). The POSIX reading above ends a word at a
+            // CR, which cmd removes, so `gi<CR>t reset --hard` is never read
+            // as `git`. Read the whole payload once more as Cmd, where the
+            // Cmd readings (CR removal, `&`, caret) apply; deny wins.
+            let cmd_reading = (content.target_command.as_deref() == Some("cmd")
+                && line_dialect == ShellDialect::Posix)
+                .then(|| crate::heredoc::ExtractedShellCommand {
+                    text: content.content.clone(),
+                    start: 0,
+                    end: content.content.len(),
+                    line_number: 1,
+                });
+            let readings = inner_commands
+                .into_iter()
+                .map(|inner| (line_dialect, inner))
+                .chain(cmd_reading.map(|inner| (ShellDialect::Cmd, inner)));
+            for (index, (reading_dialect, inner)) in readings.enumerate() {
                 if deadline_exceeded(context.deadline) {
                     return Some(EvaluationResult::indeterminate_due_to_budget());
                 }
+                let alternate_reading = reading_dialect != line_dialect;
 
                 // A leaf such as `echo > "/tmp/run-$i"` loses the `for`
                 // header or assignment that proves its target (#526).
@@ -39053,13 +39073,16 @@ fn evaluate_heredoc(
                 // whole-body command of a body without a per-command pass
                 // takes the same route, so a denial in it is mapped and
                 // line-numbered from its span.
-                let needs_source_context = whole_body
+                let needs_source_context = alternate_reading
+                    || whole_body
                     || (destination_source_context && index == 0)
                     || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
                         .is_some_and(|operator| {
                             contextual_redirects.contains(&(inner.start + operator))
                         });
-                let mut result = if needs_source_context {
+                let mut result = if alternate_reading {
+                    evaluate_source_as(&content.content, reading_dialect)
+                } else if needs_source_context {
                     complete_source_result
                         .get_or_insert_with(|| evaluate_source(&content.content))
                         .clone()
