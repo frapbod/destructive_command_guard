@@ -1781,13 +1781,22 @@ static IEX_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Regex for `Start-Process [-FilePath] <file> -ArgumentList '<args>'` (or
 /// `saps`, `-Args`, `-FilePath:`/`-ArgumentList:` colon forms). Group 1 = the
-/// file, group 2/3 = the double/single-quoted argument string. A comma list
-/// or a variable is not reconstructed (no extraction, no change).
+/// file, group 2 = the argument list: one quoted string, or a comma list of
+/// quoted strings and bare words, optionally in `@( )`, which Start-Process
+/// joins with spaces (see [`START_PROCESS_ARGUMENT`]). A variable is not
+/// reconstructed (no extraction, no change).
 static START_PROCESS_INLINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:"([^"]*)"|'([^']*)')(?:\s|$|[;|&)])"#,
+        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:@\(\s*)?((?:"[^"]*"|'[^']*')|(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`-][^\s'",;|$()`]*)(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`-][^\s'",;|$()`]*))+)\s*\)?(?:\s|$|[;|&)])"#,
     )
     .expect("start-process inline regex compiles")
+});
+
+/// One element of a [`START_PROCESS_INLINE`] argument list. Group 1/2 = the
+/// double/single-quoted text, group 3 = a bare word.
+static START_PROCESS_ARGUMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""([^"]*)"|'([^']*)'|([^\s'",]+)"#)
+        .expect("start-process argument regex compiles")
 });
 
 /// Regex for `powershell -EncodedCommand <base64>` (flag abbreviates to any prefix
@@ -3335,15 +3344,27 @@ fn extract_windows_inline_scripts(
     // <args>`, so `Start-Process cmd -ArgumentList '/c rd /s /q C:\src'` is the
     // same deletion as the denied `cmd /c rd /s /q C:\src`. The reconstructed
     // line is not a substring of the command, so there is no content_range.
-    for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2, 3]) {
+    // A comma list (`-ArgumentList '/c', 'rd /s /q C:\src'`) runs the same
+    // line: Start-Process joins its elements with spaces.
+    for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
-        let (Some(file), Some(args)) = (cap.get(1), cap.get(2).or_else(|| cap.get(3))) else {
+        let (Some(file), Some(args)) = (cap.get(1), cap.get(2)) else {
             continue;
         };
         let full = cap.get(0).expect("group 0 always present");
-        let line = format!("{} {}", text(file), text(args));
+        let mut line = text(file).to_string();
+        for element in START_PROCESS_ARGUMENT.captures_iter(text(args)) {
+            if let Some(value) = element
+                .get(1)
+                .or_else(|| element.get(2))
+                .or_else(|| element.get(3))
+            {
+                line.push(' ');
+                line.push_str(value.as_str());
+            }
+        }
         if !push_windows_inner(
             extracted,
             skip_reasons,
