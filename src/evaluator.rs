@@ -15672,15 +15672,33 @@ fn evaluate_command_in_single_dialect_view(
             return denial;
         }
     }
-    // `$IFS`/`${IFS}` word-splits to whitespace by default, so
+    // An unquoted `$IFS`/`${IFS}` word-splits whatever IFS holds, so
     // `rm${IFS}-rf${IFS}~` runs `rm -rf ~` while presenting no whitespace the
-    // tokenizer can split on. When IFS is not reassigned in the command, expand
-    // the unquoted uses to a space and evaluate the reconstruction. This only
-    // adds a recursive check of a proven expansion; the original command is
+    // tokenizer can split on, and `IFS=x; git${IFS}reset${IFS}--hard` runs
+    // `git reset --hard`. Evaluate each reconstruction the expansion can
+    // produce. This only adds recursive checks; the original command is
     // still evaluated normally below, so nothing already caught is lost.
-    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
-        && let Some(expanded) = posix_ifs_expansion_view(command)
-    {
+    let ifs_views = if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        posix_ifs_expansion_views(command)
+    } else {
+        Some(Vec::new())
+    };
+    let ifs_views = match ifs_views {
+        Some(views) => views,
+        None => {
+            if let Some(denial) = launcher_unverified_denial(
+                POSIX_EXECUTABLE_UNVERIFIED_RULE,
+                "IFS expansions in this command can split its words in more ways than dcg checks; this form requires explicit review",
+                allowlists,
+                project_path,
+                &mut heredoc_allowlist_hit,
+            ) {
+                return denial;
+            }
+            Vec::new()
+        }
+    };
+    for expanded in ifs_views {
         let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
             &expanded,
             enabled_keywords,
@@ -17434,53 +17452,1115 @@ fn posix_declaration_option(builtin: &str, option: &str) -> bool {
     flags.chars().all(|flag| allowed.contains(flag))
 }
 
-/// A view of `command` with every unquoted `$IFS`/`${IFS}` replaced by a
-/// space, or `None` when there is nothing to expand or the value cannot be
-/// proven to be the default.
+/// Upper bound on the reconstructions [`posix_ifs_expansion_views`] checks.
+/// A command whose IFS uses have more outcomes than this is denied as
+/// unverified instead.
+const MAX_IFS_EXPANSION_VIEWS: usize = 32;
+
+/// The value Bash gives `IFS` when nothing has assigned it. Bash does not
+/// import `IFS` from the environment.
+const DEFAULT_POSIX_IFS: &str = " \t\n";
+
+/// The value of `IFS` presumed in force at some point of a command.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum IfsValue {
+    /// Set to this text.
+    Set(String),
+    /// Unset (`unset IFS`, or a valueless `local IFS` in a function): it
+    /// expands to nothing, `${IFS-word}` is the word, `IFS+=w` makes `w`,
+    /// and field splitting uses the default characters.
+    Unset,
+    /// Assigned text that is not static, or written in a form dcg does not
+    /// decode.
+    Unknown,
+}
+
+impl IfsValue {
+    fn default_value() -> Self {
+        Self::Set(DEFAULT_POSIX_IFS.to_string())
+    }
+}
+
+/// How an IFS reference produces its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IfsReferenceKind {
+    /// `$IFS`, `${IFS}`, `${IFS[0]}`, `${IFS[@]}` or `${IFS[*]}`: the whole
+    /// value.
+    Whole,
+    /// An operator over the value, or another element of it: substrings
+    /// `${IFS:offset[:length]}`, removals `${IFS#pattern}`/`${IFS%pattern}`,
+    /// the set-value operators `${IFS:-word}` and friends, pattern
+    /// substitution `${IFS/pattern/text}`, case changes `${IFS^^}`,
+    /// `${IFS,}` and `${IFS~}`, the transforms `${IFS@U}`, `@u`, `@L`, `@E`
+    /// and `@P`, and `${IFS[1]}`. Some text derived from the value, possibly
+    /// none.
+    Derived,
+}
+
+/// Whether the text an expansion yields is split into fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IfsContext {
+    /// Unquoted: each IFS character in the text ends a word.
+    Unquoted,
+    /// Inside double quotes: the text is inserted as it is.
+    Quoted,
+    /// Either: the command did not parse cleanly, or the use is in a heredoc
+    /// body, which a shell may read (split) or expand as data (as is).
+    Unknown,
+}
+
+/// One parameter expansion of `IFS` in a command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IfsReference {
+    range: Range<usize>,
+    kind: IfsReferenceKind,
+    /// The operator text after the name and any subscript, without the
+    /// closing brace. Empty for a whole-value reference.
+    operation: Range<usize>,
+    /// Whether [`ifs_operation_text`] can compute the text from the value:
+    /// false for another element (`${IFS[1]}`, `${IFS[i]}`). For a scalar,
+    /// Bash 5.2 slices `${IFS[@]:1}` by characters, like `${IFS:1}`.
+    computable: bool,
+}
+
+/// Reconstructions of `command` with every IFS expansion replaced by text it
+/// can produce, for the evaluator to check alongside the original; `None`
+/// when there are more combinations than [`MAX_IFS_EXPANSION_VIEWS`], or
+/// more possible values of `IFS` than [`MAX_IFS_VALUES`] for a use whose
+/// text depends on the value.
 ///
-/// `$IFS` defaults to space, tab and newline, so unquoted `rm${IFS}-rf${IFS}~`
-/// runs `rm -rf ~` while carrying no separator the tokenizer sees. The proof
-/// bails when the command assigns `IFS` (the value may not be whitespace) and
-/// leaves single-quoted `$IFS` untouched (single quotes suppress expansion, so
-/// it is literal text such as a `grep '$IFS'` pattern). Double-quoted uses do
-/// expand and are replaced; that can over-split a quoted argument, which errs
-/// toward detection and never masks a command.
-fn posix_ifs_expansion_view(command: &str) -> Option<String> {
+/// An unquoted IFS expansion yields only characters of `IFS` (or text a
+/// case change or substitution made from them), and field splitting treats
+/// each IFS character as a separator, so it ends a word whatever the value
+/// is: after `IFS=x`, `git${IFS}reset${IFS}--hard` runs `git reset --hard`
+/// (Bash 5.2: `IFS=x; printf '[%s]' a${IFS}b` prints `[a][b]`). Literal
+/// characters around it are never split, so `IFS=t` does not split the `t`
+/// of `git`. When `IFS` is empty or unset, or an operator selects none of
+/// it, the expansion yields nothing and joins its neighbours
+/// (`IFS=; gi${IFS}t` and `gi${IFS:9}t` run `git`). Inside double quotes
+/// the text is inserted without splitting, so `IFS=xt; "gi${IFS:1:1}"` is
+/// `git`.
+///
+/// Which write of `IFS` is in force at a use is not decided from source
+/// order: a write in a child shell, a branch, a loop, a prefix assignment
+/// or a function body need not happen where it is written, or at all, and
+/// a function can run after a later write. So each use gets every text it
+/// can produce: a separator (any non-empty unquoted text splits), nothing,
+/// and, when its operator can be computed, its text over every value
+/// [`possible_ifs_values`] finds that `IFS` can take anywhere in the
+/// command, split by that value where the use is unquoted and as is where
+/// it is quoted. An unquoted whole-value use (`$IFS`) needs no value: the
+/// separator and nothing are all it can give. A value that is not static
+/// gives no text. Uses with different text, quoting or binding of `IFS`
+/// can resolve differently from each other (`${IFS:9}` empty, `${IFS:0:1}`
+/// not), so every combination of their texts is a view; repeats of one use
+/// share its choice. A command is denied when any view is; the original is
+/// still evaluated, so this only adds checks.
+///
+/// Single-quoted text, ANSI-C strings, comments and escaped `\$IFS` are
+/// literal and do not count. The shell parser marks that text, and the
+/// double-quoted text, when it parses `command` cleanly; otherwise every
+/// unescaped reference counts and its quoting is unknown, so it needs a
+/// value: the default when nothing else in the command mentions `IFS`,
+/// else none (denied as unverified). Heredoc bodies always count: data stays data after
+/// the replacement, and a body a shell reads expands there.
+fn posix_ifs_expansion_views(command: &str) -> Option<Vec<String>> {
     // `${IFS}` puts a `{` between the `$` and the name, so match both spellings.
-    if !(command.contains("$IFS") || command.contains("${IFS"))
-        || segment_text_may_assign(command, "IFS")
-    {
+    if !(command.contains("$IFS") || command.contains("${IFS")) {
+        return Some(Vec::new());
+    }
+    let lexical = lexical_ifs_references(command);
+    if lexical.is_empty() {
+        return Some(Vec::new());
+    }
+    let parse = parsed_ifs_literals(command);
+    let references = match &parse {
+        Some(parse) => lexical
+            .into_iter()
+            .filter(|reference| {
+                !parse
+                    .literal
+                    .iter()
+                    .any(|range| range.contains(&reference.range.start))
+            })
+            .collect::<Vec<_>>(),
+        None => lexical,
+    };
+    if references.is_empty() {
+        return Some(Vec::new());
+    }
+    let rebinding = ifs_rebinding_offsets(command, &references);
+    // Without a clean parse the writes are not decoded. The default value is
+    // then known only when nothing else in the command mentions IFS: Bash
+    // runs the lines before a syntax error, so `IFS=g; "${IFS}it" ...`
+    // followed by a stray `)` still runs `git`.
+    let default = [IfsValue::default_value()];
+    let values = match &parse {
+        Some(parse) => parse.values.as_deref(),
+        None if rebinding.is_empty() => Some(&default[..]),
+        None => None,
+    };
+    // Uses with the same text, quoting and binding of IFS yield the same text,
+    // so they share one choice; others vary independently.
+    let mut keys = Vec::new();
+    let mut candidates: Vec<Vec<String>> = Vec::new();
+    let mut combinations = 1usize;
+    let mut group_of = Vec::with_capacity(references.len());
+    for reference in &references {
+        let context = parse.as_ref().map_or(IfsContext::Unknown, |parse| {
+            parse.context_at(reference.range.start)
+        });
+        let binding = rebinding
+            .iter()
+            .filter(|offset| **offset <= reference.range.start)
+            .count();
+        let key = (&command[reference.range.clone()], binding, context);
+        let group = match keys.iter().position(|seen| *seen == key) {
+            Some(group) => group,
+            None => {
+                let needs_value =
+                    reference.kind != IfsReferenceKind::Whole || context != IfsContext::Unquoted;
+                let values: &[IfsValue] = if needs_value { values? } else { &[] };
+                let texts = ifs_reference_texts(command, reference, values, context);
+                // Stop as soon as the cap is passed.
+                combinations = combinations
+                    .checked_mul(texts.len())
+                    .filter(|total| *total <= MAX_IFS_EXPANSION_VIEWS)?;
+                keys.push(key);
+                candidates.push(texts);
+                candidates.len() - 1
+            }
+        };
+        group_of.push(group);
+    }
+    let mut choice = vec![0usize; candidates.len()];
+    let mut views = Vec::new();
+    loop {
+        let mut view = String::with_capacity(command.len());
+        let mut copied = 0usize;
+        for (reference, group) in references.iter().zip(&group_of) {
+            view.push_str(&command[copied..reference.range.start]);
+            view.push_str(&candidates[*group][choice[*group]]);
+            copied = reference.range.end;
+        }
+        view.push_str(&command[copied..]);
+        if view != command && !views.contains(&view) {
+            views.push(view);
+        }
+        // Next combination; the first group varies fastest.
+        let mut position = 0usize;
+        loop {
+            if position == choice.len() {
+                return Some(views);
+            }
+            choice[position] += 1;
+            if choice[position] < candidates[position].len() {
+                break;
+            }
+            choice[position] = 0;
+            position += 1;
+        }
+    }
+}
+
+/// Offsets after which `IFS` may hold a different value: every mention of
+/// the name outside `references` (an assignment, `unset IFS`, `read IFS`,
+/// `local IFS`, `$((IFS=1))`, a quoted `eval 'IFS=x'`), and the end of each
+/// reference that assigns it (`${IFS=x}`, `${IFS:=x}`). Within one simple
+/// command nothing else can rebind it between two expansions: a
+/// substitution runs in a subshell.
+fn ifs_rebinding_offsets(command: &str, references: &[IfsReference]) -> Vec<usize> {
+    let bytes = command.as_bytes();
+    let identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut offsets = memchr::memmem::find_iter(bytes, b"IFS")
+        .filter(|start| {
+            let end = start + 3;
+            !(*start > 0 && identifier(bytes[start - 1]))
+                && bytes.get(end).is_none_or(|byte| !identifier(*byte))
+                && !references
+                    .iter()
+                    .any(|reference| reference.range.contains(start))
+        })
+        .map(|start| start + 3)
+        .collect::<Vec<_>>();
+    offsets.extend(
+        references
+            .iter()
+            .filter(|reference| {
+                let operation = &command[reference.operation.clone()];
+                operation.starts_with('=') || operation.starts_with(":=")
+            })
+            .map(|reference| reference.range.end),
+    );
+    offsets
+}
+
+/// The texts one IFS reference can put in place of itself: a separator,
+/// nothing, and the text its operator computes over each of `values`
+/// (split by that value where the use is unquoted, as is where it is
+/// quoted). Distinct, in that order.
+fn ifs_reference_texts(
+    command: &str,
+    reference: &IfsReference,
+    values: &[IfsValue],
+    context: IfsContext,
+) -> Vec<String> {
+    let mut texts = vec![" ".to_string(), String::new()];
+    let operation = &command[reference.operation.clone()];
+    for value in values {
+        let (computed, separators) = match value {
+            _ if !reference.computable => (None, DEFAULT_POSIX_IFS),
+            IfsValue::Set(value) => (ifs_operation_text(operation, value), value.as_str()),
+            // Splitting with IFS unset uses the default characters.
+            IfsValue::Unset => (unset_ifs_operation_text(operation), DEFAULT_POSIX_IFS),
+            IfsValue::Unknown => (None, DEFAULT_POSIX_IFS),
+        };
+        let Some(text) = computed else {
+            continue;
+        };
+        if context != IfsContext::Quoted {
+            let split = unquoted_ifs_text(&text, separators);
+            if !texts.contains(&split) {
+                texts.push(split);
+            }
+        }
+        if context != IfsContext::Unquoted {
+            let quoted = double_quoted_ifs_text(&text);
+            if !texts.contains(&quoted) {
+                texts.push(quoted);
+            }
+        }
+    }
+    texts
+}
+
+/// `text` as an unquoted expansion leaves it after field splitting by `ifs`:
+/// each run of IFS characters becomes one space, and every other character
+/// that the shell would read as syntax is quoted, because expansion results
+/// are not parsed again (`;` stays a character, `~` is not the home
+/// directory).
+fn unquoted_ifs_text(text: &str, ifs: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if ifs.contains(character) {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else if character.is_ascii_alphanumeric() || "_-./,:+%@^".contains(character) {
+            out.push(character);
+        } else if character == '\'' {
+            out.push_str("\\'");
+        } else {
+            out.push('\'');
+            out.push(character);
+            out.push('\'');
+        }
+    }
+    out
+}
+
+/// `text` escaped to stand inside the double quotes around a quoted use.
+fn double_quoted_ifs_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, '\\' | '"' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out
+}
+
+/// The text the parameter operator `operation` (after the name, without the
+/// braces) yields over `value`, or `None` when it cannot be computed
+/// statically: an arithmetic offset, a bracket or extended pattern, a word
+/// that expands, or a case pattern.
+fn ifs_operation_text(operation: &str, value: &str) -> Option<String> {
+    let mut chars = operation.chars();
+    let Some(operator) = chars.next() else {
+        return Some(value.to_string());
+    };
+    let rest = chars.as_str();
+    let all = |prefix: char| {
+        rest.strip_prefix(prefix)
+            .map_or((false, rest), |pattern| (true, pattern))
+    };
+    match operator {
+        ':' => match rest.chars().next() {
+            Some('-' | '=') if value.is_empty() => static_ifs_operand(&rest[1..]),
+            Some('-' | '=' | '?') => (!value.is_empty()).then(|| value.to_string()),
+            _ => ifs_substring(rest, value),
+        },
+        // The value is presumed set, so the alternative word is not used.
+        '-' | '=' | '?' => Some(value.to_string()),
+        '#' | '%' => {
+            let (longest, pattern) = all(operator);
+            let pattern = simple_glob(pattern)?;
+            remove_glob_affix(value, &pattern, operator == '#', longest)
+        }
+        '/' => substitute_glob(rest, value),
+        '^' | ',' | '~' => {
+            let (every, pattern) = all(operator);
+            if !pattern.is_empty() {
+                return None;
+            }
+            let change = |character: char| -> String {
+                let upper = match operator {
+                    '^' => true,
+                    ',' => false,
+                    _ => !character.is_uppercase(),
+                };
+                if upper {
+                    character.to_uppercase().collect()
+                } else {
+                    character.to_lowercase().collect()
+                }
+            };
+            Some(change_ifs_case(value, every, change))
+        }
+        '@' => match rest {
+            "U" => Some(value.to_uppercase()),
+            "L" => Some(value.to_lowercase()),
+            "u" => Some(change_ifs_case(value, false, |character| {
+                character.to_uppercase().collect()
+            })),
+            "E" | "P" => (!value.contains(['\\', '$', '`', '!'])).then(|| value.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`ifs_operation_text`] for an unset `IFS`: the default word of
+/// `${IFS-word}`, `${IFS:-word}`, `${IFS=word}` and `${IFS:=word}`, and
+/// nothing for every other operator (Bash 5.2: after `unset v`,
+/// `"${v/#/X}"` and `"${v:0:1}"` are empty). `None` for `${IFS?}` and
+/// `${IFS:?}`, which run nothing, and for a word that expands.
+fn unset_ifs_operation_text(operation: &str) -> Option<String> {
+    let operation = operation.strip_prefix(':').unwrap_or(operation);
+    match operation.chars().next() {
+        Some('-' | '=') => static_ifs_operand(&operation[1..]),
+        Some('?') => None,
+        _ => Some(String::new()),
+    }
+}
+
+/// `value` with `change` applied to its first character, or to every one.
+fn change_ifs_case(value: &str, every: bool, change: impl Fn(char) -> String) -> String {
+    let mut out = String::with_capacity(value.len());
+    for (index, character) in value.chars().enumerate() {
+        if every || index == 0 {
+            out.push_str(&change(character));
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+/// A word that is the same text after expansion and quote removal.
+fn static_ifs_operand(word: &str) -> Option<String> {
+    (!word.contains(['$', '`', '"', '\'', '\\'])).then(|| word.to_string())
+}
+
+/// `${IFS:offset[:length]}` over `value` (`spec` follows the first `:`),
+/// with Bash's rules for negative numbers. Only literal integers, optionally
+/// parenthesized, are read; an empty number is zero.
+fn ifs_substring(spec: &str, value: &str) -> Option<String> {
+    fn number(text: &str) -> Option<i64> {
+        let text = text.trim();
+        let text = text
+            .strip_prefix('(')
+            .and_then(|inner| inner.strip_suffix(')'))
+            .map_or(text, str::trim);
+        if text.is_empty() {
+            return Some(0);
+        }
+        text.parse().ok()
+    }
+    let (offset, length) = match spec.split_once(':') {
+        Some((offset, length)) => (number(offset)?, Some(number(length)?)),
+        None => (number(spec)?, None),
+    };
+    let chars = value.chars().collect::<Vec<_>>();
+    let count = i64::try_from(chars.len()).ok()?;
+    let start = if offset < 0 { count + offset } else { offset };
+    if start < 0 || start > count {
+        return Some(String::new());
+    }
+    let end = match length {
+        None => count,
+        Some(length) if length < 0 => count + length,
+        Some(length) => start.saturating_add(length).min(count),
+    };
+    if end < start {
+        // Bash reports "substring expression < 0" and runs nothing.
         return None;
     }
-    let bytes = command.as_bytes();
-    let mut out = String::with_capacity(command.len());
-    let mut index = 0usize;
-    let mut in_single = false;
-    let mut replaced = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'\'' && !command_byte_is_escaped(bytes, index) {
-            in_single = !in_single;
-            out.push('\'');
-            index += 1;
-            continue;
-        }
-        if !in_single
-            && byte == b'$'
-            && !command_byte_is_escaped(bytes, index)
-            && let Some(after) = ifs_reference_end(bytes, index)
-        {
-            out.push(' ');
-            index = after;
-            replaced = true;
-            continue;
-        }
-        // Preserve multi-byte UTF-8 sequences intact.
-        let char_len = command[index..].chars().next().map_or(1, char::len_utf8);
-        out.push_str(&command[index..index + char_len]);
-        index += char_len;
+    let (start, end) = (usize::try_from(start).ok()?, usize::try_from(end).ok()?);
+    Some(chars[start..end].iter().collect())
+}
+
+/// One element of a [`simple_glob`] pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobToken {
+    Any,
+    One,
+    Char(char),
+}
+
+/// `pattern` as `*`, `?` and literal characters, or `None` when it uses
+/// quoting, expansions, brackets or extended globs. A run of `*` is one
+/// [`GlobToken::Any`]: it matches the same text.
+fn simple_glob(pattern: &str) -> Option<Vec<GlobToken>> {
+    if pattern.contains([
+        '[', ']', '\\', '\'', '"', '$', '`', '(', ')', '|', '!', '@', '+', '{', '}',
+    ]) {
+        return None;
     }
-    (replaced && out != command).then_some(out)
+    let mut tokens = Vec::with_capacity(pattern.len());
+    for character in pattern.chars() {
+        let token = match character {
+            '*' => GlobToken::Any,
+            '?' => GlobToken::One,
+            other => GlobToken::Char(other),
+        };
+        if !(token == GlobToken::Any && tokens.last() == Some(&GlobToken::Any)) {
+            tokens.push(token);
+        }
+    }
+    Some(tokens)
+}
+
+/// Upper bound on the matcher steps one IFS operator may take, counted as
+/// (pattern tokens + 1) x (text characters + 1) per scan. Real IFS values
+/// and patterns are a few characters; above the bound the text is not
+/// computed, and the separator and empty texts still apply.
+const MAX_IFS_GLOB_WORK: usize = 1 << 14;
+
+/// Whether `scans` scans of `text_len` characters each fit in
+/// [`MAX_IFS_GLOB_WORK`].
+fn ifs_glob_work_fits(pattern: &[GlobToken], text_len: usize, scans: usize) -> bool {
+    (pattern.len() + 1)
+        .checked_mul(text_len + 1)
+        .and_then(|work| work.checked_mul(scans))
+        .is_some_and(|work| work <= MAX_IFS_GLOB_WORK)
+}
+
+/// For each `length` in `0..=text.len()`, whether `pattern` matches all of
+/// `text[..length]`. One pass over `text` that tracks the set of pattern
+/// positions reached, so it takes O(pattern x text) steps and constant
+/// stack, whatever the pattern.
+fn glob_prefix_matches(pattern: &[GlobToken], text: &[char]) -> Vec<bool> {
+    let end = pattern.len();
+    // A `*` also matches nothing: whoever reaches it reaches the next token.
+    let close = |states: &mut [bool]| {
+        for position in 0..end {
+            if states[position] && pattern[position] == GlobToken::Any {
+                states[position + 1] = true;
+            }
+        }
+    };
+    let mut states = vec![false; end + 1];
+    states[0] = true;
+    close(&mut states);
+    let mut next = vec![false; end + 1];
+    let mut matched = Vec::with_capacity(text.len() + 1);
+    matched.push(states[end]);
+    for character in text {
+        next.fill(false);
+        let mut alive = false;
+        for (position, token) in pattern.iter().enumerate() {
+            if !states[position] {
+                continue;
+            }
+            let target = match token {
+                GlobToken::Any => position,
+                GlobToken::One => position + 1,
+                GlobToken::Char(expected) if expected == character => position + 1,
+                GlobToken::Char(_) => continue,
+            };
+            next[target] = true;
+            alive = true;
+        }
+        close(&mut next);
+        std::mem::swap(&mut states, &mut next);
+        matched.push(states[end]);
+        if !alive {
+            matched.resize(text.len() + 1, false);
+            break;
+        }
+    }
+    matched
+}
+
+/// Like [`glob_prefix_matches`], for suffixes: entry `length` says whether
+/// `pattern` matches the last `length` characters of `text`. A glob of `*`,
+/// `?` and literals matches a text exactly when its reverse matches the
+/// reversed text.
+fn glob_suffix_matches(pattern: &[GlobToken], text: &[char]) -> Vec<bool> {
+    let pattern = pattern.iter().rev().copied().collect::<Vec<_>>();
+    let text = text.iter().rev().copied().collect::<Vec<_>>();
+    glob_prefix_matches(&pattern, &text)
+}
+
+/// Whether `pattern` matches all of `text`.
+#[cfg(test)]
+fn glob_matches(pattern: &[GlobToken], text: &[char]) -> bool {
+    glob_prefix_matches(pattern, text)[text.len()]
+}
+
+/// `${v#p}`, `${v##p}` (`prefix`) and `${v%p}`, `${v%%p}`: `value` without
+/// the shortest or longest matching prefix or suffix. `None` above
+/// [`MAX_IFS_GLOB_WORK`].
+fn remove_glob_affix(
+    value: &str,
+    pattern: &[GlobToken],
+    prefix: bool,
+    longest: bool,
+) -> Option<String> {
+    let chars = value.chars().collect::<Vec<_>>();
+    let count = chars.len();
+    if !ifs_glob_work_fits(pattern, count, 1) {
+        return None;
+    }
+    let matches = if prefix {
+        glob_prefix_matches(pattern, &chars)
+    } else {
+        glob_suffix_matches(pattern, &chars)
+    };
+    let mut lengths = (0..=count).filter(|length| matches[*length]);
+    let Some(length) = (if longest {
+        lengths.next_back()
+    } else {
+        lengths.next()
+    }) else {
+        return Some(value.to_string());
+    };
+    let kept = if prefix {
+        &chars[length..]
+    } else {
+        &chars[..count - length]
+    };
+    Some(kept.iter().collect())
+}
+
+/// `${v/p/r}`, `${v//p/r}`, `${v/#p/r}` and `${v/%p/r}` over `value`; `spec`
+/// follows the first `/`. The replacement must be static. `None` above
+/// [`MAX_IFS_GLOB_WORK`].
+fn substitute_glob(spec: &str, value: &str) -> Option<String> {
+    let (mode, spec) = match spec.chars().next() {
+        Some(mode @ ('/' | '#' | '%')) => (Some(mode), &spec[1..]),
+        _ => (None, spec),
+    };
+    let (pattern, replacement) = spec.split_once('/').unwrap_or((spec, ""));
+    let pattern = simple_glob(pattern)?;
+    let replacement = static_ifs_operand(replacement)?;
+    let chars = value.chars().collect::<Vec<_>>();
+    let count = chars.len();
+    match mode {
+        // The longest matching prefix, or suffix, is replaced.
+        Some(anchor @ ('#' | '%')) => {
+            if !ifs_glob_work_fits(&pattern, count, 1) {
+                return None;
+            }
+            let prefix = anchor == '#';
+            let matches = if prefix {
+                glob_prefix_matches(&pattern, &chars)
+            } else {
+                glob_suffix_matches(&pattern, &chars)
+            };
+            let Some(length) = (0..=count).rev().find(|length| matches[*length]) else {
+                return Some(value.to_string());
+            };
+            let mut out = String::new();
+            if prefix {
+                out.push_str(&replacement);
+                out.extend(&chars[length..]);
+            } else {
+                out.extend(&chars[..count - length]);
+                out.push_str(&replacement);
+            }
+            Some(out)
+        }
+        _ if pattern.is_empty() => Some(value.to_string()),
+        // A pattern that matches the empty value replaces it (Bash 5.2:
+        // `v=; printf '[%s]' "${v/*/X}" "${v//*/X}"` prints `[X][X]`). In a
+        // non-empty value, a simple glob that matches nothing is all `*`,
+        // and from the first character it matches the whole value instead.
+        _ if count == 0 => Some(if glob_prefix_matches(&pattern, &[])[0] {
+            replacement
+        } else {
+            String::new()
+        }),
+        _ => {
+            // One scan from each start: the longest non-empty match there.
+            if !ifs_glob_work_fits(&pattern, count, count.max(1)) {
+                return None;
+            }
+            let mut out = String::new();
+            let mut index = 0usize;
+            let mut replaced = false;
+            while index < count {
+                let matched = (!replaced || mode == Some('/'))
+                    .then(|| {
+                        let matches = glob_prefix_matches(&pattern, &chars[index..]);
+                        (1..matches.len()).rev().find(|length| matches[*length])
+                    })
+                    .flatten();
+                if let Some(length) = matched {
+                    out.push_str(&replacement);
+                    index += length;
+                    replaced = true;
+                } else {
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+/// Every unescaped IFS reference in `command` (see [`ifs_reference_at`]),
+/// read without regard to quoting.
+fn lexical_ifs_references(command: &str) -> Vec<IfsReference> {
+    let bytes = command.as_bytes();
+    let mut references = Vec::new();
+    let mut index = 0usize;
+    while let Some(relative) = memchr::memchr(b'$', &bytes[index..]) {
+        let dollar = index + relative;
+        if !command_byte_is_escaped(bytes, dollar)
+            && let Some(reference) = ifs_reference_at(bytes, dollar)
+        {
+            index = reference.range.end;
+            references.push(reference);
+        } else {
+            index = dollar + 1;
+        }
+    }
+    references
+}
+
+/// What a clean shell parse says about IFS in a command.
+struct IfsParse {
+    /// Text where `$` cannot expand.
+    literal: Vec<Range<usize>>,
+    /// Every value `IFS` can take anywhere in the command
+    /// ([`possible_ifs_values`]), the default first; `None` when there are
+    /// more than [`MAX_IFS_VALUES`].
+    values: Option<Vec<IfsValue>>,
+    /// Double-quoted strings, substitutions and heredoc bodies, each with
+    /// the splitting it gives the expansions directly inside it.
+    contexts: Vec<(Range<usize>, IfsContext)>,
+}
+
+impl IfsParse {
+    /// Splitting at `offset`: that of the innermost range containing it,
+    /// else unquoted.
+    fn context_at(&self, offset: usize) -> IfsContext {
+        self.contexts
+            .iter()
+            .filter(|(range, _)| range.contains(&offset))
+            .max_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)))
+            .map_or(IfsContext::Unquoted, |(_, context)| *context)
+    }
+}
+
+/// One way a command writes `IFS`, as [`parsed_ifs_literals`] decodes it.
+/// A word is `None` when it is not static.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IfsWrite {
+    /// `IFS=word` (`append`: `IFS+=word`).
+    Scalar { append: bool, word: Option<String> },
+    /// `IFS=(w ...)` or `IFS+=(w ...)`: `first` is what the list makes
+    /// element 0, set to the first word, unset for an empty list, unknown
+    /// when that word is not static or an element names its index.
+    Array { append: bool, first: IfsValue },
+    /// `IFS[index]=word` or `IFS[index]+=word`; `index` is `None` unless
+    /// it is a literal non-negative integer.
+    Element {
+        index: Option<u64>,
+        append: bool,
+        word: Option<String>,
+    },
+    /// `${IFS=word}` (`colon`: `${IFS:=word}`): assigns when unset (or
+    /// empty).
+    Default { colon: bool, word: Option<String> },
+    /// `unset IFS`, or a valueless `local IFS` in a function.
+    Unset,
+    /// A write dcg does not decode: `read IFS`, `printf -v IFS`,
+    /// `for IFS in`, an element whose index is not literal.
+    Unknown,
+}
+
+impl IfsWrite {
+    /// The value `IFS` has after this write when it had `value` before.
+    fn apply(&self, value: &IfsValue) -> IfsValue {
+        let append_to = |word: &Option<String>| match (value, word) {
+            (IfsValue::Set(current), Some(word)) => IfsValue::Set(format!("{current}{word}")),
+            (IfsValue::Unset, Some(word)) => IfsValue::Set(word.clone()),
+            _ => IfsValue::Unknown,
+        };
+        let assign = |word: &Option<String>| word.clone().map_or(IfsValue::Unknown, IfsValue::Set);
+        match self {
+            Self::Scalar {
+                append: false,
+                word,
+            }
+            | Self::Element {
+                index: Some(0),
+                append: false,
+                word,
+            } => assign(word),
+            Self::Scalar { append: true, word }
+            | Self::Element {
+                index: Some(0),
+                append: true,
+                word,
+            } => append_to(word),
+            // Appending elements keeps a set element 0.
+            Self::Array { append: true, .. } if *value != IfsValue::Unset => value.clone(),
+            Self::Array { first, .. } => first.clone(),
+            Self::Element { index: Some(_), .. } => value.clone(),
+            Self::Element { index: None, .. } | Self::Unknown => IfsValue::Unknown,
+            Self::Default { colon, word } => match value {
+                IfsValue::Unset => assign(word),
+                IfsValue::Set(current) if *colon && current.is_empty() => assign(word),
+                _ => value.clone(),
+            },
+            Self::Unset => IfsValue::Unset,
+        }
+    }
+
+    /// Whether the result depends on the value before: appends and
+    /// `${IFS=word}`.
+    fn reads_value(&self) -> bool {
+        matches!(
+            self,
+            Self::Scalar { append: true, .. }
+                | Self::Array { append: true, .. }
+                | Self::Element {
+                    index: Some(0),
+                    append: true,
+                    ..
+                }
+                | Self::Default { .. }
+        )
+    }
+}
+
+/// From a clean shell parse of `command`: the byte ranges of the text where
+/// `$` cannot expand (single-quoted and ANSI-C strings, comments), every
+/// value `IFS` can take, and the quoting contexts. `None` when the command
+/// does not parse cleanly.
+///
+/// The parse only excludes text. A use the grammar does not model as an
+/// expansion still counts: tree-sitter-bash does not report the second
+/// `$IFS` of `rm$IFS-rf$IFS~` as one.
+///
+/// Writes follow Bash 5.2 (each checked with a printf analogue): `IFS+=w`
+/// appends, and makes `w` after `unset IFS`; `$IFS` is element 0, so
+/// `IFS=(g x)` and `IFS[0]=g` set `g`, `IFS+=(x)` keeps a set value and
+/// `IFS[1]=x` changes nothing; `IFS=()` unsets it; a valueless `local`,
+/// `declare` or `typeset IFS` in a function makes a local, unset IFS, while
+/// `declare IFS` at top level or with `-g`, `export IFS`, `readonly IFS`,
+/// `declare -I IFS` (the local inherits the value) and `declare -p`, `-f`
+/// or `-F IFS` (they print or name functions) leave the value. Under
+/// `shopt -s localvar_inherit` a valueless local inherits too; dcg does not
+/// track that option, and the inherited value is one of the possible values
+/// anyway. A write dcg cannot decode gives an unknown value.
+fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
+    let ast = crate::heredoc::try_parse_shell_ast(command).ok()?;
+    if ast.root().get_inner_node().has_error() {
+        return None;
+    }
+    let decode = |raw: &str| {
+        shell_word_value(raw, ShellDialect::Posix)
+            // A value that itself expands would re-enter this view.
+            .filter(|value| !value.contains(['$', '`']))
+    };
+    let mut literal = Vec::new();
+    // Each write, and whether it may run more than once: inside a loop
+    // (including its condition and word list) or a function body.
+    let mut writes: Vec<(IfsWrite, bool)> = Vec::new();
+    let mut contexts = Vec::new();
+    for node in ast.root().dfs() {
+        let repeats = || {
+            node.ancestors().any(|ancestor| {
+                matches!(
+                    ancestor.kind().as_ref(),
+                    "for_statement"
+                        | "c_style_for_statement"
+                        | "while_statement"
+                        | "function_definition"
+                )
+            })
+        };
+        match node.kind().as_ref() {
+            "raw_string" | "ansi_c_string" | "comment" => literal.push(node.range()),
+            "string" => contexts.push((node.range(), IfsContext::Quoted)),
+            "command_substitution" | "process_substitution" => {
+                contexts.push((node.range(), IfsContext::Unquoted));
+            }
+            "heredoc_body" => contexts.push((node.range(), IfsContext::Unknown)),
+            "variable_assignment" => {
+                let Some(name) = node.field("name") else {
+                    continue;
+                };
+                let append = node.children().any(|child| child.kind() == "+=");
+                let value = node.field("value");
+                let write = match name.kind().as_ref() {
+                    "variable_name" if name.text() == "IFS" => match &value {
+                        Some(value) if value.kind() == "array" => {
+                            let mut elements = value
+                                .children()
+                                .filter(|child| child.is_named() && child.kind() != "comment");
+                            let keyed = value
+                                .children()
+                                .any(|child| child.is_named() && child.text().starts_with('['));
+                            let first = match elements.next() {
+                                None => IfsValue::Unset,
+                                Some(_) if keyed => IfsValue::Unknown,
+                                Some(first) => {
+                                    decode(&first.text()).map_or(IfsValue::Unknown, IfsValue::Set)
+                                }
+                            };
+                            IfsWrite::Array { append, first }
+                        }
+                        Some(value) => IfsWrite::Scalar {
+                            append,
+                            word: decode(&value.text()),
+                        },
+                        None => IfsWrite::Scalar {
+                            append,
+                            word: Some(String::new()),
+                        },
+                    },
+                    "subscript"
+                        if name
+                            .field("name")
+                            .is_some_and(|array| array.text() == "IFS") =>
+                    {
+                        IfsWrite::Element {
+                            index: name
+                                .field("index")
+                                .and_then(|index| index.text().trim().parse().ok()),
+                            append,
+                            word: value
+                                .filter(|value| value.kind() != "array")
+                                .map_or(Some(String::new()), |value| decode(&value.text())),
+                        }
+                    }
+                    _ => continue,
+                };
+                writes.push((write, repeats()));
+            }
+            "expansion" => {
+                let text = node.text();
+                if let Some(operation) = text
+                    .strip_prefix("${IFS")
+                    .and_then(|rest| rest.strip_suffix('}'))
+                {
+                    let (colon, word) = match operation.strip_prefix(':') {
+                        Some(rest) => (true, rest),
+                        None => (false, operation),
+                    };
+                    if let Some(word) = word.strip_prefix('=') {
+                        writes.push((
+                            IfsWrite::Default {
+                                colon,
+                                word: static_ifs_operand(word),
+                            },
+                            repeats(),
+                        ));
+                    }
+                }
+            }
+            "unset_command" => {
+                // The `unset` keyword is not a named node.
+                let words = node
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .collect::<Vec<_>>();
+                if words.iter().any(|word| word.text().starts_with("-f")) {
+                    continue;
+                }
+                let unsets = words.iter().any(|word| {
+                    decode(&word.text()).is_some_and(|name| {
+                        matches!(name.as_str(), "IFS" | "IFS[0]" | "IFS[@]" | "IFS[*]")
+                    })
+                });
+                if unsets {
+                    writes.push((IfsWrite::Unset, repeats()));
+                }
+            }
+            "declaration_command" => {
+                let keyword = node
+                    .children()
+                    .next()
+                    .map(|keyword| keyword.text().into_owned())
+                    .unwrap_or_default();
+                let words = node.children().skip(1).collect::<Vec<_>>();
+                let flags = words
+                    .iter()
+                    .map(ast_grep_core::Node::text)
+                    .filter(|text| text.starts_with('-'))
+                    .collect::<String>();
+                // `-p` prints and `-f`/`-F` name functions: no variable is
+                // made. `-I` makes a local that inherits the value.
+                if flags.contains(['p', 'f', 'F']) || flags.contains('I') {
+                    continue;
+                }
+                let local = match keyword.as_str() {
+                    "local" => true,
+                    "declare" | "typeset" => !flags.contains('g'),
+                    _ => false,
+                };
+                if local
+                    && node
+                        .ancestors()
+                        .any(|ancestor| ancestor.kind() == "function_definition")
+                    && words
+                        .iter()
+                        .any(|word| word.kind() == "variable_name" && word.text() == "IFS")
+                {
+                    writes.push((IfsWrite::Unset, true));
+                }
+            }
+            "for_statement" | "select_statement"
+                if node
+                    .field("variable")
+                    .is_some_and(|variable| variable.text() == "IFS") =>
+            {
+                writes.push((IfsWrite::Unknown, true));
+            }
+            "command" => {
+                let Some(name) = node.field("name") else {
+                    continue;
+                };
+                let arguments = node
+                    .field_children("argument")
+                    .map(|argument| decode(&argument.text()).unwrap_or_default())
+                    .collect::<Vec<_>>();
+                let writes_ifs = match name.text().as_ref() {
+                    "read" | "mapfile" | "readarray" | "getopts" => {
+                        arguments.iter().any(|argument| argument == "IFS")
+                    }
+                    "printf" => {
+                        arguments.windows(2).any(|pair| pair == ["-v", "IFS"])
+                            || arguments.iter().any(|argument| argument == "-vIFS")
+                    }
+                    _ => false,
+                };
+                if writes_ifs {
+                    writes.push((IfsWrite::Unknown, repeats()));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(IfsParse {
+        literal,
+        values: possible_ifs_values(&writes),
+        contexts,
+    })
+}
+
+/// Upper bound on the distinct values [`possible_ifs_values`] collects.
+/// Past it, a command whose IFS uses depend on the value is denied as
+/// unverified, as one past [`MAX_IFS_EXPANSION_VIEWS`] is.
+const MAX_IFS_VALUES: usize = MAX_IFS_EXPANSION_VIEWS;
+
+/// Upper bound on the write applications [`possible_ifs_values`] tries.
+const MAX_IFS_VALUE_STEPS: usize = 4096;
+
+/// Upper bound on the distinct writes that read the value
+/// ([`possible_ifs_values`]).
+const MAX_IFS_READING_WRITES: usize = 64;
+
+/// Every value `IFS` can take in a command with these writes, the default
+/// first, or `None` when there are more than [`MAX_IFS_VALUES`] (or more
+/// than [`MAX_IFS_READING_WRITES`] distinct reading writes, or the search
+/// passes [`MAX_IFS_VALUE_STEPS`]). Each write comes with whether it may
+/// run more than once.
+///
+/// Any write may happen or not, in any order: source order does not show
+/// whether a write in a child shell, branch, loop, prefix assignment or
+/// function body runs, or when. A write that sets the value outright gives
+/// that value. A write that reads it (`IFS+=w`, `${IFS=w}`) is applied to
+/// every value found, and to the results: once for each place it is
+/// written, so `IFS=; IFS+=-; IFS+=-` gives `--`, and any number of times
+/// when it is in a loop or a function body, so `IFS=; for i in 1 2; do
+/// IFS+=-; done` gives `-`, `--`, ... until the value cap is passed.
+/// `unset IFS; (IFS=x); IFS+=g` gives `g` as well as `xg`.
+fn possible_ifs_values(writes: &[(IfsWrite, bool)]) -> Option<Vec<IfsValue>> {
+    let mut values = vec![IfsValue::default_value()];
+    let add = |values: &mut Vec<IfsValue>, value: IfsValue| -> Option<()> {
+        if !values.contains(&value) {
+            if values.len() == MAX_IFS_VALUES {
+                return None;
+            }
+            values.push(value);
+        }
+        Some(())
+    };
+    // Each distinct reading write, with how many times it may apply.
+    let mut reading: Vec<(&IfsWrite, usize)> = Vec::new();
+    for (write, repeats) in writes {
+        if write.reads_value() {
+            let times = if *repeats { usize::MAX } else { 1 };
+            if let Some((_, limit)) = reading.iter_mut().find(|(seen, _)| *seen == write) {
+                *limit = limit.saturating_add(times);
+            } else {
+                if reading.len() == MAX_IFS_READING_WRITES {
+                    return None;
+                }
+                reading.push((write, times));
+            }
+        } else if !matches!(
+            write,
+            IfsWrite::Element {
+                index: Some(1..),
+                ..
+            }
+        ) {
+            add(&mut values, write.apply(&IfsValue::Unknown))?;
+        }
+    }
+    // A state is a value and how many times each reading write has applied.
+    let mut frontier = values
+        .iter()
+        .map(|value| (value.clone(), vec![0usize; reading.len()]))
+        .collect::<Vec<_>>();
+    let mut seen = frontier
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut steps = 0usize;
+    while let Some((value, applied)) = frontier.pop() {
+        for (index, (write, limit)) in reading.iter().enumerate() {
+            if applied[index] == *limit {
+                continue;
+            }
+            steps += 1;
+            if steps > MAX_IFS_VALUE_STEPS {
+                return None;
+            }
+            let next = write.apply(&value);
+            if next == value {
+                continue;
+            }
+            add(&mut values, next.clone())?;
+            let mut used = applied.clone();
+            used[index] += 1;
+            let state = (next, used);
+            if seen.insert(state.clone()) {
+                frontier.push(state);
+            }
+        }
+    }
+    Some(values)
 }
 
 /// Whether the byte at `index` is preceded by an odd run of backslashes.
@@ -17492,25 +18572,93 @@ fn command_byte_is_escaped(bytes: &[u8], index: usize) -> bool {
     backslashes % 2 == 1
 }
 
-/// If `$` at `index` begins an `$IFS` or `${IFS}` reference, the byte index
-/// just past it; otherwise `None`. `$IFSX`/`${IFSX}` name a different variable
-/// and do not match.
-fn ifs_reference_end(bytes: &[u8], index: usize) -> Option<usize> {
+/// The IFS reference that the `$` at `index` begins, if any: `$IFS`, or a
+/// braced `${IFS...}` with an optional subscript and any operator whose text
+/// comes from the value (see [`IfsReferenceKind::Derived`]). `$IFSX` and
+/// `${IFSX}` name a different variable; `${#IFS}` (a length), `${!IFS}`
+/// (indirection), `${IFS:+word}` and `${IFS+word}` (the word, not the
+/// value), and `${IFS@Q}`, `@A`, `@a`, `@K` and `@k` (quoted or descriptive
+/// text) do not match.
+fn ifs_reference_at(bytes: &[u8], index: usize) -> Option<IfsReference> {
     let braced = bytes.get(index + 1) == Some(&b'{');
     let name_start = index + if braced { 2 } else { 1 };
     if bytes.get(name_start..name_start + 3) != Some(b"IFS") {
         return None;
     }
-    let after_name = name_start + 3;
-    if braced {
-        (bytes.get(after_name) == Some(&b'}')).then_some(after_name + 1)
-    } else {
+    let mut after_name = name_start + 3;
+    if !braced {
         // A bare `$IFS` ends at any non-identifier byte or end of input.
         let ends = bytes
             .get(after_name)
             .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
-        ends.then_some(after_name)
+        return ends.then_some(IfsReference {
+            range: index..after_name,
+            kind: IfsReferenceKind::Whole,
+            operation: after_name..after_name,
+            computable: true,
+        });
     }
+    // `IFS` is a scalar, which Bash also reads as a one-element array.
+    let mut subscript = None;
+    if bytes.get(after_name) == Some(&b'[') {
+        let close = after_name + 1 + memchr::memchr(b']', bytes.get(after_name + 1..)?)?;
+        subscript = Some(
+            std::str::from_utf8(&bytes[after_name + 1..close])
+                .ok()?
+                .trim()
+                .to_string(),
+        );
+        after_name = close + 1;
+    }
+    let element = subscript
+        .as_deref()
+        .is_none_or(|subscript| subscript == "0");
+    let all_elements = matches!(subscript.as_deref(), Some("@" | "*"));
+    let operator = *bytes.get(after_name)?;
+    let next = bytes.get(after_name + 1).copied();
+    match (operator, next) {
+        (b'}', _) => {
+            let whole = element || all_elements;
+            return Some(IfsReference {
+                range: index..after_name + 1,
+                kind: if whole {
+                    IfsReferenceKind::Whole
+                } else {
+                    IfsReferenceKind::Derived
+                },
+                operation: after_name..after_name,
+                computable: whole,
+            });
+        }
+        (b':', Some(b'+')) | (b'+', _) => return None,
+        (b'@', Some(b'U' | b'u' | b'L' | b'E' | b'P'))
+            if bytes.get(after_name + 2) == Some(&b'}') => {}
+        (b':' | b'#' | b'%' | b'-' | b'=' | b'?' | b'/' | b'^' | b',' | b'~', _) => {}
+        _ => return None,
+    }
+    // The operator's word can nest `${...}`; find the matching brace.
+    let mut depth = 1usize;
+    let mut cursor = after_name;
+    while let Some(&byte) = bytes.get(cursor) {
+        match byte {
+            b'\\' => cursor += 1,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(IfsReference {
+                        range: index..cursor + 1,
+                        kind: IfsReferenceKind::Derived,
+                        operation: after_name..cursor,
+                        computable: element || all_elements,
+                    });
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
 }
 
 /// Bodies of the POSIX `alias NAME=BODY ...` definitions in top-level
@@ -39108,7 +40256,7 @@ mod tests {
             assert!(!result.is_allowed(), "{command} -> {result:?}");
         }
         for command in [
-            // IFS reassigned: the value is no longer provably whitespace.
+            // IFS reassigned: harmless whether the use splits or joins.
             "IFS=x; echo${IFS}hi",
             // Single-quoted: `$IFS` is literal text, not an expansion.
             "grep '$IFS' file.txt",
@@ -39125,22 +40273,592 @@ mod tests {
     }
 
     #[test]
-    fn posix_ifs_expansion_view_is_precise() {
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn posix_ifs_expansion_views_are_precise() {
+        let views = |command: &str| posix_ifs_expansion_views(command).expect("within the cap");
+        // Each unquoted use splits or joins, independently of the others.
+        assert_eq!(views("rm${IFS}-rf${IFS}~"), ["rm -rf ~", "rm-rf~"]);
+        // Repeats of one use share a choice until IFS may be rebound.
         assert_eq!(
-            posix_ifs_expansion_view("rm${IFS}-rf${IFS}~").as_deref(),
-            Some("rm -rf ~")
+            views("a${IFS}b; IFS=; c${IFS}d"),
+            [
+                "a b; IFS=; c d",
+                "ab; IFS=; c d",
+                "a b; IFS=; cd",
+                "ab; IFS=; cd"
+            ]
+        );
+        assert_eq!(views("a${IFS=}b${IFS}c").len(), 4);
+        assert_eq!(views("rm$IFS-rf$IFS~")[0], "rm -rf ~");
+        // A rebound IFS still splits an unquoted use.
+        assert_eq!(
+            views("IFS=x; git${IFS}reset${IFS}--hard"),
+            ["IFS=x; git reset --hard", "IFS=x; gitreset--hard"]
+        );
+        // A quoted use inserts the text the value in force gives.
+        // A quoted use inserts the text of every value IFS can take.
+        assert_eq!(
+            views("IFS=t; \"gi${IFS}\" reset"),
+            [
+                "IFS=t; \"gi \" reset",
+                "IFS=t; \"gi\" reset",
+                "IFS=t; \"gi \t\n\" reset",
+                "IFS=t; \"git\" reset"
+            ]
+        );
+        // A write after the use, or one that may not run, still counts.
+        assert!(views("\"gi${IFS}\" reset; IFS=t").contains(&"\"git\" reset; IFS=t".to_string()));
+        assert!(
+            views("IFS=xt; \"gi${IFS:1:1}\" reset").contains(&"IFS=xt; \"git\" reset".to_string())
         );
         assert_eq!(
-            posix_ifs_expansion_view("rm$IFS-rf$IFS~").as_deref(),
-            Some("rm -rf ~")
+            views("echo \"a${IFS}b\""),
+            ["echo \"a b\"", "echo \"ab\"", "echo \"a \t\nb\""]
         );
-        // Nothing to expand, IFS reassigned, literal in single quotes, or a
-        // different variable: no view.
-        assert_eq!(posix_ifs_expansion_view("rm -rf ~"), None);
-        assert_eq!(posix_ifs_expansion_view("IFS=,; a$IFSb"), None);
-        assert_eq!(posix_ifs_expansion_view("echo '$IFS'"), None);
-        assert_eq!(posix_ifs_expansion_view("echo $IFSX"), None);
-        assert_eq!(posix_ifs_expansion_view(r"echo \$IFS"), None);
+        // A substitution inside double quotes splits again.
+        assert_eq!(views("echo \"$(echo a${IFS}b)\"")[1], "echo \"$(echo ab)\"");
+        // Derived uses can resolve differently from each other.
+        assert!(views("gi${IFS:9}t${IFS:0:1}reset").contains(&"git reset".to_string()));
+        assert!(views("gi${IFS#???}t${IFS::1}reset").contains(&"git reset".to_string()));
+        // Subscripts select the value or another (empty) element.
+        assert_eq!(views("git${IFS[0]}reset"), ["git reset", "gitreset"]);
+        assert_eq!(views("git${IFS[@]}reset"), ["git reset", "gitreset"]);
+        assert_eq!(views("git${IFS[1]}reset"), ["git reset", "gitreset"]);
+        // Bash 5.2 slices a scalar's `[@]` by characters.
+        assert_eq!(
+            views("\"gi${IFS[@]:1}t\""),
+            ["\"gi t\"", "\"git\"", "\"gi\t\nt\""]
+        );
+        // Case changes and substitutions of IFS characters still split.
+        for command in [
+            "git${IFS^^}reset",
+            "git${IFS,}reset",
+            "git${IFS~~}reset",
+            "git${IFS@U}reset",
+            "git${IFS/q/z}reset",
+            "git${IFS//q/z}reset",
+            "IFS=,; git${IFS^}reset",
+        ] {
+            assert!(
+                views(command)
+                    .iter()
+                    .any(|view| view.ends_with("git reset")),
+                "{command} -> {:?}",
+                views(command)
+            );
+        }
+        // Text a substitution adds stays one literal word.
+        assert!(views("echo ${IFS/ /;x}").contains(&"echo ';'x ".to_string()));
+        // Quote characters that open no quote do not hide a use.
+        assert_eq!(views("echo \"'\"; a${IFS}b")[0], "echo \"'\"; a b");
+        assert_eq!(views("echo 'a\\'; a${IFS}b")[0], "echo 'a\\'; a b");
+        assert_eq!(views("echo hi # it's\na${IFS}b")[0], "echo hi # it's\na b");
+        // A value that expands is not substituted, so views terminate.
+        assert_eq!(
+            views("IFS='$IFS'; a${IFS}b"),
+            ["IFS='$IFS'; a b", "IFS='$IFS'; ab"]
+        );
+        // Nothing to expand: no use, literal text, comments, a different
+        // variable, a length, indirection, or an operator whose text need not
+        // come from IFS.
+        for command in [
+            "rm -rf ~",
+            "echo '$IFS'",
+            "echo $'$IFS'",
+            "echo hi # $IFS",
+            "echo $IFSX",
+            r"echo \$IFS",
+            "echo ${#IFS}",
+            "echo ${!IFS}",
+            "echo ${IFS:+x}",
+            "echo ${IFS@Q}",
+            "IFS=,; a$IFSb",
+        ] {
+            assert!(
+                views(command).is_empty(),
+                "{command} -> {:?}",
+                views(command)
+            );
+        }
+        // More combinations than the cap are left to the caller to deny.
+        assert_eq!(
+            posix_ifs_expansion_views("echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f"),
+            None
+        );
+        // Without a clean parse the quoting is unknown, so every use needs a
+        // value: the default when nothing else mentions IFS, else none, and
+        // the caller denies.
+        let unparsed =
+            posix_ifs_expansion_views("\"${IFS}it\" reset --hard\n)").expect("default value");
+        assert!(
+            unparsed.contains(&"\" \t\nit\" reset --hard\n)".to_string()),
+            "{unparsed:?}"
+        );
+        for command in [
+            "IFS=g; \"${IFS}it\" reset --hard\n)",
+            "unset IFS; \"gi${IFS-t}\" reset --hard\n)",
+            "IFS=x; git${IFS}reset${IFS}--hard\n)",
+        ] {
+            assert_eq!(posix_ifs_expansion_views(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn ifs_operation_text_follows_bash() {
+        let ifs = DEFAULT_POSIX_IFS;
+        for (operation, expected) in [
+            ("", Some(" \t\n")),
+            (":0:1", Some(" ")),
+            (":1:1", Some("\t")),
+            ("::1", Some(" ")),
+            (":9", Some("")),
+            (": -1", Some("\n")),
+            (":(-2):1", Some("\t")),
+            (":0:-1", Some(" \t")),
+            (":2:-2", None),
+            (":i", None),
+            ("#?", Some("\t\n")),
+            ("##*", Some("")),
+            ("%?", Some(" \t")),
+            ("%%*", Some("")),
+            ("#???", Some("")),
+            ("#[ ]", None),
+            (":-x", Some(" \t\n")),
+            ("/ /x", Some("x\t\n")),
+            ("//?/x", Some("xxx")),
+            ("/#?/x", Some("x\t\n")),
+            ("/%?/x", Some(" \tx")),
+            ("/ /$x", None),
+            ("^^", Some(" \t\n")),
+            ("@U", Some(" \t\n")),
+            ("@Q", None),
+        ] {
+            assert_eq!(
+                ifs_operation_text(operation, ifs).as_deref(),
+                expected,
+                "{operation:?}"
+            );
+        }
+        assert_eq!(ifs_operation_text(":1:1", "xt").as_deref(), Some("t"));
+        assert_eq!(ifs_operation_text(":-word", "").as_deref(), Some("word"));
+        assert_eq!(ifs_operation_text("^", "ab").as_deref(), Some("Ab"));
+        assert_eq!(ifs_operation_text("~~", "aB").as_deref(), Some("Ab"));
+        assert_eq!(ifs_operation_text(",,", "AB").as_deref(), Some("ab"));
+        assert_eq!(ifs_operation_text("@u", "ab").as_deref(), Some("Ab"));
+        assert_eq!(ifs_operation_text("^a", "ab"), None);
+        // Runs of `*` and long patterns stay bounded.
+        let stars = format!("#{}", "*".repeat(20_000));
+        // Bash: the shortest prefix `*` matches is empty.
+        assert_eq!(ifs_operation_text(&stars, ifs).as_deref(), Some(ifs));
+        assert_eq!(ifs_operation_text("%%***", ifs).as_deref(), Some(""));
+        assert_eq!(ifs_operation_text("//***/x", ifs).as_deref(), Some("x"));
+        let value = "a".repeat(44);
+        let backtracking = format!("#{}b", "*a".repeat(16));
+        assert_eq!(
+            ifs_operation_text(&backtracking, &value).as_deref(),
+            Some(value.as_str())
+        );
+        let backtracking = format!("/{}b/x", "*a".repeat(16));
+        assert_eq!(ifs_operation_text(&backtracking, &value), None);
+        let literal = format!("#{}", "?".repeat(MAX_IFS_GLOB_WORK));
+        assert_eq!(ifs_operation_text(&literal, ifs), None);
+        // A pattern that matches an empty value replaces it.
+        assert_eq!(ifs_operation_text("//*/t", "").as_deref(), Some("t"));
+        assert_eq!(ifs_operation_text("/*/t", "").as_deref(), Some("t"));
+        assert_eq!(ifs_operation_text("//?/t", "").as_deref(), Some(""));
+        assert_eq!(ifs_operation_text("///t", "").as_deref(), Some(""));
+        // An unset IFS gives the default word, and nothing otherwise.
+        for (operation, expected) in [
+            ("", Some("")),
+            (":-t", Some("t")),
+            ("-t", Some("t")),
+            ("=t", Some("t")),
+            (":=t", Some("t")),
+            ("-$x", None),
+            ("?", None),
+            (":?", None),
+            (":0:1", Some("")),
+            ("/#/X", Some("")),
+            ("//*/X", Some("")),
+            ("^^", Some("")),
+        ] {
+            assert_eq!(
+                unset_ifs_operation_text(operation).as_deref(),
+                expected,
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn glob_matches_follows_bash() {
+        let glob = |pattern: &str| simple_glob(pattern).expect("simple");
+        let chars = |text: &str| text.chars().collect::<Vec<_>>();
+        for (pattern, text, expected) in [
+            ("", "", true),
+            ("", "a", false),
+            ("*", "", true),
+            ("*", "abc", true),
+            ("a*c", "abc", true),
+            ("a*c", "abcd", false),
+            ("?", "", false),
+            ("??", "ab", true),
+            ("*a*b", "xaxb", true),
+            ("*a*b", "xaxa", false),
+            ("a**b", "ab", true),
+            ("*?", "", false),
+            ("*?*", "x", true),
+        ] {
+            assert_eq!(
+                glob_matches(&glob(pattern), &chars(text)),
+                expected,
+                "{pattern:?} on {text:?}"
+            );
+        }
+        assert_eq!(glob(&"*".repeat(20_000)), [GlobToken::Any]);
+        // Backtracking patterns answer in one pass.
+        let pattern = glob(&format!("{}b", "*a".repeat(16)));
+        assert!(!glob_matches(&pattern, &chars(&"a".repeat(4_000))));
+        assert!(glob_matches(
+            &pattern,
+            &chars(&format!("{}b", "a".repeat(4_000)))
+        ));
+        assert_eq!(
+            glob_suffix_matches(&glob("?b"), &chars("aab")),
+            [false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn parsed_ifs_literals_follow_bash() {
+        let values = |command: &str| {
+            parsed_ifs_literals(command)
+                .expect("parses")
+                .values
+                .expect("within the cap")
+        };
+        let set = |value: &str| IfsValue::Set(value.to_string());
+        let default = || set(DEFAULT_POSIX_IFS);
+        let (unset, unknown) = (IfsValue::Unset, IfsValue::Unknown);
+        // Every value IFS can take, order ignored; the default is first.
+        let same = |command: &str, expected: &[IfsValue]| {
+            let found = values(command);
+            assert_eq!(found[0], default(), "{command}");
+            assert!(
+                found.len() == expected.len() && expected.iter().all(|v| found.contains(v)),
+                "{command} -> {found:?}, expected {expected:?}"
+            );
+        };
+        same("echo", &[default()]);
+        same("IFS+=t; echo", &[default(), set(" \t\nt")]);
+        // Each write may happen or not, in any order.
+        same(
+            "IFS=x; IFS+=y; IFS+=z",
+            &[
+                default(),
+                set("x"),
+                set(" \t\ny"),
+                set(" \t\nz"),
+                set(" \t\nyz"),
+                set(" \t\nzy"),
+                set("xy"),
+                set("xz"),
+                set("xyz"),
+                set("xzy"),
+            ],
+        );
+        same(
+            "IFS=$v; IFS+=t; IFS=k",
+            &[
+                default(),
+                unknown.clone(),
+                set(" \t\nt"),
+                set("k"),
+                set("kt"),
+            ],
+        );
+        // `unset IFS`, then `+=` starts from nothing, wherever the unset is.
+        same(
+            "unset IFS; IFS+=g",
+            &[default(), unset.clone(), set(" \t\ng"), set("g")],
+        );
+        same(
+            "IFS+=g; (unset IFS)",
+            &[default(), unset.clone(), set(" \t\ng"), set("g")],
+        );
+        same("unset -v IFS", &[default(), unset.clone()]);
+        same("unset 'IFS'", &[default(), unset.clone()]);
+        same("unset -f IFS", &[default()]);
+        same("unset 'IFS[1]'", &[default()]);
+        // A valueless local in a function is unset; the outer value stays
+        // possible too.
+        same(
+            "f(){ local IFS; }; IFS+=g",
+            &[default(), unset.clone(), set("g"), set(" \t\ng")],
+        );
+        same("f(){ declare IFS; }", &[default(), unset.clone()]);
+        same("f(){ declare -x IFS; }", &[default(), unset.clone()]);
+        same(
+            "IFS=x; f(){ local IFS=y; }; echo",
+            &[default(), set("x"), set("y")],
+        );
+        // Outside a function, with -g or -I, or when only printing or naming
+        // functions, a declaration makes no unset local.
+        for command in [
+            "declare IFS",
+            "f(){ declare -g IFS; }",
+            "f(){ export IFS; }",
+            "f(){ declare -p IFS; }",
+            "f(){ typeset -p IFS; }",
+            "f(){ local -p IFS; }",
+            "f(){ declare -f IFS; }",
+            "f(){ declare -F IFS; }",
+            "f(){ declare -I IFS; }",
+            "f(){ local -I IFS; }",
+        ] {
+            same(command, &[default()]);
+        }
+        same("declare IFS; IFS+=g", &[default(), set(" \t\ng")]);
+        // `$IFS` is element 0.
+        same("IFS=(g x)", &[default(), set("g")]);
+        same("IFS=()", &[default(), unset.clone()]);
+        same("declare -a IFS=(g)", &[default(), set("g")]);
+        same("IFS=g; IFS+=(x)", &[default(), set("g")]);
+        same("unset IFS; IFS+=(x)", &[default(), unset.clone(), set("x")]);
+        same(
+            "IFS[0]=g; IFS[0]+=h",
+            &[default(), set("g"), set(" \t\nh"), set("gh")],
+        );
+        same("IFS=g; IFS[1]=x", &[default(), set("g")]);
+        // Writes dcg does not decode give an unknown value; the decoded
+        // ones stay possible.
+        for command in [
+            "IFS=g; IFS[i]=x",
+            "IFS=g; IFS=([0]=x)",
+            "IFS=g; IFS=($v)",
+            "IFS=g; read -r IFS",
+            "IFS=g; printf -v IFS x",
+            "IFS=g; for IFS in x; do :; done",
+        ] {
+            same(command, &[default(), set("g"), unknown.clone()]);
+        }
+        // `${IFS=w}` assigns when unset, `${IFS:=w}` when empty too.
+        same(
+            "unset IFS; : ${IFS=t}",
+            &[default(), unset.clone(), set("t")],
+        );
+        same("IFS=; : ${IFS:=t}", &[default(), set(""), set("t")]);
+        same("IFS=; : ${IFS=t}", &[default(), set("")]);
+        // A reading write applies once for each place it is written.
+        same(
+            "IFS=; IFS+=-; IFS+=-",
+            &[
+                default(),
+                set(""),
+                set("-"),
+                set("--"),
+                set(" \t\n-"),
+                set(" \t\n--"),
+            ],
+        );
+        same(
+            "IFS[0]=; IFS[0]+=-; IFS[0]+=-",
+            &[
+                default(),
+                set(""),
+                set("-"),
+                set("--"),
+                set(" \t\n-"),
+                set(" \t\n--"),
+            ],
+        );
+        // In a loop or a function body it may apply any number of times;
+        // a write whose result does not change stays bounded.
+        same(
+            "IFS=; for i in 1; do : ${IFS:=t}; done",
+            &[default(), set(""), set("t")],
+        );
+        same("for i in 1; do IFS+=; done", &[default()]);
+        same(
+            "f(){ unset IFS; IFS+=(x); }",
+            &[default(), unset.clone(), set("x")],
+        );
+        same("for i in 1; do IFS=,; done", &[default(), set(",")]);
+        for command in [
+            "IFS=; for i in 1 2; do IFS+=-; done",
+            "IFS=; for ((i = 0; i < 2; i++)); do IFS+=-; done",
+            "IFS=; while :; do IFS+=-; done",
+            "IFS=; until false; do IFS+=-; done",
+            "IFS=; while IFS+=-; do :; done",
+            "IFS=; select x in a; do IFS+=-; done",
+            "f(){ IFS+=-; }; IFS=; f; f",
+            "f(){ local IFS; IFS+=g; }; echo",
+        ] {
+            assert!(
+                parsed_ifs_literals(command)
+                    .expect("parses")
+                    .values
+                    .is_none(),
+                "{command}"
+            );
+        }
+        // Past the caps the value set is not built.
+        let many = (0..40)
+            .map(|i| format!("IFS=v{i}; "))
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(parsed_ifs_literals(&many).expect("parses").values.is_none());
+        let appends = (0..12)
+            .map(|i| format!("IFS+=a{i}; "))
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(
+            parsed_ifs_literals(&appends)
+                .expect("parses")
+                .values
+                .is_none()
+        );
+    }
+
+    /// A rebound IFS still splits an unquoted use (Bash 5.2:
+    /// `IFS=x; printf '[%s]' a${IFS}b` prints `[a][b]`).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn posix_rebound_ifs_word_splitting_is_evaluated() {
+        let packs = ["core.filesystem", "core.git"];
+        for command in [
+            "IFS=x; git${IFS}reset${IFS}--hard",
+            "IFS=,; git${IFS}reset${IFS}--hard",
+            "IFS=$CUSTOM; git${IFS}reset${IFS}--hard",
+            "IFS=x git${IFS}reset${IFS}--hard",
+            "export IFS=x; git${IFS}reset${IFS}--hard",
+            "IFS=x; IFS=y; git${IFS}reset${IFS}--hard",
+            "(IFS=x; git${IFS}reset${IFS}--hard)",
+            "IFS=x; git${IFS}clean${IFS}-fdx",
+            "git${IFS:0:1}reset${IFS:0:1}--hard",
+            "IFS=; gi${IFS}t reset --hard",
+            "echo \"'\"; git${IFS}reset${IFS}--hard",
+            // Array subscripts, case changes, transforms and substitutions.
+            "git${IFS[0]}reset${IFS[0]}--hard",
+            "git${IFS[@]}reset${IFS[*]}--hard",
+            "IFS=x; git${IFS[0]}reset${IFS[0]}--hard",
+            "git${IFS[0]:0:1}reset${IFS[0]:0:1}--hard",
+            "git${IFS^^}reset${IFS^^}--hard",
+            "git${IFS,}reset${IFS,}--hard",
+            "git${IFS~~}reset${IFS~~}--hard",
+            "git${IFS@U}reset${IFS@U}--hard",
+            "IFS=,; git${IFS^}reset${IFS^}--hard",
+            "git${IFS/q/z}reset${IFS/q/z}--hard",
+            "git${IFS//q/z}reset${IFS//q/z}--hard",
+            // Uses that resolve differently from each other.
+            "gi${IFS:9}t${IFS:0:1}reset${IFS:0:1}--hard",
+            "gi${IFS#???}t${IFS::1}reset${IFS::1}--hard",
+            "r${IFS:9}m${IFS:0:1}-rf${IFS:0:1}~",
+            // A quoted slice of a literal value.
+            "IFS=xt; \"gi${IFS:1:1}\" reset --hard",
+            // `+=` appends to the value in force.
+            "IFS+=t; \"gi${IFS:3}\" reset --hard",
+            "IFS=x; IFS+=t; \"gi${IFS:1}\" reset --hard",
+            // After `unset IFS` or a valueless local, `+=` starts from
+            // nothing and `${IFS-word}` is the word.
+            "unset IFS; IFS+=g; \"${IFS}it\" reset --hard",
+            "unset -v IFS; IFS+=g; \"${IFS}it\" reset --hard",
+            "IFS=x; unset IFS; IFS+=g; \"${IFS}it\" reset --hard",
+            "unset IFS; IFS+=gi; \"${IFS}t\" reset --hard",
+            "f(){ local IFS; IFS+=g; \"${IFS}it\" reset --hard; }; f",
+            "f(){ declare IFS; IFS+=g; \"${IFS}it\" reset --hard; }; f",
+            "unset IFS; IFS+=xt; \"gi${IFS:1}\" reset --hard",
+            "unset IFS; \"gi${IFS:-t}\" reset --hard",
+            "unset IFS; \"gi${IFS-t}\" reset --hard",
+            // A pattern that matches the empty value replaces it.
+            "IFS=; gi${IFS//*/t} reset --hard",
+            "IFS=; gi${IFS/*/t} reset --hard",
+            "IFS=; \"gi${IFS//*/t}\" reset --hard",
+            // `$IFS` is element 0 of the array.
+            "IFS=(g x); \"${IFS}it\" reset --hard",
+            "IFS=(g); \"${IFS}it\" reset --hard",
+            "declare -a IFS=(g); \"${IFS}it\" reset --hard",
+            "IFS=g; IFS+=(x); \"${IFS}it\" reset --hard",
+            "IFS[0]=g; \"${IFS}it\" reset --hard",
+            // A declaration that makes no unset local leaves the value.
+            "f(){ IFS=g; declare -p IFS; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; declare -p IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; typeset -p IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; declare -f IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; declare -F IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; local -p IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; declare -I IFS; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; local -I IFS; \"${IFS}it\" reset --hard; }; f",
+            "shopt -s localvar_inherit; f(){ IFS=g; local IFS; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; local IFS=$IFS; \"${IFS}it\" reset --hard; }; f",
+            // A write need not happen where it is written, or at all.
+            "IFS=g; (unset IFS); \"${IFS}it\" reset --hard",
+            "IFS=g; : $(unset IFS); \"${IFS}it\" reset --hard",
+            "IFS=g; true | unset IFS; \"${IFS}it\" reset --hard",
+            "IFS=g; IFS=x true; \"${IFS}it\" reset --hard",
+            "IFS=g; IFS=x \"${IFS}it\" reset --hard",
+            "IFS=g; (IFS=x); \"${IFS}it\" reset --hard",
+            "IFS=g; : $(IFS=x); \"${IFS}it\" reset --hard",
+            "IFS=g; : <(IFS=x); \"${IFS}it\" reset --hard",
+            "IFS=g; true | { IFS=x; }; \"${IFS}it\" reset --hard",
+            "IFS=g; true | IFS=x; \"${IFS}it\" reset --hard",
+            "IFS=g; IFS=x & wait; \"${IFS}it\" reset --hard",
+            "IFS=g; { IFS=x; } & wait; \"${IFS}it\" reset --hard",
+            "IFS=g; f(){ IFS=x; }; \"${IFS}it\" reset --hard",
+            "IFS=g; if false; then IFS=x; fi; \"${IFS}it\" reset --hard",
+            "IFS=g; false && IFS=x; \"${IFS}it\" reset --hard",
+            "IFS=g; case a in b) IFS=x;; esac; \"${IFS}it\" reset --hard",
+            "for i in 1 2; do \"${IFS}it\" reset --hard; IFS=g; done",
+            "unset IFS; (IFS=x); IFS+=g; \"${IFS}it\" reset --hard",
+            "f(){ IFS+=g; }; unset IFS; f; \"${IFS}it\" reset --hard",
+            // A reading write applies once for each place it is written, and
+            // any number of times in a loop or a function body.
+            "unset IFS; IFS+=-; IFS+=-; git reset \"${IFS}hard\"",
+            "IFS=; IFS+=-; IFS+=-; git reset \"${IFS}hard\"",
+            "IFS[0]=; IFS[0]+=-; IFS[0]+=-; git reset \"${IFS}hard\"",
+            "bash -c 'unset IFS; IFS+=-; IFS+=-; git reset \"${IFS}hard\"'",
+            "IFS=; for i in 1 2; do IFS+=-; done; git reset \"${IFS}hard\"",
+            "f(){ IFS+=-; }; IFS=; f; f; git reset \"${IFS}hard\"",
+            "IFS=; while [ ${#IFS} -lt 2 ]; do IFS+=-; done; git reset \"${IFS}hard\"",
+            "IFS=; until [ ${#IFS} -ge 2 ]; do IFS+=-; done; git reset \"${IFS}hard\"",
+            // Bash runs the lines before a syntax error; without a clean
+            // parse a use that needs a value cannot be checked.
+            "IFS=g; \"${IFS}it\" reset --hard\n)",
+            "IFS=g; \"${IFS}it\" reset --hard\n;;",
+            "unset IFS; IFS+=g; \"${IFS}it\" reset --hard\n)",
+            "IFS=x; git${IFS}reset${IFS}--hard\n)",
+            // Patterns that made a backtracking matcher overflow or hang.
+            "IFS=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; echo ${IFS#*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*ab}; git reset --hard",
+            // More outcomes than dcg checks.
+            "echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f",
+        ] {
+            let result = evaluate_with_pack_ids(command, &packs);
+            assert!(!result.is_allowed(), "{command} -> {result:?}");
+        }
+        for command in [
+            "IFS=x; git${IFS}status",
+            "IFS=x; echo \"git${IFS}reset${IFS}--hard\"",
+            "OLDIFS=$IFS; IFS=,; set -- $csv; IFS=$OLDIFS; echo \"$1\"",
+            "while IFS= read -r line; do echo \"$line\"; done < file.txt",
+            "printf '%s' \"$IFS\" | od -c",
+            "echo \"${IFS@Q}\" ${#IFS}",
+            "IFS=x; echo ${IFS^^}",
+            "echo \"$IFS\" \"$IFS\" \"$IFS\"",
+            "git${IFS[0]}status",
+            "IFS=x; git${IFS}log${IFS}--oneline",
+            "echo a$IFS b$IFS c$IFS d$IFS e$IFS f$IFS g",
+            // At top level `declare IFS` keeps the value, so this is not git.
+            "declare IFS; IFS+=g; \"${IFS}it\" reset --hard",
+            "f(){ local IFS=,; echo \"$*\"; }; f a b",
+            "old=$IFS; unset IFS; read -r a b; IFS=$old; echo \"$a\"",
+            // Counted appends stay within the value cap.
+            "IFS+=,; echo \"$IFS\"",
+            "IFS=; IFS+=,; IFS+=,; echo \"$IFS\"",
+            "for i in 1 2; do IFS=,; echo \"$IFS\"; done",
+        ] {
+            let result = evaluate_with_pack_ids(command, &packs);
+            assert!(result.is_allowed(), "{command} -> {result:?}");
+        }
     }
 
     /// A POSIX alias body runs when the alias is invoked, but as a quoted
