@@ -17591,24 +17591,26 @@ fn posix_proven_variable_view(
     // (start, end, reconstruction, its command name)
     let mut spliced: Vec<(usize, usize, String, String)> = Vec::new();
     let mut copied = 0usize;
-    for &(start, end) in &ranges {
+    // The binding proof reads the same index; it holds each range's nesting.
+    let index = deny_only_segment_index(command, &ranges);
+    for (position, &(start, end)) in ranges.iter().enumerate() {
         if deadline_exceeded(deadline) {
             return Err(ProvenViewIncomplete::Budget);
-        }
-        if start < copied
-            || segment_range_is_nested(&ranges, start, end)
-            || quoted_bodies
-                .iter()
-                .any(|body| body.start <= start && end <= body.end)
-        {
-            continue;
         }
         let Some(segment) = command.get(start..end) else {
             continue;
         };
+        if start < copied
+            || !segment.contains('$')
+            || quoted_bodies
+                .iter()
+                .any(|body| body.start <= start && end <= body.end)
+            || index.nested.get(position).copied().unwrap_or(true)
+        {
+            continue;
+        }
         let assignments = strip_assignment_declaration(segment.trim());
-        if !segment.contains('$')
-            || posix_executable_assignment_parts(assignments).is_some()
+        if posix_executable_assignment_parts(assignments).is_some()
             || !matches!(
                 assignment_only_segment_binding(assignments, ""),
                 AssignmentOnlyBinding::NotAssignmentOnly
@@ -30223,14 +30225,14 @@ fn deny_only_nameref_aliases<'a>(
     segment_start: usize,
     name: &str,
 ) -> Vec<&'a str> {
-    if !["declare", "typeset", "local"]
-        .iter()
-        .any(|keyword| source.contains(keyword))
-    {
+    let index = deny_only_segment_index(source, segment_ranges);
+    if index.nameref_positions.is_empty() {
         return Vec::new();
     }
-    let declarations: Vec<(&str, &str)> = segment_ranges
+    let declarations: Vec<(&str, &str)> = index
+        .nameref_positions
         .iter()
+        .filter_map(|&position| segment_ranges.get(position))
         .filter(|&&(_, end)| end <= segment_start)
         .filter_map(|&(start, end)| posix_nameref_declaration(source.get(start..end)?.trim()))
         .collect();
@@ -30280,6 +30282,10 @@ struct DenyOnlySegmentIndex {
     nested: Vec<bool>,
     /// The scan state the last deny-only read of each name left.
     checkpoints: std::cell::RefCell<HashMap<String, DenyOnlyCheckpoint>>,
+    /// Segments that declare a nameref ([`posix_nameref_declaration`]).
+    nameref_positions: Vec<usize>,
+    /// Offset of the first `IFS` in the source.
+    first_ifs: Option<usize>,
 }
 
 /// Where a deny-only scan of one name stopped, in byte offsets of the
@@ -30415,6 +30421,24 @@ fn deny_only_segment_index(
             .iter()
             .map(|&(start, end)| segment_range_is_nested(segment_ranges, start, end))
             .collect();
+        let nameref_positions = if ["declare", "typeset", "local"]
+            .iter()
+            .any(|keyword| source.contains(keyword))
+        {
+            segment_ranges
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(start, end))| {
+                    source
+                        .get(start..end)
+                        .and_then(|segment| posix_nameref_declaration(segment.trim()))
+                        .is_some()
+                })
+                .map(|(position, _)| position)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let index = Rc::new(DenyOnlySegmentIndex {
             source: source.to_string(),
             ranges: segment_ranges.to_vec(),
@@ -30422,6 +30446,8 @@ fn deny_only_segment_index(
             generic,
             nested,
             checkpoints: std::cell::RefCell::default(),
+            nameref_positions,
+            first_ifs: source.find("IFS"),
         });
         *last.borrow_mut() = Some(Rc::clone(&index));
         index
@@ -31463,19 +31489,19 @@ fn deny_only_nameref_target<'a>(
     segment_start: usize,
     name: &'a str,
 ) -> Option<&'a str> {
-    if !["declare", "typeset", "local"]
-        .iter()
-        .any(|keyword| source.contains(keyword))
-    {
+    let index = deny_only_segment_index(source, segment_ranges);
+    if index.nameref_positions.is_empty() {
         return Some(name);
     }
     let mut current = name;
     for _ in 0..MAX_DENY_ONLY_COPY_DEPTH {
         // Segment ranges are in source order, so the first match from the
         // end is the latest declaration.
-        let latest = segment_ranges
+        let latest = index
+            .nameref_positions
             .iter()
             .rev()
+            .filter_map(|&position| segment_ranges.get(position))
             .filter(|&&(_, end)| end <= segment_start)
             .find_map(|&(start, end)| {
                 let (declared, target) = posix_nameref_declaration(source.get(start..end)?.trim())?;
@@ -31542,7 +31568,13 @@ fn deny_only_value_at(
     if name == "IFS" {
         // With no assignment to IFS and no command naming it as a word
         // (`unset IFS`, `read IFS`, `printf -v IFS t`), it holds the default
-        // whatever else the earlier segments do.
+        // whatever else the earlier segments do. Both need the text `IFS`.
+        if deny_only_segment_index(source, segment_ranges)
+            .first_ifs
+            .is_none_or(|offset| offset + 3 > segment_start)
+        {
+            return Some(DEFAULT_POSIX_IFS.to_string());
+        }
         let prefix = source.get(..segment_start)?;
         let named_as_word = prefix.match_indices("IFS").any(|(start, _)| {
             let end = start + 3;
