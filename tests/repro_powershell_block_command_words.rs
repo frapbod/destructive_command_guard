@@ -523,6 +523,30 @@ fn split_expansions_and_powershell_native_quote_boundaries() {
     }
 }
 
+/// Text in an optional expansion is not proof that a safe flag reaches Git.
+/// Only dcg reads these strings; this test does not execute their shell source.
+#[test]
+fn optional_expansion_cannot_grant_git_clean_dry_run_exemption() {
+    let unsafe_commands = [
+        "git clean -fdx ${X:-foo --dry-run}",
+        "git clean -fdx ${X:+foo --dry-run}",
+        "git clean -fdx ${X:-foo -n}",
+        "( git clean -fdx ${X:-foo --dry-run} )",
+    ];
+    let safe_commands = [
+        "git clean -n -fdx ${X:-foo}",
+        "git clean --dry-run -fdx ${X:-foo}",
+    ];
+    let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
+    assert_all(&unsafe_commands, "Deny", posix, "optional safe flag");
+    assert_all(&safe_commands, "Allow", posix, "literal safe flag");
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        let bash = |command: &str| hook_decision(protocol, "Bash", command);
+        assert_all(&unsafe_commands, "deny", bash, "optional safe flag");
+        assert_all(&safe_commands, "allow", bash, "literal safe flag");
+    }
+}
+
 /// A quoted argument with spaces stays one argument in the POSIX reading, and
 /// in the union that adds it.
 #[test]
