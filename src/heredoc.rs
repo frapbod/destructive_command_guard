@@ -12406,6 +12406,26 @@ pub(crate) fn heredoc_bodies_with_operators(command: &str) -> Vec<(Range<usize>,
         .collect()
 }
 
+/// Every heredoc and here-string body, with whether its delimiter is quoted:
+/// the outer shell neither expands nor runs anything in a quoted body.
+pub(crate) fn heredoc_bodies_with_quoting(command: &str) -> Vec<(Range<usize>, bool)> {
+    active_heredocs(command)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                delimiter_quoted,
+            } => Some((body_start..body_end, delimiter_quoted)),
+            ActiveHeredocBody::HereString => {
+                find_herestring_content_bounds(command, heredoc.operator_start + 3)
+                    .map(|(start, end)| (start..end, false))
+            }
+        })
+        .collect()
+}
+
 /// The quoted body belonging to this exact operator. This retains source
 /// identity when a pipeline consumer supplies the body's interpreter language;
 /// identical text in another heredoc cannot establish that relationship.

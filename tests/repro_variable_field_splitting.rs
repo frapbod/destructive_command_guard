@@ -249,3 +249,88 @@ fn quoting_empty_ifs_and_data_keep_values_whole() {
         ],
     );
 }
+
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn alternate_values_appends_and_arrays_form_the_command_word() {
+    // Bash 5.2/5.3 run `git reset --hard` for each (t_416fd788 review 2).
+    assert_both(
+        "deny",
+        &[
+            r#"X=a; "gi${X:+t}" reset --hard"#,
+            r#"X=a; "gi${X+t}" reset --hard"#,
+            r#""gi${IFS:+t}" reset --hard"#,
+            r#"X=g; X+=i; "${X}t" reset --hard"#,
+            r#"unset X; X+=g; "${X}it" reset --hard"#,
+            r#"X=(g x); "${X}it" reset --hard"#,
+            // Only the binding in force decides, even after an unknown one.
+            r"X=$(date); X=' '; git${X}reset${X}--hard",
+            // A body the outer shell expands is still judged.
+            "X=' '; bash <<EOF\ngit${X}reset${X}--hard\nEOF",
+        ],
+    );
+}
+
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn values_the_shell_does_not_use_there_are_not_read() {
+    // Bash runs no git for any of these (t_416fd788 review 2).
+    assert_both(
+        "allow",
+        &[
+            // A quoted heredoc body is not expanded by the outer shell, and X
+            // is not exported: the inner bash runs `gitreset--hard`.
+            "X=' '; bash <<'EOF'\ngit${X}reset${X}--hard\nEOF",
+            // Heredoc lines are data, not bindings: X is unset.
+            "cat > notes.txt <<'EOF'\nX=' '\nEOF\ngit${X}reset${X}--hard",
+            // A write through a nameref changes the variable it names.
+            r"X=' '; declare -n r=X; r=a; git${X}reset${X}--hard",
+            r#"X=t; declare -n r=X; r=x; "gi${X}" reset --hard"#,
+            // Unset, or set to nothing: the alternate word is not used.
+            r#"unset X; "gi${X+t}" reset --hard"#,
+            r#"X=; "gi${X:+t}" reset --hard"#,
+            // Every element of an array is not element 0.
+            r#"X=(g x); "${X[@]}it" reset --hard"#,
+        ],
+    );
+}
+
+/// The binding proof follows each copy once: copies of copies used to be
+/// re-proven from scratch at every level, which took seconds on a 740-byte
+/// command (t_416fd788 review 2: 16 s, then a timeout denial).
+#[test]
+fn copy_chains_are_proven_in_linear_time() {
+    let mut command = String::from("C=' '");
+    for (name, source) in [("B", "C"), ("A", "B"), ("Y", "A"), ("X", "Y")] {
+        for _ in 0..30 {
+            command.push_str("; ");
+            command.push_str(name);
+            command.push_str("=$");
+            command.push_str(source);
+        }
+    }
+    command.push_str("; git${X}status");
+    let started = std::time::Instant::now();
+    assert_both("allow", &[&command]);
+    let mut denied = command.clone();
+    denied.push_str("; git${X}reset${X}--hard");
+    assert_both("deny", &[&denied]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "four hook runs took {:?}",
+        started.elapsed()
+    );
+}
+
+/// Statements in front of the use do not hide it: 128 used to end the view
+/// without a verdict, and more than the view reads is denied for review.
+#[test]
+fn padding_does_not_hide_a_use() {
+    let padding = ": ; ".repeat(300);
+    let command = format!("{padding}X=' '; git${{X}}reset${{X}}--hard");
+    assert_both("deny", &[&command]);
+    let harmless = format!("{padding}X=' '; git${{X}}status");
+    assert_both("allow", &[&harmless]);
+    let beyond = format!("{}X=' '; git${{X}}status", ": ; ".repeat(1100));
+    assert_both("deny", &[&beyond]);
+}
