@@ -252,6 +252,14 @@ fn powershell_comments_do_not_hide_following_commands() {
         "Write-Output $(# it's here\ngit reset --hard)",
         "Write-Output \"$(# it's here\ngit reset --hard)\"",
         "Write-Output x\u{00a0}# it's here\ngit reset --hard",
+        "<# a <# b #>\ngit reset --hard\n#>",
+        "Write-Output `a <# a <# b #> ; git reset --hard #>",
+        "<# a <# b #> git reset --hard #>",
+        "Write-Output `a ‘ # x’; git reset --hard",
+        "Write-Output ‘ # x’; git reset --hard",
+        "if ($true) {}# it's here\ngit reset --hard",
+        "$a=@(1)[0]# it's here\ngit reset --hard",
+        "Write-Output a,# it's\n'b'; git reset --hard",
     ];
     let harmless = [
         "Write-Output \"#1 it's\"",
@@ -262,6 +270,9 @@ fn powershell_comments_do_not_hide_following_commands() {
         "# git reset --hard",
         "<# git reset --hard #>",
         "Write-Output x <# git reset --hard #>",
+        "Write-Output a,# it's here\ngit status",
+        "# it's here\u{2028}git reset --hard",
+        "# it's here\u{0085}git reset --hard",
     ];
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
         for command in dangerous {
@@ -300,8 +311,16 @@ fn powershell_comments_do_not_hide_following_commands() {
 #[cfg(windows)]
 #[test]
 fn powershell_comment_codex_bash_label() {
-    let command = "Write-Output `a; # it's here\ngit reset --hard";
-    assert_eq!(hook_decision(Protocol::Codex, "Bash", command), "deny");
+    for command in [
+        "Write-Output `a; # it's here\ngit reset --hard",
+        "Write-Output `a <# a <# b #> ; git reset --hard #>",
+        "Write-Output `a ‘ # x’; git reset --hard",
+        "Write-Output `a; if ($true) {}# it's here\ngit reset --hard",
+        "Write-Output `a; $a=@(1)[0]# it's here\ngit reset --hard",
+        "Write-Output `a; Write-Output a,# it's\n'b'; git reset --hard",
+    ] {
+        assert_eq!(hook_decision(Protocol::Codex, "Bash", command), "deny", "{command:?}");
+    }
 }
 
 /// Bash reads `\"` inside double quotes as an escaped quote, so on a proven
