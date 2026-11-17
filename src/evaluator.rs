@@ -38692,7 +38692,15 @@ fn evaluate_heredoc(
                     line_number: 1,
                 }]
             };
-            if destination_source_context {
+            // The command splitter reads a `#` inside a Bash arithmetic
+            // command `((…))` as a comment, as dash does, and so hands on no
+            // command after it: `bash -c '(( x = 1 #)); git reset --hard'`.
+            // The whole body, read by the evaluator, gets its Bash reading
+            // too (see `bash_arithmetic_hashes_as_data`).
+            let arithmetic_hash = per_command_pass
+                && !destination_source_context
+                && crate::normalize::bash_arithmetic_hashes_as_data(&content.content).is_some();
+            if destination_source_context || arithmetic_hash {
                 // `f=/etc/sudoers; tee "$f"` requires both statements. Keep
                 // the existing per-command checks as well: they reach bodies
                 // of functions and other constructs the outer walk may not

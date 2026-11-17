@@ -826,6 +826,9 @@ fn bash_arithmetic_command_hash_hides_no_later_git_command() {
         "x=1; (( x #)) || git reset --hard",
         "echo $( (( 1 #)) ; git reset --hard )",
         "echo `(( 1 #)); git reset --hard`",
+        "bash -c '(( x = 1 #)); git reset --hard'",
+        "bash -c \"for ((i=0;i<1;i++ #)); do :; done; git reset --hard\"",
+        "bash <<'EOF'\n(( x = 1 #)); git reset --hard\nEOF",
         "(( 1 #'x' )); git reset --hard",
         "(( 1 #'x\n' )); git reset --hard",
         // dash's reading: the comment ends at the line end and the quote in
