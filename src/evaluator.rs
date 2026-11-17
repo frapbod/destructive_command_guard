@@ -51653,6 +51653,10 @@ mod tests {
             r#"Start-Process -FilePath pwsh -ArgumentList:'-c "Remove-Item -Recurse C:\src"' -Wait"#,
             r"Start-Process cmd -ArgumentList '/c rd /s /q C:\src'",
             r#"saps bash -Args "-c 'rm -rf /'""#,
+            // Start-Process joins a comma list with spaces.
+            r"Start-Process cmd -ArgumentList '/c', 'rd /s /q C:\src'",
+            r#"Start-Process -FilePath cmd.exe -ArgumentList @("/c", "rd /s /q C:\src") -Wait"#,
+            r"Start-Process cmd -ArgumentList /c, 'rd /s /q C:\src'",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -51664,6 +51668,7 @@ mod tests {
         for command in [
             "Start-Process notepad -ArgumentList 'README.md'",
             "Start-Process cmd -ArgumentList '/c dir C:\\src'",
+            "Start-Process cmd -ArgumentList '/c', 'dir C:\\src'",
             "Start-Process https://example.com",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(

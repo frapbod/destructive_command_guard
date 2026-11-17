@@ -222,3 +222,105 @@ fn cmd_payload_hooks_in_other_shells_and_safe_data() {
         );
     }
 }
+
+/// A POSIX shell keeps a CR inside an unquoted word, so `cmd.exe /c
+/// gi<CR>t reset --hard` from bash (WSL) hands cmd `gi<CR>t`, which cmd
+/// reads as `git`. The same holds for a PowerShell host: it ends a line at
+/// the CR. Unquoted, the words must keep their CR for those readings.
+#[test]
+fn unquoted_posix_words_keep_cr_for_windows_launchers() {
+    for command in [
+        "cmd.exe /c gi\rt reset --hard",
+        "cmd.exe /d /c gi\rt reset --hard",
+        "cmd.exe /c gi\rt\\ reset\\ --hard",
+        "pwsh -Command echo a\rgit reset --hard",
+    ] {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    for command in [
+        "cmd.exe /c gi\rt status",
+        "cmd.exe /c echo gi\rt reset --hard",
+        "echo gi\rt reset --hard",
+    ] {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
+/// `Start-Process cmd -ArgumentList '/c gi<CR>t reset --hard'` runs cmd with
+/// that command line, and cmd removes the CR. A comma list runs the same
+/// line: Start-Process joins it with spaces.
+#[test]
+fn start_process_cmd_argument_lists_with_cr() {
+    for command in [
+        "Start-Process cmd -ArgumentList '/c gi\rt reset --hard'",
+        "Start-Process -FilePath cmd.exe -ArgumentList '/c gi\rt reset --hard' -Wait",
+        "Start-Process cmd -ArgumentList '/c', 'gi\rt reset --hard'",
+        "Start-Process cmd -ArgumentList '/c', 'git reset --hard'",
+        "Start-Process cmd -ArgumentList @(\"/c\", \"gi\rt reset --hard\")",
+    ] {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            for tool in ["PowerShell", "Bash"] {
+                assert_eq!(
+                    hook_decision(protocol, tool, command),
+                    "deny",
+                    "{protocol:?} {tool}: {command:?}"
+                );
+            }
+        }
+    }
+    for command in [
+        "Start-Process cmd -ArgumentList '/c gi\rt status'",
+        "Start-Process cmd -ArgumentList '/c', 'gi\rt status'",
+        "Start-Process cmd -ArgumentList '/c', 'echo gi\rt reset --hard'",
+    ] {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            for tool in ["PowerShell", "Bash"] {
+                assert_eq!(
+                    hook_decision(protocol, tool, command),
+                    "allow",
+                    "{protocol:?} {tool}: {command:?}"
+                );
+            }
+        }
+    }
+}
