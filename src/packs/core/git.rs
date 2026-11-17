@@ -1170,30 +1170,33 @@ pub(crate) fn command_after_posix_control_prefixes(
     dialect: ShellDialect,
 ) -> (&str, usize) {
     let (command, offset) = command_after_posix_control_prefixes_bounded(segment, dialect, 0);
-    match end_at_subshell_close(segment, command, offset) {
+    if dialect != ShellDialect::Posix {
+        return (command, offset);
+    }
+    match end_at_unmatched_close(segment, command, offset) {
         Some(command) => (command, offset),
         None => (segment, 0),
     }
 }
 
-/// End `command` at the `)` that closes a subshell its peeled prefix opened:
-/// the words after it redirect the subshell and are not the command's argv.
-/// `None` when other words follow that `)`: POSIX rejects the line, so it is
-/// not a subshell. PowerShell's `if (...) { ... }` is read this way on
-/// Windows, where both dialects are judged.
-fn end_at_subshell_close<'a>(segment: &str, command: &'a str, offset: usize) -> Option<&'a str> {
-    if !segment[..offset].contains('(') {
+/// End `command` at the first `)` it leaves unmatched. That `)` closes a
+/// subshell opened before the command, in this segment or in an earlier one
+/// (`(cd dir && git ...)` splits at `&&`): the words after it are not the
+/// command's argv. Bash accepts only redirections, more `)`, a separator or a
+/// closing reserved word after a subshell's `)`. When other words follow and
+/// this segment's peeled prefix opened a `(`, the line is not a POSIX
+/// subshell: `None`, so the segment stays as written. PowerShell's
+/// `if (...) { ... }` is read this way on Windows, where both dialects are
+/// judged. Otherwise the `)` closed something else, such as a substitution,
+/// and `command` is kept whole.
+fn end_at_unmatched_close<'a>(segment: &str, command: &'a str, offset: usize) -> Option<&'a str> {
+    if !command.contains(')') {
         return Some(command);
     }
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     let paren = |token: &crate::normalize::NormalizeToken, text: &str| {
         token.kind == NormalizeTokenKind::Separator && token.text(segment) == Some(text)
     };
-    let prefix = tokens.iter().filter(|token| token.byte_range.end <= offset);
-    let opened = prefix.clone().filter(|token| paren(token, "(")).count();
-    if opened <= prefix.filter(|token| paren(token, ")")).count() {
-        return Some(command);
-    }
     let mut depth = 0usize;
     for (index, token) in tokens.iter().enumerate() {
         if token.byte_range.start < offset {
@@ -1203,9 +1206,14 @@ fn end_at_subshell_close<'a>(segment: &str, command: &'a str, offset: usize) -> 
             depth += 1;
         } else if paren(token, ")") {
             if depth == 0 {
-                return only_redirections_follow(segment, &tokens[index + 1..])
-                    .then(|| command.get(..token.byte_range.start - offset))
-                    .flatten();
+                if posix_compound_close_may_follow(segment, &tokens[index + 1..]) {
+                    return command.get(..token.byte_range.start - offset);
+                }
+                let prefix_opened = tokens
+                    .iter()
+                    .take_while(|token| token.byte_range.end <= offset)
+                    .any(|token| paren(token, "("));
+                return (!prefix_opened).then_some(command);
             }
             depth -= 1;
         }
@@ -1213,18 +1221,43 @@ fn end_at_subshell_close<'a>(segment: &str, command: &'a str, offset: usize) -> 
     Some(command)
 }
 
-/// Whether `tokens`, after a subshell's `)`, are only further `)` and
-/// redirections, the words POSIX allows after a compound command.
-fn only_redirections_follow(segment: &str, tokens: &[crate::normalize::NormalizeToken]) -> bool {
+/// Whether `tokens`, after a subshell's `)`, are what Bash accepts there:
+/// redirections and further `)`, up to the end, a separator or a reserved
+/// word that closes or continues the enclosing compound command.
+fn posix_compound_close_may_follow(
+    segment: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> bool {
     let mut target_pending = false;
-    tokens.iter().all(|token| {
+    let mut previous_end = None;
+    for token in tokens {
         let Some(text) = token.text(segment) else {
             return false;
         };
-        if token.kind == NormalizeTokenKind::Separator {
-            return text == ")" && !target_pending;
+        let adjacent = previous_end == Some(token.byte_range.start);
+        previous_end = Some(token.byte_range.end);
+        if target_pending {
+            // The tokenizer splits `2>&1` into `2>`, `&` and `1`.
+            if token.kind == NormalizeTokenKind::Separator {
+                if !(text == "&" && adjacent) {
+                    return false;
+                }
+                continue;
+            }
+            target_pending = false;
+            continue;
         }
-        if std::mem::take(&mut target_pending) {
+        if token.kind == NormalizeTokenKind::Separator {
+            match text {
+                ")" => continue,
+                "(" => return false,
+                _ => return true,
+            }
+        }
+        if matches!(
+            text,
+            "then" | "do" | "done" | "fi" | "}" | "else" | "elif" | "esac"
+        ) {
             return true;
         }
         let operator = text.trim_start_matches(|ch: char| ch.is_ascii_digit());
@@ -1233,8 +1266,8 @@ fn only_redirections_follow(segment: &str, tokens: &[crate::normalize::Normalize
             return false;
         }
         target_pending = operator.trim_start_matches(['<', '>', '&', '|']).is_empty();
-        true
-    }) && !target_pending
+    }
+    !target_pending
 }
 
 fn command_after_posix_control_prefixes_bounded(
@@ -1281,7 +1314,7 @@ fn command_after_posix_control_prefixes_bounded(
     if !prefix_probe.starts_with('(')
         && !first.is_some_and(|word| {
             crate::context::is_shell_command_prefix_reserved_word(word)
-                || matches!(word, "function" | "case")
+                || matches!(word, "function" | "case" | "time")
         })
         && !first
             .into_iter()
@@ -1351,6 +1384,20 @@ fn command_after_posix_control_prefixes_bounded(
             return (command, offset.saturating_add(nested_offset));
         }
 
+        if raw == "time" {
+            // The `time [-p] [--]` reserved word times the pipeline after it,
+            // which may open with `(`, `{` or `!`.
+            stripped_reserved_word = true;
+            token_index = next_posix_prefix_token(segment, &tokens, index + 1);
+            for option in ["-p", "--"] {
+                if let Some(at) = token_index.filter(|&at| {
+                    tokens.get(at).and_then(|token| token.text(segment)) == Some(option)
+                }) {
+                    token_index = next_posix_prefix_token(segment, &tokens, at + 1);
+                }
+            }
+            continue;
+        }
         let command_prefix = if stripped_reserved_word {
             matches!(raw, "if" | "while" | "until" | "{" | "!")
         } else {
@@ -7806,6 +7853,46 @@ mod tests {
                 invoked_visible_git_alias_in_dialect(command, ShellDialect::PowerShell),
                 InvokedGitAliasDecision::Unverified,
                 "PowerShell call-operator expressions must fail closed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_command_ends_at_the_close_of_an_earlier_subshell() {
+        for (segment, command) in [
+            ("\"git\" reset --hard )", "\"git\" reset --hard "),
+            (
+                "\"git\" reset --hard)>/dev/null 2>&1",
+                "\"git\" reset --hard",
+            ),
+            (
+                "\"git\" reset --hard ) 2>&1 >&2 fi",
+                "\"git\" reset --hard ",
+            ),
+            ("( \"git\" reset --hard ) then :", "\"git\" reset --hard "),
+            ("{ ( \"git\" reset --hard ) }", "\"git\" reset --hard "),
+            ("do ( \"git\" reset --hard ) done", "\"git\" reset --hard "),
+            (
+                "case a in a) ( \"git\" reset --hard ) ",
+                "\"git\" reset --hard ",
+            ),
+            ("time ( \"git\" reset --hard )", "\"git\" reset --hard "),
+            (
+                "time -p -- ( \"git\" reset --hard )",
+                "\"git\" reset --hard ",
+            ),
+            ("! time ( \"git\" reset --hard )", "\"git\" reset --hard "),
+            ("time ! ( \"git\" reset --hard )", "\"git\" reset --hard "),
+            ("{ time ( \"git\" reset --hard )", "\"git\" reset --hard "),
+            ("git log --format='(%h)'", "git log --format='(%h)'"),
+            ("echo $(git status) foo", "echo $(git status) foo"),
+            ("\"git\" status) foo", "\"git\" status) foo"),
+            ("if ($n -gt 1) { 'x' }", "if ($n -gt 1) { 'x' }"),
+        ] {
+            assert_eq!(
+                command_after_posix_control_prefixes(segment, ShellDialect::Posix).0,
+                command,
+                "{segment}"
             );
         }
     }
