@@ -51,8 +51,9 @@ use crate::heredoc::{
     ExtractionResult, SkipReason, TriggerResult, check_triggers, extract_content,
 };
 use crate::normalize::{
-    NormalizeTokenKind, PATH_NORMALIZER, QUOTED_PATH_NORMALIZER, ShellDialect, ShellTokenDecoder,
-    ShellTokenRole, strip_wrapper_prefixes, tokenize_for_shell_dialect,
+    NormalizeTokenKind, PATH_NORMALIZER, PowerShellHashRole, QUOTED_PATH_NORMALIZER, ShellDialect,
+    ShellTokenDecoder, ShellTokenRole, powershell_hash_role, strip_wrapper_prefixes,
+    tokenize_for_shell_dialect,
 };
 use crate::packs::{
     PatternSuggestion, REGISTRY, pack_aware_quick_reject, pack_aware_quick_reject_pre_normalized,
@@ -4721,32 +4722,6 @@ fn raw_payload_is_outer_powershell_script_block(
     first.starts_with('{') && last.ends_with('}')
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PowerShellHashRole {
-    Comment,
-    Literal,
-    Ambiguous,
-}
-
-fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
-    if bytes.get(index) != Some(&b'#') {
-        return PowerShellHashRole::Literal;
-    }
-    if index == 0
-        || bytes[index - 1].is_ascii_whitespace()
-        || matches!(
-            bytes[index - 1],
-            b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}' | b'[' | b']' | b','
-        )
-    {
-        return PowerShellHashRole::Comment;
-    }
-    if bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_' {
-        return PowerShellHashRole::Literal;
-    }
-    PowerShellHashRole::Ambiguous
-}
-
 /// Byte offset immediately after a shell escape sequence starting at `index`,
 /// where `index` points at the escape character itself (a PowerShell backtick,
 /// a cmd.exe caret, or a POSIX backslash).
@@ -7083,24 +7058,9 @@ fn powershell_here_string_end(command: &str, start: usize) -> Option<(u8, usize,
 }
 
 fn skip_powershell_block_comment(command: &str, start: usize) -> usize {
-    let bytes = command.as_bytes();
-    let mut index = start + 2;
-    let mut depth = 1usize;
-    while index < bytes.len() {
-        if bytes.get(index..index + 2) == Some(b"<#") {
-            depth += 1;
-            index += 2;
-        } else if bytes.get(index..index + 2) == Some(b"#>") {
-            depth -= 1;
-            index += 2;
-            if depth == 0 {
-                return index;
-            }
-        } else {
-            index += 1;
-        }
-    }
-    bytes.len()
+    command[start + 2..]
+        .find("#>")
+        .map_or(command.len(), |end| start + 2 + end + 2)
 }
 
 fn skip_powershell_single_quote(command: &str, start: usize) -> usize {
@@ -15434,6 +15394,70 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             {
                 info.matched_text_preview = Some(extract_match_preview(command, span));
             }
+        }
+    }
+    // Read comment and smart-quote syntax as a separate deny-only PowerShell
+    // view. Keep the original tokenizer's decisions and grants intact.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        )
+        && let Some(masked) = crate::normalize::mask_powershell_comments(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        // The copy's incomplete analyses count only if its result is used.
+        let alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            evaluate_command_in_dialect_union(
+                &masked,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                ShellDialect::PowerShell,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny => true,
+            // This copy only adds denials. Text it cannot read keeps the
+            // original verdict (a smart quote in POSIX data is not a
+            // PowerShell quote); running out of time still fails closed.
+            EvaluationDecision::Indeterminate => deadline_exceeded(deadline),
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            drop(alternate_scope);
+            result = alternate;
+            if let Some(info) = result.pattern_info.as_mut() {
+                if masked.len() == command.len()
+                    && let Some(span) = info.matched_span.as_ref()
+                    && span.end <= command.len()
+                    && command.is_char_boundary(span.start)
+                    && command.is_char_boundary(span.end)
+                {
+                    info.matched_text_preview = Some(extract_match_preview(command, span));
+                } else if masked.len() != command.len() {
+                    // Smart-quote spelling changes byte offsets.
+                    info.matched_span = None;
+                    info.matched_text_preview = None;
+                }
+            }
+        } else {
+            alternate_scope.discard();
         }
     }
     // A program name in another case runs the same program on a
