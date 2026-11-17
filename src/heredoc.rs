@@ -8637,11 +8637,24 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
         return !(is_trusted_os_data_sink_path(&lexical_target, target)
             || is_trusted_interpreter_path(&lexical_target, target));
     }
+    shell_name_may_be_overridden_before(command, redirection_start, target)
+}
+
+/// Whether shell state visible before `offset` (a function, alias, `hash`
+/// entry, `PATH` change, `enable`, or an opaque `eval`/`source`), or an
+/// exported Bash function, can make the bare command name `target` run
+/// something other than the program of that name. Fails closed when the
+/// command cannot be parsed.
+pub(crate) fn shell_name_may_be_overridden_before(
+    command: &str,
+    offset: usize,
+    target: &str,
+) -> bool {
     if std::env::var_os(format!("BASH_FUNC_{target}%%")).is_some() {
         return true;
     }
 
-    let Some(prefix) = command.get(..redirection_start) else {
+    let Some(prefix) = command.get(..offset) else {
         return true;
     };
     let ast = parse_shell_ast(prefix);

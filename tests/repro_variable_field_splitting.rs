@@ -112,6 +112,7 @@ fn assert_both(decision: &str, commands: &[&str]) {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)]
 fn proven_whitespace_values_split_the_command_word() {
     assert_both(
         "deny",
@@ -143,6 +144,33 @@ fn proven_whitespace_values_split_the_command_word() {
             r"declare -n r=IFS; git${r}reset${r}--hard",
             r#"X=" "; v=X; git${!v}reset${!v}--hard"#,
             r#"X=" "; declare -n r=X; git${r}reset${r}--hard"#,
+            // Scalar operators whose text comes from the value (Bash 5.2/5.3:
+            // `printf '[%s]' a${X:0:1}b` prints `[a][b]` after `X=' '`).
+            r"X=' '; git${X[0]}reset${X[0]}--hard",
+            r"X=' '; git${X:0:1}reset${X:0:1}--hard",
+            r"X=' '; git${X:-other}reset${X:-other}--hard",
+            r"X=' x'; git${X%x}reset${X%x}--hard",
+            // An assignment list runs left to right.
+            r"X=' ' Y=$X; git${Y}reset${Y}--hard",
+        ],
+    );
+}
+
+#[test]
+fn only_proven_bindings_and_the_ifs_in_force_split() {
+    assert_both(
+        "allow",
+        &[
+            // A blank that is not an IFS character stays inside the word
+            // (`IFS=x; X=' '; printf '[%s]' a${X}b` prints `[a b]`).
+            r"IFS=x; X=' '; git${X}reset${X}--hard",
+            r"IFS=,; X=$'\n'; git${X}reset${X}--hard",
+            // A nameref declaration that may not have run proves no alias
+            // (`X=' '; r=a; false && declare -n r=X; printf '[%s]' a${r}b`
+            // prints `[aab]`).
+            r"X=' '; r=a; false && declare -n r=X; git${r}reset${r}--hard",
+            r"X=' '; r=a; (declare -n r=X); git${r}reset${r}--hard",
+            r"X=' '; declare -n r=X; declare +n r; git${r}reset${r}--hard",
         ],
     );
 }
@@ -156,6 +184,26 @@ fn quoted_composition_of_a_proven_value_forms_the_command_word() {
             r#"X=gi; "$X"t reset --hard"#,
             r#"X=gi; Y=t; "$X$Y" reset --hard"#,
             r#"X=g; Y="${X}i"; "${Y}t" reset --hard"#,
+            // An eval body runs with the shell's bindings and its own prefix
+            // assignments (t_49339710 review: Bash 3.2/5.2/5.3 print `[git]`).
+            r#"X=t eval '"gi${X}" reset --hard'"#,
+            r#"X=t; eval '"gi${X}" reset --hard'"#,
+            r#"IFS=t eval '"gi${IFS}" reset --hard'"#,
+            // `printf -v` with a plain format binds the value.
+            r#"printf -v X t; "gi${X}" reset --hard"#,
+            r#"printf -v IFS t; "gi${IFS}" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn eval_bodies_and_printf_bindings_keep_harmless_uses() {
+    assert_both(
+        "allow",
+        &[
+            r#"X=t eval 'echo "gi${X}" reset --hard'"#,
+            r#"X=t; eval 'X=a; "gi${X}" reset --hard'"#,
+            r#"printf -v X t; "gi${X}" status"#,
         ],
     );
 }
