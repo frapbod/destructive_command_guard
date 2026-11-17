@@ -1644,22 +1644,51 @@ pub(crate) fn starts_with_shell_redirection(s: &str) -> bool {
 
 #[must_use]
 pub fn consume_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
-    consume_word_token_inner(bytes, i, len, false, false)
+    consume_word_token_inner(bytes, i, len, false, false, None)
 }
 
 /// Consume one POSIX argv word, excluding adjacent local redirections.
 /// Normalization deliberately keeps redirections in its token view; program
 /// extraction needs the argv boundary, but must use the same quote walker.
 pub(crate) fn consume_posix_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
-    consume_word_token_inner(bytes, i, len, true, true)
+    consume_word_token_inner(bytes, i, len, true, true, Some(&mut BraceLookup::default()))
 }
 
+/// Whether a `${` may still close. Looking for its `}` reads ahead, to the
+/// end of the input when none closes it; such a `${` is a shell syntax error.
+/// After one, later `${` are read as plain text, as on the base and as the
+/// segmenter does (`ParameterExpansion::unclosed`), so a run of them stays
+/// linear across a whole tokenization, not only within one word.
+#[derive(Default)]
+struct BraceLookup {
+    unclosed: bool,
+}
+
+impl BraceLookup {
+    /// End of the `${…}` at `i` through its matching `}`, within
+    /// `bytes[..len]` (see [`crate::context::braced_parameter_span`]); `None`
+    /// when it is not one, when no `}` closes it, or once an earlier one did
+    /// not close.
+    fn end(&mut self, bytes: &[u8], i: usize, len: usize, in_double_quotes: bool) -> Option<usize> {
+        if self.unclosed || i + 1 >= len || bytes[i] != b'$' || bytes[i + 1] != b'{' {
+            return None;
+        }
+        let close = crate::context::braced_parameter_span(&bytes[..len], i, in_double_quotes);
+        self.unclosed = close.is_none();
+        close
+    }
+}
+
+/// `braces` is `None` for the readers that keep a `${…}` split at blanks as
+/// before (Unknown, wrapper and prefix parsing); only POSIX readers, where a
+/// `#` after a blank can open a comment, keep it whole.
 fn consume_word_token_inner(
     bytes: &[u8],
     mut i: usize,
     len: usize,
     stop_at_redirect: bool,
     posix_blanks: bool,
+    mut braces: Option<&mut BraceLookup>,
 ) -> usize {
     while i < len {
         let b = bytes[i];
@@ -1680,7 +1709,9 @@ fn consume_word_token_inner(
         // `${…}` is one piece of the word through its matching `}`: a blank
         // in it is no word break and a `#` in it is no comment (`x=${y:- #}`).
         if b == b'$'
-            && let Some(close) = posix_braced_parameter_end(bytes, i, len, false)
+            && let Some(close) = braces
+                .as_deref_mut()
+                .and_then(|lookup| lookup.end(bytes, i, len, false))
         {
             i = close;
             continue;
@@ -1772,8 +1803,9 @@ fn consume_word_token_inner(
                             i = consume_shell_paren_construct(bytes, i + 2, len);
                         }
                         // Quotes nest inside `${…}`: `"${y:-" #"}"` is one string.
-                        b'$' if let Some(close) =
-                            posix_braced_parameter_end(bytes, i, len, true) =>
+                        b'$' if let Some(close) = braces
+                            .as_deref_mut()
+                            .and_then(|lookup| lookup.end(bytes, i, len, true)) =>
                         {
                             i = close;
                         }
@@ -1790,21 +1822,6 @@ fn consume_word_token_inner(
     }
 
     i
-}
-
-/// End of the `${…}` at `i` through its matching `}`, within `bytes[..len]`;
-/// `None` when it is not one or no `}` closes it. See
-/// [`crate::context::braced_parameter_span`].
-fn posix_braced_parameter_end(
-    bytes: &[u8],
-    i: usize,
-    len: usize,
-    in_double_quotes: bool,
-) -> Option<usize> {
-    if bytes.get(i + 1) != Some(&b'{') || i + 1 >= len {
-        return None;
-    }
-    crate::context::braced_parameter_span(&bytes[..len], i, in_double_quotes)
 }
 
 pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
@@ -3453,6 +3470,7 @@ fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> Normaliz
 
     let mut tokens = NormalizeTokens::new();
     let mut i = 0;
+    let mut braces = BraceLookup::default();
 
     while i < len {
         if posix_comments {
@@ -3494,7 +3512,14 @@ fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> Normaliz
         }
 
         let start = i;
-        let end = consume_word_token_inner(bytes, i, len, false, posix_comments);
+        let end = consume_word_token_inner(
+            bytes,
+            i,
+            len,
+            false,
+            posix_comments,
+            posix_comments.then_some(&mut braces),
+        );
         i = end;
 
         if start < i {
@@ -5095,6 +5120,34 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 
 #[cfg(test)]
 mod tests {
+    /// A `${` that no `}` closes is read to the end once per tokenization;
+    /// later ones are plain, so a run of them, in one word, in quotes or one
+    /// per word, stays linear (64 KB took up to 21 s) and the separator after
+    /// them is still found.
+    #[test]
+    fn unclosed_braced_parameters_are_read_in_linear_time() {
+        let started = std::time::Instant::now();
+        for command in [
+            format!("echo {}; ls", "${".repeat(100_000)),
+            format!("echo \"{}\"; ls", "${".repeat(100_000)),
+            format!("echo {}; ls", "${a ".repeat(50_000)),
+        ] {
+            let tokens = tokenize_for_shell_dialect(&command, ShellDialect::Posix);
+            let tail: Vec<&str> = tokens
+                .iter()
+                .rev()
+                .take(2)
+                .map(|token| &command[token.byte_range.clone()])
+                .collect();
+            assert_eq!(tail, ["ls", ";"]);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     /// A `#` inside `${…}` is data in the POSIX tokenizer: the blank before it
     /// ends no word, so no comment starts. After the `}` a comment starts again.
     #[test]

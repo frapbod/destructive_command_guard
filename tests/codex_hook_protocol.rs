@@ -3689,3 +3689,27 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
     }
 }
+
+/// Unclosed `${` used to be looked up again at each one, quadratic in them,
+/// so a large file write ran out of the evaluation budget and asked instead
+/// of denying (review round 3: 60 KB took 1.5 s). A run of them is linear.
+#[test]
+fn unclosed_braced_parameters_keep_the_hook_within_budget() {
+    let body = "${".repeat(30_000);
+    let deny = format!("cat <<'EOF' > notes.txt\n{body}\nEOF\ngit reset --hard");
+    let allow = format!("cat <<'EOF' > notes.txt\n{body}\nEOF\ngit status");
+    let quoted = format!("echo \"{body}\"; git reset --hard");
+    for codex in [true, false] {
+        for command in [&deny, &quoted] {
+            let outcome = run_hook_raw(&multiline_payload(command, codex), &[]);
+            // A deny, not an ask after the budget ran out.
+            assert_eq!(
+                outcome.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+                "codex={codex}\n{outcome}"
+            );
+        }
+        let outcome = run_hook_raw(&multiline_payload(&allow, codex), &[]);
+        assert!(outcome.is_allow_shape(), "codex={codex}\n{outcome}");
+    }
+}

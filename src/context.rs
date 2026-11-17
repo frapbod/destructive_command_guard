@@ -2855,6 +2855,8 @@ fn tokenize_command(command: &str, posix_blanks: bool) -> SanitizeTokens {
 
     let mut tokens = SanitizeTokens::new();
     let mut i = 0;
+    // A quoted `${` that no `}` closes makes later ones plain (see below).
+    let mut unclosed_brace = false;
 
     while i < len {
         // Preserve both POSIX and the pre-existing shared whitespace views.
@@ -2934,7 +2936,8 @@ fn tokenize_command(command: &str, posix_blanks: bool) -> SanitizeTokens {
         }
 
         let start = i;
-        let (end, has_inline_code) = consume_word_token(command, bytes, i, len, posix_blanks);
+        let (end, has_inline_code) =
+            consume_word_token(command, bytes, i, len, posix_blanks, &mut unclosed_brace);
         i = end;
 
         if start < i {
@@ -3005,6 +3008,7 @@ fn consume_word_token(
     mut i: usize,
     len: usize,
     posix_blanks: bool,
+    unclosed_brace: &mut bool,
 ) -> (usize, bool) {
     let mut has_inline_code = false;
 
@@ -3077,13 +3081,16 @@ fn consume_word_token(
                         }
                         // Quotes nest inside `${…}`: `"${y:-" #"}"` is one
                         // string, so the `#` after the blank is no comment.
-                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                        // One that no `}` closes was read to the end; later
+                        // ones are then plain, so a run of them stays linear.
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' && !*unclosed_brace => {
                             let (end, inline, closed) =
                                 consume_braced_parameter_core(bytes, i, true);
                             if closed {
                                 has_inline_code |= inline;
                                 i = end;
                             } else {
+                                *unclosed_brace = true;
                                 i += 1;
                             }
                         }
@@ -3324,9 +3331,11 @@ pub(crate) fn consume_braced_parameter<T: AsRef<[u8]> + ?Sized>(
 /// and runs nothing, and the scanners then keep reading the line as before.
 ///
 /// `in_double_quotes` is for an expansion that opens inside `"…"`. There
-/// dash reads a `'` as an ordinary character where bash reads a quote, so
-/// it is read as ordinary: if bash would have quoted, the scan only splits
-/// or blocks more, never less.
+/// dash reads a `'` as an ordinary character where bash reads a quote; it
+/// is read as ordinary here, as dash does. Limit: where bash quotes, a
+/// `'` read this way can end the span early, and a `#` after it can then
+/// look like a comment: bash runs the git command in
+/// `echo "${y:-'}" #'}"; git reset --hard`, and this reading misses it.
 #[must_use]
 pub(crate) fn braced_parameter_span(
     bytes: &[u8],
@@ -5225,6 +5234,25 @@ mod tests {
                 "{cmd:?}: {spans:?}"
             );
         }
+    }
+
+    /// A quoted `${` that no `}` closes is read to the end once; later ones
+    /// are plain, so a run of them stays linear (it was quadratic: 64 KB of
+    /// `${` in quotes took 13 s) and the command after the string stays seen.
+    #[test]
+    fn unclosed_quoted_braced_parameters_are_read_in_linear_time() {
+        let started = std::time::Instant::now();
+        for cmd in [
+            format!("echo \"{}\"; rm -rf /", "${".repeat(100_000)),
+            format!("echo {}; rm -rf /", "\"${a\" ".repeat(40_000)),
+        ] {
+            assert!(sanitize_for_pattern_matching(&cmd).contains("rm -rf /"));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// The bodies, with their terminator lines, that `rules` finds.
