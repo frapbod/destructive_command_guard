@@ -15238,8 +15238,10 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // so the other readings below apply to those lines too; that spelling
     // has no such CR left, so it is not read a third time. Deny wins, as
     // between dialect views. The spelling differs from the command as
-    // written, so what the user authorized as written stays authorized, and
-    // no allow-once grant is spent.
+    // written, so what the user authorized as written stays authorized. The
+    // spelling is not a request the user made, so it may spend no allow-once
+    // grant: one for the spelled text belongs to that other request. An
+    // absent audit config cannot ensure that, so grants are suppressed.
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
         && matches!(
@@ -15252,6 +15254,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         let alternate = if deadline_exceeded(deadline) {
             EvaluationResult::indeterminate_due_to_budget()
         } else {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
             evaluate_command_with_pack_order_deadline_at_path_inner(
                 &spelled,
                 enabled_keywords,
@@ -56787,6 +56790,129 @@ mod tests {
                 );
                 assert!(active().is_empty());
             }
+        }
+        println!("{CHILD_COMPLETION}");
+    }
+
+    /// The lone-CR reading spells `echo a<CR>git reset --hard` as
+    /// `echo a<LF>git reset --hard`. That spelling is not the request, so it
+    /// must not spend a single-use grant written for the LF request; a grant
+    /// for the CR request itself is still honored once.
+    #[test]
+    fn lone_carriage_return_reading_spends_no_allow_once_grant() {
+        use crate::pending_exceptions::{
+            AllowOnceEntry, AllowOnceScopeKind, ENV_ALLOW_ONCE_PATH, PendingExceptionRecord,
+        };
+
+        const CHILD_MARKER: &str = "DCG_TEST_LONE_CR_ALLOW_ONCE_CHILD";
+        const CHILD_COMPLETION: &str = "dcg-lone-cr-allow-once-child-complete";
+
+        // Store selection is process-wide: run the assertions in a child.
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let fixtures = tempfile::tempdir().expect("allow-once fixture directory");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "evaluator::tests::lone_carriage_return_reading_spends_no_allow_once_grant",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(
+                ENV_ALLOW_ONCE_PATH,
+                fixtures.path().join("allow_once.jsonl"),
+            )
+            .output()
+            .expect("run isolated allow-once test");
+            assert!(
+                output.status.success(),
+                "isolated allow-once test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETION),
+                "the exact child test must run its assertions"
+            );
+            return;
+        }
+
+        let cwd = std::env::current_dir().expect("fixture working directory");
+        let cwd_text = cwd.to_string_lossy();
+        let store = AllowOnceStore::new(PathBuf::from(
+            std::env::var_os(ENV_ALLOW_ONCE_PATH).expect("isolated allow-once store"),
+        ));
+        let redaction = crate::logging::RedactionConfig::default();
+        let grant = |command: &str| {
+            let now = Utc::now();
+            let pending = PendingExceptionRecord::new(
+                now,
+                &cwd_text,
+                command,
+                "lone carriage return grant control",
+                &redaction,
+                true,
+                None,
+            );
+            let entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                &cwd_text,
+                true,
+                false,
+                &redaction,
+            );
+            store.add_entry(&entry, now).expect("seed one-use grant");
+        };
+        let active = || store.preview_active(Utc::now()).unwrap().0.len();
+
+        let config = default_config();
+        let enabled = config.enabled_pack_ids();
+        let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let index = REGISTRY.build_enabled_keyword_index(&ordered);
+        let overrides = config.overrides.compile();
+        let allowlists = default_allowlists();
+        let settings = config.heredoc_settings();
+
+        let lf = "echo a\ngit reset --hard";
+        let cr = "echo a\rgit reset --hard";
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            let evaluate = |command: &str| {
+                evaluate_command_with_pack_order_at_path_in_dialect(
+                    command,
+                    &keywords,
+                    &ordered,
+                    index.as_ref(),
+                    &overrides,
+                    &allowlists,
+                    &settings,
+                    Some(&cwd),
+                    dialect,
+                )
+            };
+
+            // A grant for the LF request does not cover the CR request.
+            grant(lf);
+            let result = evaluate(cr);
+            assert!(result.is_denied(), "{dialect:?}: {result:?}");
+            assert_eq!(active(), 1, "{dialect:?}: the spelling spent the LF grant");
+
+            // The LF request still spends its own grant.
+            let result = evaluate(lf);
+            assert!(result.is_allowed(), "{dialect:?}: {result:?}");
+            assert_eq!(result.bypass_method, Some(BypassMethod::AllowOnce));
+            assert_eq!(active(), 0, "{dialect:?}");
+
+            // A grant for the CR request itself is honored once.
+            grant(cr);
+            let result = evaluate(cr);
+            assert!(result.is_allowed(), "{dialect:?}: {result:?}");
+            assert_eq!(result.bypass_method, Some(BypassMethod::AllowOnce));
+            assert_eq!(active(), 0, "{dialect:?}");
+            assert!(evaluate(cr).is_denied(), "{dialect:?}: single use");
         }
         println!("{CHILD_COMPLETION}");
     }
