@@ -18532,13 +18532,29 @@ fn evaluate_command_in_dialect_union(
         let frames = (nested_command_depth < MAX_FUNCTION_FRAME_DEPTH)
             .then(|| crate::heredoc::shell_function_frame_view(command))
             .flatten();
+        // The frame view holds the whole command; the command's own two views
+        // follow it. Unknown names are read only in the command as the agent
+        // sent it: a nested payload (an `eval` body, `bash -c`) is judged
+        // without the bindings around it, and this view's own reconstruction
+        // is judged one level down, where its bare rendering must not split
+        // again.
+        let unknown_names = nested_command_depth == 0;
+        let views = posix_proven_variable_view(command, deadline, unknown_names).and_then(|view| {
+            let arguments = posix_proven_argument_view(command, deadline, unknown_names)?;
+            Ok(frames
+                .into_iter()
+                .chain(view)
+                .chain(arguments)
+                .fold(Vec::new(), |mut views, candidate| {
+                    if !views.contains(&candidate) {
+                        views.push(candidate);
+                    }
+                    views
+                }))
+        });
         // An unfinished view is never proof that the command is safe.
-        // Unknown names are read only in the command as the agent sent it:
-        // a nested payload (an `eval` body, `bash -c`) is judged without the
-        // bindings around it, and this view's own reconstruction is judged
-        // one level down, where its bare rendering must not split again.
-        match posix_proven_variable_view(command, deadline, nested_command_depth == 0) {
-            Ok(view) => frames.into_iter().chain(view).collect(),
+        match views {
+            Ok(views) => views,
             Err(ProvenViewIncomplete::Budget) => {
                 return EvaluationResult::indeterminate_due_to_budget();
             }
@@ -18549,9 +18565,8 @@ fn evaluate_command_in_dialect_union(
     let primary = if !views.is_empty()
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
-        let mut adopted = primary;
-        for expanded in &views {
-            let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+        evaluate_proven_views(&views, primary, |expanded| {
+            evaluate_command_with_pack_order_deadline_at_path_inner(
                 expanded,
                 enabled_keywords,
                 ordered_packs,
@@ -18565,18 +18580,8 @@ fn evaluate_command_in_dialect_union(
                 ShellDialect::Posix,
                 nested_command_depth + 1,
                 inherited_automated_stdin,
-            );
-            if result.decision != EvaluationDecision::Allow {
-                // The nested span indexes the reconstructed text.
-                if let Some(info) = result.pattern_info.as_mut() {
-                    info.matched_span = None;
-                    info.matched_text_preview = None;
-                }
-                adopted = result;
-                break;
-            }
-        }
-        adopted
+            )
+        })
     } else {
         primary
     };
@@ -20841,6 +20846,42 @@ fn posix_proven_variable_view(
     deadline: Option<&Deadline>,
     unknown_names: bool,
 ) -> Result<Option<String>, ProvenViewIncomplete> {
+    posix_proven_view(command, deadline, unknown_names, false)
+}
+
+/// [`posix_proven_variable_view`] that also splices a whole single-field
+/// argument whose proven value is a plain atom ([`literal_posix_argument_atom`]):
+/// `x=--hard; git reset "$x"` reads as `x=--hard; git reset --hard`. The
+/// variable-aware analyses of such an argument keep the first view; this one
+/// is a second deny-only candidate, so it cannot remove a denial they find.
+/// A command name, a redirection target, a here-string operand and an
+/// assignment are not arguments here.
+fn posix_proven_argument_view(
+    command: &str,
+    deadline: Option<&Deadline>,
+    unknown_names: bool,
+) -> Result<Option<String>, ProvenViewIncomplete> {
+    posix_proven_view(command, deadline, unknown_names, true)
+}
+
+/// A value that is the same word quoted or bare, and cannot be shell syntax.
+fn literal_posix_argument_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'.' | b'/' | b':' | b'+' | b',' | b'=' | b'@' | b'%' | b'-'
+                )
+        })
+}
+
+fn posix_proven_view(
+    command: &str,
+    deadline: Option<&Deadline>,
+    unknown_names: bool,
+    arguments: bool,
+) -> Result<Option<String>, ProvenViewIncomplete> {
     // Every binding source spells `=` (an assignment word) or `printf -v`;
     // IFS holds its default with none. Without one, every reference is
     // unknown and only [`posix_unknown_command_word_view`] can apply.
@@ -20930,6 +20971,7 @@ fn posix_proven_variable_view(
                 Some(ProvenSplice {
                     ifs: &ifs,
                     earlier_words: "",
+                    arguments,
                 }),
             )
         };
@@ -20966,8 +21008,8 @@ fn posix_proven_variable_view(
             changed.then_some(text)
         } else {
             match posix_eval_words(segment) {
-                Some((prefix, arguments)) => resolve_proven_eval_arguments(
-                    command, &ranges, start, segment, prefix, &arguments, &ifs,
+                Some((prefix, words)) => resolve_proven_eval_arguments(
+                    command, &ranges, start, segment, prefix, &words, &ifs, arguments,
                 ),
                 None => {
                     let resolved = if bindings_possible {
@@ -21256,6 +21298,28 @@ fn posix_unknown_reference_name(text: &str) -> Option<(&str, usize)> {
         .then_some(("", 2))
 }
 
+/// The first decision other than Allow among the deny-only `views`, each
+/// judged by `evaluate`, or `primary`. Only a denial (or an incomplete
+/// evaluation, which fails closed) is adopted; its span indexes the
+/// reconstructed text, so it is cleared.
+fn evaluate_proven_views(
+    views: &[String],
+    primary: EvaluationResult,
+    mut evaluate: impl FnMut(&str) -> EvaluationResult,
+) -> EvaluationResult {
+    for expanded in views {
+        let mut result = evaluate(expanded);
+        if result.decision != EvaluationDecision::Allow {
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.matched_span = None;
+                info.matched_text_preview = None;
+            }
+            return result;
+        }
+    }
+    primary
+}
+
 /// Why [`posix_proven_variable_view`] could not finish.
 #[derive(Debug)]
 enum ProvenViewIncomplete {
@@ -21292,6 +21356,7 @@ fn resolve_proven_eval_arguments(
     prefix: &str,
     arguments: &[&str],
     ifs: &str,
+    splice_arguments: bool,
 ) -> Option<String> {
     let body_ifs = deny_only_value_at_for_splitting(
         source,
@@ -21320,6 +21385,7 @@ fn resolve_proven_eval_arguments(
                 Some(ProvenSplice {
                     ifs: body_ifs,
                     earlier_words: prefix,
+                    arguments: splice_arguments,
                 }),
             )
             .filter(|resolved| {
@@ -21343,6 +21409,7 @@ fn resolve_proven_eval_arguments(
                 Some(ProvenSplice {
                     ifs,
                     earlier_words: "",
+                    arguments: splice_arguments,
                 }),
             ),
         };
@@ -36002,6 +36069,9 @@ struct ProvenSplice<'a> {
     /// segment proofs: the prefix of `X=t eval '...'`, whose body runs with
     /// them.
     earlier_words: &'a str,
+    /// Also splice a whole single-field argument with a plain value
+    /// ([`posix_proven_argument_view`]).
+    arguments: bool,
 }
 
 /// [`resolve_proven_variables_in_segment`] for the reconstruction view
@@ -36040,6 +36110,7 @@ fn resolve_proven_variables_in_segment_with_ifs(
     let composite_only = view.is_some();
     let ifs = view.map_or(DEFAULT_POSIX_IFS, |view| view.ifs);
     let earlier_words = view.map_or("", |view| view.earlier_words);
+    let splice_arguments = view.is_some_and(|view| view.arguments);
     let proven_value = |name: &str| {
         deny_only_value_at(
             source,
@@ -36391,6 +36462,30 @@ fn resolve_proven_variables_in_segment_with_ifs(
                         || posix_word_is_assignment_prefix(&before[word_start..])
                         || segment_text_may_assign(&out, name)
                     {
+                        let field = rendered.trim_matches(' ');
+                        let redirection = before[word_start..].contains(['<', '>'])
+                            || before[..word_start].trim_end().ends_with(['<', '>']);
+                        if splice_arguments
+                            && whole
+                            && fields == 1
+                            && !command_name
+                            && !here_string
+                            && !redirection
+                            && !posix_word_is_assignment_prefix(&before[word_start..])
+                            && !segment_text_may_assign(&out, name)
+                            && literal_posix_argument_atom(field)
+                        {
+                            if in_double_quote {
+                                out.pop();
+                                in_double_quote = false;
+                                rest = &tail[consumed + 1..];
+                            } else {
+                                rest = &tail[consumed..];
+                            }
+                            out.push_str(field);
+                            substituted = true;
+                            continue;
+                        }
                         rest = keep(&mut out);
                         continue;
                     }
@@ -55052,6 +55147,10 @@ mod tests {
             ("f() { \"$@\"; }; f \"$x\"", false),
             ("retry() { \"$@\" || retry \"$@\"; }; retry make", false),
             ("x='git reset --hard'; cat <<< \"$x\"", false),
+            ("x=--hard; git reset \"$x\"", true),
+            ("x=--hard; git reset $x", true),
+            ("x=--soft; git reset \"$x\"", false),
+            ("x=--hard; echo \"$x\"", false),
         ];
         for index in [None, keyword_index.as_ref()] {
             for (command, denied) in cases {

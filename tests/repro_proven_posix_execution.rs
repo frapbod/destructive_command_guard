@@ -187,3 +187,30 @@ fn harmless_and_unknown_commands_keep_current_policy() {
     );
     assert_both("deny", &[r#"eval "$*""#]);
 }
+
+/// A whole quoted or bare argument with a proven plain value (PR #2 "Not
+/// covered", fixed upstream in 18687c83): the second deny-only reading.
+#[test]
+fn proven_plain_argument_values_are_judged() {
+    assert_both(
+        "deny",
+        &[
+            r#"x=--hard; git reset "$x""#,
+            r#"x=--hard; git reset $x"#,
+            r#"x=-f; git push "$x""#,
+            r#"x=--force; git push origin "$x""#,
+            r#"x=-D; git branch "$x" main"#,
+            r#"x=--hard; f() { git reset "$1"; }; f "$x""#,
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"x=--soft; git reset "$x""#,
+            r#"x=main; git push origin "$x""#,
+            r#"x=--hard; echo "$x""#,
+            r#"x=--hard; printf '%s\n' "$x" > notes.txt"#,
+            r#"x=-la; ls "$x""#,
+        ],
+    );
+}
