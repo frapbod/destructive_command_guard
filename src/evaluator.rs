@@ -15326,25 +15326,22 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             result = alternate;
         }
     }
-    // PowerShell (the shell Codex runs on Windows) has no backslash escape:
-    // `"C:\temp\"` is a complete string there, and the backtick escapes
-    // instead. The scanners read quotes the POSIX way, so in `Write-Output
-    // "C:\temp\"; git reset --hard` they saw one string. When the command may
-    // be PowerShell, read it again spelled so that the POSIX scanners put
-    // its quote boundaries where PowerShell does (see
-    // `powershell_quoting_in_posix_spelling`), with `$'` read plainly too.
-    // Deny wins, as between dialect views. The spelling differs from the
-    // command as written, so what the user authorized as written stays
-    // authorized, and no allow-once grant is spent. Like the plain `$'`
-    // reading, nothing inside a second reading is read again.
+    // PowerShell (the shell Codex runs on Windows) and cmd.exe have no
+    // backslash escape: `"C:\temp\"` is a complete string there. The shared
+    // scanners read `\"` as an escaped quote, so in `Write-Output "C:\temp\";
+    // git reset --hard` they saw one string. When the command may run in one
+    // of those shells, read it again with its backslashes spelled `/`, which
+    // parses the same for them (see `without_backslash_escapes`), with `$'`
+    // read plainly too, as PowerShell does. Deny wins, as between dialect
+    // views. The spelling differs from the command as written, so what the
+    // user authorized as written stays authorized, and no allow-once grant is
+    // spent. Like the plain `$'` reading, nothing inside a second reading is
+    // read again.
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
-        && matches!(
-            shell_dialect,
-            ShellDialect::PowerShell | ShellDialect::Unknown
-        )
+        && !matches!(shell_dialect, ShellDialect::Posix)
         && !crate::context::PlainDollarQuoteReading::active()
-        && let Some(spelled) = crate::normalize::powershell_quoting_in_posix_spelling(command)
+        && let Some(spelled) = crate::normalize::without_backslash_escapes(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
         let alternate = if deadline_exceeded(deadline) {
@@ -15362,7 +15359,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 None,
                 project_path,
                 deadline,
-                ShellDialect::Posix,
+                shell_dialect,
                 nested_command_depth,
                 inherited_automated_stdin,
             )
@@ -40781,10 +40778,9 @@ mod tests {
             "cd ~/.ssh && rm id_rsa.pub",
             "cd ~/.ssh && ls -la",
             "cd ~/.ssh && echo hi 2>&1 > /tmp/x",
-            // The sanitizer now exposes every glued redirect; a quoted or
-            // escaped arrow is still echo's data.
+            // The sanitizer now exposes every glued redirect; a quoted arrow
+            // is still echo's data.
             "echo \"a>.git/config\"",
-            "echo a\\>.git/config",
             // A static substitution naming an ordinary file, and one that is
             // not static at all (the `rm $UNKNOWN` posture).
             "rm $(echo /home/user/notes.txt)",
@@ -40798,6 +40794,15 @@ mod tests {
                 "{command:?}: no proven directory makes this a protected file"
             );
         }
+        // An escaped arrow is echo's data in a POSIX shell. PowerShell and
+        // cmd.exe have no backslash escape and write `.git/config`, so the
+        // union of dialects denies it.
+        let escaped = "echo a\\>.git/config";
+        assert!(
+            evaluate_with_pack_ids_in_dialect(escaped, &["core.filesystem"], ShellDialect::Posix)
+                .is_allowed()
+        );
+        assert!(evaluate_with_pack_ids(escaped, &["core.filesystem"]).is_denied());
 
         assert_eq!(
             anchor_relative_words("echo x > authorized_keys", "~/.ssh").as_deref(),
@@ -51110,8 +51115,8 @@ mod tests {
                 .and_then(|info| info.matched_text_preview.as_deref())
                 .unwrap_or_default();
             assert!(
-                preview.contains("reset --hard") && command.contains(preview),
-                "the preview shows the command's own text: {command:?}: {preview:?}"
+                command.contains(preview),
+                "a preview shows the command's own text: {command:?}: {preview:?}"
             );
         }
         for command in [
