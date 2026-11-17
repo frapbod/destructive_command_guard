@@ -15305,6 +15305,35 @@ fn dialect_view_may_expose_hidden_execution(
             || names_powershell_word(command, &POWERSHELL_ALIAS_DEFINERS))
 }
 
+/// Adopt a second reading of `command` (a length-preserving spelling or a
+/// different token reading) when it denies, cannot decide, or adds an
+/// effective mode. Deny wins, as between dialect views. The preview shows the
+/// command's own text.
+fn adopt_alternate_reading(
+    result: &mut EvaluationResult,
+    alternate: EvaluationResult,
+    command: &str,
+) {
+    let adopt = match alternate.decision {
+        EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+        EvaluationDecision::Allow => {
+            result.effective_mode.is_none() && alternate.effective_mode.is_some()
+        }
+    };
+    if !adopt {
+        return;
+    }
+    *result = alternate;
+    if let Some(info) = result.pattern_info.as_mut()
+        && let Some(span) = info.matched_span.as_ref()
+        && span.end <= command.len()
+        && command.is_char_boundary(span.start)
+        && command.is_char_boundary(span.end)
+    {
+        info.matched_text_preview = Some(extract_match_preview(command, span));
+    }
+}
+
 /// Evaluate a command, fanning out across dialects when the caller could not
 /// prove one (dcg#294).
 ///
@@ -15417,24 +15446,49 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 inherited_automated_stdin,
             )
         };
-        let adopt = match alternate.decision {
-            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
-            EvaluationDecision::Allow => {
-                result.effective_mode.is_none() && alternate.effective_mode.is_some()
-            }
+        adopt_alternate_reading(&mut result, alternate, command);
+    }
+    // A backtick escape such as `` `n `` or `` `r `` is a control character in
+    // a PowerShell double-quoted string and bare word, so a nested
+    // `powershell -Command "echo a`ngit reset --hard"` runs the reset as a new
+    // statement. The token readers keep the escaped letter, which can itself
+    // spell a command (`` Remove-Item -Fo`rce ``). When the command may be
+    // PowerShell and holds such an escape, read it again through this whole
+    // function with the control characters; that reading does not start a
+    // third one. Deny wins, and no allow-once grant is spent, as for the
+    // lone-CR reading above.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        )
+        && !crate::normalize::powershell_control_escapes_active()
+        && crate::normalize::has_powershell_control_escape(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            let _escape_scope = crate::normalize::PowerShellControlEscapeScope::enter();
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                command,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
         };
-        if adopt {
-            result = alternate;
-            // The spelling is length preserving: show the command's own text.
-            if let Some(info) = result.pattern_info.as_mut()
-                && let Some(span) = info.matched_span.as_ref()
-                && span.end <= command.len()
-                && command.is_char_boundary(span.start)
-                && command.is_char_boundary(span.end)
-            {
-                info.matched_text_preview = Some(extract_match_preview(command, span));
-            }
-        }
+        adopt_alternate_reading(&mut result, alternate, command);
     }
     // A program name in another case runs the same program on a
     // case-insensitive filesystem (`RM -rf ~` runs `rm`), while the packs and

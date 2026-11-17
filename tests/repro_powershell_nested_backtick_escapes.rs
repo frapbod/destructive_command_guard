@@ -35,6 +35,10 @@ const CHILD_RUNS_IT: &[&str] = &[
     // PowerShell 6+ reads `` `u{hex} `` as that code point.
     "pwsh -Command \"echo a`u{a}git reset --hard\"",
     "pwsh -Command \"echo a; `u{67}it reset --hard\"",
+    // The control-character reading is a second reading: an escaped letter
+    // that spells a destructive word still denies in the first.
+    "Remove-Item -Re`curse -Fo`rce C:\\src",
+    "powershell -Command \"Remove-Item -Recurse -Fo`rce C:\\src\"",
 ];
 
 /// Single-quoted payloads keep the backtick literal; a doubled backtick or an

@@ -2314,6 +2314,55 @@ fn decode_powershell_unicode_escape(
     Some(decoded)
 }
 
+thread_local! {
+    static POWERSHELL_CONTROL_ESCAPES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, PowerShell syntax tokens on this thread read a backtick
+/// escape (`` `n `` `` `r `` `` `t `` `` `0 `` `` `a `` `` `b `` `` `f `` `` `v ``
+/// and a valid `` `u{hex} ``) as the control character PowerShell makes of
+/// it, not as the letter. The evaluator enters it for a second reading of a
+/// command that may be PowerShell; see [`has_powershell_control_escape`].
+pub(crate) struct PowerShellControlEscapeScope {
+    previous: bool,
+}
+
+impl PowerShellControlEscapeScope {
+    #[must_use]
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: POWERSHELL_CONTROL_ESCAPES.with(|slot| slot.replace(true)),
+        }
+    }
+}
+
+impl Drop for PowerShellControlEscapeScope {
+    fn drop(&mut self) {
+        POWERSHELL_CONTROL_ESCAPES.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Whether a [`PowerShellControlEscapeScope`] is alive on this thread.
+#[must_use]
+pub(crate) fn powershell_control_escapes_active() -> bool {
+    POWERSHELL_CONTROL_ESCAPES.with(std::cell::Cell::get)
+}
+
+/// Whether the command holds a backtick escape that PowerShell reads as a
+/// control character, so the control-character reading can differ from the
+/// letter reading. Quoting is not checked: a backtick in single quotes only
+/// costs one more reading.
+#[must_use]
+pub(crate) fn has_powershell_control_escape(command: &str) -> bool {
+    command.as_bytes().windows(2).any(|pair| {
+        pair[0] == b'`'
+            && matches!(
+                pair[1],
+                b'n' | b'r' | b't' | b'0' | b'a' | b'b' | b'f' | b'v' | b'u'
+            )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PowerShellQuote {
     Unquoted,
@@ -2382,25 +2431,32 @@ fn decode_powershell_syntax_token(token: &str) -> Cow<'_, str> {
                         // backtick escape is a control character: `` `n `` and
                         // `` `r `` are line breaks, so a nested `-Command`
                         // payload that holds one runs the text after it as a
-                        // new statement. PowerShell 6+ also reads
-                        // `` `u{hex} `` as that code point; Windows
-                        // PowerShell 5.1 reads `` `u `` and `` `e `` as the
-                        // letters, so `` `e `` keeps its letter here and
-                        // `` `u{hex} `` takes the 6+ reading, whichever can
-                        // spell a command. Any other escaped character is
-                        // itself.
-                        'n' => output.push('\n'),
-                        'r' => output.push('\r'),
-                        't' => output.push('\t'),
-                        '0' => output.push('\0'),
-                        'a' => output.push('\u{7}'),
-                        'b' => output.push('\u{8}'),
-                        'f' => output.push('\u{c}'),
-                        'v' => output.push('\u{b}'),
-                        'u' => match decode_powershell_unicode_escape(&mut chars) {
-                            Some(decoded) => output.push(decoded),
-                            None => output.push('u'),
-                        },
+                        // new statement. The first reading keeps the letter,
+                        // which can still spell a command (`` Fo`rce ``); the
+                        // evaluator reads the command again with the control
+                        // characters (`PowerShellControlEscapeScope`), and
+                        // deny wins. PowerShell 6+ also reads `` `u{hex} `` as
+                        // that code point; Windows PowerShell 5.1 reads `` `u ``
+                        // and `` `e `` as the letters, so `` `e `` keeps its
+                        // letter in both readings.
+                        'n' | 'r' | 't' | '0' | 'a' | 'b' | 'f' | 'v' | 'u'
+                            if powershell_control_escapes_active() =>
+                        {
+                            match escaped {
+                                'n' => output.push('\n'),
+                                'r' => output.push('\r'),
+                                't' => output.push('\t'),
+                                '0' => output.push('\0'),
+                                'a' => output.push('\u{7}'),
+                                'b' => output.push('\u{8}'),
+                                'f' => output.push('\u{c}'),
+                                'v' => output.push('\u{b}'),
+                                _ => match decode_powershell_unicode_escape(&mut chars) {
+                                    Some(decoded) => output.push(decoded),
+                                    None => output.push('u'),
+                                },
+                            }
+                        }
                         other => output.push(other),
                     }
                 }
