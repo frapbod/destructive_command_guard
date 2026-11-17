@@ -62,6 +62,11 @@ fn payload(protocol: Protocol, command: &str, cwd: &std::path::Path) -> serde_js
 /// What the agent reads: "allow" for empty stdout, else the decision.
 /// Panics unless the hook exited 0 with no stack overflow.
 fn hook_decision(protocol: Protocol, command: &str) -> String {
+    hook_verdict(protocol, command).0
+}
+
+/// The decision, as [`hook_decision`], and the reason the hook gave.
+fn hook_verdict(protocol: Protocol, command: &str) -> (String, String) {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -101,14 +106,21 @@ fn hook_decision(protocol: Protocol, command: &str) -> String {
         out.status
     );
     if stdout.trim().is_empty() {
-        return "allow".to_string();
+        return ("allow".to_string(), String::new());
     }
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("{protocol:?}: stdout is not one JSON value ({e}): {stdout}"));
-    parsed["hookSpecificOutput"]["permissionDecision"]
-        .as_str()
-        .unwrap_or("<missing>")
-        .to_string()
+    let output = &parsed["hookSpecificOutput"];
+    (
+        output["permissionDecision"]
+            .as_str()
+            .unwrap_or("<missing>")
+            .to_string(),
+        output["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 fn assert_both(decision: &str, commands: &[&str]) {
@@ -179,6 +191,8 @@ fn rebound_ifs_splitting_denies_under_both_protocols() {
             "r${IFS:9}m${IFS:0:1}-rf${IFS:0:1}~",
             // A quoted slice of a literal value is that slice.
             "IFS=xt; \"gi${IFS:1:1}\" reset --hard",
+            // `+=` appends to the value in force.
+            "IFS+=t; \"gi${IFS:3}\" reset --hard",
             // More combinations than dcg checks.
             "echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f",
         ],
@@ -212,6 +226,43 @@ fn harmless_ifs_uses_stay_allowed_under_both_protocols() {
             "echo a$IFS b$IFS c$IFS d$IFS e$IFS f$IFS g",
         ],
     );
+}
+
+/// Glob patterns in IFS operators that made a recursive, backtracking
+/// matcher overflow the 1 MiB Windows main-thread stack (one frame per `*`)
+/// or run for minutes, past Codex's 600 s hook timeout. Either way the
+/// agent ran the command. Each must get the reset's own denial, quickly.
+#[test]
+fn ifs_glob_patterns_stay_bounded_under_both_protocols() {
+    let stars = "*".repeat(20_000);
+    let backtracking = format!(
+        "IFS={}; echo ${{IFS#{}b}}; git reset --hard",
+        "a".repeat(44),
+        "*a".repeat(16)
+    );
+    assert_eq!(backtracking.len(), 113);
+    let commands = [
+        format!("echo ${{IFS#{stars}}}; git reset --hard"),
+        format!("echo ${{IFS%%{stars}}}; git reset --hard"),
+        format!("echo ${{IFS//{stars}/x}}; git reset --hard"),
+        backtracking,
+    ];
+    for command in &commands {
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            let started = std::time::Instant::now();
+            let (decision, reason) = hook_verdict(protocol, command);
+            let elapsed = started.elapsed();
+            assert_eq!(decision, "deny", "{protocol:?}: {}", &command[..40]);
+            assert!(
+                reason.contains("reset-hard") || reason.contains("reset --hard"),
+                "{protocol:?}: the reset's own rule must deny, not a time budget: {reason}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "{protocol:?}: took {elapsed:?}"
+            );
+        }
+    }
 }
 
 /// The #628 shapes under Codex as well as Claude Code. Each crashed 0.16.0.

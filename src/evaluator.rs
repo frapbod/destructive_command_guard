@@ -17758,7 +17758,7 @@ fn ifs_operation_text(operation: &str, value: &str) -> Option<String> {
         '#' | '%' => {
             let (longest, pattern) = all(operator);
             let pattern = simple_glob(pattern)?;
-            Some(remove_glob_affix(value, &pattern, operator == '#', longest))
+            remove_glob_affix(value, &pattern, operator == '#', longest)
         }
         '/' => substitute_glob(rest, value),
         '^' | ',' | '~' => {
@@ -17858,63 +17858,144 @@ enum GlobToken {
 }
 
 /// `pattern` as `*`, `?` and literal characters, or `None` when it uses
-/// quoting, expansions, brackets or extended globs.
+/// quoting, expansions, brackets or extended globs. A run of `*` is one
+/// [`GlobToken::Any`]: it matches the same text.
 fn simple_glob(pattern: &str) -> Option<Vec<GlobToken>> {
     if pattern.contains([
         '[', ']', '\\', '\'', '"', '$', '`', '(', ')', '|', '!', '@', '+', '{', '}',
     ]) {
         return None;
     }
-    Some(
-        pattern
-            .chars()
-            .map(|character| match character {
-                '*' => GlobToken::Any,
-                '?' => GlobToken::One,
-                other => GlobToken::Char(other),
-            })
-            .collect(),
-    )
+    let mut tokens = Vec::with_capacity(pattern.len());
+    for character in pattern.chars() {
+        let token = match character {
+            '*' => GlobToken::Any,
+            '?' => GlobToken::One,
+            other => GlobToken::Char(other),
+        };
+        if !(token == GlobToken::Any && tokens.last() == Some(&GlobToken::Any)) {
+            tokens.push(token);
+        }
+    }
+    Some(tokens)
+}
+
+/// Upper bound on the matcher steps one IFS operator may take, counted as
+/// (pattern tokens + 1) x (text characters + 1) per scan. Real IFS values
+/// and patterns are a few characters; above the bound the text is not
+/// computed, and the separator and empty texts still apply.
+const MAX_IFS_GLOB_WORK: usize = 1 << 14;
+
+/// Whether `scans` scans of `text_len` characters each fit in
+/// [`MAX_IFS_GLOB_WORK`].
+fn ifs_glob_work_fits(pattern: &[GlobToken], text_len: usize, scans: usize) -> bool {
+    (pattern.len() + 1)
+        .checked_mul(text_len + 1)
+        .and_then(|work| work.checked_mul(scans))
+        .is_some_and(|work| work <= MAX_IFS_GLOB_WORK)
+}
+
+/// For each `length` in `0..=text.len()`, whether `pattern` matches all of
+/// `text[..length]`. One pass over `text` that tracks the set of pattern
+/// positions reached, so it takes O(pattern x text) steps and constant
+/// stack, whatever the pattern.
+fn glob_prefix_matches(pattern: &[GlobToken], text: &[char]) -> Vec<bool> {
+    let end = pattern.len();
+    // A `*` also matches nothing: whoever reaches it reaches the next token.
+    let close = |states: &mut [bool]| {
+        for position in 0..end {
+            if states[position] && pattern[position] == GlobToken::Any {
+                states[position + 1] = true;
+            }
+        }
+    };
+    let mut states = vec![false; end + 1];
+    states[0] = true;
+    close(&mut states);
+    let mut next = vec![false; end + 1];
+    let mut matched = Vec::with_capacity(text.len() + 1);
+    matched.push(states[end]);
+    for character in text {
+        next.fill(false);
+        let mut alive = false;
+        for (position, token) in pattern.iter().enumerate() {
+            if !states[position] {
+                continue;
+            }
+            let target = match token {
+                GlobToken::Any => position,
+                GlobToken::One => position + 1,
+                GlobToken::Char(expected) if expected == character => position + 1,
+                GlobToken::Char(_) => continue,
+            };
+            next[target] = true;
+            alive = true;
+        }
+        close(&mut next);
+        std::mem::swap(&mut states, &mut next);
+        matched.push(states[end]);
+        if !alive {
+            matched.resize(text.len() + 1, false);
+            break;
+        }
+    }
+    matched
+}
+
+/// Like [`glob_prefix_matches`], for suffixes: entry `length` says whether
+/// `pattern` matches the last `length` characters of `text`. A glob of `*`,
+/// `?` and literals matches a text exactly when its reverse matches the
+/// reversed text.
+fn glob_suffix_matches(pattern: &[GlobToken], text: &[char]) -> Vec<bool> {
+    let pattern = pattern.iter().rev().copied().collect::<Vec<_>>();
+    let text = text.iter().rev().copied().collect::<Vec<_>>();
+    glob_prefix_matches(&pattern, &text)
 }
 
 /// Whether `pattern` matches all of `text`.
+#[cfg(test)]
 fn glob_matches(pattern: &[GlobToken], text: &[char]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some((GlobToken::Any, rest)) => {
-            (0..=text.len()).any(|skip| glob_matches(rest, &text[skip..]))
-        }
-        Some((GlobToken::One, rest)) => !text.is_empty() && glob_matches(rest, &text[1..]),
-        Some((GlobToken::Char(expected), rest)) => {
-            text.first() == Some(expected) && glob_matches(rest, &text[1..])
-        }
-    }
+    glob_prefix_matches(pattern, text)[text.len()]
 }
 
 /// `${v#p}`, `${v##p}` (`prefix`) and `${v%p}`, `${v%%p}`: `value` without
-/// the shortest or longest matching prefix or suffix.
-fn remove_glob_affix(value: &str, pattern: &[GlobToken], prefix: bool, longest: bool) -> String {
+/// the shortest or longest matching prefix or suffix. `None` above
+/// [`MAX_IFS_GLOB_WORK`].
+fn remove_glob_affix(
+    value: &str,
+    pattern: &[GlobToken],
+    prefix: bool,
+    longest: bool,
+) -> Option<String> {
     let chars = value.chars().collect::<Vec<_>>();
     let count = chars.len();
-    let mut lengths: Vec<usize> = (0..=count).collect();
-    if longest {
-        lengths.reverse();
+    if !ifs_glob_work_fits(pattern, count, 1) {
+        return None;
     }
-    for length in lengths {
-        let (kept, removed) = if prefix {
-            (&chars[length..], &chars[..length])
-        } else {
-            (&chars[..count - length], &chars[count - length..])
-        };
-        if glob_matches(pattern, removed) {
-            return kept.iter().collect();
-        }
-    }
-    value.to_string()
+    let matches = if prefix {
+        glob_prefix_matches(pattern, &chars)
+    } else {
+        glob_suffix_matches(pattern, &chars)
+    };
+    let mut lengths = (0..=count).filter(|length| matches[*length]);
+    let Some(length) = (if longest {
+        lengths.next_back()
+    } else {
+        lengths.next()
+    }) else {
+        return Some(value.to_string());
+    };
+    let kept = if prefix {
+        &chars[length..]
+    } else {
+        &chars[..count - length]
+    };
+    Some(kept.iter().collect())
 }
 
 /// `${v/p/r}`, `${v//p/r}`, `${v/#p/r}` and `${v/%p/r}` over `value`; `spec`
-/// follows the first `/`. The replacement must be static.
+/// follows the first `/`. The replacement must be static. `None` above
+/// [`MAX_IFS_GLOB_WORK`].
 fn substitute_glob(spec: &str, value: &str) -> Option<String> {
     let (mode, spec) = match spec.chars().next() {
         Some(mode @ ('/' | '#' | '%')) => (Some(mode), &spec[1..]),
@@ -17925,50 +18006,50 @@ fn substitute_glob(spec: &str, value: &str) -> Option<String> {
     let replacement = static_ifs_operand(replacement)?;
     let chars = value.chars().collect::<Vec<_>>();
     let count = chars.len();
-    let joined = |parts: &[&[char]], with: &str| -> String {
-        let mut out = String::new();
-        for (index, part) in parts.iter().enumerate() {
-            if index > 0 {
-                out.push_str(with);
-            }
-            out.extend(part.iter());
-        }
-        out
-    };
     match mode {
-        Some('#') => Some(
-            (0..=count)
-                .rev()
-                .find(|length| glob_matches(&pattern, &chars[..*length]))
-                .map_or_else(
-                    || value.to_string(),
-                    |length| joined(&[&[], &chars[length..]], &replacement),
-                ),
-        ),
-        Some('%') => Some(
-            (0..=count)
-                .find(|start| glob_matches(&pattern, &chars[*start..]))
-                .map_or_else(
-                    || value.to_string(),
-                    |start| joined(&[&chars[..start], &[]], &replacement),
-                ),
-        ),
+        // The longest matching prefix, or suffix, is replaced.
+        Some(anchor @ ('#' | '%')) => {
+            if !ifs_glob_work_fits(&pattern, count, 1) {
+                return None;
+            }
+            let prefix = anchor == '#';
+            let matches = if prefix {
+                glob_prefix_matches(&pattern, &chars)
+            } else {
+                glob_suffix_matches(&pattern, &chars)
+            };
+            let Some(length) = (0..=count).rev().find(|length| matches[*length]) else {
+                return Some(value.to_string());
+            };
+            let mut out = String::new();
+            if prefix {
+                out.push_str(&replacement);
+                out.extend(&chars[length..]);
+            } else {
+                out.extend(&chars[..count - length]);
+                out.push_str(&replacement);
+            }
+            Some(out)
+        }
         _ if pattern.is_empty() => Some(value.to_string()),
         _ => {
+            // One scan from each start: the longest non-empty match there.
+            if !ifs_glob_work_fits(&pattern, count, count.max(1)) {
+                return None;
+            }
             let mut out = String::new();
             let mut index = 0usize;
             let mut replaced = false;
             while index < count {
                 let matched = (!replaced || mode == Some('/'))
                     .then(|| {
-                        (index + 1..=count)
-                            .rev()
-                            .find(|end| glob_matches(&pattern, &chars[index..*end]))
+                        let matches = glob_prefix_matches(&pattern, &chars[index..]);
+                        (1..matches.len()).rev().find(|length| matches[*length])
                     })
                     .flatten();
-                if let Some(end) = matched {
+                if let Some(length) = matched {
                     out.push_str(&replacement);
-                    index = end;
+                    index += length;
                     replaced = true;
                 } else {
                     out.push(chars[index]);
@@ -18038,7 +18119,8 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
         return None;
     }
     let mut literal = Vec::new();
-    let mut assignments = Vec::new();
+    // (end offset, appends, decoded word or `None` when it is not static)
+    let mut writes = Vec::new();
     let mut contexts = Vec::new();
     for node in ast.root().dfs() {
         match node.kind().as_ref() {
@@ -18054,15 +18136,29 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
                 let value = node.field("value").map_or(Some(String::new()), |value| {
                     shell_word_value(&value.text(), ShellDialect::Posix)
                 });
+                let appends = node.text().starts_with("IFS+=");
                 // A value that itself expands would re-enter this view.
-                if let Some(value) = value.filter(|value| !value.contains(['$', '`'])) {
-                    assignments.push((node.range().end, value));
-                }
+                let value = value.filter(|value| !value.contains(['$', '`']));
+                writes.push((node.range().end, appends, value));
             }
             _ => {}
         }
     }
-    assignments.sort_by_key(|(end, _)| *end);
+    // `IFS+=word` appends to the value in force (Bash: `IFS+=t; printf
+    // '[%s]' "gi${IFS:3}"` prints `[git]`). After a value that is not
+    // static, the appended value is unknown as well.
+    writes.sort_by_key(|(end, _, _)| *end);
+    let mut assignments = Vec::new();
+    let mut in_force = Some(DEFAULT_POSIX_IFS.to_string());
+    for (end, appends, value) in writes {
+        in_force = match (appends, value) {
+            (true, Some(word)) => in_force.map(|current| current + &word),
+            (false, value) | (true, value @ None) => value,
+        };
+        if let Some(value) = &in_force {
+            assignments.push((end, value.clone()));
+        }
+    }
     Some(IfsParse {
         literal,
         assignments,
@@ -39933,6 +40029,77 @@ mod tests {
         assert_eq!(ifs_operation_text(",,", "AB").as_deref(), Some("ab"));
         assert_eq!(ifs_operation_text("@u", "ab").as_deref(), Some("Ab"));
         assert_eq!(ifs_operation_text("^a", "ab"), None);
+        // Runs of `*` and long patterns stay bounded.
+        let stars = format!("#{}", "*".repeat(20_000));
+        // Bash: the shortest prefix `*` matches is empty.
+        assert_eq!(ifs_operation_text(&stars, ifs).as_deref(), Some(ifs));
+        assert_eq!(ifs_operation_text("%%***", ifs).as_deref(), Some(""));
+        assert_eq!(ifs_operation_text("//***/x", ifs).as_deref(), Some("x"));
+        let value = "a".repeat(44);
+        let backtracking = format!("#{}b", "*a".repeat(16));
+        assert_eq!(
+            ifs_operation_text(&backtracking, &value).as_deref(),
+            Some(value.as_str())
+        );
+        let backtracking = format!("/{}b/x", "*a".repeat(16));
+        assert_eq!(ifs_operation_text(&backtracking, &value), None);
+        let literal = format!("#{}", "?".repeat(MAX_IFS_GLOB_WORK));
+        assert_eq!(ifs_operation_text(&literal, ifs), None);
+    }
+
+    #[test]
+    fn glob_matches_follows_bash() {
+        let glob = |pattern: &str| simple_glob(pattern).expect("simple");
+        let chars = |text: &str| text.chars().collect::<Vec<_>>();
+        for (pattern, text, expected) in [
+            ("", "", true),
+            ("", "a", false),
+            ("*", "", true),
+            ("*", "abc", true),
+            ("a*c", "abc", true),
+            ("a*c", "abcd", false),
+            ("?", "", false),
+            ("??", "ab", true),
+            ("*a*b", "xaxb", true),
+            ("*a*b", "xaxa", false),
+            ("a**b", "ab", true),
+            ("*?", "", false),
+            ("*?*", "x", true),
+        ] {
+            assert_eq!(
+                glob_matches(&glob(pattern), &chars(text)),
+                expected,
+                "{pattern:?} on {text:?}"
+            );
+        }
+        assert_eq!(glob(&"*".repeat(20_000)), [GlobToken::Any]);
+        // Backtracking patterns answer in one pass.
+        let pattern = glob(&format!("{}b", "*a".repeat(16)));
+        assert!(!glob_matches(&pattern, &chars(&"a".repeat(4_000))));
+        assert!(glob_matches(
+            &pattern,
+            &chars(&format!("{}b", "a".repeat(4_000)))
+        ));
+        assert_eq!(
+            glob_suffix_matches(&glob("?b"), &chars("aab")),
+            [false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn parsed_ifs_literals_appends() {
+        let values = |command: &str| {
+            parsed_ifs_literals(command)
+                .expect("parses")
+                .assignments
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values("IFS+=t; echo"), [" \t\nt"]);
+        assert_eq!(values("IFS=x; IFS+=y; IFS+=z"), ["x", "xy", "xyz"]);
+        // After a value that is not static, an append is unknown too.
+        assert_eq!(values("IFS=$v; IFS+=t; IFS=k"), ["k"]);
     }
 
     /// A rebound IFS still splits an unquoted use (Bash 5.2:
@@ -39971,6 +40138,11 @@ mod tests {
             "r${IFS:9}m${IFS:0:1}-rf${IFS:0:1}~",
             // A quoted slice of a literal value.
             "IFS=xt; \"gi${IFS:1:1}\" reset --hard",
+            // `+=` appends to the value in force.
+            "IFS+=t; \"gi${IFS:3}\" reset --hard",
+            "IFS=x; IFS+=t; \"gi${IFS:1}\" reset --hard",
+            // Patterns that made a backtracking matcher overflow or hang.
+            "IFS=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; echo ${IFS#*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*ab}; git reset --hard",
             // More outcomes than dcg checks.
             "echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f",
         ] {
