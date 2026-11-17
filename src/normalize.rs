@@ -2779,7 +2779,8 @@ pub(crate) fn powershell_assignment_rhs(candidate: &str) -> Option<&str> {
 #[must_use]
 pub(crate) fn tokenize_for_shell_dialect(command: &str, dialect: ShellDialect) -> NormalizeTokens {
     match dialect {
-        ShellDialect::Posix | ShellDialect::Unknown => tokenize_for_normalization(command),
+        ShellDialect::Posix => tokenize_normalization_inner(command, true),
+        ShellDialect::Unknown => tokenize_for_normalization(command),
         ShellDialect::PowerShell => tokenize_powershell_raw(command),
         ShellDialect::Cmd => tokenize_cmd_raw(command),
     }
@@ -3404,6 +3405,13 @@ fn cmd_byte_is_caret_escaped(bytes: &[u8], index: usize) -> bool {
 
 #[must_use]
 pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
+    tokenize_normalization_inner(command, false)
+}
+
+/// With `posix_comments`, a `#` where a word starts is a comment to the end
+/// of its line (the newline stays a separator), so a quote inside it opens no
+/// string that would hide the next line.
+fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> NormalizeTokens {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
@@ -3415,6 +3423,13 @@ pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
         i = skip_ascii_whitespace(bytes, i, len);
         if i >= len {
             break;
+        }
+
+        if posix_comments && bytes[i] == b'#' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
         }
 
         if bytes[i] == b'\n' {

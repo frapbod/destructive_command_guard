@@ -4438,6 +4438,23 @@ fn collect_command_segments<'a>(
             i += 2;
             continue;
         }
+        // A POSIX `#` at the start of a word opens a comment that runs to the
+        // newline; a quote inside it must not open a string that swallows the
+        // next line (`# it's` LF `git reset --hard`).
+        if b == b'#'
+            && !in_single
+            && !in_double
+            && (i == start
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')'
+                ))
+        {
+            while i < end && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
         if b == b'\'' && !in_double {
             in_single = !in_single;
             in_ansi_c = false;
@@ -5919,6 +5936,29 @@ destructive_patterns:
             split_command_segments(r#"echo ">|" | grep x"#),
             vec![r#"echo ">|""#, "grep x"]
         );
+    }
+
+    #[test]
+    fn split_command_segments_ends_a_posix_comment_at_the_newline() {
+        for cmd in [
+            "# it's here\ngit reset --hard",
+            "# say \"hi\ngit reset --hard",
+            "#it's\ngit push --force origin main",
+            "  # it's\ngit reset --hard",
+            "# it's\r\ngit reset --hard",
+            "ls; # it's\ngit reset --hard",
+        ] {
+            let segments = split_command_segments(cmd);
+            assert!(
+                segments.iter().any(|s| s.starts_with("git ")),
+                "{cmd:?} -> {segments:?}"
+            );
+        }
+        // `#` inside a word or a quote is not a comment.
+        let segments = split_command_segments("echo a#b 'x' ; git status");
+        assert_eq!(segments, vec!["echo a#b 'x'", "git status"]);
+        let segments = split_command_segments("echo \"it's #1\"; git status");
+        assert_eq!(segments, vec!["echo \"it's #1\"", "git status"]);
     }
 
     #[test]

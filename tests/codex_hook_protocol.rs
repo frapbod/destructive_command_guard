@@ -3571,3 +3571,51 @@ fn heredoc_safe_python_codex_allows() {
         "safe python one-liner should be allowed\n{o}"
     );
 }
+
+/// Payloads whose command holds real line breaks (the shared builders escape
+/// only quotes and backslashes).
+fn multiline_payload(command: &str, codex: bool) -> Vec<u8> {
+    let mut payload = serde_json::json!({
+        "session_id": "sess-posix-comment",
+        "cwd": "/tmp/test-workdir",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_use_id": "call_comment",
+    });
+    if codex {
+        payload["turn_id"] = serde_json::json!("turn-test-comment");
+    }
+    payload.to_string().into_bytes()
+}
+
+/// A POSIX `#` comment that starts the command ends at the newline: a quote in
+/// it opens no string, so the next line's destructive git command is seen.
+#[test]
+fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
+    for command in [
+        "# it's here\ngit reset --hard",
+        "# say \"hi\ngit reset --hard",
+        "#it's\ngit push --force origin main",
+        "  # it's\ngit reset --hard",
+        "# it's\r\ngit reset --hard",
+    ] {
+        let codex = run_hook_raw(&multiline_payload(command, true), &[]);
+        assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&multiline_payload(command, false), &[]);
+        assert!(
+            claude.is_claude_block_shape(),
+            "claude {command:?}\n{claude}"
+        );
+    }
+    for command in [
+        "# it's here\ngit status",
+        "# git reset --hard",
+        "echo \"it's #1\"",
+    ] {
+        let codex = run_hook_raw(&multiline_payload(command, true), &[]);
+        assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&multiline_payload(command, false), &[]);
+        assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+}
