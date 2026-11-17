@@ -3610,6 +3610,11 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         "echo $((1+2))#x; git reset --hard",
         "$(true)#; git reset --hard",
         "echo a\\ #; git reset --hard",
+        // CR, FF and VT do not end a POSIX word; continuations remove no word.
+        "echo x\r\\\n#; git reset --hard",
+        "echo x\x0c\\\n#; git reset --hard",
+        "echo x\x0b\\\n#; git reset --hard",
+        "echo x\r\\\n\\\n#; git reset --hard",
         // A line continuation keeps the comment at a word start.
         "echo a \\\n#it's\ngit reset --hard",
         "\\\n#it's\ngit reset --hard",
@@ -3663,6 +3668,8 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         "# git reset --hard",
         "echo \"it's #1\"",
         "echo a \\\n#it's\ngit status",
+        // A continuation after an actual blank leaves # at a comment boundary.
+        "echo x \\\n#; git reset --hard",
         "echo a #$(git reset --hard)",
         // `#` after the closing `}` starts a comment again.
         "x=${y:- #}; git status",

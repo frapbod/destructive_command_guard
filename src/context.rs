@@ -5151,6 +5151,11 @@ mod tests {
             "echo ${x:-$'a\\'b' #}; rm -rf /",
             "echo a\r#b; rm -rf /",
             "echo a\x0c#b; rm -rf /",
+            // Nonblank bytes remain in the word across removed continuations.
+            "echo x\r\\\n#; rm -rf /",
+            "echo x\x0c\\\n#; rm -rf /",
+            "echo x\x0b\\\n#; rm -rf /",
+            "echo x\r\\\n\\\n#; rm -rf /",
         ] {
             assert!(
                 sanitize_for_pattern_matching(cmd).contains("rm -rf /"),
