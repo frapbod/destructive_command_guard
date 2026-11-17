@@ -2359,6 +2359,19 @@ fn decode_powershell_syntax_token(token: &str) -> Cow<'_, str> {
                         '\r' if chars.peek() == Some(&'\n') => {
                             chars.next();
                         }
+                        // In an expandable (double-quoted) string a backtick
+                        // escape is a control character: `` `n `` and `` `r ``
+                        // are line breaks, so a nested `-Command` payload that
+                        // holds one runs the text after it as a new
+                        // statement. Any other escaped character is itself.
+                        'n' if quote == PowerShellQuote::Double => output.push('\n'),
+                        'r' if quote == PowerShellQuote::Double => output.push('\r'),
+                        't' if quote == PowerShellQuote::Double => output.push('\t'),
+                        '0' if quote == PowerShellQuote::Double => output.push('\0'),
+                        'a' if quote == PowerShellQuote::Double => output.push('\u{7}'),
+                        'b' if quote == PowerShellQuote::Double => output.push('\u{8}'),
+                        'f' if quote == PowerShellQuote::Double => output.push('\u{c}'),
+                        'v' if quote == PowerShellQuote::Double => output.push('\u{b}'),
                         other => output.push(other),
                     }
                 }
