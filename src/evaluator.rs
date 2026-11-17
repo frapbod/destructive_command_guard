@@ -15182,11 +15182,6 @@ fn dialect_view_may_expose_hidden_execution(
     if view_decode_exposes_pack_keyword(command, view, keyword_index) {
         return true;
     }
-    if view == ShellDialect::PowerShell
-        && powershell_block_exposes_pack_keyword(command, keyword_index)
-    {
-        return true;
-    }
     // An escaped DCG option or subcommand can expose a control change without
     // exposing a new pack keyword: both views already contain `dcg`. Ask the
     // native argv proof, which distinguishes syntax from agent-name/data
@@ -15707,6 +15702,33 @@ fn evaluate_command_in_dialect_union(
                     return alternate;
                 }
             }
+        }
+    }
+
+    // A running PowerShell script block starts commands that the POSIX
+    // reading takes for arguments (see `powershell_block_exposes_pack_keyword`).
+    // Judge those bodies as PowerShell, deny wins. Only the bodies: the rest of
+    // the line was read above, and reading all of it as PowerShell would add
+    // that view's own false positives to every line with a block.
+    if powershell_block_exposes_pack_keyword(command, keyword_index) {
+        if deadline_exceeded(deadline) {
+            return EvaluationResult::indeterminate_due_to_budget();
+        }
+        if let Some(result) = evaluate_powershell_executable_blocks(
+            command,
+            nested_command_depth,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            inherited_automated_stdin,
+        ) {
+            return result;
         }
     }
 

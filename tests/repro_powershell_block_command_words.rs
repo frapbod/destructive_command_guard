@@ -58,7 +58,7 @@ const SEPARATOR_AFTER_QUOTED_GIT_BASH_ONLY: &[&str] = &[
     r#"g"it" reset --hard &"#,
     r#""git" reset --hard;"#,
     r#""git" push --force origin main;"#,
-    r#"'git' reset --hard;"#,
+    r"'git' reset --hard;",
 ];
 
 const HARMLESS: &[&str] = &[
