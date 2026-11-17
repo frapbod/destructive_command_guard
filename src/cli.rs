@@ -19967,6 +19967,7 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     let (_temp_dir, script_path) =
         download_verified_installer(&script_url, &sha_url, "install.sh")?;
 
+    // real-shell-gate: exempt (production: runs the verified installer for `dcg update`)
     let status = std::process::Command::new("bash")
         .arg(&script_path)
         .args(&args)
@@ -20092,6 +20093,7 @@ fn windows_update_worker_command_line(
 fn launch_windows_update_worker_via_cim(
     worker_command_line: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // real-shell-gate: exempt (production: launches the Windows update worker)
     let output = std::process::Command::new("powershell.exe")
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -20120,6 +20122,7 @@ fn launch_windows_update_worker_direct(
     runner_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fn runner_command(runner_path: &std::path::Path) -> std::process::Command {
+        // real-shell-gate: exempt (production: runs the Windows update runner)
         let mut runner = std::process::Command::new("powershell.exe");
         runner
             .arg("-NoProfile")
@@ -25054,6 +25057,9 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         let hook = claude_dcg_hook_for_executable(executable).expect("hook generation");
         let command = hook["command"].as_str().expect("hook command");
         assert_eq!(dcg_command_program(command).as_deref(), executable.to_str());
+        if !crate::real_shell_gate::allowed("posix_hook_quoting_round_trips_shell_metacharacters") {
+            return;
+        }
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &format!("set -- {command}; printf %s \"$1\"")])
             .output()
@@ -27151,6 +27157,7 @@ if ($errors.Count -ne 0) {
   $errors | ForEach-Object { Write-Error ([string]$_) }
   exit 1
 }";
+        // real-shell-gate: exempt (constant parser probe; ParseFile only parses the runner)
         let output = std::process::Command::new("powershell.exe")
             .arg("-NoProfile")
             .arg("-NonInteractive")
