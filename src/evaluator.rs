@@ -31111,10 +31111,17 @@ fn hazard_first_word(segment: &str) -> Cow<'_, str> {
 }
 
 /// Whether `text`, the words of a segment before some word, leaves that word
-/// in command-name position: only the prefixes [`hazard_first_word`] skips
-/// (control-flow openers, grouping, negation, `command`/`builtin`/`time`,
+/// in command-name position: only shell syntax that opens a body (subshell,
+/// group, function declaration, case arm, control-flow words) and the
+/// prefixes [`hazard_first_word`] skips (negation, `command`/`builtin`/`time`,
 /// redirections and assignment words) come first.
 fn posix_words_precede_command_name(text: &str) -> bool {
+    // Peel the syntax with the parser the packs use, ahead of a stand-in for
+    // the word, so both agree where the command name is.
+    let probe = format!("{text}x");
+    let (rest, _) =
+        crate::packs::core::git::command_after_posix_control_prefixes(&probe, ShellDialect::Posix);
+    let text = rest.strip_suffix('x').unwrap_or(rest);
     text.split_ascii_whitespace().all(|word| {
         matches!(
             word,

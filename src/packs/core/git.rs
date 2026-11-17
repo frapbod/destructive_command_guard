@@ -5070,6 +5070,16 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         .as_ref()
         .map_or(command, |result| result.normalized.as_ref());
     let tokens = tokenize_for_shell_dialect(command, dialect);
+    // A `)` here closes a subshell opened before the peeled prefix; the words
+    // after it redirect that subshell and are not Git's argv.
+    let tokens = match tokens.iter().position(|token| {
+        dialect == ShellDialect::Posix
+            && token.kind == NormalizeTokenKind::Separator
+            && token.text(command) == Some(")")
+    }) {
+        Some(end) => &tokens[..end],
+        None => &tokens[..],
+    };
     if tokens
         .iter()
         .any(|token| token.kind == NormalizeTokenKind::Separator)
