@@ -185,6 +185,7 @@ fn quoted_executables_in_shell_groups_are_judged() {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)]
 fn parameter_expansion_parentheses_are_not_group_closes() {
     assert_both(
         "deny",
@@ -205,8 +206,8 @@ fn parameter_expansion_parentheses_are_not_group_closes() {
             r"git restore ${x:+)} --staged .",
             r"git stash ${x:-pop} clear",
             r"git status ${x:+)}",
-            r#"git commit -m '${x:+)} git reset --hard'"#,
-            r#"printf '%s' 'git reset ${x:+)} --hard'"#,
+            r"git commit -m '${x:+)} git reset --hard'",
+            r"printf '%s' 'git reset ${x:+)} --hard'",
         ],
     );
 }
