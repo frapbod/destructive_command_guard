@@ -267,6 +267,11 @@ fn powershell_comments_do_not_hide_following_commands() {
         "$a=@(1)[0]<# it's #>\ngit reset --hard",
         "Write-Output 'x'<# it's #>\ngit reset --hard",
         "Write-Output \"x\"<# it's #>\ngit reset --hard",
+        "Write-Output ([<# it's #>int] 1); git reset --hard",
+        "$x = 3 -<# it's #>\n2; git reset --hard",
+        "$x = 3 *<# it's #>\n2; git reset --hard",
+        "$x = 3 /<# it's #>\n2; git reset --hard",
+        "$x = 3 %<# it's #>\n2; git reset --hard",
     ];
     let harmless = [
         "Write-Output \"#1 it's\"",
@@ -336,6 +341,11 @@ fn powershell_comment_codex_bash_label() {
         "Write-Output `a; $a=@(1)[0]<# it's #>\ngit reset --hard",
         "Write-Output `a; Write-Output 'x'<# it's #>\ngit reset --hard",
         "Write-Output `a; Write-Output \"x\"<# it's #>\ngit reset --hard",
+        "Write-Output `a; Write-Output ([<# it's #>int] 1); git reset --hard",
+        "Write-Output `a; $x = 3 -<# it's #>\n2; git reset --hard",
+        "Write-Output `a; $x = 3 *<# it's #>\n2; git reset --hard",
+        "Write-Output `a; $x = 3 /<# it's #>\n2; git reset --hard",
+        "Write-Output `a; $x = 3 %<# it's #>\n2; git reset --hard",
     ] {
         assert_eq!(
             hook_decision(Protocol::Codex, "Bash", command),

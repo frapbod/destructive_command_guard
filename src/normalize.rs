@@ -2796,6 +2796,11 @@ pub(crate) fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHash
     if bytes.get(index) != Some(&b'#') {
         return PowerShellHashRole::Literal;
     }
+    powershell_comment_predecessor_role(bytes, index)
+}
+
+/// Classify the byte before a possible line or block comment.
+fn powershell_comment_predecessor_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
     if index == 0
         || bytes[index - 1].is_ascii_whitespace()
         || bytes[..index].ends_with("\u{00a0}".as_bytes())
@@ -3113,12 +3118,8 @@ fn consume_shell_escape(bytes: &[u8], i: usize, len: usize) -> usize {
 /// let a `#` start a line comment, including after an operator or closing
 /// quote. `a<#x#>` stays text.
 fn powershell_block_comment_starts_after(bytes: &[u8], i: usize) -> bool {
-    i > 0
-        && bytes.get(i..i + 2) == Some(b"<#")
-        && (matches!(
-            bytes[i - 1],
-            b',' | b'=' | b'+' | b']' | b'}' | b')' | b'(' | b';' | b'|' | b'&' | b'\'' | b'"'
-        ) || bytes[..i].ends_with("\u{00a0}".as_bytes()))
+    bytes.get(i..i + 2) == Some(b"<#")
+        && powershell_comment_predecessor_role(bytes, i) != PowerShellHashRole::Literal
 }
 
 fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments: bool) -> usize {
