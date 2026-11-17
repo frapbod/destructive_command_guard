@@ -5153,25 +5153,37 @@ fn frontend_bail_may_execute_git(words: &[GitSemanticWord], dialect: ShellDialec
 /// quoting cannot hide existing regex-backed `core.git` rules. Callers must not
 /// synthesize source spans from the decoded string.
 pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Option<String> {
-    syntax_view_with_split_words(command, dialect, false)
+    syntax_views_with_split_words(command, dialect, false).map(|mut views| views.swap_remove(0))
 }
 
-/// The decoded Git view that safe patterns may read.
+/// The decoded Git views that a safe pattern must all accept.
 ///
-/// An unquoted expansion whose text holds blanks (`${X:-foo --dry-run}`) may
-/// give those fields or an unknown value. Its text is not proof that a safe
-/// flag reaches Git, so this view reads such a word as one opaque value. The
-/// destructive patterns keep reading its fields through
+/// An unquoted expansion may give its operand's fields or an unknown value
+/// (`${X:-. -"W"}` runs `. -W` when `X` is unset). Its text proves neither
+/// that a safe flag reaches Git nor that an unsafe one does not, so a
+/// `core.git` exemption holds only if it holds under every reading of each
+/// such word: the unset or empty reading (the operand's fields after quote
+/// removal) and the set reading (one opaque value). A split word with blanks
+/// that has no such reading grants no exemption: the result is then empty.
+/// `None` means there is no decoded view; the caller reads the segment as
+/// written. The destructive patterns keep reading the fields through
 /// [`syntax_view_in_dialect`].
-pub(crate) fn safe_syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Option<String> {
-    syntax_view_with_split_words(command, dialect, true)
-}
-
-fn syntax_view_with_split_words(
+pub(crate) fn safe_syntax_views_in_dialect(
     command: &str,
     dialect: ShellDialect,
-    opaque_split_words: bool,
-) -> Option<String> {
+) -> Option<Vec<String>> {
+    syntax_views_with_split_words(command, dialect, true)
+}
+
+/// Readings of one decoded word: `[unset or empty, set]`, each a list of regex
+/// words. `None` means the word has no reading that may grant an exemption.
+type WordReadings = [Vec<String>; 2];
+
+fn syntax_views_with_split_words(
+    command: &str,
+    dialect: ShellDialect,
+    safe_readings: bool,
+) -> Option<Vec<String>> {
     let resolved_substitutions = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         .then(|| resolve_literal_printf_substitutions(command))
         .transpose()
@@ -5186,7 +5198,7 @@ fn syntax_view_with_split_words(
     };
 
     if dialect == ShellDialect::Unknown {
-        return Some(command.to_string());
+        return Some(vec![command.to_string()]);
     }
 
     let command = command.trim();
@@ -5198,7 +5210,9 @@ fn syntax_view_with_split_words(
             PowerShellCallTarget::GitBranch => format!("git branch {tail}"),
             PowerShellCallTarget::Git | PowerShellCallTarget::Dynamic => format!("git {tail}"),
         };
-        return Some(crate::normalize::normalize_command(&synthetic).into_owned());
+        return Some(vec![
+            crate::normalize::normalize_command(&synthetic).into_owned(),
+        ]);
     }
     let command = command
         .strip_prefix('&')
@@ -5230,26 +5244,39 @@ fn syntax_view_with_split_words(
             .collect::<String>()
     };
     let regex_word = |decoded: &str, may_split: bool| {
-        if opaque_split_words && may_split && decoded.contains(char::is_whitespace) {
-            PARAMETER_VALUE.to_string()
-        } else if may_split || (dialect == ShellDialect::PowerShell && decoded.contains('"')) {
+        if may_split || (dialect == ShellDialect::PowerShell && decoded.contains('"')) {
             decoded.to_string()
         } else {
             preserve_word(decoded)
         }
     };
+    let word_readings = |decoded: &str, may_split: bool| -> Option<WordReadings> {
+        if !(safe_readings && may_split) {
+            let word = regex_word(decoded, may_split);
+            return Some([vec![word.clone()], vec![word]]);
+        }
+        if dialect == ShellDialect::Posix
+            && let Some(readings) = posix_parameter_readings(decoded)
+        {
+            return Some(readings.map(|fields| fields.iter().map(|f| preserve_word(f)).collect()));
+        }
+        if decoded.contains(char::is_whitespace) {
+            return None;
+        }
+        Some([vec![decoded.to_string()], vec![decoded.to_string()]])
+    };
     let mut decoder = ShellTokenDecoder::new(dialect);
     let mut words = Vec::with_capacity(tokens.len());
+    let mut readings = Vec::with_capacity(tokens.len());
     for token in tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
     {
         let raw = token.text(command)?;
         if let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) {
-            words.push(regex_word(
-                &decoded,
-                git_token_expansion_may_split(raw, dialect),
-            ));
+            let may_split = git_token_expansion_may_split(raw, dialect);
+            words.push(regex_word(&decoded, may_split));
+            readings.push(word_readings(&decoded, may_split));
         }
     }
     if words.is_empty() {
@@ -5259,7 +5286,7 @@ fn syntax_view_with_split_words(
         // Command-substitution output is argv data; it is not parsed again as
         // shell source. Do not let an `echo "$(printf 'git reset --hard')"`
         // data argument become a synthetic Git invocation in the regex view.
-        return Some("__dcg_non_git_command__".to_string());
+        return Some(vec!["__dcg_non_git_command__".to_string()]);
     }
 
     if let Some(semantic) = decode_git_semantic_words(command, dialect)
@@ -5267,17 +5294,32 @@ fn syntax_view_with_split_words(
         && let Some(executable_index) = semantic_git_executable_index(&semantic.words, dialect)
         && semantic.words[executable_index].dynamic
     {
-        let mut words: Vec<_> = semantic
+        readings = semantic
             .words
             .iter()
-            .map(|word| regex_word(&word.decoded, word.may_split))
+            .map(|word| word_readings(&word.decoded, word.may_split))
             .collect();
-        words[executable_index] = "git".to_string();
-        return Some(crate::normalize::normalize_command(&words.join(" ")).into_owned());
+        readings[executable_index] = Some([vec!["git".to_string()], vec!["git".to_string()]]);
     }
 
-    let decoded = words.join(" ");
-    Some(crate::normalize::normalize_command(&decoded).into_owned())
+    // Every word fixed: one view. Otherwise the all-unset and the all-set
+    // readings. Mixed readings are not tried.
+    let Some(readings) = readings.into_iter().collect::<Option<Vec<_>>>() else {
+        return Some(Vec::new());
+    };
+    let mut views = Vec::with_capacity(2);
+    for choice in 0..2 {
+        let view = readings
+            .iter()
+            .flat_map(|reading| reading[choice].iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let view = crate::normalize::normalize_command(&view).into_owned();
+        if !views.contains(&view) {
+            views.push(view);
+        }
+    }
+    Some(views)
 }
 
 /// An unknown parameter value in a reconstructed Git argv: one word that no
@@ -5289,15 +5331,21 @@ const PARAMETER_VALUE: &str = "__dcg_parameter_value__";
 /// one opaque word. Returns `None` for any other dynamic word, and for operands
 /// that hold further expansions; those keep the conservative raw view.
 fn posix_parameter_argument_readings(word: &GitSemanticWord) -> Option<[Vec<String>; 2]> {
-    if !(word.dynamic
-        && word.may_split
-        && git_dynamic_fragments(&word.decoded, ShellDialect::Posix)
-            .iter()
-            .all(String::is_empty))
+    if !(word.dynamic && word.may_split) {
+        return None;
+    }
+    posix_parameter_readings(&word.decoded)
+}
+
+/// [`posix_parameter_argument_readings`] for one decoded unquoted word.
+fn posix_parameter_readings(decoded: &str) -> Option<[Vec<String>; 2]> {
+    if !git_dynamic_fragments(decoded, ShellDialect::Posix)
+        .iter()
+        .all(String::is_empty)
     {
         return None;
     }
-    let inner = word.decoded.strip_prefix("${")?.strip_suffix('}')?;
+    let inner = decoded.strip_prefix("${")?.strip_suffix('}')?;
     let name_len = inner
         .bytes()
         .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')

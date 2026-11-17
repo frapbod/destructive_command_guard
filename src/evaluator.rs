@@ -768,6 +768,30 @@ impl<'a> SafePatternInputs<'a> {
     }
 }
 
+/// Whether a `core.git` safe pattern exempts `segment`. The exemption must
+/// hold under every reading of the decoded Git argv
+/// ([`crate::packs::core::git::safe_syntax_views_in_dialect`]); a word with
+/// no reading grants none. Without a decoded view the segment is read as
+/// written.
+fn core_git_safe_exemption(
+    pack: &crate::packs::Pack,
+    segment: &str,
+    dialect: ShellDialect,
+    inputs: SafePatternInputs<'_>,
+    range: Option<(usize, usize)>,
+    deadline: Option<&Deadline>,
+) -> bool {
+    match crate::packs::core::git::safe_syntax_views_in_dialect(segment, dialect) {
+        None => inputs.matches(pack, segment, range, deadline),
+        Some(views) => {
+            !views.is_empty()
+                && views
+                    .iter()
+                    .all(|view| inputs.matches(pack, view, range, deadline))
+        }
+    }
+}
+
 fn compute_normalized_offset(command_for_match: &str, normalized: &str) -> Option<usize> {
     if normalized == command_for_match {
         return Some(0);
@@ -28064,18 +28088,14 @@ fn evaluate_packs_with_allowlists_at_depth(
                     ) {
                         return result;
                     }
-                    let safe_view = crate::packs::core::git::safe_syntax_view_in_dialect(
+                    if core_git_safe_exemption(
+                        pack,
                         segment,
                         shell_dialect,
-                    );
-                    if SafePatternInputs::new(core_git_command, input_command, shell_dialect)
-                        .matches(
-                            pack,
-                            safe_view.as_deref().unwrap_or(segment),
-                            Some((segment_start - command_prefix_len, segment_end)),
-                            deadline,
-                        )
-                    {
+                        SafePatternInputs::new(core_git_command, input_command, shell_dialect),
+                        Some((segment_start - command_prefix_len, segment_end)),
+                        deadline,
+                    ) {
                         continue;
                     }
 
@@ -28149,18 +28169,14 @@ fn evaluate_packs_with_allowlists_at_depth(
                     ) {
                         return result;
                     }
-                    let safe_view = crate::packs::core::git::safe_syntax_view_in_dialect(
+                    if core_git_safe_exemption(
+                        pack,
                         core_git_segment,
                         shell_dialect,
-                    );
-                    if SafePatternInputs::new(core_git_command, input_command, shell_dialect)
-                        .matches(
-                            pack,
-                            safe_view.as_deref().unwrap_or(core_git_segment),
-                            None,
-                            deadline,
-                        )
-                    {
+                        SafePatternInputs::new(core_git_command, input_command, shell_dialect),
+                        None,
+                        deadline,
+                    ) {
                         continue;
                     }
                     if let Some(result) = evaluate_pack_destructive_patterns(

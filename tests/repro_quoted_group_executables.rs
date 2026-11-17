@@ -278,3 +278,64 @@ fn safe_quoted_shell_groups_remain_allowed() {
         ],
     );
 }
+
+/// t_25afdc20 review round 4: a flag inside an unquoted expansion's operand
+/// reaches Git when the parameter is unset (`${X:-. -"W"}` runs
+/// `git restore --staged . -W`, which discards worktree changes). A safe
+/// exemption must hold under every reading of such a word, in a plain
+/// command and inside a subshell, function body or case arm alike. Only dcg
+/// reads these strings; this test does not execute their shell source.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn expansion_operands_cannot_grant_core_git_exemptions() {
+    let unsafe_commands = [
+        r#"git restore --staged ${X:-. -"W"}"#,
+        r"git restore --staged ${X:-. -\W}",
+        r"git restore --staged ${X:-. -'W'}",
+        r#"git restore --staged ${X:-. --work"tree"}"#,
+        r#"git restore -S ${X:-. -"W"}"#,
+        r#"git restore --staged ${X:=. -"W"}"#,
+        r#"git restore --staged ${X-. -"W"}"#,
+        r#"X=; git restore --staged ${X:-. -"W"}"#,
+        r#"cd /tmp && git restore --staged ${X:-. -"W"}"#,
+        r#"git restore --staged ${X:-. -"W"} && echo ok"#,
+        r#"git restore --staged ${X:-. -"W"} ${Y}"#,
+        r"git restore --staged ${X:--W}",
+        r#"git restore --staged ${X:+-"W"} ."#,
+        r#"git restore --staged . ${X:+--"worktree"}"#,
+        r#"git restore --staged ${X:-. -"W"$Z}"#,
+        r#"bash -c 'git restore --staged ${X:-. -"W"}'"#,
+        r#"( git restore --staged ${X:-. -"W"} )"#,
+        r#"f() { git restore --staged ${X:-. -"W"}; }; f"#,
+        r#"case a in a) git restore --staged ${X:-. -"W"};; esac"#,
+    ];
+    let safe_commands = [
+        r"git restore --staged ${X:-a b}",
+        r"git restore --staged ${FILES}",
+        r"git restore --staged ${X:-src docs}",
+        r"git restore --staged ${X:-.} ${Y:-src}",
+        r"git clean -n ${X:-a b}",
+        r"git clean -n ${FILES}",
+        r"git checkout -b ${X:-a b}",
+        r"( git restore --staged ${X:-src docs} )",
+        r"f() { git clean -n ${FILES}; }; f",
+    ];
+    assert_both("deny", &unsafe_commands);
+    assert_both("allow", &safe_commands);
+    let mut wrong = Vec::new();
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in unsafe_commands {
+            let actual = hook_decision_with_tool(protocol, command, "Shell");
+            if actual != "deny" {
+                wrong.push(format!("{protocol:?} Shell {actual}: {command}"));
+            }
+        }
+        for command in safe_commands {
+            let actual = hook_decision_with_tool(protocol, command, "Shell");
+            if actual != "allow" {
+                wrong.push(format!("{protocol:?} Shell {actual}: {command}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "unknown shell:\n{}", wrong.join("\n"));
+}
