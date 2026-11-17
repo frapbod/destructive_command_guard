@@ -213,6 +213,96 @@ fn variable_executables_respect_actual_override_kinds() {
             r"PATH=/usr/local/bin:$PATH; git reset --hard",
             r"alias git=echo; git reset --hard",
             r"git() { :; }; unset -f git; git reset --hard",
+            // Bash clears its command hash with hash -r or a PATH assignment.
+            r#"hash -p /usr/bin/printf git; hash -r; X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; PATH="$PATH"; X=gi; "${X}t" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn command_override_state_is_scoped_and_nonmonotonic() {
+    assert_both(
+        "deny",
+        &[
+            // The first use is overridden, but the later use is not.
+            r#"git() { :; }; X=gi; "${X}t" reset --hard; unset -f git; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; X=gi; "${X}t" reset --hard; hash -r; "${X}t" reset --hard"#,
+            // An uncalled function's body does not define its nested function.
+            r#"outer() { git() { :; }; }; X=gi; "${X}t" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn command_override_invalidation_in_child_or_skipped_branch_does_not_leak() {
+    assert_both(
+        "allow",
+        &[
+            // Neither a failed conditional nor a child can clear the parent binding.
+            r#"git() { :; }; false && unset -f git; X=gi; "${X}t" reset --hard"#,
+            r#"git() { :; }; (unset -f git); X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; (hash -r); X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; false && hash -r; X=gi; "${X}t" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn eval_uses_live_override_state() {
+    assert_both(
+        "deny",
+        &[
+            r#"git() { :; }; unset -f git; X=gi; eval '"${X}t" reset --hard'"#,
+            r#"hash -p /usr/bin/printf git; hash -r; X=gi; eval '"${X}t" reset --hard'"#,
+        ],
+    );
+}
+
+#[test]
+fn eval_preserves_active_override_state() {
+    assert_both(
+        "allow",
+        &[
+            r#"git() { :; }; X=gi; eval '"${X}t" reset --hard'"#,
+            r#"hash -p /usr/bin/printf git; X=gi; eval '"${X}t" reset --hard'"#,
+            r#"X=gi; eval 'git() { :; }; "${X}t" reset --hard'"#,
+        ],
+    );
+}
+
+#[test]
+fn child_shell_write_does_not_change_parent_binding() {
+    // A child shell cannot change its parent's binding.
+    assert_both("allow", &[r"X=a; (X=' '); git${X}reset${X}--hard"]);
+}
+
+#[test]
+fn scope_controls_for_proven_bindings() {
+    assert_both(
+        "deny",
+        &[
+            r"{ X=' '; }; git${X}reset${X}--hard",
+            r"X=' '; echo $(X=a); git${X}reset${X}--hard",
+            r"X=' '; (X=a); git${X}reset${X}--hard",
+            r"( { X=' '; }; git${X}reset${X}--hard )",
+        ],
+    );
+}
+
+#[test]
+fn scope_controls_keep_harmless_commands() {
+    assert_both(
+        "allow",
+        &[
+            r"X=a; false && { X=' '; }; git${X}reset${X}--hard",
+            r"X=a; if false; then { X=' '; }; fi; git${X}reset${X}--hard",
+            r"X=a; { X=' '; } | cat; git${X}reset${X}--hard",
+            r"X=a; { X=' '; } & wait; git${X}reset${X}--hard",
+            r"X=a; ( { X=' '; }; : ); git${X}reset${X}--hard",
+            r"X=a; echo $(X=' '); git${X}reset${X}--hard",
+            r"{ X=' '; }; echo${X}reset${X}--hard",
+            r"X=' '; echo $(X=a); git${X}status",
         ],
     );
 }
