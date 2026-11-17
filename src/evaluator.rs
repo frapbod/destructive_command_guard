@@ -6198,7 +6198,18 @@ fn parse_windows_launcher_segment_as(
         }
     }
     let segment = static_substitution.as_deref().unwrap_or(segment);
-    let tokens = tokenize_for_shell_dialect(segment, outer_dialect);
+    // A POSIX shell keeps a CR inside a word (it is not a metacharacter), so
+    // `cmd.exe /c gi<CR>t reset --hard` hands cmd the argument `gi<CR>t`,
+    // and cmd removes the CR. The shared tokenizer ends a word at a CR. Mark
+    // word boundaries on a spelling with each CR as another word byte (same
+    // length), and take the words from the segment itself, so the launcher
+    // payload keeps the CR its shell reading needs.
+    let cr_as_word_byte = (outer_dialect == ShellDialect::Posix && segment.contains('\r'))
+        .then(|| segment.replace('\r', "\u{1}"));
+    let tokens = tokenize_for_shell_dialect(
+        cr_as_word_byte.as_deref().unwrap_or(segment),
+        outer_dialect,
+    );
     if tokens
         .iter()
         .any(|token| token.kind == NormalizeTokenKind::Separator)
