@@ -17867,25 +17867,17 @@ fn posix_proven_variable_view(
         return Err(ProvenViewIncomplete::Budget);
     }
     // The packs judge a command name as the program of that name. When
-    // earlier shell state can bind the name to something else
-    // (`hash -p /usr/bin/printf git`, a function, an alias), the
-    // reconstruction would name the wrong program; the variable-aware
-    // analyses that see the original keep that context. The check parses
-    // the source before the segment, so ask once per program at its last
-    // use: a source with no override there has none before its earlier
-    // uses either.
-    let mut overridable: HashMap<&str, bool> = HashMap::new();
-    for (start, _, _, program) in spliced.iter().rev() {
-        if !program.is_empty() && !overridable.contains_key(program.as_str()) {
-            let overridden =
-                crate::heredoc::shell_name_may_be_overridden_before(command, *start, program);
-            overridable.insert(program, overridden);
-        }
-    }
+    // earlier shell state proves the name runs something else
+    // (`hash -p /usr/bin/printf git`, a function), the reconstruction would
+    // name the wrong program; the variable-aware analyses that see the
+    // original keep that context. State that only may have changed it
+    // (`PATH`, `source`, a removed function) leaves the reconstruction to be
+    // judged: this view only adds denials. The state can go back
+    // (`unset -f`, `hash -r`), so each use is asked on its own.
     let mut copied = 0usize;
     for (start, end, resolved, program) in &spliced {
-        if overridable.get(program.as_str()).copied().unwrap_or(false)
-            && crate::heredoc::shell_name_may_be_overridden_before(command, *start, program)
+        if !program.is_empty()
+            && crate::heredoc::shell_name_proven_shadowed_before(command, *start, program)
         {
             continue;
         }
@@ -17970,7 +17962,7 @@ fn resolve_proven_eval_arguments(
                 // The body's own command name keeps its owner too.
                 let program = hazard_first_word(resolved);
                 program.is_empty()
-                    || !crate::heredoc::shell_name_may_be_overridden_before(
+                    || !crate::heredoc::shell_name_proven_shadowed_before(
                         source,
                         segment_start,
                         &program,
@@ -29998,7 +29990,19 @@ fn resolve_variable_bindings(
     // statements it adds all come after the ones it read, so the cost stays
     // linear in the statements. A nameref alias changes what the scan
     // visits, so those reads are not cached.
-    let checkpoints = index.as_ref().filter(|_| aliases.is_empty());
+    // How the shell runs an earlier statement depends on the constructs it
+    // shares with the use ([`deny_only_segment_scope`]), so only a use no
+    // construct holds can share another's state.
+    let scopes = index.as_ref().and_then(|index| index.scopes());
+    let use_at_top_level = scopes.is_none_or(|scopes| {
+        let after = scopes
+            .top_level
+            .partition_point(|range| range.start < segment_start);
+        after == 0 || scopes.top_level[after - 1].end <= segment_start
+    });
+    let checkpoints = index
+        .as_ref()
+        .filter(|_| aliases.is_empty() && use_at_top_level);
     let resumed = checkpoints.and_then(|index| {
         let checkpoint = index.checkpoints.borrow().get(name).cloned()?;
         (!checkpoint.refused
@@ -30053,6 +30057,16 @@ fn resolve_variable_bindings(
             if segment.is_empty() {
                 continue;
             }
+            // Deny-only reads how the shell runs the segment from the parse:
+            // a child shell's statements cannot change the use's value, and
+            // only a statement the use's shell always runs binds it. Without
+            // a parse, the text rules below decide.
+            let scope = scopes.and_then(|scopes| {
+                deny_only_segment_scope(scopes, source, start, end, segment_start)
+            });
+            if matches!(scope, Some((crate::heredoc::ShellScope::Child, _))) {
+                continue;
+            }
             // A binding inside a command or process substitution runs in a
             // subshell and cannot set `NAME` for this segment — the live value
             // would come from the ambient environment instead
@@ -30071,20 +30085,36 @@ fn resolve_variable_bindings(
             // below, where `segment_text_may_assign` refuses the proof outright —
             // which is the right answer, because an unprovable binding is exactly
             // the case the exemption must not cover.
-            let binds_in_parent = !nested
+            let binds_in_parent = match &scope {
+                Some((scope, _)) => *scope == crate::heredoc::ShellScope::Always,
+                None => {
+                    !nested
+                        && (segment_binding_reaches_parent_shell(source, start, end)
+                            || (matches!(mode, VariableResolution::Redirect { .. })
+                                && source
+                                    .get(..start)
+                                    .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
+                                && conditional_binding_dominates_redirect(
+                                    source,
+                                    end,
+                                    segment_start,
+                                )))
+                }
+            }
                 // A heredoc is input to another command, not a parent-shell
                 // assignment scope. Keep its segments in the hazard checks below:
                 // an expanding body can still mutate the caller's shell state.
                 && !heredoc_bodies
                     .iter()
-                    .any(|(body, _)| body.start < end && start < body.end)
-                && (segment_binding_reaches_parent_shell(source, start, end)
-                    || (matches!(mode, VariableResolution::Redirect { .. })
-                        && source
-                            .get(..start)
-                            .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
-                        && conditional_binding_dominates_redirect(source, end, segment_start)));
+                    .any(|(body, _)| body.start < end && start < body.end);
             if binds_in_parent {
+                // The statement without the `{` that opens its group.
+                let segment = match &scope {
+                    Some((_, statement)) => {
+                        source.get(statement.clone()).map_or(segment, str::trim)
+                    }
+                    None => segment,
+                };
                 let assignments = strip_assignment_declaration(segment);
                 let binding = match assignment_only_segment_binding(assignments, name) {
                     AssignmentOnlyBinding::NotAssignmentOnly => assignments
@@ -30204,17 +30234,38 @@ fn resolve_variable_bindings(
             }
             // Text of a quoted heredoc body in this segment is data to the outer
             // shell; only the rest can mutate `NAME`.
+            // So is the text of a child shell inside it (`echo $(X=a)`) that
+            // does not hold the use.
+            let children: Vec<(Range<usize>, bool)> = scopes
+                .map(|scopes| {
+                    let from = scopes
+                        .child_shells
+                        .partition_point(|child| child.start < start);
+                    scopes.child_shells[from..]
+                        .iter()
+                        .take_while(|child| child.start < end)
+                        .filter(|child| child.end <= end && !child.contains(&segment_start))
+                        .map(|child| (child.clone(), true))
+                        .collect()
+                })
+                .unwrap_or_default();
             let blanked;
             let segment = if deny_only
-                && heredoc_bodies
-                    .iter()
-                    .any(|(body, quoted)| *quoted && body.start < end && start < body.end)
+                && (!children.is_empty()
+                    || heredoc_bodies
+                        .iter()
+                        .any(|(body, quoted)| *quoted && body.start < end && start < body.end))
             {
-                blanked = blank_quoted_heredoc_bodies(source, start, end, &heredoc_bodies);
+                let mut bodies = children;
+                bodies.extend(heredoc_bodies.iter().cloned());
+                blanked = blank_quoted_heredoc_bodies(source, start, end, &bodies);
                 blanked.trim()
             } else {
                 segment
             };
+            if segment.is_empty() {
+                continue;
+            }
             // A write through a nameref of `NAME` writes `NAME`
             // (`declare -n r=X; r=a` sets X).
             if !aliases.is_empty() {
@@ -30384,8 +30435,14 @@ fn posix_unset_names(segment: &str) -> Option<Vec<&str>> {
         return None;
     }
     let mut names = Vec::new();
+    // `unset -f NAME` removes functions and leaves every variable alone.
+    let mut functions = false;
     for word in words {
         if word == "-v" {
+            continue;
+        }
+        if word == "-f" {
+            functions = true;
             continue;
         }
         let identifier = word
@@ -30399,6 +30456,9 @@ fn posix_unset_names(segment: &str) -> Option<Vec<&str>> {
             return None;
         }
         names.push(word);
+    }
+    if functions {
+        names.clear();
     }
     Some(names)
 }
@@ -30490,6 +30550,51 @@ struct DenyOnlySegmentIndex {
     nameref_positions: Vec<usize>,
     /// Offset of the first `IFS` in the source.
     first_ifs: Option<usize>,
+    /// [`crate::heredoc::shell_scope_index`] of the source, parsed on first
+    /// use.
+    scopes: std::cell::OnceCell<Option<crate::heredoc::ShellScopeIndex>>,
+}
+
+impl DenyOnlySegmentIndex {
+    fn scopes(&self) -> Option<&crate::heredoc::ShellScopeIndex> {
+        self.scopes
+            .get_or_init(|| {
+                (self.source.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
+                    .then(|| crate::heredoc::shell_scope_index(&self.source))
+                    .flatten()
+            })
+            .as_ref()
+    }
+}
+
+/// How the shell runs the segment `start..end` as seen from `point`, and
+/// the statement it holds, when the parse places it. A segment can start
+/// with the `{` or `(` that opens its group (`{ X=' '; }` splits into
+/// `{ X=' '` and `}`).
+fn deny_only_segment_scope(
+    scopes: &crate::heredoc::ShellScopeIndex,
+    source: &str,
+    start: usize,
+    end: usize,
+    point: usize,
+) -> Option<(crate::heredoc::ShellScope, Range<usize>)> {
+    let segment = source.get(start..end)?;
+    let inner =
+        segment.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '{' || ch == '(');
+    let first = start + (segment.len() - inner.len());
+    let from = scopes
+        .statements
+        .partition_point(|(range, _)| range.start < first);
+    let (range, steps) = scopes.statements[from..]
+        .iter()
+        .take_while(|(range, _)| range.start == first)
+        .filter(|(range, _)| range.end <= end)
+        .max_by_key(|(range, _)| range.end)?;
+    source
+        .get(range.end..end)?
+        .bytes()
+        .all(|byte| byte.is_ascii_whitespace() || matches!(byte, b'}' | b')'))
+        .then(|| (crate::heredoc::shell_scope_at(steps, point), range.clone()))
 }
 
 /// Where a deny-only scan of one name stopped, in byte offsets of the
@@ -30655,6 +30760,7 @@ fn deny_only_segment_index(
             checkpoints: std::cell::RefCell::default(),
             nameref_positions,
             first_ifs: source.find("IFS"),
+            scopes: std::cell::OnceCell::new(),
         });
         *last.borrow_mut() = Some(Rc::clone(&index));
         index

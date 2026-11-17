@@ -239,11 +239,28 @@ fn command_override_invalidation_in_child_or_skipped_branch_does_not_leak() {
     assert_both(
         "allow",
         &[
-            // Neither a failed conditional nor a child can clear the parent binding.
-            r#"git() { :; }; false && unset -f git; X=gi; "${X}t" reset --hard"#,
+            // A child shell cannot clear the parent's function or hash entry.
             r#"git() { :; }; (unset -f git); X=gi; "${X}t" reset --hard"#,
             r#"hash -p /usr/bin/printf git; (hash -r); X=gi; "${X}t" reset --hard"#,
-            r#"hash -p /usr/bin/printf git; false && hash -r; X=gi; "${X}t" reset --hard"#,
+            r#"git() { :; }; echo $(unset -f git); X=gi; "${X}t" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn command_override_removed_in_a_branch_is_not_proof() {
+    // A removal in a branch may have run, so the view judges the command
+    // that names git. `false &&` is read the same way: an accepted extra
+    // denial.
+    assert_both(
+        "deny",
+        &[
+            r#"git() { :; }; test -n "$C" && unset -f git; X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; test -n "$C" && hash -r; X=gi; "${X}t" reset --hard"#,
+            r#"test -n "$C" && git() { :; }; X=gi; "${X}t" reset --hard"#,
+            r#"(git() { :; }); X=gi; "${X}t" reset --hard"#,
+            r#"git() { :; } & X=gi; "${X}t" reset --hard"#,
+            r#"source ./env.sh; X=gi; "${X}t" reset --hard"#,
         ],
     );
 }
@@ -266,7 +283,6 @@ fn eval_preserves_active_override_state() {
         &[
             r#"git() { :; }; X=gi; eval '"${X}t" reset --hard'"#,
             r#"hash -p /usr/bin/printf git; X=gi; eval '"${X}t" reset --hard'"#,
-            r#"X=gi; eval 'git() { :; }; "${X}t" reset --hard'"#,
         ],
     );
 }
@@ -574,5 +590,69 @@ fn many_references_to_one_name_are_read_in_linear_time() {
         started.elapsed() < std::time::Duration::from_secs(20),
         "four hook runs took {:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+fn child_shell_and_group_scope_follow_bash() {
+    // Bash runs a pipeline stage, a background job, a process substitution
+    // and a backquoted substitution in a child shell, and a brace group in
+    // the current shell, so each of these runs `git reset --hard`.
+    assert_both(
+        "deny",
+        &[
+            r"X=' '; echo a | read X; git${X}reset${X}--hard",
+            r"X=' '; X=a & git${X}reset${X}--hard",
+            r"X=' '; cat <(X=a); git${X}reset${X}--hard",
+            r"X=' '; echo `X=a`; git${X}reset${X}--hard",
+            r"X=a; ( X=' '; git${X}reset${X}--hard )",
+            r"{ { X=' '; }; }; git${X}reset${X}--hard",
+            r"{ X=' '; } > /dev/null; git${X}reset${X}--hard",
+            r"{ unset IFS; }; X=' '; git${X}reset${X}--hard",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            // Arithmetic assigns in the current shell: `git1reset1--hard`.
+            r"X=' '; echo $((X=1)); git${X}reset${X}--hard",
+            // The function call sets X=a first.
+            r"X=' '; f() { X=a; }; f; git${X}reset${X}--hard",
+            // Inside the substitution X is a.
+            r"X=' '; echo $(X=a; git${X}reset${X}--hard)",
+            r"unset -f IFS; IFS=x; X=' '; git${X}reset${X}--hard",
+        ],
+    );
+}
+
+#[test]
+fn only_a_proven_function_or_hash_entry_skips_the_view() {
+    assert_both(
+        "deny",
+        &[
+            // A function of another name, or one defined after the use.
+            r#"ls() { :; }; X=gi; "${X}t" reset --hard"#,
+            r#"X=gi; "${X}t" reset --hard; git() { :; }"#,
+            // A hash entry for a file named git still runs a git.
+            r#"hash -p /usr/bin/git git; X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; hash -d git; X=gi; "${X}t" reset --hard"#,
+            r"export PATH=/opt/bin:$PATH; X=' '; git${X}reset${X}--hard",
+        ],
+    );
+}
+
+#[test]
+fn permission_lifting_proofs_keep_refusing_group_and_child_bindings() {
+    // The deny-only scope rules must not reach the proofs that can exempt
+    // a command: each of these stays denied, as in 0.16.0.
+    assert_both(
+        "deny",
+        &[
+            r#"D=$HOME; { D=/tmp/build; }; rm -rf "$D""#,
+            r#"if test -n "$C"; then D=/tmp/build; fi; rm -rf "$D""#,
+            r"F=/etc/passwd; { F=/dev/null; }; echo x > $F",
+            r"F=/dev/null; echo $(F=/etc/passwd); echo x > $F",
+            r"F=/etc/passwd; true && F=/dev/null; echo x > $F",
+        ],
     );
 }
