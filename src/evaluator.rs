@@ -15780,6 +15780,39 @@ fn evaluate_command_in_dialect_union(
         primary
     };
 
+    // Unknown includes POSIX (for example a Windows Codex payload may request
+    // bash). Its generic normalization can lose quoting in command words, so
+    // retain the independently parsed POSIX reading when quotes or escapes can
+    // alter an executable. Only a denial or an incomplete read is adopted.
+    let primary = if shell_dialect == ShellDialect::Unknown
+        && nested_command_depth == 0
+        && primary.decision == EvaluationDecision::Allow
+        && primary.allowlist_override.is_none()
+        && command.contains(['\'', '"', '\\'])
+    {
+        let alternate = evaluate_command_in_single_dialect_view(
+            command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            ShellDialect::Posix,
+            nested_command_depth,
+            inherited_automated_stdin,
+        );
+        if alternate.decision != EvaluationDecision::Allow {
+            return alternate;
+        }
+        primary
+    } else {
+        primary
+    };
+
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
         || primary.decision != EvaluationDecision::Allow

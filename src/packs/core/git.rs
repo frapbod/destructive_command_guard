@@ -5286,6 +5286,50 @@ pub(crate) fn syntax_view_for_pattern_matching(
         .skip(executable_index + 1)
         .any(|word| word.dynamic)
     {
+        // An unquoted parameter-only argument can disappear when its value is
+        // empty. The raw regex view cannot walk punctuation inside `${...}`;
+        // try that possible argv without ever using it as a safe exemption.
+        // Keep all other dynamic words on the existing conservative path.
+        let args = &decoded.words[executable_index + 1..];
+        let can_drop = |word: &GitSemanticWord| {
+            word.dynamic
+                && word.may_split
+                && word.decoded.starts_with("${")
+                && word.decoded.ends_with('}')
+                && git_dynamic_fragments(&word.decoded, ShellDialect::Posix)
+                    .iter()
+                    .all(String::is_empty)
+                && {
+                    // Recognize only operators which can produce no fields:
+                    // a bare parameter, `+`/`:+`, or pattern substitution /
+                    // removal. Defaults, assignment and errors need a value
+                    // model instead of guessing that the result can vanish.
+                    let inner = &word.decoded[2..word.decoded.len() - 1];
+                    let name_len = inner
+                        .bytes()
+                        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                        .count();
+                    name_len > 0
+                        && inner.as_bytes()[0].is_ascii_alphabetic()
+                        && (inner[name_len..].is_empty()
+                            || inner[name_len..].starts_with(['+', '/', '%', '#'])
+                            || inner[name_len..].starts_with(":+"))
+                }
+        };
+        if dialect == ShellDialect::Posix
+            && args.iter().any(can_drop)
+            && args.iter().all(|word| !word.dynamic || can_drop(word))
+        {
+            let mut candidate = String::from("git");
+            for word in args.iter().filter(|word| !can_drop(word)) {
+                candidate.push(' ');
+                candidate.push_str(&shell_words::quote(&word.decoded));
+            }
+            let sanitized = crate::context::sanitize_for_pattern_matching(&candidate);
+            if AMBIGUITY_ARBITER.check(sanitized.as_ref()).is_some() {
+                return syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix);
+            }
+        }
         return sanitized_view;
     }
 

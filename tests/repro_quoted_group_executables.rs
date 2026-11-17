@@ -15,7 +15,12 @@ enum Protocol {
     Codex,
 }
 
-fn payload(protocol: Protocol, command: &str, cwd: &std::path::Path, tool_name: &str) -> serde_json::Value {
+fn payload(
+    protocol: Protocol,
+    command: &str,
+    cwd: &std::path::Path,
+    tool_name: &str,
+) -> serde_json::Value {
     match protocol {
         Protocol::Claude => serde_json::json!({
             "session_id": "sess-var",
@@ -180,6 +185,33 @@ fn quoted_executables_in_shell_groups_are_judged() {
 }
 
 #[test]
+fn parameter_expansion_parentheses_are_not_group_closes() {
+    assert_both(
+        "deny",
+        &[
+            r"git checkout ${x:+)} -- .",
+            r"git checkout ${x:-)} -- .",
+            r"git reset ${x//)} --hard",
+            r"git push ${x:+)} --force origin main",
+            r"rm ${x:+)} -rf /tmp/zz",
+            r"git clean ${x:+)} -fdx",
+            r"git stash ${x:+)} clear",
+            r#"( cd /tmp && "git" reset ${x:+(} --hard )"#,
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r"git restore ${x:+)} --staged .",
+            r"git stash ${x:-pop} clear",
+            r"git status ${x:+)}",
+            r#"git commit -m '${x:+)} git reset --hard'"#,
+            r#"printf '%s' 'git reset ${x:+)} --hard'"#,
+        ],
+    );
+}
+
+#[test]
 fn quoted_git_groups_with_unknown_shell_are_judged() {
     for protocol in [Protocol::Claude, Protocol::Codex] {
         for command in [
@@ -190,10 +222,18 @@ fn quoted_git_groups_with_unknown_shell_are_judged() {
             r#"function f { g"it" reset --hard; }; f"#,
             r#"f(){ g"it" push --force origin main; }; f"#,
             r#"if true; then g"it" reset --hard; fi"#,
+            r#"cat <( cd /tmp && "git" reset --hard )"#,
         ] {
-            assert_eq!(hook_decision_with_tool(protocol, command, "Shell"), "deny", "{protocol:?}: {command}");
+            assert_eq!(
+                hook_decision_with_tool(protocol, command, "Shell"),
+                "deny",
+                "{protocol:?}: {command}"
+            );
         }
-        assert_eq!(hook_decision_with_tool(protocol, r#"f(){ g"it" status; }; f"#, "Shell"), "allow");
+        assert_eq!(
+            hook_decision_with_tool(protocol, r#"f(){ g"it" status; }; f"#, "Shell"),
+            "allow"
+        );
     }
 }
 

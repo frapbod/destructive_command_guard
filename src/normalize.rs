@@ -5067,7 +5067,11 @@ mod tests {
             "$(echo ${x:+)})",
         ] {
             let line = format!("{word}; next");
-            assert_eq!(super::consume_word_token(line.as_bytes(), 0, line.len()), word.len(), "{line}");
+            assert_eq!(
+                super::consume_word_token(line.as_bytes(), 0, line.len()),
+                word.len(),
+                "{line}"
+            );
         }
     }
     use super::*;
