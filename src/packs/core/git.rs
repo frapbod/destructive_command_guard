@@ -1326,7 +1326,10 @@ fn command_after_posix_control_prefixes_bounded(
         && !first
             .into_iter()
             .chain(words.next())
-            .any(|word| word.contains(['(', ')']))
+            // A backslash-newline between a function name and `()` may
+            // leave more than two whitespace-separated probe words. Let
+            // the tokenizer inspect such a prefix rather than skipping it.
+            .any(|word| word.contains(['(', ')']) || word.ends_with('\\'))
     {
         return (segment, 0);
     }
@@ -7918,6 +7921,19 @@ mod tests {
                 InvokedGitAliasDecision::Unverified,
                 "PowerShell call-operator expressions must fail closed: {command}"
             );
+        }
+    }
+
+    #[test]
+    fn posix_function_prefix_with_line_continuations_exposes_body() {
+        for segment in [
+            "echo \\\n () \\\n { eval \"$*\"",
+            "echo\\\n() { eval \"$*\"",
+            "echo \\\n \\\n () { eval \"$*\"",
+        ] {
+            let (body, offset) = command_after_posix_control_prefixes(segment, ShellDialect::Posix);
+            assert_eq!(body, "eval \"$*\"", "{segment:?}");
+            assert_eq!(&segment[offset..], body, "{segment:?}");
         }
     }
 
