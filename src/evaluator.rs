@@ -15326,20 +15326,25 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             result = alternate;
         }
     }
-    // PowerShell (the shell Codex runs on Windows) and cmd.exe have no
-    // backslash escape: `"C:\temp\"` is a complete string there. The shared
-    // scanners read `\"` as an escaped quote, so in `Write-Output "C:\temp\";
-    // git reset --hard` they saw one string. When the command may run in one
-    // of those shells, read it again with its backslashes spelled `/`, which
-    // parses the same for them (see `without_backslash_escapes`), with `$'`
-    // read plainly too, as PowerShell does. Deny wins, as between dialect
-    // views. The spelling differs from the command as written, so what the
-    // user authorized as written stays authorized, and no allow-once grant is
+    // PowerShell (the shell Codex runs on Windows) has no backslash escape:
+    // `"C:\temp\"` is a complete string there. The shared scanners read `\"`
+    // as an escaped quote, so even the PowerShell view saw one string in
+    // `Write-Output "C:\temp\"; git reset --hard`. When the command may be
+    // PowerShell and its backslashes move a command boundary, read it again
+    // as PowerShell with them spelled `/`, which PowerShell parses the same
+    // way (see `without_backslash_escapes`), with `$'` read plainly too, as
+    // PowerShell does. Only the PowerShell view reads the copy: POSIX shells
+    // do give the backslashes meaning. Deny wins, as between dialect views.
+    // The spelling differs from the command as written, so what the user
+    // authorized as written stays authorized, and no allow-once grant is
     // spent. Like the plain `$'` reading, nothing inside a second reading is
     // read again.
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
-        && !matches!(shell_dialect, ShellDialect::Posix)
+        && matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        )
         && !crate::context::PlainDollarQuoteReading::active()
         && let Some(spelled) = crate::normalize::without_backslash_escapes(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
@@ -15359,7 +15364,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 None,
                 project_path,
                 deadline,
-                shell_dialect,
+                ShellDialect::PowerShell,
                 nested_command_depth,
                 inherited_automated_stdin,
             )
@@ -40778,9 +40783,10 @@ mod tests {
             "cd ~/.ssh && rm id_rsa.pub",
             "cd ~/.ssh && ls -la",
             "cd ~/.ssh && echo hi 2>&1 > /tmp/x",
-            // The sanitizer now exposes every glued redirect; a quoted arrow
-            // is still echo's data.
+            // The sanitizer now exposes every glued redirect; a quoted or
+            // escaped arrow is still echo's data.
             "echo \"a>.git/config\"",
+            "echo a\\>.git/config",
             // A static substitution naming an ordinary file, and one that is
             // not static at all (the `rm $UNKNOWN` posture).
             "rm $(echo /home/user/notes.txt)",
@@ -40794,15 +40800,6 @@ mod tests {
                 "{command:?}: no proven directory makes this a protected file"
             );
         }
-        // An escaped arrow is echo's data in a POSIX shell. PowerShell and
-        // cmd.exe have no backslash escape and write `.git/config`, so the
-        // union of dialects denies it.
-        let escaped = "echo a\\>.git/config";
-        assert!(
-            evaluate_with_pack_ids_in_dialect(escaped, &["core.filesystem"], ShellDialect::Posix)
-                .is_allowed()
-        );
-        assert!(evaluate_with_pack_ids(escaped, &["core.filesystem"]).is_denied());
 
         assert_eq!(
             anchor_relative_words("echo x > authorized_keys", "~/.ssh").as_deref(),

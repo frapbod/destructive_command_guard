@@ -3117,26 +3117,43 @@ fn consume_powershell_here_string(bytes: &[u8], start: usize, len: usize) -> Opt
     Some(len)
 }
 
-/// `command` with every backslash spelled `/`, or `None` when no backslash
-/// can move a POSIX quote, escape or word boundary.
+/// `command` with every backslash spelled `/`, or `None` unless that moves a
+/// POSIX command boundary.
 ///
-/// PowerShell and cmd.exe have no backslash escape: `"C:\temp\"` is a
-/// complete string there (PowerShell escapes with a backtick). dcg's shared
-/// scanners read `\"` as an escaped quote, so `Write-Output "C:\temp\"; git
-/// reset --hard` looked like one string to them. A backslash means nothing to
-/// either Windows shell, and `/` is the other path separator Windows accepts,
-/// so this length-preserving spelling parses the same for them, while the
-/// POSIX scanners now find the boundaries those shells find. A backslash
-/// before an ASCII letter, digit, `.`, `-` or `_` moves no POSIX boundary, so
-/// a command whose backslashes are all such path separators gets `None`.
+/// PowerShell has no backslash escape: `"C:\temp\"` is a complete string
+/// there (it escapes with a backtick). dcg's shared scanners read `\"` as an
+/// escaped quote, so the string ran on over `; git reset --hard` in
+/// `Write-Output "C:\temp\"; git reset --hard`. A backslash means nothing to
+/// PowerShell, and `/` is the other path separator Windows accepts, so this
+/// length-preserving spelling parses the same for PowerShell, while the
+/// POSIX scanners now find the separators PowerShell finds. A backslash
+/// before an ASCII letter, digit, `.`, `-` or `_` cannot move a boundary, so
+/// such paths skip the comparison.
 pub(crate) fn without_backslash_escapes(command: &str) -> Option<String> {
     let bytes = command.as_bytes();
-    let moves_a_boundary = memchr::memchr_iter(b'\\', bytes).any(|at| {
+    let may_move_a_boundary = memchr::memchr_iter(b'\\', bytes).any(|at| {
         !bytes
             .get(at + 1)
             .is_some_and(|next| next.is_ascii_alphanumeric() || b".-_".contains(next))
     });
-    moves_a_boundary.then(|| command.replace('\\', "/"))
+    if !may_move_a_boundary {
+        return None;
+    }
+    let spelled = command.replace('\\', "/");
+    // Segments that follow a separator; a substitution (`\$(id)` in Bash
+    // prose) is a segment too, but no separator precedes it.
+    let starts = |text: &str| -> Vec<usize> {
+        crate::packs::split_command_segments(text)
+            .iter()
+            .map(|segment| (segment.as_ptr() as usize).saturating_sub(text.as_ptr() as usize))
+            .filter(|start| {
+                text[..*start]
+                    .trim_end_matches([' ', '\t'])
+                    .ends_with([';', '&', '|', '\n'])
+            })
+            .collect()
+    };
+    (starts(&spelled) != starts(command)).then_some(spelled)
 }
 
 fn skip_powershell_header_whitespace(bytes: &[u8], mut i: usize, len: usize) -> usize {
@@ -4863,15 +4880,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backslashes_that_move_a_posix_boundary_are_spelled_as_slashes() {
+    fn backslashes_are_spelled_as_slashes_only_where_that_moves_a_command_boundary() {
         for (command, spelled) in [
             (r#"echo "C:\temp\"; x"#, r#"echo "C:/temp/"; x"#),
             (r"echo a\; x", "echo a/; x"),
-            (r"echo a\>b", "echo a/>b"),
-            (
-                r#"Get-Item "\\server\share""#,
-                r#"Get-Item "//server/share""#,
-            ),
+            (r#"echo "a\" | x"#, r#"echo "a/" | x"#),
+            ("echo \"a\\\"\nx", "echo \"a/\"\nx"),
         ] {
             assert_eq!(
                 without_backslash_escapes(command).as_deref(),
@@ -4882,8 +4896,10 @@ mod tests {
         for command in [
             "git status",
             r"cd C:\Users\kaita\repo",
-            r#"Write-Output "C:\Users\kaita\repo.txt""#,
-            r"Get-Item .\x\-y\_z",
+            r#"Write-Output "C:\temp\""#,
+            r#"git -C "C:\Users\kaita\repo\" status"#,
+            r#"gh pr comment 1 --body "see \$(id)""#,
+            r"echo a\>b",
         ] {
             assert_eq!(without_backslash_escapes(command), None, "{command:?}");
         }
