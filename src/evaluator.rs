@@ -11753,8 +11753,15 @@ fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
     if *dynamic {
         return false;
     }
+    let command = command.to_ascii_lowercase();
+    // `function NAME [(params)] { … }`, `filter NAME { … }` and
+    // `workflow NAME { … }` define a command whose body runs when the name is
+    // called, as POSIX function bodies are judged.
+    if matches!(command.as_str(), "function" | "filter" | "workflow") {
+        return words.get(1).is_some_and(|(name, dynamic, _)| !*dynamic && !name.is_empty());
+    }
     matches!(
-        command.to_ascii_lowercase().as_str(),
+        command.as_str(),
         "if" | "elseif"
             | "else"
             | "switch"
@@ -14970,7 +14977,45 @@ fn unknown_dialect_fanout_candidate(
             || [ShellDialect::Cmd, ShellDialect::PowerShell]
                 .into_iter()
                 .any(|view| view_decode_exposes_pack_keyword(command, view, Some(index)))
+            || powershell_block_exposes_pack_keyword(command, Some(index))
     })
+}
+
+/// Whether a PowerShell script block that runs names an enabled-pack keyword
+/// once PowerShell decodes its command words.
+///
+/// A running block (`& { … }`, `if (…) { … }`, `foreach (…) { … }`,
+/// `function f { … }`) starts a command at its first word. The POSIX reading
+/// sees that word as an argument of `&`, `if` or `function` and never decodes
+/// it, so the quoted word in `& { g"it" reset --hard }` stays `g"it"` there,
+/// while PowerShell runs Git. Only the PowerShell view reads these bodies as
+/// commands (`evaluate_powershell_executable_blocks`). Blocks nested in a body
+/// are asked too, up to the embedded-shell depth.
+fn powershell_block_exposes_pack_keyword(
+    command: &str,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+) -> bool {
+    fn at_depth(
+        command: &str,
+        keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_EMBEDDED_SHELL_DEPTH || !command.contains('{') {
+            return false;
+        }
+        let Ok(bodies) = powershell_executable_block_bodies(command) else {
+            return false;
+        };
+        bodies.into_iter().any(|body| {
+            keyword_index.is_none_or(|index| {
+                index.has_any_keyword(
+                    crate::normalize::normalize_command_in_dialect(body, ShellDialect::PowerShell)
+                        .as_ref(),
+                )
+            }) || at_depth(body, keyword_index, depth + 1)
+        })
+    }
+    at_depth(command, keyword_index, 0)
 }
 
 /// Whether `view`'s own decode of `command` reveals an enabled-pack keyword
@@ -15133,6 +15178,10 @@ fn dialect_view_may_expose_hidden_execution(
         return true;
     }
     if view_decode_exposes_pack_keyword(command, view, keyword_index) {
+        return true;
+    }
+    if view == ShellDialect::PowerShell && powershell_block_exposes_pack_keyword(command, keyword_index)
+    {
         return true;
     }
     // An escaped DCG option or subcommand can expose a control change without
@@ -27864,11 +27913,19 @@ fn evaluate_packs_with_allowlists_at_depth(
                     }
                 }
             } else {
+                // Read the one segment without a separator after it: the
+                // decoded view refuses text that holds one, so the quoted
+                // word in `"git" reset --hard;` stayed quoted for the rules.
+                let (single_start, single_end) = core_git_segment_ranges
+                    .first()
+                    .copied()
+                    .unwrap_or((0, core_git_command.len()));
                 let (core_git_segment, command_prefix_len) =
                     crate::packs::core::git::command_after_posix_control_prefixes(
-                        core_git_command,
+                        &core_git_command[single_start..single_end],
                         shell_dialect,
                     );
+                let command_prefix_len = single_start + command_prefix_len;
                 if core_git_segment.is_empty() {
                     continue;
                 }
