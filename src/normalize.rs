@@ -2785,19 +2785,60 @@ pub(crate) fn tokenize_for_shell_dialect(command: &str, dialect: ShellDialect) -
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PowerShellHashRole {
+    Comment,
+    Literal,
+    Ambiguous,
+}
+
+pub(crate) fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
+    if bytes.get(index) != Some(&b'#') {
+        return PowerShellHashRole::Literal;
+    }
+    if index == 0
+        || bytes[index - 1].is_ascii_whitespace()
+        || bytes[..index].ends_with("\u{00a0}".as_bytes())
+        || matches!(
+            bytes[index - 1],
+            b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}' | b'[' | b']' | b','
+        )
+    {
+        return PowerShellHashRole::Comment;
+    }
+    if bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_' {
+        return PowerShellHashRole::Literal;
+    }
+    PowerShellHashRole::Ambiguous
+}
+
 fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
-    tokenize_powershell_with_comments(command).0
+    tokenize_powershell_with_comments(command, false).0
 }
 
-/// Return a same-length PowerShell view with comments replaced by spaces.
-/// Line comments retain their line ending; line breaks in block comments are
-/// spaces because a block comment is whitespace, not a statement boundary.
-/// Word and quote boundaries are shared with the PowerShell tokenizer.
+/// Read PowerShell comments and smart quotes in a separate deny-only view.
+/// Masked comments preserve line ends; block-comment line ends are spaces.
+/// Smart quotes use their ASCII spelling so the existing readers see them.
 pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
-    tokenize_powershell_with_comments(command).1
+    let has_smart_quotes = command
+        .chars()
+        .any(|c| matches!(c, '\u{2018}'..='\u{201e}'));
+    if has_smart_quotes {
+        let spelled: String = command
+            .chars()
+            .map(|c| match c {
+                '\u{2018}'..='\u{201b}' => '\'',
+                '\u{201c}'..='\u{201e}' => '"',
+                _ => c,
+            })
+            .collect();
+        Some(tokenize_powershell_with_comments(&spelled, true).1.unwrap_or(spelled))
+    } else {
+        tokenize_powershell_with_comments(command, true).1
+    }
 }
 
-fn tokenize_powershell_with_comments(command: &str) -> (NormalizeTokens, Option<String>) {
+fn tokenize_powershell_with_comments(command: &str, read_comments: bool) -> (NormalizeTokens, Option<String>) {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
@@ -2834,7 +2875,7 @@ fn tokenize_powershell_with_comments(command: &str) -> (NormalizeTokens, Option<
             continue;
         }
 
-        if !literal_mode && bytes[i] == b'#' {
+        if read_comments && !literal_mode && bytes[i] == b'#' {
             let start = i;
             while i < len && !matches!(bytes[i], b'\r' | b'\n') {
                 i += 1;
@@ -2842,21 +2883,13 @@ fn tokenize_powershell_with_comments(command: &str) -> (NormalizeTokens, Option<
             masked.get_or_insert_with(|| bytes.to_vec())[start..i].fill(b' ');
             continue;
         }
-        if !literal_mode && bytes.get(i..i + 2) == Some(b"<#") {
+        if read_comments && !literal_mode && bytes.get(i..i + 2) == Some(b"<#") {
             let start = i;
             i += 2;
-            let mut depth = 1usize;
-            while i < len && depth > 0 {
-                if bytes.get(i..i + 2) == Some(b"<#") {
-                    depth += 1;
-                    i += 2;
-                } else if bytes.get(i..i + 2) == Some(b"#>") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+            while i < len && bytes.get(i..i + 2) != Some(b"#>") {
+                i += 1;
             }
+            i = (i + 2).min(len);
             masked.get_or_insert_with(|| bytes.to_vec())[start..i].fill(b' ');
             continue;
         }
@@ -2876,7 +2909,7 @@ fn tokenize_powershell_with_comments(command: &str) -> (NormalizeTokens, Option<
         i = if literal_mode {
             consume_powershell_literal_word(bytes, i, len)
         } else {
-            consume_powershell_word(bytes, i, len)
+            consume_powershell_word(bytes, i, len, read_comments)
         };
 
         if start == i {
@@ -3069,19 +3102,24 @@ fn consume_shell_escape(bytes: &[u8], i: usize, len: usize) -> usize {
     }
 }
 
-fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
+fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments: bool) -> usize {
     let mut quote = PowerShellQuote::Unquoted;
 
     while i < len {
         let byte = bytes[i];
         match quote {
             PowerShellQuote::Unquoted => {
-                if byte.is_ascii_whitespace() || powershell_separator_end(bytes, i, len).is_some() {
+                if byte.is_ascii_whitespace()
+                    || powershell_separator_end(bytes, i, len).is_some()
+                    || (read_comments
+                        && byte == b'#'
+                        && powershell_hash_role(bytes, i) == PowerShellHashRole::Comment)
+                {
                     break;
                 }
                 match byte {
                     b'`' => i = consume_shell_escape(bytes, i, len),
-                    b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                    b'$' if read_comments && bytes.get(i + 1) == Some(&b'{') => {
                         // Braced variable names may contain spaces and `#`.
                         // Neither starts a comment until the closing brace.
                         i += 2;
