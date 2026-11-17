@@ -324,3 +324,60 @@ fn start_process_cmd_argument_lists_with_cr() {
         }
     }
 }
+
+/// The line Start-Process rebuilds is the target's own command line. For
+/// cmd it is read as cmd reads it: `&` is cmd's operator, CR is removed and
+/// `C:\Windows\System32\cmd.exe` stays a path to cmd. The argument list is
+/// one grammar: blanks before a comma do not end it, and an element after a
+/// comma may start with `-` (PowerShell passes `--hard` on).
+#[test]
+fn start_process_lines_read_in_the_target_dialect() {
+    for command in [
+        "Start-Process cmd -ArgumentList '/c echo ok&gi\rt reset --hard'",
+        "Start-Process cmd -ArgumentList '/c echo ok','&gi\rt reset --hard'",
+        "Start-Process C:\\Windows\\System32\\cmd.exe -ArgumentList '/c gi\rt reset --hard'",
+        "Start-Process C:\\Windows\\System32\\cmd.exe -ArgumentList '/c', 'gi\rt reset --hard'",
+        "Start-Process cmd -ArgumentList '/c echo ok' , '&git reset --hard'",
+        "Start-Process cmd -ArgumentList '/c echo ok' , '&gi\rt reset --hard'",
+        "Start-Process cmd -ArgumentList '/c', 'git', reset, --hard",
+        "Start-Process cmd -ArgumentList '/c', 'gi\rt', reset, --hard",
+        "Start-Process cmd -ArgumentList @('/c' , 'git reset --hard')",
+    ] {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    for command in [
+        "Start-Process cmd -ArgumentList @('/c' , 'echo SAFE')",
+        "Start-Process cmd -ArgumentList '/c' , 'dir'",
+        "Start-Process cmd -ArgumentList '/c echo ok&gi\rt status'",
+        "Start-Process C:\\Windows\\System32\\cmd.exe -ArgumentList '/c dir'",
+        "Start-Process cmd -ArgumentList '/c', 'echo', reset, --hard",
+    ] {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
