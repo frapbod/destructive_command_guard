@@ -260,6 +260,13 @@ fn powershell_comments_do_not_hide_following_commands() {
         "if ($true) {}# it's here\ngit reset --hard",
         "$a=@(1)[0]# it's here\ngit reset --hard",
         "Write-Output a,# it's\n'b'; git reset --hard",
+        "Write-Output a,<# it's #>'b'; git reset --hard",
+        "$x=<# it's #>\ngit reset --hard",
+        "$x = 1 +<# it's #>\n2; git reset --hard",
+        "if ($true) {}<# it's #>\ngit reset --hard",
+        "$a=@(1)[0]<# it's #>\ngit reset --hard",
+        "Write-Output 'x'<# it's #>\ngit reset --hard",
+        "Write-Output \"x\"<# it's #>\ngit reset --hard",
     ];
     let harmless = [
         "Write-Output \"#1 it's\"",
@@ -270,6 +277,7 @@ fn powershell_comments_do_not_hide_following_commands() {
         "# git reset --hard",
         "<# git reset --hard #>",
         "Write-Output x <# git reset --hard #>",
+        "Write-Output a<#x#>; git status",
         "Write-Output a,# it's here\ngit status",
         "# it's here\u{2028}git reset --hard",
         "# it's here\u{0085}git reset --hard",
@@ -321,6 +329,13 @@ fn powershell_comment_codex_bash_label() {
         "Write-Output `a; if ($true) {}# it's here\ngit reset --hard",
         "Write-Output `a; $a=@(1)[0]# it's here\ngit reset --hard",
         "Write-Output `a; Write-Output a,# it's\n'b'; git reset --hard",
+        "Write-Output `a; Write-Output a,<# it's #>'b'; git reset --hard",
+        "Write-Output `a; $x=<# it's #>\ngit reset --hard",
+        "Write-Output `a; $x = 1 +<# it's #>\n2; git reset --hard",
+        "Write-Output `a; if ($true) {}<# it's #>\ngit reset --hard",
+        "Write-Output `a; $a=@(1)[0]<# it's #>\ngit reset --hard",
+        "Write-Output `a; Write-Output 'x'<# it's #>\ngit reset --hard",
+        "Write-Output `a; Write-Output \"x\"<# it's #>\ngit reset --hard",
     ] {
         assert_eq!(
             hook_decision(Protocol::Codex, "Bash", command),

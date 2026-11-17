@@ -3109,6 +3109,18 @@ fn consume_shell_escape(bytes: &[u8], i: usize, len: usize) -> usize {
     }
 }
 
+/// A `<#` inside a word starts a block comment when the byte before it would
+/// let a `#` start a line comment, including after an operator or closing
+/// quote. `a<#x#>` stays text.
+fn powershell_block_comment_starts_after(bytes: &[u8], i: usize) -> bool {
+    i > 0
+        && bytes.get(i..i + 2) == Some(b"<#")
+        && (matches!(
+            bytes[i - 1],
+            b',' | b'=' | b'+' | b']' | b'}' | b')' | b'(' | b';' | b'|' | b'&' | b'\'' | b'"'
+        ) || bytes[..i].ends_with("\u{00a0}".as_bytes()))
+}
+
 fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments: bool) -> usize {
     let mut quote = PowerShellQuote::Unquoted;
 
@@ -3121,6 +3133,7 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments
                     || (read_comments
                         && byte == b'#'
                         && powershell_hash_role(bytes, i) == PowerShellHashRole::Comment)
+                    || (read_comments && powershell_block_comment_starts_after(bytes, i))
                 {
                     break;
                 }
