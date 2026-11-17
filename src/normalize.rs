@@ -3117,6 +3117,105 @@ fn consume_powershell_here_string(bytes: &[u8], start: usize, len: usize) -> Opt
     Some(len)
 }
 
+/// `command` as PowerShell reads its quotes, spelled so that the POSIX
+/// scanners put every quote, escape and word boundary where PowerShell does,
+/// or `None` when the two readings cannot differ.
+///
+/// PowerShell has no backslash escape (`"C:\temp\"` is a complete string)
+/// and escapes with a backtick instead. The POSIX scanners that the rest of
+/// dcg runs read `\"` as an escaped quote, so `Write-Output "C:\temp\"; git
+/// reset --hard` looked like one string to them. The spelling is length
+/// preserving and changes only these bytes:
+///
+/// - a backslash outside a single-quoted string becomes `/`, the other path
+///   separator Windows accepts, so it escapes nothing;
+/// - an escaping backtick becomes `\`, which escapes the next byte the same
+///   way for POSIX (a CRLF line continuation becomes ` \` before the LF);
+/// - a here-string body loses its quote of the here-string's kind, so its
+///   `@'`/`@"` and `'@`/`"@` delimit one POSIX string.
+///
+/// Doubled quotes (`''`, `""`) close and reopen the string for POSIX at the
+/// same places, so they need nothing. A backslash before an ASCII letter,
+/// digit, `.`, `-` or `_` escapes nothing that POSIX treats specially, so a
+/// command whose only backslashes are such path separators gets `None`.
+pub(crate) fn powershell_quoting_in_posix_spelling(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let mut out = bytes.to_vec();
+    let mut differs = false;
+    let mut quote = PowerShellQuote::Unquoted;
+    let mut i = 0usize;
+    // Mirrors `consume_powershell_word`.
+    while i < len {
+        match (quote, bytes[i]) {
+            (PowerShellQuote::Single, b'\'') => {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                } else {
+                    quote = PowerShellQuote::Unquoted;
+                    i += 1;
+                }
+            }
+            (PowerShellQuote::Single, _) => i += 1,
+            (_, b'`') => {
+                differs = true;
+                if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
+                    out[i] = b' ';
+                    out[i + 1] = b'\\';
+                } else {
+                    out[i] = b'\\';
+                    if bytes.get(i + 1) == Some(&b'\\') {
+                        out[i + 1] = b'/';
+                    }
+                }
+                i = consume_shell_escape(bytes, i, len);
+            }
+            (_, b'\\') => {
+                out[i] = b'/';
+                differs |= !bytes
+                    .get(i + 1)
+                    .is_some_and(|next| next.is_ascii_alphanumeric() || b".-_".contains(next));
+                i += 1;
+            }
+            (PowerShellQuote::Double, b'"') | (PowerShellQuote::Unquoted, b'\'' | b'"') => {
+                quote = match bytes[i] {
+                    b'\'' => PowerShellQuote::Single,
+                    b'"' if quote == PowerShellQuote::Unquoted => PowerShellQuote::Double,
+                    _ => PowerShellQuote::Unquoted,
+                };
+                i += 1;
+            }
+            (PowerShellQuote::Unquoted, b'@') => {
+                let Some(end) = consume_powershell_here_string(bytes, i, len) else {
+                    i += 1;
+                    continue;
+                };
+                let kind = bytes[i + 1];
+                let body_end = if end >= i + 4 && bytes[end - 1] == b'@' && bytes[end - 2] == kind {
+                    end - 2
+                } else {
+                    end
+                };
+                for at in i + 2..body_end {
+                    match bytes[at] {
+                        byte if byte == kind => out[at] = b'_',
+                        b'\\' if kind == b'"' => out[at] = b'/',
+                        b'`' if kind == b'"' => out[at] = b'\\',
+                        _ => continue,
+                    }
+                    differs = true;
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    if !differs {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
 fn skip_powershell_header_whitespace(bytes: &[u8], mut i: usize, len: usize) -> usize {
     while i < len {
         let width = match bytes[i] {
@@ -4839,6 +4938,40 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_quoting_in_posix_spelling_moves_only_boundary_bytes() {
+        for (command, spelled) in [
+            (r#"echo "C:\temp\"; x"#, r#"echo "C:/temp/"; x"#),
+            (r"echo a\; x", "echo a/; x"),
+            ("echo `\"; x", "echo \\\"; x"),
+            ("echo \"a``\"; x", "echo \"a\\`\"; x"),
+            ("echo \"a`\\\"; x", "echo \"a\\/\"; x"),
+            ("Get-Item `\r\n x", "Get-Item  \\\n x"),
+            // A here-string body loses its own kind of quote.
+            ("echo @\"\na\"b`c\\\n\"@; x", "echo @\"\na_b\\c/\n\"@; x"),
+            ("echo @'\nit's\\\n'@; x", "echo @'\nit_s\\\n'@; x"),
+            // Single-quoted text keeps its backslashes: POSIX reads them
+            // literally there as well.
+            (r"echo 'a\'; x \;", r"echo 'a\'; x /;"),
+        ] {
+            assert_eq!(
+                powershell_quoting_in_posix_spelling(command).as_deref(),
+                Some(spelled),
+                "{command:?}"
+            );
+            assert_eq!(spelled.len(), command.len());
+        }
+        for command in [
+            "git status",
+            r"cd C:\Users\kaita\repo",
+            r#"Write-Output "C:\Users\kaita\repo.txt""#,
+            r"echo 'a\'; git status",
+            r#"echo "it""s""#,
+        ] {
+            assert_eq!(powershell_quoting_in_posix_spelling(command), None, "{command:?}");
+        }
+    }
 
     fn raw_token_snapshot(
         command: &str,
