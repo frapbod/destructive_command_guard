@@ -15,7 +15,7 @@ enum Protocol {
     Codex,
 }
 
-fn payload(protocol: Protocol, command: &str, cwd: &std::path::Path) -> serde_json::Value {
+fn payload(protocol: Protocol, command: &str, cwd: &std::path::Path, tool_name: &str) -> serde_json::Value {
     match protocol {
         Protocol::Claude => serde_json::json!({
             "session_id": "sess-var",
@@ -23,7 +23,7 @@ fn payload(protocol: Protocol, command: &str, cwd: &std::path::Path) -> serde_js
             "cwd": cwd,
             "permission_mode": "default",
             "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
+            "tool_name": tool_name,
             "tool_input": {"command": command},
             "tool_use_id": "toolu_var",
         }),
@@ -36,7 +36,7 @@ fn payload(protocol: Protocol, command: &str, cwd: &std::path::Path) -> serde_js
             "hook_event_name": "PreToolUse",
             "model": "gpt-5.5",
             "permission_mode": "default",
-            "tool_name": "Bash",
+            "tool_name": tool_name,
             "tool_input": {"command": command},
             "tool_use_id": "call_var",
         }),
@@ -45,10 +45,14 @@ fn payload(protocol: Protocol, command: &str, cwd: &std::path::Path) -> serde_js
 
 /// What the agent reads: "allow" for empty stdout, else the decision.
 fn hook_decision(protocol: Protocol, command: &str) -> String {
+    hook_decision_with_tool(protocol, command, "Bash")
+}
+
+fn hook_decision_with_tool(protocol: Protocol, command: &str, tool_name: &str) -> String {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let payload = payload(protocol, command, temp.path()).to_string();
+    let payload = payload(protocol, command, temp.path(), tool_name).to_string();
     let mut child = Command::new(dcg_binary())
         .env_clear()
         .env("HOME", &home)
@@ -173,6 +177,24 @@ fn quoted_executables_in_shell_groups_are_judged() {
             r#"time ! ( "git" reset --hard )"#,
         ],
     );
+}
+
+#[test]
+fn quoted_git_groups_with_unknown_shell_are_judged() {
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in [
+            r#"{ g"it" reset --hard; }"#,
+            r#"f() { g"it" reset --hard; }; f"#,
+            r#"f(){ gi"t" reset --hard; }; f"#,
+            r"f(){ g\it reset --hard; }; f",
+            r#"function f { g"it" reset --hard; }; f"#,
+            r#"f(){ g"it" push --force origin main; }; f"#,
+            r#"if true; then g"it" reset --hard; fi"#,
+        ] {
+            assert_eq!(hook_decision_with_tool(protocol, command, "Shell"), "deny", "{protocol:?}: {command}");
+        }
+        assert_eq!(hook_decision_with_tool(protocol, r#"f(){ g"it" status; }; f"#, "Shell"), "allow");
+    }
 }
 
 #[test]

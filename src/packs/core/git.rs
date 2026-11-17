@@ -1169,6 +1169,13 @@ pub(crate) fn command_after_posix_control_prefixes(
     segment: &str,
     dialect: ShellDialect,
 ) -> (&str, usize) {
+    // An unknown shell may be POSIX, notably Windows Codex invoking Bash.
+    // Read the POSIX view with the same peeler used by the filesystem pack.
+    let dialect = if dialect == ShellDialect::Unknown {
+        ShellDialect::Posix
+    } else {
+        dialect
+    };
     let (command, offset) = command_after_posix_control_prefixes_bounded(segment, dialect, 0);
     if dialect != ShellDialect::Posix {
         return (command, offset);
