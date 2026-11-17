@@ -4426,11 +4426,14 @@ fn collect_command_segments<'a>(
     let mut in_double = false;
     // True where an unquoted POSIX word may start (see `posix_word_follows`).
     let mut word_start = true;
+    // End of the `${…}` the scan is inside, or 0 (see `ParameterExpansion`).
+    let mut expansion = ParameterExpansion::default();
 
     while i < end {
         let b = bytes[i];
         let at_word_start = word_start;
         word_start = false;
+        expansion.enter(bytes, i, end, in_single, in_double);
 
         if !in_single && !in_double && crate::context::ansi_c_quote_starts_at(bytes, i) {
             in_single = true;
@@ -4546,7 +4549,7 @@ fn collect_command_segments<'a>(
             continue;
         }
 
-        word_start = posix_word_follows(bytes, i);
+        word_start = !expansion.contains(i) && posix_word_follows(bytes, i);
         let split_width: Option<usize> = if b == b';' || b == b'\n' {
             Some(1)
         } else if b == b'&' {
@@ -4657,11 +4660,13 @@ fn collect_quoted_shell_separator_offsets(
     let mut in_ansi_c = false;
     let mut in_double = false;
     let mut word_start = true;
+    let mut expansion = ParameterExpansion::default();
 
     while i < end {
         let b = bytes[i];
         let at_word_start = word_start;
         word_start = false;
+        expansion.enter(bytes, i, end, in_single, in_double);
 
         if !in_single && !in_double && crate::context::ansi_c_quote_starts_at(bytes, i) {
             in_single = true;
@@ -4755,9 +4760,47 @@ fn collect_quoted_shell_separator_offsets(
                 offsets.push(i);
             }
         } else {
-            word_start = posix_word_follows(bytes, i);
+            word_start = !expansion.contains(i) && posix_word_follows(bytes, i);
         }
         i += 1;
+    }
+}
+
+/// The `${…}` parameter expansion a POSIX scan is inside. The shell reads it
+/// as part of one word through its matching `}`, blanks and `;` included, so
+/// no byte of it starts a word and a `#` in it (`x=${y:- #}`) is data, not a
+/// comment. Quotes inside are still read as quotes, and a nested `$(…)` or
+/// `<(…)` is scanned as its own body with its own comment rules. The end
+/// comes from [`crate::context::braced_parameter_span`]; a `${` that no `}`
+/// closes is a shell syntax error, so the scan reads it as plain text.
+#[derive(Default)]
+struct ParameterExpansion {
+    /// Offset just past the matching `}`; no byte before it starts a word.
+    end: usize,
+    /// A `${` had no closing `}`: stop looking, so a run of them stays linear.
+    unclosed: bool,
+}
+
+impl ParameterExpansion {
+    /// Note a `${` at `index`, outside single quotes and not already inside an
+    /// expansion (a nested one closes within it).
+    fn enter(&mut self, bytes: &[u8], index: usize, end: usize, in_single: bool, in_double: bool) {
+        if in_single
+            || self.unclosed
+            || index < self.end
+            || bytes[index] != b'$'
+            || bytes.get(index + 1) != Some(&b'{')
+        {
+            return;
+        }
+        match crate::context::braced_parameter_span(&bytes[..end], index, in_double) {
+            Some(close) => self.end = close,
+            None => self.unclosed = true,
+        }
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        index < self.end
     }
 }
 
@@ -6021,6 +6064,45 @@ destructive_patterns:
                 "{cmd:?} -> {segments:?}"
             );
         }
+        // A `#` anywhere in an unquoted `${…}` is data, whatever blank
+        // precedes it; after the `}` a comment starts again.
+        for (cmd, first) in [
+            ("x=${y:- #}; git status", "x=${y:- #}"),
+            ("x=${y:-\t#}; git status", "x=${y:-\t#}"),
+            (": ${y:= #}; git status", ": ${y:= #}"),
+            ("x=${y/ #/}; git status", "x=${y/ #/}"),
+            ("x=${y:-${z:- #} #}; git status", "x=${y:-${z:- #} #}"),
+            ("x=${y:-\"a #\"}; git status", "x=${y:-\"a #\"}"),
+            ("x=${y:-'a #'}; git status", "x=${y:-'a #'}"),
+            ("echo \"${y:-\" #\"}\"; git status", "echo \"${y:-\" #\"}\""),
+            ("echo \"${y:-it's}\"; git status", "echo \"${y:-it's}\""),
+            (
+                "echo ${y:- #} ${z} x#y; git status",
+                "echo ${y:- #} ${z} x#y",
+            ),
+        ] {
+            let segments = split_command_segments(cmd);
+            assert_eq!(segments, vec![first, "git status"], "{cmd:?}");
+        }
+        // After the `}` a `#` opens a comment again, a `#` in a nested
+        // `$(…)` follows that body's own rules, and an unclosed `${` is plain.
+        let segments = split_command_segments("echo ${y:- a} #it's\ngit status");
+        assert_eq!(segments.last(), Some(&"git status"), "{segments:?}");
+        let segments = split_command_segments("x=${y:- #$(git reset --hard)}");
+        assert!(segments.contains(&"git reset --hard"), "{segments:?}");
+        let segments = split_command_segments("echo ${y:- ; git reset --hard");
+        assert!(segments.contains(&"git reset --hard"), "{segments:?}");
+        // The mask reads the same expansions: the `;` in the quote is masked,
+        // and a `#` in `${…}` hides no later quote from it.
+        assert_eq!(
+            quoted_shell_separator_offsets("x=${y:- #}; echo 'a;b'"),
+            vec![19]
+        );
+        assert_eq!(quoted_shell_separator_offsets("x=${y:- #'a;b'}"), vec![11]);
+        assert_eq!(
+            quoted_shell_separator_offsets("echo \"${y:-\" #\"}\"; echo 'a;b'"),
+            vec![26]
+        );
         // A line continuation keeps the word state it follows.
         let segments = split_command_segments("echo a \\\n#it's\ngit status");
         assert_eq!(segments.last(), Some(&"git status"), "{segments:?}");
