@@ -23,6 +23,18 @@ const CHILD_RUNS_IT: &[&str] = &[
     "powershell -Command \"echo a`r`ngit branch -D doomed\"",
     "powershell -Command \"echo a`ngit reset --hard`necho done\"",
     "powershell -Command \"echo a``;`ngit reset --hard\"",
+    // A bare word decodes the same escapes (Windows PowerShell 5.1 measured
+    // `` `r `` in a bare word; PowerShell 7.5 measured `` `n ``, `` `r ``,
+    // `` `t ``): `` ` `` before a space joins the words into one payload.
+    "powershell -Command echo`ngit` reset` --hard",
+    "powershell -Command echo`rgit` reset` --hard",
+    "pwsh -c echo`ngit` branch` -D` doomed",
+    // cmd.exe splits on the tab a bare or quoted `` `t `` becomes.
+    "cmd /c git`treset`t--hard",
+    "cmd /c \"git`treset`t--hard\"",
+    // PowerShell 6+ reads `` `u{hex} `` as that code point.
+    "pwsh -Command \"echo a`u{a}git reset --hard\"",
+    "pwsh -Command \"echo a; `u{67}it reset --hard\"",
 ];
 
 /// Single-quoted payloads keep the backtick literal; a doubled backtick or an
@@ -33,6 +45,11 @@ const HARMLESS: &[&str] = &[
     "powershell -Command \"echo a`ngit status\"",
     "powershell -Command \"echo a`tb\"",
     "powershell -Command \"echo `\"hi`\"\"",
+    "powershell -Command echo`ta`nb",
+    // `` `u `` that is not `` `u{hex} `` is the letter (5.1), or a parse
+    // error that runs nothing (6+).
+    "pwsh -Command \"echo a`ugit reset --hard\"",
+    "pwsh -Command \"echo a`u{zz}git reset --hard\"",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {

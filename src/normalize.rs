@@ -2295,6 +2295,25 @@ fn consume_radix_digits(
     (consumed > 0).then_some(value)
 }
 
+/// Reads the `{hex}` of a PowerShell 6+ `` `u{hex} `` escape (one to six hex
+/// digits, a valid code point). On anything else nothing is consumed: the
+/// escape is then the letter `u`, as Windows PowerShell 5.1 reads it.
+fn decode_powershell_unicode_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<char> {
+    let mut probe = chars.clone();
+    if probe.next() != Some('{') {
+        return None;
+    }
+    let value = consume_radix_digits(&mut probe, 16, 6)?;
+    if probe.next() != Some('}') {
+        return None;
+    }
+    let decoded = char::from_u32(value)?;
+    *chars = probe;
+    Some(decoded)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PowerShellQuote {
     Unquoted,
@@ -2359,19 +2378,29 @@ fn decode_powershell_syntax_token(token: &str) -> Cow<'_, str> {
                         '\r' if chars.peek() == Some(&'\n') => {
                             chars.next();
                         }
-                        // In an expandable (double-quoted) string a backtick
-                        // escape is a control character: `` `n `` and `` `r ``
-                        // are line breaks, so a nested `-Command` payload that
-                        // holds one runs the text after it as a new
-                        // statement. Any other escaped character is itself.
-                        'n' if quote == PowerShellQuote::Double => output.push('\n'),
-                        'r' if quote == PowerShellQuote::Double => output.push('\r'),
-                        't' if quote == PowerShellQuote::Double => output.push('\t'),
-                        '0' if quote == PowerShellQuote::Double => output.push('\0'),
-                        'a' if quote == PowerShellQuote::Double => output.push('\u{7}'),
-                        'b' if quote == PowerShellQuote::Double => output.push('\u{8}'),
-                        'f' if quote == PowerShellQuote::Double => output.push('\u{c}'),
-                        'v' if quote == PowerShellQuote::Double => output.push('\u{b}'),
+                        // In a double-quoted string and in a bare word a
+                        // backtick escape is a control character: `` `n `` and
+                        // `` `r `` are line breaks, so a nested `-Command`
+                        // payload that holds one runs the text after it as a
+                        // new statement. PowerShell 6+ also reads
+                        // `` `u{hex} `` as that code point; Windows
+                        // PowerShell 5.1 reads `` `u `` and `` `e `` as the
+                        // letters, so `` `e `` keeps its letter here and
+                        // `` `u{hex} `` takes the 6+ reading, whichever can
+                        // spell a command. Any other escaped character is
+                        // itself.
+                        'n' => output.push('\n'),
+                        'r' => output.push('\r'),
+                        't' => output.push('\t'),
+                        '0' => output.push('\0'),
+                        'a' => output.push('\u{7}'),
+                        'b' => output.push('\u{8}'),
+                        'f' => output.push('\u{c}'),
+                        'v' => output.push('\u{b}'),
+                        'u' => match decode_powershell_unicode_escape(&mut chars) {
+                            Some(decoded) => output.push(decoded),
+                            None => output.push('u'),
+                        },
                         other => output.push(other),
                     }
                 }
