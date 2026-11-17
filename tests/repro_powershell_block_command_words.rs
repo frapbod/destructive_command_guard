@@ -136,7 +136,7 @@ const HARMLESS: &[&str] = &[
     "if ($x) { git status }",
     r#"foreach ($i in 1) { "reset --hard" }"#,
     r#"$sb = { Write-Output "git reset --hard" }"#,
-    r#"$sb = { Write-Output 'git reset --hard' }"#,
+    r"$sb = { Write-Output 'git reset --hard' }",
     r#"$sb = { Write-Output "git clean -fdx" }"#,
     r#"& { git commit -m "reset --hard" }"#,
     r#""git" status;"#,
@@ -149,8 +149,8 @@ const HARMLESS: &[&str] = &[
 /// these as `git reset --hard` or `git clean -f`.
 const QUOTED_TEXT_IN_ONE_ARGUMENT: &[&str] = &[
     r#"$sb = { Write-Output "git reset --hard" }"#,
-    r#"$sb = { Write-Output 'git reset --hard' }"#,
-    r#"$X 'reset --hard'"#,
+    r"$sb = { Write-Output 'git reset --hard' }",
+    r"$X 'reset --hard'",
     r#"git commit -m "x" "reset --hard""#,
     r#"git -c "a=b reset --hard" status"#,
     r#"git commit -m "fix: reset --hard bug""#,
@@ -166,7 +166,7 @@ const QUOTED_TEXT_IN_ONE_ARGUMENT: &[&str] = &[
 /// exclude pattern, so Git still cleans).
 const GIT_NEXT_TO_QUOTED_TEXT: &[&str] = &[
     r#"git clean -e "-n foo" -fdx"#,
-    r#"git clean -e '-n foo' -fdx"#,
+    r"git clean -e '-n foo' -fdx",
     r#"X=git; $X clean -e "-n foo" -fdx"#,
     r#"git clean -fdx -- "a b""#,
     r#"git -C "/tmp/a b" reset --hard"#,
