@@ -15428,7 +15428,11 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             )
         };
         let adopt = match alternate.decision {
-            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Deny => true,
+            // This copy only adds denials. Text it cannot read keeps the
+            // original verdict (a smart quote in POSIX data is not a
+            // PowerShell quote); running out of time still fails closed.
+            EvaluationDecision::Indeterminate => deadline_exceeded(deadline),
             EvaluationDecision::Allow => {
                 result.effective_mode.is_none() && alternate.effective_mode.is_some()
             }

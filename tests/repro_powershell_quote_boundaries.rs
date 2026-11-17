@@ -273,6 +273,9 @@ fn powershell_comments_do_not_hide_following_commands() {
         "Write-Output a,# it's here\ngit status",
         "# it's here\u{2028}git reset --hard",
         "# it's here\u{0085}git reset --hard",
+        // A smart quote in POSIX heredoc data: the PowerShell copy cannot be
+        // read, which must not turn an allowed command into a denial.
+        "python<<'PY'\n('\u{2019}\\:')\nPY",
     ];
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
         for command in dangerous {
