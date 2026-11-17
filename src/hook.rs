@@ -6781,6 +6781,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn explain_hint_round_trips_through_a_real_shell_without_running_source() {
+        if !crate::real_shell_gate::allowed(
+            "explain_hint_round_trips_through_a_real_shell_without_running_source",
+        ) {
+            return;
+        }
         // `dcg` is a shell function that ONLY captures argv. Every fixture
         // that could expose the old interpolation bug uses harmless printf
         // controls, so a regression cannot run a destructive target command.

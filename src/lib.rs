@@ -104,6 +104,10 @@ pub mod update;
 #[cfg(test)]
 mod scanner_regression_tests;
 
+// Tests that run text in a real shell ask this gate first; see the file.
+#[cfg(test)]
+pub(crate) mod real_shell_gate;
+
 // Re-export commonly used types
 pub use allowlist::{
     AllowEntry, AllowSelector, AllowlistError, AllowlistFile, AllowlistLayer, LayeredAllowlist,

@@ -13,6 +13,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[path = "../src/real_shell_gate.rs"]
+mod real_shell_gate;
+
 /// Path to the exact dcg binary Cargo built for this integration test.
 fn dcg_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
@@ -5312,7 +5315,9 @@ mod config_tests {
 
         // The installed command, run as Reasonix runs it.
         #[cfg(unix)]
-        {
+        if crate::real_shell_gate::allowed(
+            "install_reasonix_hook_blocks_through_the_installed_command",
+        ) {
             let hook = |shell_command: &str| {
                 let payload = serde_json::json!({
                     "event": "PreToolUse",
@@ -5452,6 +5457,7 @@ mod config_tests {
 
         // The installed command, run the way Muse runs a hook.
         #[cfg(unix)]
+        if crate::real_shell_gate::allowed("install_muse_hook_blocks_through_the_installed_command")
         {
             let dcg_config = xdg_config_dir.join("dcg").join("config.toml");
             std::fs::create_dir_all(dcg_config.parent().unwrap()).expect("dcg config dir");
@@ -6649,6 +6655,9 @@ mod config_tests {
             command.contains(binary.to_string_lossy().as_ref()),
             "hook must name the exact test binary: {command}"
         );
+        if !crate::real_shell_gate::allowed("project_install_hook_runs_without_interactive_path") {
+            return;
+        }
 
         let mut hook = Command::new("/bin/sh")
             .args(["-c", command])

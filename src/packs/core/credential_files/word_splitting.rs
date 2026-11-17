@@ -2358,6 +2358,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn background_binding_regressions_match_real_shell_argv() {
+        let real_shell =
+            crate::real_shell_gate::allowed("background_binding_regressions_match_real_shell_argv");
         for shell in ["/bin/sh", "/bin/bash"] {
             for mutation in [
                 "S=/tmp/safe T=x &",
@@ -2375,6 +2377,9 @@ mod tests {
                         .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME),
                     "native scan lost the inherited destination: {source}"
                 );
+                if !real_shell {
+                    continue;
+                }
                 let script = format!(
                     "{prefix} set -- $S; printf '%s\\0' \"$#\"; for arg; do printf '%s\\0' \"$arg\"; done; wait"
                 );
@@ -2560,6 +2565,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reconstructed_scalar_words_match_native_shell_argv_566() {
+        if !crate::real_shell_gate::allowed(
+            "reconstructed_scalar_words_match_native_shell_argv_566",
+        ) {
+            return;
+        }
         for shell in ["/bin/sh", "/bin/bash"] {
             for ifs in ["", "@", DEFAULT_IFS] {
                 for value in ["", "/tmp/work", "élève", "a b", "a@b", "literal*text"] {
@@ -2936,6 +2946,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn printf_count_detection_matches_bash_builtin() {
+        if !crate::real_shell_gate::allowed("printf_count_detection_matches_bash_builtin") {
+            return;
+        }
         for (format, arguments) in [
             ("%n", vec!["COUNT"]),
             ("abcde%n", vec!["COUNT"]),
@@ -3220,6 +3233,10 @@ mod tests {
     #[cfg(unix)]
     fn field_splitting_matches_posix_shell_argv() {
         use std::process::Command;
+
+        if !crate::real_shell_gate::allowed("field_splitting_matches_posix_shell_argv") {
+            return;
+        }
 
         let values = [
             "",

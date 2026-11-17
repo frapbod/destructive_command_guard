@@ -31,6 +31,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/real_shell_gate.rs"]
+mod real_shell_gate;
+
 /// The driver is JavaScript because the thing under test is a JavaScript module:
 /// only a real loader proves it parses, and only a real call proves it denies.
 const DRIVER: &str = r#"
@@ -602,6 +605,11 @@ fn real_opencode_blocks_through_the_plugin_516() {
         );
         return;
     };
+    // OpenCode runs the model's command in a real shell. Not a
+    // `Command::new(shell)`, so the gate audit cannot see it: gated by hand.
+    if !real_shell_gate::allowed("real_opencode_blocks_through_the_plugin_516") {
+        return;
+    }
 
     let run = |command: &str| {
         let temp = tempfile::tempdir().expect("create a temporary HOME");

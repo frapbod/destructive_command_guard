@@ -8,6 +8,9 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::{Value, json};
 
+#[path = "../src/real_shell_gate.rs"]
+mod real_shell_gate;
+
 struct Sandbox {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -656,6 +659,11 @@ fn doctor_rejects_non_enforcing_matchers_filters_and_command_arguments() {
 fn installed_command_with_shell_metacharacters_in_its_path_delivers_real_verdicts() {
     use std::io::Write as _;
 
+    if !real_shell_gate::allowed(
+        "installed_command_with_shell_metacharacters_in_its_path_delivers_real_verdicts",
+    ) {
+        return;
+    }
     let mut sandbox = Sandbox::new();
     let binary_directory = sandbox.root.join("space $ dollar ` tick ' quote");
     std::fs::create_dir_all(&binary_directory).unwrap();
