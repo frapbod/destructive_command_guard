@@ -833,6 +833,25 @@ fn bash_data_hash_hides_no_later_git_command() {
         "(( 1 #'x\n' )); git reset --hard",
         "[[ x =~ ( #) ]]; git reset --hard",
         "[[ x =~ ((a) #) ]]; git reset --hard",
+        "for((i=0;i<1;i++ #));do :;done;git reset --hard",
+        "if((1 #));then :;fi;git reset --hard",
+        "while((0 #));do :;done;git reset --hard",
+        "if true;then((1 #));fi;git reset --hard",
+        "for x in 1;do((1 #));done;git reset --hard",
+        "if false;then :;else((1 #));fi;git reset --hard",
+        "if false;then :;elif((1 #));then :;fi;git reset --hard",
+        "!((1 #));git reset --hard",
+        "time((1 #));git reset --hard",
+        "case x in x)((1 #));;esac;git reset --hard",
+        "case x in (x)((1 #));;esac;git reset --hard",
+        "{((1 #));};git reset --hard",
+        "f(){((1 #));};f;git reset --hard",
+        "bash -c 'for((i=0;i<1;i++ #));do :;done;git reset --hard'",
+        "(\\\n( 1 #)); git reset --hard",
+        "[[ x =~ a|( #) ]]; git reset --hard",
+        "[[ x =~ |( #) ]]; git reset --hard",
+        "[[ x =~ a||( #) ]]; git reset --hard",
+        "[[ x =~ (a)|b|( #) ]] || git reset --hard",
         // dash's reading: the comment ends at the line end and the quote in
         // it opens nothing; Bash reads one arithmetic command to the end.
         "(( 1 #'\ngit reset --hard))\n'))",
@@ -851,6 +870,9 @@ fn bash_data_hash_hides_no_later_git_command() {
         "(( x = 1 #)); git status",
         "echo $(( 2#101 ))",
         "[[ x =~ ( a ) ]] # git reset --hard",
+        "if((x>1));then :;fi; git status",
+        "for((i=0;i<3;i++));do :;done # git reset --hard",
+        "[[ x =~ ^(a|b)$ ]] && echo ok # git reset --hard",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
