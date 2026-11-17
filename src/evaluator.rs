@@ -6206,10 +6206,8 @@ fn parse_windows_launcher_segment_as(
     // payload keeps the CR its shell reading needs.
     let cr_as_word_byte = (outer_dialect == ShellDialect::Posix && segment.contains('\r'))
         .then(|| segment.replace('\r', "\u{1}"));
-    let tokens = tokenize_for_shell_dialect(
-        cr_as_word_byte.as_deref().unwrap_or(segment),
-        outer_dialect,
-    );
+    let tokens =
+        tokenize_for_shell_dialect(cr_as_word_byte.as_deref().unwrap_or(segment), outer_dialect);
     if tokens
         .iter()
         .any(|token| token.kind == NormalizeTokenKind::Separator)

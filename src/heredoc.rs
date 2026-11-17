@@ -1795,8 +1795,7 @@ static START_PROCESS_INLINE: LazyLock<Regex> = LazyLock::new(|| {
 /// One element of a [`START_PROCESS_INLINE`] argument list. Group 1/2 = the
 /// double/single-quoted text, group 3 = a bare word.
 static START_PROCESS_ARGUMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""([^"]*)"|'([^']*)'|([^\s'",]+)"#)
-        .expect("start-process argument regex compiles")
+    Regex::new(r#""([^"]*)"|'([^']*)'|([^\s'",]+)"#).expect("start-process argument regex compiles")
 });
 
 /// Regex for `powershell -EncodedCommand <base64>` (flag abbreviates to any prefix
