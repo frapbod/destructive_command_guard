@@ -5415,36 +5415,46 @@ pub(crate) fn powershell_line_breaks_as_line_feeds(command: &str) -> Option<Stri
 }
 
 /// `command` with each `#` that may start a comment to dcg's readers, but is
-/// data in a Bash arithmetic command `((…))`, spelled `_`; `None` when there
-/// is none.
+/// data to Bash, spelled `_`; `None` when there is none.
 ///
-/// Bash and zsh read `((…))` (also a `for ((…))` header) as arithmetic,
-/// where `#` starts no comment: `(( x = 1 #)); git reset --hard` runs `git
-/// reset --hard` after the arithmetic fails. dash reads the same parentheses
-/// as two subshells, where a `#` after a blank does start one: `(( 1 #'` LF
-/// `git reset --hard))` LF `'))` runs `git reset --hard` in dash and nothing
-/// in Bash. dcg's shared readers (the quote and span classifier, the
-/// sanitizer, the segment splitter, the tokenizers) read the dash way, so the
-/// evaluator also reads this spelling, in which they see the Bash reading,
-/// and deny wins. Measured with bash 5.2, zsh 5.9 and dash 0.5.12.
+/// Bash and zsh read two places where a `#` after a blank starts no comment:
 ///
-/// `[[ … ]]` is left alone: Bash reads a `#` after a blank there as a
-/// comment. So is `$((…))`: Bash reads a `#` there as a comment too, and
-/// reports an error that ends the line before anything after it runs.
+/// - an arithmetic command `((…))` (also a `for ((…))` header):
+///   `(( x = 1 #)); git reset --hard` runs `git reset --hard` after the
+///   arithmetic fails;
+/// - a parenthesized group in the regex after `=~` in `[[ … ]]`, where
+///   blanks are part of the word: `[[ x =~ ( #) ]]; git reset --hard` runs
+///   it too.
 ///
-/// An arithmetic command starts where a word does (after a blank, `;`, `&`,
-/// `|`, `(` or a backquote) and ends where Bash ends it (see
-/// [`crate::context::arithmetic_end`]); quoted text and comments outside it
-/// are passed over. Inside it, only a `#` outside quotes that follows a
-/// blank or an operator byte is spelled: one after a word byte (`2#101`,
-/// `$#`, `${#x}`) starts no comment to any reader.
+/// dash reads the first as two subshells and has no `[[`, so there a `#`
+/// after a blank does start a comment: `(( 1 #'` LF `git reset --hard))` LF
+/// `'))` runs `git reset --hard` in dash and nothing in Bash. dcg's shared
+/// readers (the quote and span classifier, the sanitizer, the segment
+/// splitter, the tokenizers) read the dash way, so the evaluator also reads
+/// this spelling, in which they see the Bash reading, and deny wins.
+/// Measured with bash 3.2, 5.2 and 5.3, zsh 5.9 and dash 0.5.12.
+///
+/// Elsewhere in `[[ … ]]` Bash does read a comment (`[[ a == a #]]` is a
+/// syntax error), and in `$((…))` too, where it reports an error that ends
+/// the line before anything after it runs; those are left alone.
+///
+/// Both constructs start where a word does (after a blank, `;`, `&`, `|`,
+/// `(` or a backquote). An arithmetic command ends where Bash ends it (see
+/// [`crate::context::arithmetic_end`]); a regex word ends at a blank outside
+/// its parentheses. Quoted text and comments outside them are passed over.
+/// Inside them, only a `#` outside quotes that follows a blank or an
+/// operator byte is spelled: one after a word byte (`2#101`, `$#`, `${#x}`)
+/// starts no comment to any reader.
 ///
 /// Length preserving (one ASCII byte for another), so every range in the
 /// view is the same range in `command`.
 #[must_use]
-pub(crate) fn bash_arithmetic_hashes_as_data(command: &str) -> Option<String> {
+pub(crate) fn bash_hashes_as_data(command: &str) -> Option<String> {
     let bytes = command.as_bytes();
-    if memchr::memchr(b'#', bytes).is_none() || memchr::memmem::find(bytes, b"((").is_none() {
+    if memchr::memchr(b'#', bytes).is_none()
+        || (memchr::memmem::find(bytes, b"((").is_none()
+            && memchr::memmem::find(bytes, b"=~").is_none())
+    {
         return None;
     }
     let len = bytes.len();
@@ -5455,10 +5465,17 @@ pub(crate) fn bash_arithmetic_hashes_as_data(command: &str) -> Option<String> {
                 b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'`'
             )
     };
+    let blank_or_end = |i: usize| {
+        bytes
+            .get(i)
+            .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\n'))
+    };
     let mut spelled: Option<Vec<u8>> = None;
     // Each open double-quoted string (`(true, _)`) or substitution body
     // (`(false, open parentheses inside it)`); none at the top level.
     let mut frames: Vec<(bool, usize)> = Vec::new();
+    // Inside `[[ … ]]`, where `=~` takes a regex word.
+    let mut in_conditional = false;
     let mut i = 0;
     while i < len {
         let in_double = frames.last().is_some_and(|frame| frame.0);
@@ -5499,7 +5516,33 @@ pub(crate) fn bash_arithmetic_hashes_as_data(command: &str) -> Option<String> {
                 && word_starts_after(i)
                 && let Some(end) = crate::context::arithmetic_end(bytes, i + 2) =>
             {
-                spell_arithmetic_comment_hashes(bytes, i + 2, end - 2, &mut spelled);
+                spell_comment_hashes(bytes, i + 2, end - 2, &mut spelled);
+                end
+            }
+            b'[' if bytes.get(i + 1) == Some(&b'[')
+                && word_starts_after(i)
+                && blank_or_end(i + 2) =>
+            {
+                in_conditional = true;
+                i + 2
+            }
+            b']' if in_conditional && bytes.get(i + 1) == Some(&b']') && word_starts_after(i) => {
+                in_conditional = false;
+                i + 2
+            }
+            b'=' if in_conditional
+                && bytes.get(i + 1) == Some(&b'~')
+                && word_starts_after(i)
+                && (blank_or_end(i + 2) || bytes.get(i + 2) == Some(&b'(')) =>
+            {
+                let start = i
+                    + 2
+                    + bytes[i + 2..]
+                        .iter()
+                        .take_while(|b| matches!(b, b' ' | b'\t'))
+                        .count();
+                let end = regex_word_end(bytes, start);
+                spell_comment_hashes(bytes, start, end, &mut spelled);
                 end
             }
             b'(' => {
@@ -5525,32 +5568,58 @@ pub(crate) fn bash_arithmetic_hashes_as_data(command: &str) -> Option<String> {
     spelled.and_then(|spelled| String::from_utf8(spelled).ok())
 }
 
-/// Spell `_` each `#` in the arithmetic text `start..end` of `bytes` that is
-/// outside quotes and follows a blank or an operator byte, quoting read as
+/// End of the `=~` regex word of `[[ … ]]` that starts at `start`: the first
+/// blank, `;`, `&` or `|` outside quotes and outside its parentheses, where
+/// Bash keeps blanks in the word.
+fn regex_word_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < bytes.len() {
+        i = match bytes[i] {
+            b'\\' => i + 2,
+            b'\'' => memchr::memchr(b'\'', &bytes[i + 1..]).map_or(bytes.len(), |at| i + at + 2),
+            b'"' => skip_double_quoted_text(bytes, i + 1, bytes.len()),
+            b'(' => {
+                depth += 1;
+                i + 1
+            }
+            b')' if depth > 0 => {
+                depth -= 1;
+                i + 1
+            }
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b')' if depth == 0 => return i,
+            _ => i + 1,
+        };
+    }
+    bytes.len()
+}
+
+/// Index past the closing quote of the double-quoted text that starts at
+/// `start`, or `end`.
+fn skip_double_quoted_text(bytes: &[u8], start: usize, end: usize) -> usize {
+    let mut at = start;
+    while at < end && bytes[at] != b'"' {
+        at += if bytes[at] == b'\\' { 2 } else { 1 };
+    }
+    at + 1
+}
+
+/// Spell `_` each `#` in `start..end` of `bytes` that is outside quotes and
+/// follows a blank or an operator byte, quoting read as
 /// [`crate::context::arithmetic_end`] reads it.
-fn spell_arithmetic_comment_hashes(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    spelled: &mut Option<Vec<u8>>,
-) {
+fn spell_comment_hashes(bytes: &[u8], start: usize, end: usize, spelled: &mut Option<Vec<u8>>) {
     let mut i = start;
     while i < end {
         i = match bytes[i] {
             b'\\' => i + 2,
             b'\'' => memchr::memchr(b'\'', &bytes[i + 1..end]).map_or(end, |at| i + at + 2),
-            b'"' => {
-                let mut at = i + 1;
-                while at < end && bytes[at] != b'"' {
-                    at += if bytes[at] == b'\\' { 2 } else { 1 };
-                }
-                at + 1
-            }
-            b'#' if bytes[i - 1].is_ascii_whitespace()
-                || matches!(
-                    bytes[i - 1],
-                    b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'`'
-                ) =>
+            b'"' => skip_double_quoted_text(bytes, i + 1, end),
+            b'#' if i > 0
+                && (bytes[i - 1].is_ascii_whitespace()
+                    || matches!(
+                        bytes[i - 1],
+                        b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'`'
+                    )) =>
             {
                 spelled.get_or_insert_with(|| bytes.to_vec())[i] = b'_';
                 i + 1
@@ -5964,7 +6033,7 @@ mod tests {
     /// Bash reads `#` inside an arithmetic command as data, where the shared
     /// readers may take it for a comment; only those bytes are spelled.
     #[test]
-    fn bash_arithmetic_comment_hashes_are_spelled_as_data() {
+    fn bash_data_hashes_are_spelled_as_data() {
         for (command, spelled) in [
             (
                 "(( x = 1 #)); git reset --hard",
@@ -6006,9 +6075,22 @@ mod tests {
                 "(( 1 _'x' )); git reset --hard",
             ),
             ("(( 1 #'#' ))", "(( 1 _'#' ))"),
+            // A group in a `=~` regex keeps its blanks in the word.
+            (
+                "[[ x =~ ( #) ]]; git reset --hard",
+                "[[ x =~ ( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x =~ ((a) #) ]]; git reset --hard",
+                "[[ x =~ ((a) _) ]]; git reset --hard",
+            ),
+            (
+                "[[ -n x && x =~ (a| #'b') ]]",
+                "[[ -n x && x =~ (a| _'b') ]]",
+            ),
         ] {
             assert_eq!(
-                bash_arithmetic_hashes_as_data(command).as_deref(),
+                bash_hashes_as_data(command).as_deref(),
                 Some(spelled),
                 "{command:?}"
             );
@@ -6018,9 +6100,13 @@ mod tests {
             "(( x = 1 )) # git reset --hard",
             // A `#` after a word byte starts no comment to any reader.
             "(( x = 2#101 )); echo $(( $# + ${#x} ))",
-            // Bash reads `#` after a blank as a comment in `[[ … ]]` and
-            // `$((…))`.
+            // Bash reads `#` after a blank as a comment in `[[ … ]]` outside
+            // a regex group, and in `$((…))`.
             "[[ a == a #]]; git reset --hard",
+            "[[ x =~ a #) ]]; git reset --hard",
+            "[[ x =~ ( a ) #]]; git reset --hard",
+            "[[ ( x =~ y ) #]]; git reset --hard",
+            "echo =~ ( #)",
             "echo $(( 1 #)); git reset --hard",
             // Not an arithmetic command: nested subshells, quoted text, a
             // comment, or parentheses inside a word.
@@ -6031,7 +6117,7 @@ mod tests {
             "echo a((1 #))",
             "",
         ] {
-            assert_eq!(bash_arithmetic_hashes_as_data(command), None, "{command:?}");
+            assert_eq!(bash_hashes_as_data(command), None, "{command:?}");
         }
     }
 

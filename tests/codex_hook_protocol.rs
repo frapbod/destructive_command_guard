@@ -794,12 +794,12 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
     }
 }
 
-/// Bash and zsh read `((…))` as arithmetic, where `#` starts no comment, so
-/// the git command after it runs; dash reads nested subshells, where it
-/// does. Every blocked command below runs its git command in Bash 5.2 or
+/// Bash and zsh read `((…))` as arithmetic and keep blanks in a `=~` regex
+/// group, where `#` starts no comment, so the git command after it runs;
+/// dash reads nested subshells and has no `[[`, so there it does. Every blocked command below runs its git command in Bash 5.2 or
 /// dash 0.5.12 (measured with a `git` that only prints its arguments).
 #[test]
-fn bash_arithmetic_command_hash_hides_no_later_git_command() {
+fn bash_data_hash_hides_no_later_git_command() {
     let payload = |command: &str, codex: bool| {
         let mut payload = serde_json::json!({
             "session_id": "sess-arithmetic-hash",
@@ -831,6 +831,8 @@ fn bash_arithmetic_command_hash_hides_no_later_git_command() {
         "bash <<'EOF'\n(( x = 1 #)); git reset --hard\nEOF",
         "(( 1 #'x' )); git reset --hard",
         "(( 1 #'x\n' )); git reset --hard",
+        "[[ x =~ ( #) ]]; git reset --hard",
+        "[[ x =~ ((a) #) ]]; git reset --hard",
         // dash's reading: the comment ends at the line end and the quote in
         // it opens nothing; Bash reads one arithmetic command to the end.
         "(( 1 #'\ngit reset --hard))\n'))",
@@ -848,6 +850,7 @@ fn bash_arithmetic_command_hash_hides_no_later_git_command() {
         "(( x = 1 )) # git reset --hard",
         "(( x = 1 #)); git status",
         "echo $(( 2#101 ))",
+        "[[ x =~ ( a ) ]] # git reset --hard",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

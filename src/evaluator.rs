@@ -15630,18 +15630,20 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             }
         }
     }
-    // Bash and zsh read `((…))` as arithmetic, where `#` starts no comment:
-    // `(( x = 1 #)); git reset --hard` runs `git reset --hard`. dash reads
-    // nested subshells there, where it does, and so do the shared readers.
-    // When a `#` inside one may start a comment, read the command again with
-    // it spelled as data (see `bash_arithmetic_hashes_as_data`), through
-    // this whole function, as the lone-CR spelling above is read; that
-    // spelling has no such `#` left. Deny wins. What the user authorized as
-    // written stays authorized, and the spelling spends no allow-once grant.
+    // Bash and zsh read a `#` after a blank as data inside an arithmetic
+    // command and inside a `=~` regex group: `(( x = 1 #)); git reset --hard`
+    // and `[[ x =~ ( #) ]]; git reset --hard` run `git reset --hard`. dash
+    // reads nested subshells and has no `[[`, so there it starts a comment,
+    // as it does for the shared readers. When such a `#` may start a comment,
+    // read the command again with it spelled as data (see
+    // `bash_hashes_as_data`), through this whole function, as the lone-CR
+    // spelling above is read; that spelling has no such `#` left. Deny wins.
+    // What the user authorized as written stays authorized, and the spelling
+    // spends no allow-once grant.
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
         && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
-        && let Some(spelled) = crate::normalize::bash_arithmetic_hashes_as_data(command)
+        && let Some(spelled) = crate::normalize::bash_hashes_as_data(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
         // The copy's incomplete analyses count only if its result is used.
@@ -38692,15 +38694,15 @@ fn evaluate_heredoc(
                     line_number: 1,
                 }]
             };
-            // The command splitter reads a `#` inside a Bash arithmetic
-            // command `((…))` as a comment, as dash does, and so hands on no
-            // command after it: `bash -c '(( x = 1 #)); git reset --hard'`.
-            // The whole body, read by the evaluator, gets its Bash reading
-            // too (see `bash_arithmetic_hashes_as_data`).
-            let arithmetic_hash = per_command_pass
+            // The command splitter reads a `#` that Bash reads as data (in
+            // `((…))` or a `=~` regex group) as a comment, as dash does, and
+            // so hands on no command after it: `bash -c '(( x = 1 #)); git
+            // reset --hard'`. The whole body, read by the evaluator, gets its
+            // Bash reading too (see `bash_hashes_as_data`).
+            let bash_data_hash = per_command_pass
                 && !destination_source_context
-                && crate::normalize::bash_arithmetic_hashes_as_data(&content.content).is_some();
-            if destination_source_context || arithmetic_hash {
+                && crate::normalize::bash_hashes_as_data(&content.content).is_some();
+            if destination_source_context || bash_data_hash {
                 // `f=/etc/sudoers; tee "$f"` requires both statements. Keep
                 // the existing per-command checks as well: they reach bodies
                 // of functions and other constructs the outer walk may not
