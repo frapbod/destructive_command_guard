@@ -91,15 +91,17 @@ fn hook_decision(protocol: Protocol, command: &str) -> String {
 }
 
 fn assert_both(decision: &str, commands: &[&str]) {
+    let mut wrong = Vec::new();
     for command in commands {
         for protocol in [Protocol::Claude, Protocol::Codex] {
-            assert_eq!(
-                hook_decision(protocol, command),
-                decision,
-                "{protocol:?}: {command:?}"
-            );
+            let actual = hook_decision(protocol, command);
+            if actual != decision {
+                wrong.push(format!("{protocol:?} {actual}: {command}"));
+            }
         }
     }
+    assert!(wrong.is_empty(), "expected {decision}:\n{}", wrong.join("\n"));
+}
 
 #[test]
 fn quoted_executables_in_shell_groups_are_judged() {
