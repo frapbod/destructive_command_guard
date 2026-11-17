@@ -35924,7 +35924,29 @@ fn resolve_proven_variables_in_segment_with_ifs(
                     let command_name = whole
                         && fields == 1
                         && posix_words_precede_command_name(&before[..word_start]);
-                    if (whole && fields == 1 && !command_name)
+                    // A `<<<` operand is one word whatever it holds; the shell
+                    // reads it as source text for the receiver, so it is
+                    // spliced and the literal here-string path judges it.
+                    let here_string = before[..word_start].trim_end().ends_with("<<<")
+                        || before[word_start..].starts_with("<<<");
+                    if here_string && !in_double_quote && fields > 1 {
+                        // A bare operand is still one word; quote the splice.
+                        let field = rendered.trim_matches(' ');
+                        if !whole
+                            || !value_is_safe_to_splice_for_denial(field)
+                            || field.contains(['"', '\'', '\\', '`', '$'])
+                        {
+                            rest = keep(&mut out);
+                            continue;
+                        }
+                        out.push('"');
+                        out.push_str(field);
+                        out.push('"');
+                        rest = &tail[consumed..];
+                        substituted = true;
+                        continue;
+                    }
+                    if (whole && fields == 1 && !command_name && !here_string)
                         || posix_word_is_assignment_prefix(&before[word_start..])
                         || segment_text_may_assign(&out, name)
                     {
