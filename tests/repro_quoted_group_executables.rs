@@ -127,6 +127,12 @@ fn quoted_executables_in_shell_groups_are_judged() {
         r#"X=git; case a in a) $X reset --hard;; esac"#,
         r#"X=git; case a in a) "$X" reset --hard;; esac"#,
         r#"case a in a) git reset --hard;; esac"#,
+        r#"case a in (a) "git" reset --hard;; esac"#,
+        r#"case a in b|a) "git" reset --hard;; esac"#,
+        r#"f () ( "git" reset --hard ); f"#,
+        r#"function f { "git" reset --hard; }; f"#,
+        r#"( "git" reset --hard ) >/dev/null"#,
+        r#"if true; then ( "git" reset --hard ); fi"#,
     ]);
 }
 
@@ -142,5 +148,9 @@ fn safe_quoted_shell_groups_remain_allowed() {
         r#"printf '%s' '( "git" reset --hard )'"#,
         r#"case a in a) "git" status;; esac"#,
         r#"case a in a) printf '%s' '"git" reset --hard';; esac"#,
+        r#"( cd /tmp && "git" status ) >/dev/null"#,
+        r#"( "git" commit -m "reset --hard" )"#,
+        r#"f() { "git" log; }; f"#,
+        r#"printf '%s\n' 'a) "git" reset --hard'"#,
     ]);
 }

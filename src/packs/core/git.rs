@@ -7778,6 +7778,15 @@ mod tests {
             "function f() { git reset --hard",
             "function f if git reset --hard",
             "then function f { git reset --hard",
+            "( git reset --hard",
+            "(\"git\" reset --hard",
+            "{ ( git reset --hard",
+            "f() { git reset --hard",
+            "f () ( git reset --hard",
+            "case a in a) git reset --hard",
+            "case a in (a) git reset --hard",
+            "a) git reset --hard",
+            "b|a) git reset --hard",
         ] {
             assert!(
                 command_executes_git_in_dialect(command, ShellDialect::Posix),
@@ -7802,6 +7811,11 @@ mod tests {
             "sudo coproc git reset --hard",
             "/usr/bin/coproc git reset --hard",
             "'coproc' git reset --hard",
+            "f ( git reset --hard",
+            "f() echo git reset --hard",
+            "case a in a) echo git reset --hard",
+            "a) echo git reset --hard",
+            "echo a) git reset --hard",
         ] {
             assert!(
                 !command_executes_git_in_dialect(command, ShellDialect::Posix),
