@@ -38970,7 +38970,19 @@ fn evaluate_heredoc(
             } else {
                 Vec::new()
             };
+            // A line rebuilt from `Start-Process <file> -ArgumentList …` is
+            // the target's own command line, read in the target's dialect:
+            // cmd.exe's operators, CR removal and `C:\…\cmd.exe` path, not
+            // POSIX's. It is read whole; the POSIX split below would cut it
+            // at cmd's `&` and keep the CR in the second command.
+            let line_dialect = if content.target_command.as_deref() == Some("start-process") {
+                crate::heredoc::start_process_line_dialect(&content.content)
+            } else {
+                crate::normalize::ShellDialect::Posix
+            };
+            let whole_body = !per_command_pass || line_dialect != ShellDialect::Posix;
             let destination_source_context = per_command_pass
+                && line_dialect == ShellDialect::Posix
                 && crate::packs::core::credential_files::shell_destination_context_required(
                     &content.content,
                 )
@@ -38989,13 +39001,13 @@ fn evaluate_heredoc(
                     context.allow_once_audit,
                     context.project_path,
                     context.deadline,
-                    crate::normalize::ShellDialect::Posix,
+                    line_dialect,
                     context.nested_command_depth + 1,
                     inline_automated_stdin,
                 )
             };
             let mut complete_source_result = None;
-            let mut inner_commands = if per_command_pass {
+            let mut inner_commands = if !whole_body {
                 crate::heredoc::extract_shell_commands(&content.content)
             } else {
                 // Without a keyword or trigger the per-command pass has
@@ -39052,7 +39064,7 @@ fn evaluate_heredoc(
                 // whole-body command of a body without a per-command pass
                 // takes the same route, so a denial in it is mapped and
                 // line-numbered from its span.
-                let needs_source_context = !per_command_pass
+                let needs_source_context = whole_body
                     || (destination_source_context && index == 0)
                     || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
                         .is_some_and(|operator| {
@@ -51655,6 +51667,11 @@ mod tests {
             r"Start-Process cmd -ArgumentList '/c', 'rd /s /q C:\src'",
             r#"Start-Process -FilePath cmd.exe -ArgumentList @("/c", "rd /s /q C:\src") -Wait"#,
             r"Start-Process cmd -ArgumentList /c, 'rd /s /q C:\src'",
+            // Blanks before a comma do not end the list.
+            r"Start-Process cmd -ArgumentList '/c dir' , '&rd /s /q C:\src'",
+            // The line is cmd's: its `&`, and a full path to cmd.exe.
+            r"Start-Process cmd -ArgumentList '/c dir&rd /s /q C:\src'",
+            r"Start-Process C:\Windows\System32\cmd.exe -ArgumentList '/c rd /s /q C:\src'",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -51667,6 +51684,9 @@ mod tests {
             "Start-Process notepad -ArgumentList 'README.md'",
             "Start-Process cmd -ArgumentList '/c dir C:\\src'",
             "Start-Process cmd -ArgumentList '/c', 'dir C:\\src'",
+            "Start-Process cmd -ArgumentList '/c' , 'dir'",
+            "Start-Process cmd -ArgumentList @('/c' , 'echo SAFE')",
+            "Start-Process C:\\Windows\\System32\\cmd.exe -ArgumentList '/c dir'",
             "Start-Process https://example.com",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
