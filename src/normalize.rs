@@ -4723,6 +4723,47 @@ fn is_recognized_program_name(name: &[u8], enabled_keywords: &[&str]) -> bool {
             .any(|keyword| keyword.as_bytes().eq_ignore_ascii_case(name))
 }
 
+/// `command` with every carriage return that starts no CRLF pair spelled as
+/// a line feed, or `None` when it has no such carriage return.
+///
+/// PowerShell ends a line at a lone CR exactly as at LF or CRLF: `echo
+/// a<CR>git reset --hard` runs `git reset --hard`, and so do a `#` comment, a
+/// `--%` argument list and a here-string closed by a lone CR, followed by a
+/// command. Inside a quoted string or a here-string body a lone CR is data,
+/// as an LF there is, and a backtick before it continues the line, as before
+/// an LF. Measured on Windows PowerShell 5.1: NEL, U+2028, U+2029, VT and FF
+/// end no line.
+///
+/// dcg's shared readers (the quote and span classifier, the sanitizer, the
+/// segment splitter) end a line at LF only, as Bash, dash and zsh do: they
+/// read a lone CR as a byte of the word around it. So in this spelling those
+/// readers see the lines PowerShell runs. Callers read it only where the
+/// command may be PowerShell.
+///
+/// Every lone CR is spelled, not only those PowerShell's tokenizer sees
+/// between words: dcg's PowerShell tokenizer has no comments, so a quote in
+/// `echo a # say "hi<CR>git reset --hard` would hide the line break from it.
+/// The cost is a CR inside a string that PowerShell hands to a POSIX
+/// program (`bash -c 'echo a<CR>git reset --hard'`), which reads it as a
+/// byte: that is read as a line break too, and denied.
+///
+/// Length preserving (one ASCII byte for another), so every range in the
+/// view is the same range in `command`.
+#[must_use]
+pub(crate) fn powershell_line_breaks_as_line_feeds(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let is_lone_cr = |index: usize| bytes[index] == b'\r' && bytes.get(index + 1) != Some(&b'\n');
+    let first = memchr::memchr_iter(b'\r', bytes).find(|&index| is_lone_cr(index))?;
+    let mut spelled = bytes.to_vec();
+    for (index, byte) in spelled.iter_mut().enumerate().skip(first) {
+        if is_lone_cr(index) {
+            *byte = b'\n';
+        }
+    }
+    // Only an ASCII byte changed into another ASCII byte.
+    String::from_utf8(spelled).ok()
+}
+
 /// `command` with every program name it spells in a case other than lower
 /// case folded to lower case, or `None` when it spells none.
 ///
@@ -5069,6 +5110,41 @@ mod tests {
             fold_program_name_case("x <<<SH", &[]).as_deref(),
             Some("x <<<sh"),
         );
+    }
+
+    /// PowerShell ends a line at a lone CR; CRLF and LF are line breaks to
+    /// every reader already, and other line-like characters end no line.
+    #[test]
+    fn powershell_lone_carriage_returns_are_spelled_as_line_feeds() {
+        for (command, spelled) in [
+            ("echo a\rgit reset --hard", "echo a\ngit reset --hard"),
+            ("a\r\rb\r", "a\n\nb\n"),
+            ("a\r\r\nb", "a\n\r\nb"),
+            ("Write-Output 'x\ry'", "Write-Output 'x\ny'"),
+            ("\u{e9}\r\u{2028}", "\u{e9}\n\u{2028}"),
+        ] {
+            assert_eq!(
+                powershell_line_breaks_as_line_feeds(command).as_deref(),
+                Some(spelled),
+                "{command:?}"
+            );
+        }
+        for command in [
+            "echo a\ngit reset --hard",
+            "echo a\r\ngit reset --hard",
+            "echo a\u{85}git reset --hard",
+            "echo a\u{2028}git reset --hard",
+            "echo a\u{2029}git reset --hard",
+            "echo a\u{b}git reset --hard",
+            "echo a\u{c}git reset --hard",
+            "",
+        ] {
+            assert_eq!(
+                powershell_line_breaks_as_line_feeds(command),
+                None,
+                "{command:?}"
+            );
+        }
     }
 
     #[test]

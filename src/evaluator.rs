@@ -15228,6 +15228,65 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         nested_command_depth,
         inherited_automated_stdin,
     );
+    // PowerShell (the shell Codex runs on Windows) ends a line at a lone
+    // carriage return, as at a line feed: `echo a<CR>git reset --hard` runs
+    // `git reset --hard`. The shared readers end a line at a line feed only,
+    // as POSIX shells do, so they read the whole text as `echo` arguments.
+    // When the command may be PowerShell, read it again with each lone CR
+    // that PowerShell reads as a line break spelled as a line feed (see
+    // `powershell_line_breaks_as_line_feeds`), through this whole function,
+    // so the other readings below apply to those lines too; that spelling
+    // has no such CR left, so it is not read a third time. Deny wins, as
+    // between dialect views. The spelling differs from the command as
+    // written, so what the user authorized as written stays authorized, and
+    // no allow-once grant is spent.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        )
+        && let Some(spelled) = crate::normalize::powershell_line_breaks_as_line_feeds(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                &spelled,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            result = alternate;
+            // The spelling is length preserving: show the command's own text.
+            if let Some(info) = result.pattern_info.as_mut()
+                && let Some(span) = info.matched_span.as_ref()
+                && span.end <= command.len()
+                && command.is_char_boundary(span.start)
+                && command.is_char_boundary(span.end)
+            {
+                info.matched_text_preview = Some(extract_match_preview(command, span));
+            }
+        }
+    }
     // A program name in another case runs the same program on a
     // case-insensitive filesystem (`RM -rf ~` runs `rm`), while the packs and
     // the shell analysis compare lower-case names. Read the command again with
@@ -51015,6 +51074,62 @@ mod tests {
             "quoted delimiter is data: {:?}",
             result.pattern_info
         );
+    }
+
+    /// Desktop Codex runs a `Bash`-labelled payload with
+    /// `powershell.exe -Command`, which ends a line at a lone carriage
+    /// return: `echo a<CR>git reset --hard` runs the reset. On Windows the
+    /// label resolves to a dialect that may be PowerShell, which must deny
+    /// it; a proven POSIX shell reads the CR as a byte of `a<CR>git`, so
+    /// `echo` prints it and nothing else runs.
+    #[test]
+    fn codex_windows_bash_label_reads_lone_carriage_returns_as_line_breaks() {
+        use crate::hook::{HookProtocol, codex_host_shell_dialect};
+        let packs = ["core.git", "core.filesystem"];
+        let resolve = |command: &str| {
+            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true, command)
+        };
+        for command in [
+            "echo a\rgit reset --hard",
+            "echo \"a/\"\rgit reset --hard",
+            "# note\rgit reset --hard",
+            "echo a # say \"hi\rgit reset --hard",
+            "echo a\rGIT reset --hard\recho done",
+        ] {
+            let dialect = resolve(command);
+            assert!(
+                matches!(dialect, ShellDialect::Unknown | ShellDialect::PowerShell),
+                "{command:?}: {dialect:?}"
+            );
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+            assert!(result.is_denied(), "must deny: {command:?}");
+            let preview = result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.matched_text_preview.as_deref())
+                .unwrap_or_default();
+            assert!(
+                command.contains(preview),
+                "a preview shows the command's own text: {command:?}: {preview:?}"
+            );
+            assert!(
+                !evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix)
+                    .is_denied(),
+                "a POSIX shell runs no reset: {command:?}"
+            );
+        }
+        for command in [
+            "echo a\rgit status",
+            "Write-Output \"x\rgit reset --hard\"",
+            "git commit -m \"line one\rline two\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, resolve(command));
+            assert!(
+                !result.is_denied(),
+                "must allow: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
     }
 
     /// #379 follow-up: a `Bash`-labelled Codex payload on native Windows runs
