@@ -224,6 +224,10 @@ fn quoted_git_groups_with_unknown_shell_are_judged() {
             r#"f(){ g"it" push --force origin main; }; f"#,
             r#"if true; then g"it" reset --hard; fi"#,
             r#"cat <( cd /tmp && "git" reset --hard )"#,
+            r"git push ${x:+)} --force origin main",
+            r"git reset ${x//)} --hard",
+            r"git clean ${x:+)} -fdx",
+            r"git stash ${x:+)} clear",
         ] {
             assert_eq!(
                 hook_decision_with_tool(protocol, command, "Shell"),

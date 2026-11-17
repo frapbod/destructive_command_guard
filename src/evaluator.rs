@@ -15791,7 +15791,7 @@ fn evaluate_command_in_dialect_union(
     // Its generic normalization can lose quotes or escapes in command words.
     // Feed that reading through the same deny-wins fan-out as the other views.
     let posix_candidate =
-        primary.allowlist_override.is_none() && command.contains(['\'', '"', '\\']);
+        primary.allowlist_override.is_none() && command.contains(['\'', '"', '\\', '$']);
     let other_candidate = unknown_dialect_fanout_candidate(command, keyword_index);
     if !posix_candidate && !other_candidate {
         return primary;
