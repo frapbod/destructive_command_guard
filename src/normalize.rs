@@ -3431,6 +3431,12 @@ fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> Normaliz
             }
             continue;
         }
+        // A line continuation between words is removed, so a word still
+        // starts after it (`echo a \` LF `# it's` is a comment).
+        if posix_comments && bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 2;
+            continue;
+        }
 
         if bytes[i] == b'\n' {
             tokens.push(NormalizeToken {
