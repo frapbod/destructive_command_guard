@@ -2988,8 +2988,10 @@ fn strip_leading_rm_prefixes(command: &str) -> (&str, bool) {
 /// reserved words, function declarations and case arms. The git pack owns
 /// the parser so both packs find the same command word.
 fn strip_leading_posix_group_openers(original: &str) -> (&str, bool) {
-    let (command, _) =
-        crate::packs::core::git::command_after_posix_control_prefixes(original, ShellDialect::Posix);
+    let (command, _) = crate::packs::core::git::command_after_posix_control_prefixes(
+        original,
+        ShellDialect::Posix,
+    );
     let command = command.trim_start();
     (command, command.as_ptr() != original.as_ptr())
 }

@@ -100,60 +100,70 @@ fn assert_both(decision: &str, commands: &[&str]) {
             }
         }
     }
-    assert!(wrong.is_empty(), "expected {decision}:\n{}", wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "expected {decision}:\n{}",
+        wrong.join("\n")
+    );
 }
 
 #[test]
 fn quoted_executables_in_shell_groups_are_judged() {
-    assert_both("deny", &[
-        r#"( "git" reset --hard )"#,
-        r#"("git" reset --hard)"#,
-        r#"f() { "git" reset --hard; }; f"#,
-        r#"f() { "rm" -rf ~/; }; f"#,
-        r"( git reset --hard )",
-        r#"( "rm" -rf ~/ )"#,
-        r#"{ "git" reset --hard; }"#,
-        r"f() { git reset --hard; }; f",
-        r#"X=t; ( "gi${X}" reset --hard )"#,
-        r#"X=t; f() { "gi${X}" reset --hard; }; f"#,
-        // t_49339710 review round 5: Bash runs `git` here.
-        r#"f(){ "${IFS}it" reset --hard; }; IFS=g; f"#,
-        r#"f(){ "git" reset --hard; }; f"#,
-        r"f(){ 'git' reset --hard; }; f",
-        r#"f(){ g"it" reset --hard; }; f"#,
-        // t_416fd788 review round 4: case arms are compound bodies too.
-        r#"case a in a) "git" reset --hard;; esac"#,
-        r#"X=gi; case a in a) "${X}t" reset --hard;; esac"#,
-        r"X=git; case a in a) $X reset --hard;; esac",
-        r#"X=git; case a in a) "$X" reset --hard;; esac"#,
-        r"case a in a) git reset --hard;; esac",
-        r#"case a in (a) "git" reset --hard;; esac"#,
-        r#"case a in b|a) "git" reset --hard;; esac"#,
-        r#"f () ( "git" reset --hard ); f"#,
-        r#"function f { "git" reset --hard; }; f"#,
-        r#"( "git" reset --hard ) >/dev/null"#,
-        r#"if true; then ( "git" reset --hard ); fi"#,
-    ]);
+    assert_both(
+        "deny",
+        &[
+            r#"( "git" reset --hard )"#,
+            r#"("git" reset --hard)"#,
+            r#"f() { "git" reset --hard; }; f"#,
+            r#"f() { "rm" -rf ~/; }; f"#,
+            r"( git reset --hard )",
+            r#"( "rm" -rf ~/ )"#,
+            r#"{ "git" reset --hard; }"#,
+            r"f() { git reset --hard; }; f",
+            r#"X=t; ( "gi${X}" reset --hard )"#,
+            r#"X=t; f() { "gi${X}" reset --hard; }; f"#,
+            // t_49339710 review round 5: Bash runs `git` here.
+            r#"f(){ "${IFS}it" reset --hard; }; IFS=g; f"#,
+            r#"f(){ "git" reset --hard; }; f"#,
+            r"f(){ 'git' reset --hard; }; f",
+            r#"f(){ g"it" reset --hard; }; f"#,
+            // t_416fd788 review round 4: case arms are compound bodies too.
+            r#"case a in a) "git" reset --hard;; esac"#,
+            r#"X=gi; case a in a) "${X}t" reset --hard;; esac"#,
+            r"X=git; case a in a) $X reset --hard;; esac",
+            r#"X=git; case a in a) "$X" reset --hard;; esac"#,
+            r"case a in a) git reset --hard;; esac",
+            r#"case a in (a) "git" reset --hard;; esac"#,
+            r#"case a in b|a) "git" reset --hard;; esac"#,
+            r#"f () ( "git" reset --hard ); f"#,
+            r#"function f { "git" reset --hard; }; f"#,
+            r#"( "git" reset --hard ) >/dev/null"#,
+            r#"if true; then ( "git" reset --hard ); fi"#,
+        ],
+    );
 }
 
 #[test]
 fn safe_quoted_shell_groups_remain_allowed() {
-    assert_both("allow", &[
-        r#"( "git" status )"#,
-        r#"f() { "git" status; }; f"#,
-        r#"f() { "rm" ./unimportant; }; f"#,
-        r#"{ "git" status; }"#,
-        r#"( printf '%s' '"git" reset --hard' )"#,
-        r#"f() { printf '%s' '"rm" -rf ~/'; }; f"#,
-        r#"printf '%s' '( "git" reset --hard )'"#,
-        r#"case a in a) "git" status;; esac"#,
-        r#"case a in a) printf '%s' '"git" reset --hard';; esac"#,
-        r#"( cd /tmp && "git" status ) >/dev/null"#,
-        r#"( "git" commit -m "reset --hard" )"#,
-        r#"f() { "git" log; }; f"#,
-        r#"( git commit -m "reset --hard" )"#,
-        r#"(git commit -m "reset --hard")"#,
-        r#"( "git" log --grep "reset --hard" ) | cat"#,
-        r#"printf '%s\n' 'a) "git" reset --hard'"#,
-    ]);
+    assert_both(
+        "allow",
+        &[
+            r#"( "git" status )"#,
+            r#"f() { "git" status; }; f"#,
+            r#"f() { "rm" ./unimportant; }; f"#,
+            r#"{ "git" status; }"#,
+            r#"( printf '%s' '"git" reset --hard' )"#,
+            r#"f() { printf '%s' '"rm" -rf ~/'; }; f"#,
+            r#"printf '%s' '( "git" reset --hard )'"#,
+            r#"case a in a) "git" status;; esac"#,
+            r#"case a in a) printf '%s' '"git" reset --hard';; esac"#,
+            r#"( cd /tmp && "git" status ) >/dev/null"#,
+            r#"( "git" commit -m "reset --hard" )"#,
+            r#"f() { "git" log; }; f"#,
+            r#"( git commit -m "reset --hard" )"#,
+            r#"(git commit -m "reset --hard")"#,
+            r#"( "git" log --grep "reset --hard" ) | cat"#,
+            r#"printf '%s\n' 'a) "git" reset --hard'"#,
+        ],
+    );
 }

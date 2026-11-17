@@ -1189,7 +1189,10 @@ fn end_at_subshell_close<'a>(segment: &str, command: &'a str, offset: usize) -> 
         return command;
     }
     let mut depth = 0usize;
-    for token in tokens.iter().filter(|token| token.byte_range.start >= offset) {
+    for token in tokens
+        .iter()
+        .filter(|token| token.byte_range.start >= offset)
+    {
         if paren(token, "(") {
             depth += 1;
         } else if paren(token, ")") {
