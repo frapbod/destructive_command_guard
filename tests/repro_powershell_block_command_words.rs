@@ -355,6 +355,65 @@ fn powershell_and_unknown_dialects_judge_block_command_words() {
     }
 }
 
+/// Windows PowerShell 5.1 ran harmless marker bodies in every one of these
+/// layouts with LF, CRLF and lone CR. ScriptBlock literals remain inert.
+fn multiline_control_cases() -> Vec<(String, bool)> {
+    let layouts = [
+        "if (1)\n{ BODY }",
+        "if (\n1) { BODY }",
+        "try\n{ BODY } catch { }",
+        "foreach ($n in @(1))\n{ BODY }",
+        "foreach(\n$n in @(1)) { BODY }",
+        "foreach($n\nin @(1)) { BODY }",
+        "foreach\n($n in @(1)) { BODY }",
+        "while ($true)\n{ BODY; break }",
+    ];
+    let mut cases = Vec::new();
+    for newline in ["\n", "\r\n", "\r"] {
+        for layout in layouts {
+            for (body, deny) in [
+                ("git reset --hard", true),
+                ("Remove-Item -Recurse -Force ./victim", true),
+                ("Write-Output 1", false),
+            ] {
+                cases.push((layout.replace("BODY", body).replace('\n', newline), deny));
+            }
+        }
+        for inert in [
+            "$b = { git reset --hard }",
+            "{ git reset --hard }",
+            "$b = { if (1)\n{ git reset --hard } }",
+        ] {
+            cases.push((inert.replace('\n', newline), false));
+        }
+    }
+    cases
+}
+
+#[test]
+fn powershell_multiline_control_blocks_in_dialect_and_both_hook_protocols() {
+    for (command, deny) in multiline_control_cases() {
+        let expected = if deny {
+            EvaluationDecision::Deny
+        } else {
+            EvaluationDecision::Allow
+        };
+        assert_eq!(
+            decision_in(&command, ShellDialect::PowerShell),
+            expected,
+            "{command:?}"
+        );
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            let expected = if deny { "deny" } else { "allow" };
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", &command),
+                expected,
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
 /// Past the nesting depth the union's block gate fails closed, as the
 /// PowerShell reading does.
 #[test]
