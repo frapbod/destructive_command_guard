@@ -152,7 +152,6 @@ const QUOTED_TEXT_IN_ONE_ARGUMENT: &[&str] = &[
     r"$sb = { Write-Output 'git reset --hard' }",
     r"$X 'reset --hard'",
     r#"git commit -m "x" "reset --hard""#,
-    r#"git -c "a=b reset --hard" status"#,
     r#"git commit -m "fix: reset --hard bug""#,
     r#"git log --grep "reset --hard""#,
     r#"git stash push -m "clean -fdx later""#,
@@ -160,6 +159,12 @@ const QUOTED_TEXT_IN_ONE_ARGUMENT: &[&str] = &[
     r#"git clean -n -e "a b""#,
     r#"git clean -e "x y" -n"#,
 ];
+
+/// POSIX only. Under `Unknown` the Git view is the raw text (the dialect may
+/// be PowerShell), so the `-c` value's words still read as `reset --hard`
+/// there. That over-deny predates this boundary (v0.16.0 and PR #9 block it
+/// too) and errs safe; the Bash hook reads POSIX and allows it.
+const QUOTED_TEXT_IN_ONE_ARGUMENT_POSIX: &[&str] = &[r#"git -c "a=b reset --hard" status"#];
 
 /// The same boundary must not hide real Git syntax next to a quoted argument
 /// with spaces, nor let its text supply a dry-run flag (`-e "-n foo"` is an
@@ -476,10 +481,16 @@ fn quoted_argument_with_spaces_stays_one_word() {
         assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT, "Allow", decide, &label);
         assert_all(GIT_NEXT_TO_QUOTED_TEXT, "Deny", decide, &label);
     }
+    let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
+    assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT_POSIX, "Allow", posix, "Posix");
     for protocol in [Protocol::Claude, Protocol::Codex] {
         let decide = |command: &str| hook_decision(protocol, "Bash", command);
         let label = format!("{protocol:?} Bash");
         assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT, "allow", decide, &label);
+        // Codex on a Windows host reads a Bash label as `Unknown`.
+        if !cfg!(windows) {
+            assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT_POSIX, "allow", decide, &label);
+        }
         assert_all(GIT_NEXT_TO_QUOTED_TEXT, "deny", decide, &label);
     }
 }
