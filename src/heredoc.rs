@@ -1952,14 +1952,20 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
     //
     // The mask is blank-fill and length preserving, so every `byte_range` an
     // extractor computes against the view is the same range in the original.
-    if let Some(completed) = completed_extraction(command, limits) {
+    //
+    // The kept extractions are Bash's reading of `$'`; the plain reading
+    // extracts again and keeps nothing.
+    let cacheable = !crate::context::PlainDollarQuoteReading::active();
+    if cacheable && let Some(completed) = completed_extraction(command, limits) {
         return completed;
     }
     #[cfg(test)]
     EXTRACTIONS_RUN.with(|count| count.set(count.get() + 1));
     let scan_view = mask_non_expanding_data_heredocs(command);
     let result = extract_content_with_scan_view(command, scan_view.as_ref(), limits);
-    remember_completed_extraction(command, limits, &result);
+    if cacheable {
+        remember_completed_extraction(command, limits, &result);
+    }
     result
 }
 

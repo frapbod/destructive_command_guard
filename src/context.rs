@@ -434,7 +434,7 @@ impl ContextClassifier {
             match current_state {
                 TokenizerState::Normal => {
                     match byte {
-                        b'\'' | b'$' if byte == b'\'' || bytes.get(i + 1) == Some(&b'\'') => {
+                        b'\'' | b'$' if byte == b'\'' || ansi_c_quote_starts_at(bytes, i) => {
                             let ansi_c = byte == b'$';
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
@@ -713,7 +713,7 @@ impl ContextClassifier {
                             stack.push(TokenizerState::CommandSubst);
                         }
                         b'"' => stack.push(TokenizerState::DoubleQuote),
-                        b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                        b'$' if ansi_c_quote_starts_at(bytes, i) => {
                             stack.push(TokenizerState::AnsiCQuote);
                             i += 1;
                         }
@@ -2985,11 +2985,11 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
         }
 
         match b {
-            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+            b'$' if ansi_c_quote_starts_at(bytes, i) => {
                 i = skip_ansi_c_quoted(bytes, i + 2);
             }
             b'\\' => {
-                // Handle CRLF escape (consumes 3 bytes: \\, \\r, \\n)
+                // Handle CRLF escape (consumes 3 bytes: \, \r, \n)
                 if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
                     i += 3;
                 } else {
@@ -3266,13 +3266,7 @@ pub(crate) fn consume_braced_parameter(command: &str, start: usize) -> (usize, b
                 i += 2;
             }
             // `$'…'` takes backslash escapes, so `\'` does not close it.
-            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
-                i += 2;
-                while i < len && bytes[i] != b'\'' {
-                    i += if bytes[i] == b'\\' { 2 } else { 1 };
-                }
-                i = (i + 1).min(len);
-            }
+            b'$' if ansi_c_quote_starts_at(bytes, i) => i = skip_ansi_c_quoted(bytes, i + 2),
             b'}' => {
                 i += 1;
                 depth -= 1;
@@ -3588,7 +3582,7 @@ impl HeredocScanner<'_> {
                 }
                 b'\\' => (i + 2).min(len),
                 b'\'' => memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + at + 2),
-                b'$' if bytes.get(i + 1) == Some(&b'\'') => skip_ansi_c_quoted(bytes, i + 2),
+                b'$' if ansi_c_quote_starts_at(bytes, i) => skip_ansi_c_quoted(bytes, i + 2),
                 b'$' if bytes.get(i + 1) == Some(&b'"') => self.double_quoted(i + 2, depth + 1),
                 b'"' => self.double_quoted(i + 1, depth + 1),
                 b'$' if bytes.get(i + 1) == Some(&b'(') => self.substitution(i, depth + 1),
@@ -3690,7 +3684,7 @@ impl HeredocScanner<'_> {
                     nesting += 1;
                     i + 2
                 }
-                b'$' if bytes.get(i + 1) == Some(&b'\'') => skip_ansi_c_quoted(bytes, i + 2),
+                b'$' if ansi_c_quote_starts_at(bytes, i) => skip_ansi_c_quoted(bytes, i + 2),
                 b'}' => {
                     nesting -= 1;
                     if nesting == 0 {
@@ -3749,7 +3743,7 @@ impl HeredocScanner<'_> {
                     delimiter.extend_from_slice(&bytes[i + 1..close]);
                     i = (close + 1).min(len);
                 }
-                b'$' if matches!(bytes.get(i + 1), Some(b'\'' | b'"')) => {
+                b'$' if bytes.get(i + 1) == Some(&b'"') || ansi_c_quote_starts_at(bytes, i) => {
                     quoted = true;
                     let quote = bytes[i + 1];
                     let mut close = i + 2;
@@ -3964,12 +3958,85 @@ fn bracket_arithmetic_end(bytes: &[u8], start: usize) -> usize {
 }
 
 /// Index past the `$'…'` string whose text starts at `start`.
-fn skip_ansi_c_quoted(bytes: &[u8], start: usize) -> usize {
+pub(crate) fn skip_ansi_c_quoted(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     while i < bytes.len() && bytes[i] != b'\'' {
         i += if bytes[i] == b'\\' { 2 } else { 1 };
     }
     (i + 1).min(bytes.len())
+}
+
+thread_local! {
+    static PLAIN_DOLLAR_QUOTE_READING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the unquoted `$` at `i` opens a Bash ANSI-C string `$'…'`, in
+/// which a backslash escapes the next byte, so `\'` does not close it.
+///
+/// Only an odd run of unescaped `$` opens one: `$$` is the shell's process
+/// id, so `$$'` is a plain quote, while `$$$'` is the process id followed
+/// by `$'`, and `\$$'` is a literal `$` followed by `$'`. Every scanner that
+/// recognizes `$'` asks this one predicate.
+///
+/// Shells without ANSI-C strings (PowerShell, and dash as `/bin/sh`) read
+/// `$'` as a literal `$` and a plain quote. Under
+/// [`PlainDollarQuoteReading`] the predicate is always false, so the whole
+/// evaluation sees that reading instead.
+pub(crate) fn ansi_c_quote_starts_at(bytes: &[u8], i: usize) -> bool {
+    if bytes.get(i) != Some(&b'$')
+        || bytes.get(i + 1) != Some(&b'\'')
+        || PLAIN_DOLLAR_QUOTE_READING.with(std::cell::Cell::get)
+    {
+        return false;
+    }
+    let run_start = bytes[..i]
+        .iter()
+        .rposition(|byte| *byte != b'$')
+        .map_or(0, |at| at + 1);
+    let escapes = bytes[..run_start]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    let unescaped_dollars = i + 1 - run_start - escapes % 2;
+    unescaped_dollars % 2 == 1
+}
+
+/// Whether reading `$'` as a plain quote would put a quote boundary of
+/// `command` somewhere else: some ANSI-C string holds an escaped quote or
+/// ends at an escaped byte. Only then can the two readings disagree.
+pub(crate) fn dollar_quote_readings_differ(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    memchr::memmem::find_iter(bytes, b"$'").any(|i| {
+        ansi_c_quote_starts_at(bytes, i)
+            && memchr::memchr(b'\'', &bytes[i + 2..]).map_or(bytes.len(), |at| i + at + 3)
+                != skip_ansi_c_quoted(bytes, i + 2)
+    })
+}
+
+/// While alive, every scanner reads `$'` as a literal `$` and a plain quote,
+/// as PowerShell and dash do (see [`ansi_c_quote_starts_at`]).
+pub(crate) struct PlainDollarQuoteReading {
+    previous: bool,
+}
+
+impl PlainDollarQuoteReading {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: PLAIN_DOLLAR_QUOTE_READING.with(|reading| reading.replace(true)),
+        }
+    }
+
+    /// Whether a reading scope is active on this thread.
+    pub(crate) fn active() -> bool {
+        PLAIN_DOLLAR_QUOTE_READING.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for PlainDollarQuoteReading {
+    fn drop(&mut self) {
+        PLAIN_DOLLAR_QUOTE_READING.with(|reading| reading.set(self.previous));
+    }
 }
 
 /// Index past the `))` closing the arithmetic whose text starts at `start`
@@ -4093,6 +4160,38 @@ fn merge_ranges(ranges: &[Range<usize>]) -> SmallVec<[Range<usize>; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `$'` opens an ANSI-C string only after an odd run of unescaped `$`,
+    /// and never under the plain reading.
+    #[test]
+    fn ansi_c_quote_needs_an_odd_run_of_unescaped_dollars() {
+        let opens = |command: &str| {
+            let bytes = command.as_bytes();
+            (0..bytes.len())
+                .filter(|&i| ansi_c_quote_starts_at(bytes, i))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(opens("echo $'a'"), [5]);
+        assert_eq!(opens("echo $$'a'"), [] as [usize; 0]);
+        assert_eq!(opens("echo $$$'a'"), [7]);
+        assert_eq!(opens("echo $$$$'a'"), [] as [usize; 0]);
+        assert_eq!(opens(r"echo \$'a'"), [] as [usize; 0]);
+        assert_eq!(opens(r"echo \$$'a'"), [7]);
+        assert_eq!(opens(r"echo \\$'a'"), [7]);
+        assert_eq!(opens("$'a'"), [0]);
+
+        assert!(dollar_quote_readings_differ(r"echo $'a\'b'"));
+        assert!(!dollar_quote_readings_differ(r"echo $'a\n'"));
+        assert!(!dollar_quote_readings_differ(r"echo $$'a\'b'"));
+        {
+            let _plain = PlainDollarQuoteReading::enter();
+            assert!(PlainDollarQuoteReading::active());
+            assert_eq!(opens("echo $'a'"), [] as [usize; 0]);
+            assert!(!dollar_quote_readings_differ(r"echo $'a\'b'"));
+        }
+        assert!(!PlainDollarQuoteReading::active());
+        assert_eq!(opens("echo $'a'"), [5]);
+    }
 
     /// The interpreter search behind an inline-code flag reads each word of a
     /// segment once, however many flags the segment holds, and still resets

@@ -1031,7 +1031,7 @@ pub(super) fn join_line_continuations(command: &str) -> Option<(String, Vec<usiz
             b'\'' if !double_quoted => {
                 memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + at + 2)
             }
-            b'$' if !double_quoted && bytes.get(i + 1) == Some(&b'\'') => {
+            b'$' if !double_quoted && crate::context::ansi_c_quote_starts_at(bytes, i) => {
                 let mut at = i + 2;
                 while at < len && bytes[at] != b'\'' {
                     at += if bytes[at] == b'\\' { 2 } else { 1 };

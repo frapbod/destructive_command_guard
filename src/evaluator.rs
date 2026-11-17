@@ -8106,7 +8106,7 @@ fn shell_source_references_positional_input(source: &str) -> bool {
             // it is text, and its escaped quotes must not corrupt quote state.
             b'$' if !in_single
                 && !in_double
-                && source.as_bytes().get(index + 1) == Some(&b'\'') =>
+                && crate::context::ansi_c_quote_starts_at(source.as_bytes(), index) =>
             {
                 index = ansi_c_quote_end(source, index);
                 continue;
@@ -8466,7 +8466,7 @@ fn fixed_positional_template_with_masked_records(source: &str) -> Option<String>
             // quotes so they cannot corrupt the quote-state tracking.
             b'$' if !in_single
                 && !in_double
-                && source.as_bytes().get(index + 1) == Some(&b'\'') =>
+                && crate::context::ansi_c_quote_starts_at(source.as_bytes(), index) =>
             {
                 let end = ansi_c_quote_end(source, index);
                 masked.push_str(&source[index..end]);
@@ -15278,6 +15278,52 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             {
                 info.matched_text_preview = Some(extract_match_preview(command, span));
             }
+        }
+    }
+    // Bash reads `$'…'` as an ANSI-C string, which `\'` does not close.
+    // PowerShell (the shell Codex runs on Windows) and dash (`/bin/sh` on
+    // Debian, so any `sh -c`) read `$'` as a literal `$` and a plain quote.
+    // Their reading can close a string where Bash keeps it open, and run what
+    // Bash reads as text: `echo $'a\'; git reset --hard; echo 'x'`. When the
+    // two readings put a quote boundary in different places, read the whole
+    // command again the second way. Deny wins, as between dialect views; an
+    // allow-once grant is not spent on the second reading. Nested payloads
+    // come through here too (`sh -c "echo \$'a\\'; …"` differs only inside),
+    // and nothing read the second way is read again, so the extra work grows
+    // with the nesting depth, not exponentially.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && !crate::context::PlainDollarQuoteReading::active()
+        && crate::context::dollar_quote_readings_differ(command)
+    {
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            let _plain = crate::context::PlainDollarQuoteReading::enter();
+            evaluate_command_in_dialect_union(
+                command,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            result = alternate;
         }
     }
     // A positive denial remains decisive. An exact-command grant explicitly

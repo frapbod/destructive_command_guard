@@ -1697,7 +1697,7 @@ fn consume_word_token_inner(
         }
 
         match b {
-            b'$' if i + 1 < len && bytes[i + 1] == b'\'' => {
+            b'$' if crate::context::ansi_c_quote_starts_at(bytes, i) => {
                 // ANSI-C quotes are one segment of the same word. An escaped
                 // apostrophe does not end that segment (issue #570).
                 i += 2;
@@ -2098,7 +2098,9 @@ fn decode_posix_token(token: &str, literal_word: bool) -> Option<Cow<'_, str>> {
                         other => output.push(other),
                     }
                 }
-                '$' if chars.peek() == Some(&'\'') => {
+                '$' if chars.peek() == Some(&'\'')
+                    && !crate::context::PlainDollarQuoteReading::active() =>
+                {
                     chars.next();
                     if decode_ansi_c_quoted(&mut chars, &mut output).is_err() {
                         return None;
@@ -3902,11 +3904,13 @@ fn normalize_subcommand_token(token: &str, posix_quoting: bool) -> Option<String
 fn dcg_syntax_quote_state(token: &str, dialect: ShellDialect) -> Option<(PosixQuote, bool)> {
     let mut quote = PosixQuote::Unquoted;
     let mut ansi_c_quote = false;
-    let mut chars = token.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let mut chars = token.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
         if quote == PosixQuote::Single && !ansi_c_quote {
             if ch == '\'' {
-                if dialect == ShellDialect::PowerShell && chars.peek() == Some(&'\'') {
+                if dialect == ShellDialect::PowerShell
+                    && chars.peek().map(|&(_, next)| next) == Some('\'')
+                {
                     chars.next();
                 } else {
                     quote = PosixQuote::Unquoted;
@@ -3915,7 +3919,7 @@ fn dcg_syntax_quote_state(token: &str, dialect: ShellDialect) -> Option<(PosixQu
             continue;
         }
         if dialect == ShellDialect::PowerShell && ch == '`' {
-            let escaped = chars.next()?;
+            let (_, escaped) = chars.next()?;
             if matches!(
                 escaped,
                 '0' | 'a' | 'b' | 'e' | 'f' | 'n' | 'r' | 't' | 'u' | 'v'
@@ -3930,7 +3934,8 @@ fn dcg_syntax_quote_state(token: &str, dialect: ShellDialect) -> Option<(PosixQu
         }
         match (quote, ch) {
             (PosixQuote::Unquoted, '$')
-                if dialect == ShellDialect::Posix && chars.peek() == Some(&'\'') =>
+                if dialect == ShellDialect::Posix
+                    && crate::context::ansi_c_quote_starts_at(token.as_bytes(), at) =>
             {
                 chars.next();
                 quote = PosixQuote::Single;

@@ -1,6 +1,10 @@
 // `${IFS:0:1}` in the shell commands below is not a format argument.
 #![allow(clippy::literal_string_with_formatting_args)]
 
+use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
+use destructive_command_guard::normalize::ShellDialect;
+use destructive_command_guard::packs::REGISTRY;
+use destructive_command_guard::{Config, EvaluationDecision, LayeredAllowlist};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -142,11 +146,116 @@ fn ansi_c_quote_boundaries_both_protocols() {
     assert_both(
         "allow",
         &[
-            r"echo $'a\'b; git reset --hard'",
             r"echo $'a\'b'; git status",
             r"echo 'a\'; git status",
             r"printf '%s' $'it\'s fine'",
             r"echo \$'a\'; git status",
         ],
     );
+}
+
+/// `$$` is the shell's process id, so `$$'` opens a plain quote: Bash 3.2 and
+/// 5.2 run the middle command of each of these. An odd run of `$` before the
+/// quote (`$$$'`) is the process id followed by an ANSI-C string.
+#[test]
+fn process_id_before_a_quote_is_not_ansi_c() {
+    assert_both(
+        "deny",
+        &[
+            r"echo $$'a\'; git reset --hard; echo 'x'",
+            "echo $$'a\\'\ngit reset --hard\necho 'x'",
+            r"echo $$'a\' && rm -rf ~; echo 'x'",
+            r"echo $$'a\' && git reset --hard && echo 'x'",
+            r"echo $$$$'a\'; git reset --hard; echo 'x'",
+            r"x=$(echo $$'a\'; git reset --hard; echo 'x')",
+            r"echo $$$'a\'b'; git reset --hard",
+        ],
+    );
+    assert_both("allow", &[r"echo $$'a\'; git status; echo 'x'"]);
+}
+
+/// PowerShell (what Codex runs on Windows) and dash (`/bin/sh` on Debian)
+/// read `$'` as a literal `$` and a plain quote, so `$'a\'` ends at the
+/// backslash and the next command runs. The hook denies what either reading
+/// runs. Measured: dash and powershell.exe ran the middle command; Bash
+/// refused the whole line (unterminated quote).
+#[test]
+fn plain_dollar_quote_reading_both_protocols() {
+    assert_both(
+        "deny",
+        &[
+            r"echo $'a\'; git reset --hard; echo 'x'",
+            r#"sh -c "echo \$'a\\'; git reset --hard; echo 'x'""#,
+            r"echo $'C:\temp\'; git reset --hard; echo 'done'",
+            // Bash's own reading still decides this one.
+            r"echo $'a\'b'; git reset --hard",
+            // Destructive text inside the ANSI-C string is a command in the
+            // plain reading: accepted as a false positive, as every earlier
+            // build denied it too.
+            r"echo $'a\'b; git reset --hard'",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r"echo $'a\'; git status; echo 'x'",
+            r"printf $'a\n'; git status",
+        ],
+    );
+}
+
+fn evaluate_all_packs(command: &str, dialect: ShellDialect) -> EvaluationDecision {
+    let enabled: std::collections::HashSet<String> = REGISTRY
+        .all_pack_ids()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+    let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+    let index = REGISTRY.build_enabled_keyword_index(&ordered);
+    let config = Config::default();
+    let overrides = config.overrides.compile();
+    let heredoc = config.heredoc_settings();
+    evaluate_command_with_pack_order_at_path_in_dialect(
+        command,
+        &keywords,
+        &ordered,
+        index.as_ref(),
+        &overrides,
+        &LayeredAllowlist::default(),
+        &heredoc,
+        None,
+        dialect,
+    )
+    .decision
+}
+
+/// A Windows Codex "Bash" payload is evaluated as `Unknown` (or PowerShell),
+/// and desktop Codex runs it with `powershell.exe -Command`. There `$'` is a
+/// literal `$` and a plain quote: `Write-Output $'a\'; Write-Output '[RUN]'`
+/// printed `[RUN]` on the desktop.
+#[test]
+fn powershell_reading_of_dollar_quote_under_unknown_and_powershell() {
+    for dialect in [
+        ShellDialect::Unknown,
+        ShellDialect::PowerShell,
+        ShellDialect::Posix,
+    ] {
+        for command in [
+            r"Write-Output $'a\'; git reset --hard; Write-Output 'x'",
+            r"echo $'C:\temp\'; git reset --hard; echo 'done'",
+        ] {
+            assert_eq!(
+                evaluate_all_packs(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        let harmless = r"Write-Output $'a\'; git status; Write-Output 'x'";
+        assert_eq!(
+            evaluate_all_packs(harmless, dialect),
+            EvaluationDecision::Allow,
+            "{dialect:?}: {harmless:?}"
+        );
+    }
 }
