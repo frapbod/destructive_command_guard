@@ -3902,7 +3902,7 @@ pub(crate) fn blank_inert_redirections(command: &str) -> std::borrow::Cow<'_, st
         match byte {
             b'\'' => in_single = true,
             b'"' => in_double = true,
-            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+            b'$' if crate::context::ansi_c_quote_starts_at(bytes, i) => {
                 in_ansi_c = true;
                 i += 2;
                 continue;
@@ -4336,17 +4336,25 @@ fn collect_command_segments<'a>(
     let mut segment_start = start;
     let mut i = start;
     let mut in_single = false;
+    let mut in_ansi_c = false;
     let mut in_double = false;
 
     while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < end {
+        if !in_single && !in_double && crate::context::ansi_c_quote_starts_at(bytes, i) {
+            in_single = true;
+            in_ansi_c = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\\' && (!in_single || in_ansi_c) && i + 1 < end {
             i += 2;
             continue;
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            in_ansi_c = false;
             i += 1;
             continue;
         }
@@ -4541,12 +4549,19 @@ fn collect_quoted_shell_separator_offsets(
     let bytes = cmd.as_bytes();
     let mut i = start;
     let mut in_single = false;
+    let mut in_ansi_c = false;
     let mut in_double = false;
 
     while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < end {
+        if !in_single && !in_double && crate::context::ansi_c_quote_starts_at(bytes, i) {
+            in_single = true;
+            in_ansi_c = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\\' && (!in_single || in_ansi_c) && i + 1 < end {
             if matches!(bytes[i + 1], b';' | b'|' | b'&') {
                 offsets.push(i + 1);
             }
@@ -4555,6 +4570,7 @@ fn collect_quoted_shell_separator_offsets(
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            in_ansi_c = false;
             i += 1;
             continue;
         }
@@ -4657,17 +4673,25 @@ fn find_matching_command_substitution(cmd: &str, start: usize, end: usize) -> Op
     let bytes = cmd.as_bytes();
     let mut i = start;
     let mut in_single = false;
+    let mut in_ansi_c = false;
     let mut in_double = false;
 
     while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < end {
+        if !in_single && !in_double && crate::context::ansi_c_quote_starts_at(bytes, i) {
+            in_single = true;
+            in_ansi_c = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\\' && (!in_single || in_ansi_c) && i + 1 < end {
             i += 2;
             continue;
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            in_ansi_c = false;
             i += 1;
             continue;
         }
@@ -4737,17 +4761,25 @@ fn find_matching_arithmetic_expansion(cmd: &str, start: usize, end: usize) -> Op
     let mut i = start;
     let mut paren_depth = 0usize;
     let mut in_single = false;
+    let mut in_ansi_c = false;
     let mut in_double = false;
 
     while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < end {
+        if !in_single && !in_double && crate::context::ansi_c_quote_starts_at(bytes, i) {
+            in_single = true;
+            in_ansi_c = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\\' && (!in_single || in_ansi_c) && i + 1 < end {
             i += 2;
             continue;
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            in_ansi_c = false;
             i += 1;
             continue;
         }
@@ -5818,6 +5850,23 @@ destructive_patterns:
         assert_eq!(split_command_segments(r"echo a\; b"), vec![r"echo a\; b"]);
         assert_eq!(split_command_segments(r"echo a\| b"), vec![r"echo a\| b"]);
         assert_eq!(split_command_segments(r"echo a\& b"), vec![r"echo a\& b"]);
+        // `\'` does not close `$'…'`, but `$$'` is the process id and a plain
+        // quote.
+        assert_eq!(
+            split_command_segments(r"echo $'a\'b'; git reset --hard"),
+            vec![r"echo $'a\'b'", "git reset --hard"]
+        );
+        assert_eq!(
+            split_command_segments(r"echo $$'a\'; git reset --hard; echo 'x'"),
+            vec![r"echo $$'a\'", "git reset --hard", "echo 'x'"]
+        );
+        // Under the plain reading (PowerShell, dash) `$'a\'` ends at the
+        // backslash too.
+        let _plain = crate::context::PlainDollarQuoteReading::enter();
+        assert_eq!(
+            split_command_segments(r"echo $'a\'; git reset --hard; echo 'x'"),
+            vec![r"echo $'a\'", "git reset --hard", "echo 'x'"]
+        );
     }
 
     #[test]
