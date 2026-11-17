@@ -245,6 +245,22 @@ fn rebound_ifs_splitting_denies_under_both_protocols() {
             "for i in 1 2; do \"${IFS}it\" reset --hard; IFS=g; done",
             "unset IFS; (IFS=x); IFS+=g; \"${IFS}it\" reset --hard",
             "f(){ IFS+=g; }; unset IFS; f; \"${IFS}it\" reset --hard",
+            // A reading write applies once for each place it is written, and
+            // any number of times in a loop or a function body.
+            "unset IFS; IFS+=-; IFS+=-; git reset \"${IFS}hard\"",
+            "IFS=; IFS+=-; IFS+=-; git reset \"${IFS}hard\"",
+            "IFS[0]=; IFS[0]+=-; IFS[0]+=-; git reset \"${IFS}hard\"",
+            "bash -c 'unset IFS; IFS+=-; IFS+=-; git reset \"${IFS}hard\"'",
+            "IFS=; for i in 1 2; do IFS+=-; done; git reset \"${IFS}hard\"",
+            "f(){ IFS+=-; }; IFS=; f; f; git reset \"${IFS}hard\"",
+            "IFS=; while [ ${#IFS} -lt 2 ]; do IFS+=-; done; git reset \"${IFS}hard\"",
+            "IFS=; until [ ${#IFS} -ge 2 ]; do IFS+=-; done; git reset \"${IFS}hard\"",
+            // Bash runs the lines before a syntax error; without a clean
+            // parse a use that needs a value cannot be checked.
+            "IFS=g; \"${IFS}it\" reset --hard\n)",
+            "IFS=g; \"${IFS}it\" reset --hard\n;;",
+            "unset IFS; IFS+=g; \"${IFS}it\" reset --hard\n)",
+            "IFS=x; git${IFS}reset${IFS}--hard\n)",
             // More combinations than dcg checks.
             "echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f",
         ],
@@ -283,6 +299,10 @@ fn harmless_ifs_uses_stay_allowed_under_both_protocols() {
             "old=$IFS; IFS=,; echo \"${arr[*]}\"; IFS=$old",
             "while IFS=: read -r a b; do echo \"$a\"; done < /etc/passwd",
             "f(){ declare -p IFS; }; f",
+            // Counted appends stay within the value cap.
+            "IFS+=,; echo \"$IFS\"",
+            "IFS=; IFS+=,; IFS+=,; echo \"$IFS\"",
+            "for i in 1 2; do IFS=,; echo \"$IFS\"; done",
         ],
     );
 }

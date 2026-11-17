@@ -17462,7 +17462,7 @@ const MAX_IFS_EXPANSION_VIEWS: usize = 32;
 const DEFAULT_POSIX_IFS: &str = " \t\n";
 
 /// The value of `IFS` presumed in force at some point of a command.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum IfsValue {
     /// Set to this text.
     Set(String),
@@ -17560,8 +17560,9 @@ struct IfsReference {
 /// Single-quoted text, ANSI-C strings, comments and escaped `\$IFS` are
 /// literal and do not count. The shell parser marks that text, and the
 /// double-quoted text, when it parses `command` cleanly; otherwise every
-/// unescaped reference counts, its quoting is unknown and only the default
-/// value is computed. Heredoc bodies always count: data stays data after
+/// unescaped reference counts and its quoting is unknown, so it needs a
+/// value: the default when nothing else in the command mentions `IFS`,
+/// else none (denied as unverified). Heredoc bodies always count: data stays data after
 /// the replacement, and a body a shell reads expands there.
 fn posix_ifs_expansion_views(command: &str) -> Option<Vec<String>> {
     // `${IFS}` puts a `{` between the `$` and the name, so match both spellings.
@@ -17588,14 +17589,19 @@ fn posix_ifs_expansion_views(command: &str) -> Option<Vec<String>> {
     if references.is_empty() {
         return Some(Vec::new());
     }
+    let rebinding = ifs_rebinding_offsets(command, &references);
+    // Without a clean parse the writes are not decoded. The default value is
+    // then known only when nothing else in the command mentions IFS: Bash
+    // runs the lines before a syntax error, so `IFS=g; "${IFS}it" ...`
+    // followed by a stray `)` still runs `git`.
     let default = [IfsValue::default_value()];
     let values = match &parse {
         Some(parse) => parse.values.as_deref(),
-        None => Some(&default[..]),
+        None if rebinding.is_empty() => Some(&default[..]),
+        None => None,
     };
     // Uses with the same text, quoting and binding of IFS yield the same text,
     // so they share one choice; others vary independently.
-    let rebinding = ifs_rebinding_offsets(command, &references);
     let mut keys = Vec::new();
     let mut candidates: Vec<Vec<String>> = Vec::new();
     let mut combinations = 1usize;
@@ -18275,9 +18281,22 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
             .filter(|value| !value.contains(['$', '`']))
     };
     let mut literal = Vec::new();
-    let mut writes: Vec<IfsWrite> = Vec::new();
+    // Each write, and whether it may run more than once: inside a loop
+    // (including its condition and word list) or a function body.
+    let mut writes: Vec<(IfsWrite, bool)> = Vec::new();
     let mut contexts = Vec::new();
     for node in ast.root().dfs() {
+        let repeats = || {
+            node.ancestors().any(|ancestor| {
+                matches!(
+                    ancestor.kind().as_ref(),
+                    "for_statement"
+                        | "c_style_for_statement"
+                        | "while_statement"
+                        | "function_definition"
+                )
+            })
+        };
         match node.kind().as_ref() {
             "raw_string" | "ansi_c_string" | "comment" => literal.push(node.range()),
             "string" => contexts.push((node.range(), IfsContext::Quoted)),
@@ -18335,7 +18354,7 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
                     }
                     _ => continue,
                 };
-                writes.push(write);
+                writes.push((write, repeats()));
             }
             "expansion" => {
                 let text = node.text();
@@ -18348,10 +18367,13 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
                         None => (false, operation),
                     };
                     if let Some(word) = word.strip_prefix('=') {
-                        writes.push(IfsWrite::Default {
-                            colon,
-                            word: static_ifs_operand(word),
-                        });
+                        writes.push((
+                            IfsWrite::Default {
+                                colon,
+                                word: static_ifs_operand(word),
+                            },
+                            repeats(),
+                        ));
                     }
                 }
             }
@@ -18370,7 +18392,7 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
                     })
                 });
                 if unsets {
-                    writes.push(IfsWrite::Unset);
+                    writes.push((IfsWrite::Unset, repeats()));
                 }
             }
             "declaration_command" => {
@@ -18403,7 +18425,7 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
                         .iter()
                         .any(|word| word.kind() == "variable_name" && word.text() == "IFS")
                 {
-                    writes.push(IfsWrite::Unset);
+                    writes.push((IfsWrite::Unset, true));
                 }
             }
             "for_statement" | "select_statement"
@@ -18411,7 +18433,7 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
                     .field("variable")
                     .is_some_and(|variable| variable.text() == "IFS") =>
             {
-                writes.push(IfsWrite::Unknown);
+                writes.push((IfsWrite::Unknown, true));
             }
             "command" => {
                 let Some(name) = node.field("name") else {
@@ -18432,7 +18454,7 @@ fn parsed_ifs_literals(command: &str) -> Option<IfsParse> {
                     _ => false,
                 };
                 if writes_ifs {
-                    writes.push(IfsWrite::Unknown);
+                    writes.push((IfsWrite::Unknown, repeats()));
                 }
             }
             _ => {}
@@ -18453,18 +18475,26 @@ const MAX_IFS_VALUES: usize = MAX_IFS_EXPANSION_VIEWS;
 /// Upper bound on the write applications [`possible_ifs_values`] tries.
 const MAX_IFS_VALUE_STEPS: usize = 4096;
 
+/// Upper bound on the distinct writes that read the value
+/// ([`possible_ifs_values`]).
+const MAX_IFS_READING_WRITES: usize = 64;
+
 /// Every value `IFS` can take in a command with these writes, the default
-/// first, or `None` when there are more than [`MAX_IFS_VALUES`] (or the
-/// search passes [`MAX_IFS_VALUE_STEPS`]).
+/// first, or `None` when there are more than [`MAX_IFS_VALUES`] (or more
+/// than [`MAX_IFS_READING_WRITES`] distinct reading writes, or the search
+/// passes [`MAX_IFS_VALUE_STEPS`]). Each write comes with whether it may
+/// run more than once.
 ///
 /// Any write may happen or not, in any order: source order does not show
 /// whether a write in a child shell, branch, loop, prefix assignment or
 /// function body runs, or when. A write that sets the value outright gives
 /// that value. A write that reads it (`IFS+=w`, `${IFS=w}`) is applied to
-/// every value found, and to the results, each such write at most once per
-/// chain, so `unset IFS; (IFS=x); IFS+=g` gives `g` as well as `xg`. A
-/// write repeated by a loop is counted once.
-fn possible_ifs_values(writes: &[IfsWrite]) -> Option<Vec<IfsValue>> {
+/// every value found, and to the results: once for each place it is
+/// written, so `IFS=; IFS+=-; IFS+=-` gives `--`, and any number of times
+/// when it is in a loop or a function body, so `IFS=; for i in 1 2; do
+/// IFS+=-; done` gives `-`, `--`, ... until the value cap is passed.
+/// `unset IFS; (IFS=x); IFS+=g` gives `g` as well as `xg`.
+fn possible_ifs_values(writes: &[(IfsWrite, bool)]) -> Option<Vec<IfsValue>> {
     let mut values = vec![IfsValue::default_value()];
     let add = |values: &mut Vec<IfsValue>, value: IfsValue| -> Option<()> {
         if !values.contains(&value) {
@@ -18475,14 +18505,18 @@ fn possible_ifs_values(writes: &[IfsWrite]) -> Option<Vec<IfsValue>> {
         }
         Some(())
     };
-    let mut reading: Vec<&IfsWrite> = Vec::new();
-    for write in writes {
+    // Each distinct reading write, with how many times it may apply.
+    let mut reading: Vec<(&IfsWrite, usize)> = Vec::new();
+    for (write, repeats) in writes {
         if write.reads_value() {
-            if !reading.contains(&write) {
-                if reading.len() == u64::BITS as usize {
+            let times = if *repeats { usize::MAX } else { 1 };
+            if let Some((_, limit)) = reading.iter_mut().find(|(seen, _)| *seen == write) {
+                *limit = limit.saturating_add(times);
+            } else {
+                if reading.len() == MAX_IFS_READING_WRITES {
                     return None;
                 }
-                reading.push(write);
+                reading.push((write, times));
             }
         } else if !matches!(
             write,
@@ -18494,15 +18528,19 @@ fn possible_ifs_values(writes: &[IfsWrite]) -> Option<Vec<IfsValue>> {
             add(&mut values, write.apply(&IfsValue::Unknown))?;
         }
     }
+    // A state is a value and how many times each reading write has applied.
     let mut frontier = values
         .iter()
-        .map(|value| (value.clone(), 0u64))
+        .map(|value| (value.clone(), vec![0usize; reading.len()]))
         .collect::<Vec<_>>();
+    let mut seen = frontier
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
     let mut steps = 0usize;
     while let Some((value, applied)) = frontier.pop() {
-        for (bit, write) in reading.iter().enumerate() {
-            let mask = 1u64 << bit;
-            if applied & mask != 0 {
+        for (index, (write, limit)) in reading.iter().enumerate() {
+            if applied[index] == *limit {
                 continue;
             }
             steps += 1;
@@ -18510,9 +18548,15 @@ fn possible_ifs_values(writes: &[IfsWrite]) -> Option<Vec<IfsValue>> {
                 return None;
             }
             let next = write.apply(&value);
-            if next != value {
-                add(&mut values, next.clone())?;
-                frontier.push((next, applied | mask));
+            if next == value {
+                continue;
+            }
+            add(&mut values, next.clone())?;
+            let mut used = applied.clone();
+            used[index] += 1;
+            let state = (next, used);
+            if seen.insert(state.clone()) {
+                frontier.push(state);
             }
         }
     }
@@ -40341,6 +40385,22 @@ mod tests {
             posix_ifs_expansion_views("echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f"),
             None
         );
+        // Without a clean parse the quoting is unknown, so every use needs a
+        // value: the default when nothing else mentions IFS, else none, and
+        // the caller denies.
+        let unparsed =
+            posix_ifs_expansion_views("\"${IFS}it\" reset --hard\n)").expect("default value");
+        assert!(
+            unparsed.contains(&"\" \t\nit\" reset --hard\n)".to_string()),
+            "{unparsed:?}"
+        );
+        for command in [
+            "IFS=g; \"${IFS}it\" reset --hard\n)",
+            "unset IFS; \"gi${IFS-t}\" reset --hard\n)",
+            "IFS=x; git${IFS}reset${IFS}--hard\n)",
+        ] {
+            assert_eq!(posix_ifs_expansion_views(command), None, "{command}");
+        }
     }
 
     #[test]
@@ -40533,7 +40593,7 @@ mod tests {
         // A valueless local in a function is unset; the outer value stays
         // possible too.
         same(
-            "f(){ local IFS; IFS+=g; }; echo",
+            "f(){ local IFS; }; IFS+=g",
             &[default(), unset.clone(), set("g"), set(" \t\ng")],
         );
         same("f(){ declare IFS; }", &[default(), unset.clone()]);
@@ -40589,6 +40649,59 @@ mod tests {
         );
         same("IFS=; : ${IFS:=t}", &[default(), set(""), set("t")]);
         same("IFS=; : ${IFS=t}", &[default(), set("")]);
+        // A reading write applies once for each place it is written.
+        same(
+            "IFS=; IFS+=-; IFS+=-",
+            &[
+                default(),
+                set(""),
+                set("-"),
+                set("--"),
+                set(" \t\n-"),
+                set(" \t\n--"),
+            ],
+        );
+        same(
+            "IFS[0]=; IFS[0]+=-; IFS[0]+=-",
+            &[
+                default(),
+                set(""),
+                set("-"),
+                set("--"),
+                set(" \t\n-"),
+                set(" \t\n--"),
+            ],
+        );
+        // In a loop or a function body it may apply any number of times;
+        // a write whose result does not change stays bounded.
+        same(
+            "IFS=; for i in 1; do : ${IFS:=t}; done",
+            &[default(), set(""), set("t")],
+        );
+        same("for i in 1; do IFS+=; done", &[default()]);
+        same(
+            "f(){ unset IFS; IFS+=(x); }",
+            &[default(), unset.clone(), set("x")],
+        );
+        same("for i in 1; do IFS=,; done", &[default(), set(",")]);
+        for command in [
+            "IFS=; for i in 1 2; do IFS+=-; done",
+            "IFS=; for ((i = 0; i < 2; i++)); do IFS+=-; done",
+            "IFS=; while :; do IFS+=-; done",
+            "IFS=; until false; do IFS+=-; done",
+            "IFS=; while IFS+=-; do :; done",
+            "IFS=; select x in a; do IFS+=-; done",
+            "f(){ IFS+=-; }; IFS=; f; f",
+            "f(){ local IFS; IFS+=g; }; echo",
+        ] {
+            assert!(
+                parsed_ifs_literals(command)
+                    .expect("parses")
+                    .values
+                    .is_none(),
+                "{command}"
+            );
+        }
         // Past the caps the value set is not built.
         let many = (0..40)
             .map(|i| format!("IFS=v{i}; "))
@@ -40698,6 +40811,22 @@ mod tests {
             "for i in 1 2; do \"${IFS}it\" reset --hard; IFS=g; done",
             "unset IFS; (IFS=x); IFS+=g; \"${IFS}it\" reset --hard",
             "f(){ IFS+=g; }; unset IFS; f; \"${IFS}it\" reset --hard",
+            // A reading write applies once for each place it is written, and
+            // any number of times in a loop or a function body.
+            "unset IFS; IFS+=-; IFS+=-; git reset \"${IFS}hard\"",
+            "IFS=; IFS+=-; IFS+=-; git reset \"${IFS}hard\"",
+            "IFS[0]=; IFS[0]+=-; IFS[0]+=-; git reset \"${IFS}hard\"",
+            "bash -c 'unset IFS; IFS+=-; IFS+=-; git reset \"${IFS}hard\"'",
+            "IFS=; for i in 1 2; do IFS+=-; done; git reset \"${IFS}hard\"",
+            "f(){ IFS+=-; }; IFS=; f; f; git reset \"${IFS}hard\"",
+            "IFS=; while [ ${#IFS} -lt 2 ]; do IFS+=-; done; git reset \"${IFS}hard\"",
+            "IFS=; until [ ${#IFS} -ge 2 ]; do IFS+=-; done; git reset \"${IFS}hard\"",
+            // Bash runs the lines before a syntax error; without a clean
+            // parse a use that needs a value cannot be checked.
+            "IFS=g; \"${IFS}it\" reset --hard\n)",
+            "IFS=g; \"${IFS}it\" reset --hard\n;;",
+            "unset IFS; IFS+=g; \"${IFS}it\" reset --hard\n)",
+            "IFS=x; git${IFS}reset${IFS}--hard\n)",
             // Patterns that made a backtracking matcher overflow or hang.
             "IFS=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; echo ${IFS#*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*ab}; git reset --hard",
             // More outcomes than dcg checks.
@@ -40722,6 +40851,10 @@ mod tests {
             "declare IFS; IFS+=g; \"${IFS}it\" reset --hard",
             "f(){ local IFS=,; echo \"$*\"; }; f a b",
             "old=$IFS; unset IFS; read -r a b; IFS=$old; echo \"$a\"",
+            // Counted appends stay within the value cap.
+            "IFS+=,; echo \"$IFS\"",
+            "IFS=; IFS+=,; IFS+=,; echo \"$IFS\"",
+            "for i in 1 2; do IFS=,; echo \"$IFS\"; done",
         ] {
             let result = evaluate_with_pack_ids(command, &packs);
             assert!(result.is_allowed(), "{command} -> {result:?}");
