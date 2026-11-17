@@ -9445,9 +9445,9 @@ pub(crate) fn shell_name_proven_shadowed_before(
             continue;
         }
         let changes = match &event.kind {
-            ShadowEventKind::Function(Some(name)) if name == target => (Shadow, Keep),
-            ShadowEventKind::Function(Some(_)) => (Keep, Keep),
-            ShadowEventKind::Function(None) => (Clear, Keep),
+            ShadowEventKind::Function(Some(name), _) if name == target => (Shadow, Keep),
+            ShadowEventKind::Function(Some(_), _) => (Keep, Keep),
+            ShadowEventKind::Function(None, _) => (Clear, Keep),
             ShadowEventKind::PathAssignment => (Keep, Clear),
             ShadowEventKind::Words(tokens) => command_shadow_changes(tokens, target),
             ShadowEventKind::Unreadable => (Clear, Clear),
@@ -9464,6 +9464,139 @@ pub(crate) fn shell_name_proven_shadowed_before(
     function || hashed
 }
 
+/// The body of the function `target` that a call at `offset` may run: the
+/// last definition before it in a shell the call shares, conditional ones
+/// included, unless a statement the call's shell always runs since (`unset
+/// -f`, `eval`, `source`, a definition under a computed name) may have
+/// removed it. A deny-only candidate: [`shell_function_frame_view`] judges
+/// what that body would run.
+pub(crate) fn shell_function_body_before(
+    command: &str,
+    offset: usize,
+    target: &str,
+) -> Option<std::ops::Range<usize>> {
+    let events = shell_shadow_events(command);
+    let events = events.as_ref().as_ref()?;
+    let mut body = None;
+    for event in events.iter().take_while(|event| event.range.start < offset) {
+        if event.range.end > offset {
+            continue;
+        }
+        let scope = shell_scope_at(&event.steps, offset);
+        if scope == ShellScope::Child {
+            continue;
+        }
+        let cleared = match &event.kind {
+            ShadowEventKind::Function(Some(name), defined) if name == target => {
+                body.clone_from(defined);
+                continue;
+            }
+            ShadowEventKind::Function(Some(_), _) | ShadowEventKind::PathAssignment => false,
+            ShadowEventKind::Function(None, _) | ShadowEventKind::Unreadable => true,
+            ShadowEventKind::Words(tokens) => {
+                command_shadow_changes(tokens, target).0 == ShadowChange::Clear
+            }
+        };
+        if cleared && scope == ShellScope::Always {
+            body = None;
+        }
+    }
+    body
+}
+
+/// The bytes of every function definition in `command`.
+pub(crate) fn shell_function_definitions(command: &str) -> Vec<std::ops::Range<usize>> {
+    shell_shadow_events(command)
+        .as_ref()
+        .as_ref()
+        .map(|events| {
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, ShadowEventKind::Function(..)))
+                .map(|event| event.range.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `command` with each call of a function it defines replaced by the body
+/// that call runs, in a frame that binds the call's words as positional
+/// parameters: `f() { "$@"; }; f git reset --hard` reads as
+/// `f() { "$@"; }; ( set -- git reset --hard; "$@"; )`. Bash runs the body
+/// with those parameters, so the proven-variable view can splice them where
+/// the body uses them. The subshell keeps the frame from reaching later
+/// statements, and the caller's variables stay visible in it.
+///
+/// Only calls outside every definition are replaced; a call in a body runs
+/// when its function does, and the frame for that call replaces it on the
+/// next reading. The call's words are taken as written, before any data
+/// masking of the command name (`echo() { "$@"; }; echo git reset --hard`).
+/// A call with assignment words, a body with no expansion and a definition
+/// the call cannot see (after it, in a child shell, removed) are left
+/// alone. `None` when nothing was replaced or the parse is incomplete.
+pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
+    if !command.contains('$') || !(command.contains("()") || command.contains("function")) {
+        return None;
+    }
+    let definitions = shell_function_definitions(command);
+    if definitions.is_empty() {
+        return None;
+    }
+    let ast = try_parse_shell_ast(command).ok()?;
+    let mut frames: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for node in ast.root().dfs() {
+        if node.is_error() || node.is_missing() {
+            return None;
+        }
+        if node.kind().as_ref() != "command" {
+            continue;
+        }
+        let call = node.range();
+        if definitions
+            .iter()
+            .any(|definition| definition.contains(&call.start))
+            || frames
+                .last()
+                .is_some_and(|(frame, _)| frame.end > call.start)
+        {
+            continue;
+        }
+        let Some(name) = node.field("name") else {
+            continue;
+        };
+        let name_range = name.range();
+        let name_text = name.text();
+        if name_range.start != call.start || !is_static_shell_name(name_text.as_ref()) {
+            continue;
+        }
+        let Some(body) = shell_function_body_before(command, call.start, name_text.as_ref()) else {
+            continue;
+        };
+        let body = command.get(body)?;
+        if !body.contains('$') {
+            continue;
+        }
+        let body = body
+            .strip_prefix('{')
+            .and_then(|inner| inner.strip_suffix('}'))
+            .unwrap_or(body);
+        let arguments = command.get(name_range.end..call.end)?;
+        frames.push((call, format!("( set --{arguments}; {body}\n)")));
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(command.len() * 2);
+    let mut copied = 0usize;
+    for (call, frame) in frames {
+        out.push_str(command.get(copied..call.start)?);
+        out.push_str(&frame);
+        copied = call.end;
+    }
+    out.push_str(command.get(copied..)?);
+    Some(out)
+}
+
 /// A statement that can change what a bare command name runs, for
 /// [`shell_name_proven_shadowed_before`].
 struct ShadowEvent {
@@ -9476,8 +9609,8 @@ struct ShadowEvent {
 type ShadowEvents = std::rc::Rc<Option<Vec<ShadowEvent>>>;
 
 enum ShadowEventKind {
-    /// A function definition, with its name when it is static.
-    Function(Option<String>),
+    /// A function definition, with its name when it is static, and its body.
+    Function(Option<String>, Option<std::ops::Range<usize>>),
     PathAssignment,
     /// A builtin that may change it, as words.
     Words(Vec<String>),
@@ -9519,6 +9652,7 @@ fn read_shell_shadow_events(command: &str) -> Option<Vec<ShadowEvent>> {
                 node.field("name")
                     .map(|name| name.text().into_owned())
                     .filter(|name| is_static_shell_name(name)),
+                node.field("body").map(|body| body.range()),
             ),
             "variable_assignment" if shell_assignment_name(text.as_ref()) == Some("PATH") => {
                 ShadowEventKind::PathAssignment

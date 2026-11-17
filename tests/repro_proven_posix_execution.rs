@@ -121,6 +121,51 @@ fn proven_command_arguments_and_source_are_judged() {
     );
 }
 
+/// The cases from the design review, measured allowed before this change.
+#[test]
+fn function_frames_and_positional_bindings_are_judged() {
+    assert_both(
+        "deny",
+        &[
+            r#"run() { echo "+ $*"; "$@"; }; run git reset --hard"#,
+            r#"f() { "$1" "${@:2}"; }; f git reset --hard"#,
+            r#"f() { shift; "$@"; }; f x git reset --hard"#,
+            r#"f() { local a=$1; shift; "$a" "$@"; }; f git reset --hard"#,
+            r#"f() { "$@"; }; g() { f "$@"; }; g git reset --hard"#,
+            r#"function f { "$@"; }; f git reset --hard"#,
+            r#"f() ( "$@" ); f git reset --hard"#,
+            r#"set -- git reset --hard; exec "$@""#,
+            r#"x=git; f() { "$@"; }; f "$x" reset --hard"#,
+            r#"retry() { "$@"; }; retry git push --force "$branch""#,
+            r#"x='git reset --hard'; bash <<< $x"#,
+            r#"x='git reset --hard'; bash <<< "${x}""#,
+            r#"x='git reset --hard'; bash -s <<< "$x""#,
+            r#"X='git reset --hard'; bash <<< " $X""#,
+        ],
+    );
+}
+
+#[test]
+fn frames_do_not_leak_or_run_before_their_definition() {
+    assert_both(
+        "allow",
+        &[
+            r#"f() { :; }; f git reset --hard; "$@""#,
+            r#"f git reset --hard; f() { "$@"; }"#,
+            r#"IFS=,; set -- git reset --hard; "$*""#,
+            r#"f() { "$@"; }; f "$x""#,
+            r#"x='git reset --hard'; cat <<< "$x""#,
+            r#"x='git reset --hard'; grep -q foo <<< "$x""#,
+            r#"f() { "$@"; }; f echo git reset --hard"#,
+            r#"set -- git reset --hard; shift 3; "$@""#,
+            r#"retry() { "$@" || retry "$@"; }; retry make"#,
+            r#"mk() { make "$@"; }; mk -j4 all"#,
+            r#"log() { echo "+ $*"; }; log git reset --hard"#,
+            r#"set -e; set -o pipefail; "$@""#,
+        ],
+    );
+}
+
 #[test]
 fn harmless_and_unknown_commands_keep_current_policy() {
     assert_both(

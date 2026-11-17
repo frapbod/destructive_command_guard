@@ -18520,52 +18520,63 @@ fn evaluate_command_in_dialect_union(
     // evaluate the reconstruction with those values spliced in. Running it
     // last keeps every existing denial's rule and span; only a denial (or an
     // incomplete evaluation, which fails closed) is adopted.
-    let view = if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+    let views: Vec<String> = if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
         && primary.decision == EvaluationDecision::Allow
         && primary.allowlist_override.is_none()
     {
+        // A function call runs its body with the call's words as positional
+        // parameters; that reading is judged first, and the proven-variable
+        // view of it splices them where the body uses them. Each frame is
+        // one level deeper, so recursion stops at the frame limit. The
+        // command's own proven view is judged after it, deny wins.
+        let frames = (nested_command_depth < MAX_FUNCTION_FRAME_DEPTH)
+            .then(|| crate::heredoc::shell_function_frame_view(command))
+            .flatten();
         // An unfinished view is never proof that the command is safe.
         // Unknown names are read only in the command as the agent sent it:
         // a nested payload (an `eval` body, `bash -c`) is judged without the
         // bindings around it, and this view's own reconstruction is judged
         // one level down, where its bare rendering must not split again.
         match posix_proven_variable_view(command, deadline, nested_command_depth == 0) {
-            Ok(view) => view,
+            Ok(view) => frames.into_iter().chain(view).collect(),
             Err(ProvenViewIncomplete::Budget) => {
                 return EvaluationResult::indeterminate_due_to_budget();
             }
         }
     } else {
-        None
+        Vec::new()
     };
-    let primary = if let Some(expanded) = view
+    let primary = if !views.is_empty()
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
-        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
-            &expanded,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
-            compiled_overrides,
-            allowlists,
-            heredoc_settings,
-            allow_once_audit,
-            project_path,
-            deadline,
-            ShellDialect::Posix,
-            nested_command_depth + 1,
-            inherited_automated_stdin,
-        );
-        if result.decision == EvaluationDecision::Allow {
-            primary
-        } else {
-            // The nested span indexes the reconstructed text.
-            if let Some(info) = result.pattern_info.as_mut() {
-                info.matched_span = None;
-                info.matched_text_preview = None;
+        let mut adopted = primary;
+        for expanded in &views {
+            let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                expanded,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                allow_once_audit,
+                project_path,
+                deadline,
+                ShellDialect::Posix,
+                nested_command_depth + 1,
+                inherited_automated_stdin,
+            );
+            if result.decision != EvaluationDecision::Allow {
+                // The nested span indexes the reconstructed text.
+                if let Some(info) = result.pattern_info.as_mut() {
+                    info.matched_span = None;
+                    info.matched_text_preview = None;
+                }
+                adopted = result;
+                break;
             }
-            result
         }
+        adopted
     } else {
         primary
     };
@@ -20335,6 +20346,12 @@ fn segment_is_pipeline_member(command: &str, start: usize, end: usize) -> bool {
 const MAX_INDIRECT_INPUT_BYTES: u64 = 256 * 1024;
 const MAX_INDIRECT_INPUT_FLOWS: usize = 32;
 const MAX_EMBEDDED_SHELL_DEPTH: usize = 8;
+
+/// Function frames [`crate::heredoc::shell_function_frame_view`] reads in
+/// one command (`g` calling `f` is two). Each is one nesting level, and it
+/// stays below [`MAX_EMBEDDED_SHELL_DEPTH`], past which a command is denied,
+/// so a recursive function is read a few calls deep and not denied for it.
+const MAX_FUNCTION_FRAME_DEPTH: usize = 4;
 const MAX_DATABASE_INCLUDE_DEPTH: usize = 8;
 const INDIRECT_INPUT_RULE: &str = "stdin-unverified";
 const SED_EXEC_UNVERIFIED_RULE: &str = "sed-exec-unverified";
@@ -20827,11 +20844,14 @@ fn posix_proven_variable_view(
     // Every binding source spells `=` (an assignment word) or `printf -v`;
     // IFS holds its default with none. Without one, every reference is
     // unknown and only [`posix_unknown_command_word_view`] can apply.
+    // Positional parameters are bound by `set` or a function frame.
     if !command.contains('$') || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
         return Ok(None);
     }
-    let bindings_possible =
-        command.contains('=') || command.contains("printf") || command.contains("IFS");
+    let bindings_possible = command.contains('=')
+        || command.contains("printf")
+        || command.contains("IFS")
+        || posix_text_has_positional_reference(command);
     if !bindings_possible && !unknown_names {
         return Ok(None);
     }
@@ -33467,6 +33487,18 @@ fn resolve_variable_bindings(
                     .and_then(|statement| source.get(statement))
                     .map_or(segment, str::trim);
                 let assignments = strip_assignment_declaration(segment);
+                // `local NAME=value` binds NAME in the frame it runs in; a
+                // deny-only proof reads it like any other assignment.
+                let assignments = match assignments.strip_prefix("local") {
+                    Some(rest)
+                        if deny_only
+                            && rest.starts_with([' ', '\t'])
+                            && !rest.trim_start().starts_with('-') =>
+                    {
+                        rest.trim_start()
+                    }
+                    _ => assignments,
+                };
                 let binding = match assignment_only_segment_binding(assignments, name) {
                     AssignmentOnlyBinding::NotAssignmentOnly => assignments
                         .strip_prefix(name)
@@ -35268,6 +35300,17 @@ fn deny_only_value_at_for_splitting(
     copy_depth: usize,
     ifs_splitting: bool,
 ) -> Option<String> {
+    // `$1`: the positional parameter in force, as a binding like any other.
+    if let Ok(position) = name.parse::<usize>() {
+        return match positional_fields_at(source, segment_ranges, segment_start, copy_depth)?
+            .get(position.checked_sub(1)?)
+        {
+            Some(PositionalField::Literal(value)) => Some(value.clone()),
+            Some(PositionalField::Word(_)) => None,
+            // Fewer parameters: `$5` expands to nothing.
+            None => Some(String::new()),
+        };
+    }
     let name = deny_only_nameref_target(source, segment_ranges, segment_start, name)?;
     if let Some((raw, before)) = earlier_assignment_word(earlier_words, name).ok()? {
         return deny_only_assignment_value(
@@ -35308,6 +35351,350 @@ fn deny_only_value_at_for_splitting(
         return None;
     };
     Some(value.clone())
+}
+
+/// A positional parameter reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PositionalReference {
+    /// `$N`, `${N}`.
+    One(usize),
+    /// `$@` (or `$*` when `star`), and `${@:FROM}`, `${@:FROM:COUNT}`.
+    All {
+        star: bool,
+        from: usize,
+        count: Option<usize>,
+    },
+}
+
+/// The positional parameter reference at the start of `tail`: what it
+/// reads, the bytes of its name and the bytes it spans. `$0`, `$#` and
+/// operators other than a literal slice are not read.
+fn positional_reference_at(tail: &str) -> Option<(PositionalReference, Range<usize>, usize)> {
+    let bytes = tail.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return None;
+    }
+    let all = |star| PositionalReference::All {
+        star,
+        from: 1,
+        count: None,
+    };
+    match *bytes.get(1)? {
+        b'@' => Some((all(false), 1..2, 2)),
+        b'*' => Some((all(true), 1..2, 2)),
+        digit @ b'1'..=b'9' => Some((PositionalReference::One(usize::from(digit - b'0')), 1..2, 2)),
+        b'{' => {
+            let close = tail.find('}')?;
+            let body = &tail[2..close];
+            let reference = match body {
+                "@" => all(false),
+                "*" => all(true),
+                _ if body.bytes().all(|byte| byte.is_ascii_digit()) && !body.starts_with('0') => {
+                    PositionalReference::One(body.parse().ok()?)
+                }
+                _ => {
+                    let star = match body.as_bytes().first()? {
+                        b'@' => false,
+                        b'*' => true,
+                        _ => return None,
+                    };
+                    let slice = body[1..].strip_prefix(':')?;
+                    let (from, count) = match slice.split_once(':') {
+                        Some((from, count)) => (from, Some(count)),
+                        None => (slice, None),
+                    };
+                    let number = |text: &str| {
+                        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+                            .then(|| text.parse::<usize>().ok())
+                            .flatten()
+                    };
+                    let from = number(from).filter(|from| *from > 0)?;
+                    let count = match count {
+                        Some(count) => Some(number(count)?),
+                        None => None,
+                    };
+                    PositionalReference::All { star, from, count }
+                }
+            };
+            Some((reference, 2..close, close + 1))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `text` spells a positional parameter reference anywhere.
+fn posix_text_has_positional_reference(text: &str) -> bool {
+    text.match_indices('$').any(|(index, _)| {
+        let after = &text.as_bytes()[index + 1..];
+        let after = after.strip_prefix(b"{").unwrap_or(after);
+        after
+            .first()
+            .is_some_and(|byte| matches!(byte, b'@' | b'*' | b'1'..=b'9'))
+    })
+}
+
+/// One positional parameter as a deny-only proof knows it.
+#[derive(Clone, Debug)]
+enum PositionalField {
+    /// Its exact value.
+    Literal(String),
+    /// The word that set it, as written, when its value is not proven: the
+    /// same word expands to the same fields where the frame uses it.
+    Word(String),
+}
+
+/// `set [OPTIONS] [--] WORDS`: the words it binds as positional parameters,
+/// `Some(None)` when it binds none (`set -e`, `set -o pipefail`), `None`
+/// when its options cannot be read.
+fn posix_set_positional_words<'a, 'w>(words: &'w [&'a str]) -> Option<Option<&'w [&'a str]>> {
+    let mut index = 1;
+    while let Some(word) = words.get(index) {
+        if matches!(*word, "--" | "-") {
+            return Some(Some(&words[index + 1..]));
+        }
+        if !(word.starts_with('-') || word.starts_with('+')) {
+            return Some(Some(&words[index..]));
+        }
+        if !word[1..].bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return None;
+        }
+        // `-o NAME` takes the next word.
+        index += if word[1..].contains('o') { 2 } else { 1 };
+    }
+    Some(None)
+}
+
+/// The positional parameters in force at `point`, for a deny-only proof.
+///
+/// They are bound by `set -- WORDS` (or `set WORDS`) earlier in the same
+/// shell and function frame, and `shift` drops from them; a frame's own
+/// parameters, before any `set`, are unknown. That includes a function body,
+/// whose parameters are its call's words: [`crate::heredoc::shell_function_frame_view`]
+/// spells each call as `( set -- WORDS; BODY )` so this proof reads them.
+/// A `set` or `shift` in a child shell does not reach `point`; one in a
+/// branch is a value the shell may hold, as with variables. After `eval`,
+/// `source`, `.` or a `set`/`shift` it cannot read, they are unknown until
+/// the next `set`.
+///
+/// Each word is read where the `set` ran: a literal, a copy of a parameter
+/// of the frame before it (`set -- "$@"`, up to `copy_depth` frames), or a
+/// proven variable (`x=git; set -- "$x"`). Any other word is kept as written
+/// ([`PositionalField::Word`]).
+fn positional_fields_at(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    point: usize,
+    copy_depth: usize,
+) -> Option<Vec<PositionalField>> {
+    let index = deny_only_segment_index(source, segment_ranges);
+    let scopes = index.scopes()?;
+    let definitions = crate::heredoc::shell_function_definitions(source);
+    let frame = |offset: usize| {
+        definitions
+            .iter()
+            .filter(|definition| definition.contains(&offset))
+            .min_by_key(|definition| definition.len())
+    };
+    let use_frame = frame(point);
+    // (where the binding `set` starts, its words)
+    let mut bound: Option<(usize, Vec<&str>)> = None;
+    for (range, steps) in &scopes.statements {
+        if range.start >= point {
+            break;
+        }
+        if range.end > point {
+            continue;
+        }
+        let text = source.get(range.clone())?.trim();
+        let first = text
+            .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
+            .next()
+            .unwrap_or_default();
+        if !matches!(first, "set" | "shift" | "eval" | "source" | ".")
+            || frame(range.start) != use_frame
+            || crate::heredoc::shell_scope_at(steps, point) == crate::heredoc::ShellScope::Child
+        {
+            continue;
+        }
+        if deny_only_deadline_exceeded() {
+            return None;
+        }
+        let words = split_assignment_words(text);
+        match (first, words.as_deref()) {
+            ("set", Some(words)) => match posix_set_positional_words(words) {
+                Some(Some(set)) => bound = Some((range.start, set.to_vec())),
+                Some(None) => {}
+                None => bound = None,
+            },
+            ("shift", Some([_, count @ ..])) => {
+                let count = match count {
+                    [] => 1,
+                    [count] => match count.parse::<usize>() {
+                        Ok(count) => count,
+                        Err(_) => {
+                            bound = None;
+                            continue;
+                        }
+                    },
+                    _ => {
+                        bound = None;
+                        continue;
+                    }
+                };
+                // Bash leaves them as they were when there are fewer.
+                if let Some((_, words)) = bound.as_mut()
+                    && count <= words.len()
+                {
+                    words.drain(..count);
+                }
+            }
+            _ => bound = None,
+        }
+    }
+    let (at, words) = bound?;
+    let blank_or_glob =
+        |value: &str| value.contains([' ', '\t', '\n']) || value_expands_when_unquoted(value);
+    let mut fields = Vec::with_capacity(words.len());
+    for word in words {
+        if let Some(value) = crate::normalize::decode_posix_literal_word(word) {
+            fields.push(PositionalField::Literal(value.into_owned()));
+            continue;
+        }
+        let (inner, quoted) = match word
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            Some(inner) if !inner.contains('"') => (inner, true),
+            _ => (word, false),
+        };
+        if let Some((reference, _, consumed)) = positional_reference_at(inner)
+            && consumed == inner.len()
+        {
+            let outer =
+                positional_fields_at(source, segment_ranges, at, copy_depth.checked_sub(1)?)?;
+            let copied: Vec<PositionalField> = match reference {
+                PositionalReference::One(position) => match outer.get(position - 1) {
+                    Some(field) => vec![field.clone()],
+                    None if quoted => vec![PositionalField::Literal(String::new())],
+                    None => Vec::new(),
+                },
+                // `"$*"` joins them on IFS: not read here.
+                PositionalReference::All { star: true, .. } if quoted => return None,
+                PositionalReference::All { from, count, .. } => outer
+                    .into_iter()
+                    .skip(from - 1)
+                    .take(count.unwrap_or(usize::MAX))
+                    .collect(),
+            };
+            if !quoted
+                && copied.iter().any(
+                    |field| matches!(field, PositionalField::Literal(value) if blank_or_glob(value)),
+                )
+            {
+                return None;
+            }
+            fields.extend(copied);
+            continue;
+        }
+        // Another frame's parameters, which this proof does not hold.
+        if posix_text_has_positional_reference(word) {
+            return None;
+        }
+        if let Some(depth) = copy_depth.checked_sub(1)
+            && let Some((prefix, name, suffix)) = parse_posix_variable_with_literal_affixes(inner)
+            && let Some(value) = deny_only_value_at(source, segment_ranges, at, "", name, depth)
+        {
+            let value = format!("{prefix}{value}{suffix}");
+            if quoted || (!value.is_empty() && !blank_or_glob(&value)) {
+                fields.push(PositionalField::Literal(value));
+                continue;
+            }
+        }
+        fields.push(PositionalField::Word(word.to_string()));
+    }
+    Some(fields)
+}
+
+/// `$@`, `$*` or a slice of them (`star`, `from`, `count`) at the start of
+/// `tail`, a suffix of `segment` spanning `consumed` bytes, spelled as the
+/// words Bash expands it to. Only a whole word is read: `"$@"` is one word
+/// per parameter, `"$*"` one word joined on the first IFS character, and an
+/// unquoted `$@` or `$*` every parameter split on IFS. A value that would
+/// glob, or split on an IFS character that is not a blank, is left as
+/// written, as is a joined parameter whose value is not proven.
+fn render_positional_parameters(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    (segment, tail, consumed): (&str, &str, usize),
+    in_double_quote: bool,
+    ifs: &str,
+    (star, from, count): (bool, usize, Option<usize>),
+) -> Option<String> {
+    let before = &segment[..segment.len() - tail.len()];
+    let after = &tail[consumed..];
+    let boundary = |ch: Option<char>| {
+        ch.is_none_or(|ch| {
+            ch.is_ascii_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`')
+        })
+    };
+    let whole = if in_double_quote {
+        before
+            .strip_suffix('"')
+            .is_some_and(|text| boundary(text.chars().next_back()))
+            && after
+                .strip_prefix('"')
+                .is_some_and(|text| boundary(text.chars().next()))
+    } else {
+        boundary(before.chars().next_back()) && boundary(after.chars().next())
+    };
+    if !whole {
+        return None;
+    }
+    let fields = positional_fields_at(
+        source,
+        segment_ranges,
+        segment_start,
+        MAX_DENY_ONLY_COPY_DEPTH,
+    )?
+    .into_iter()
+    .skip(from - 1)
+    .take(count.unwrap_or(usize::MAX));
+    if in_double_quote && star {
+        let separator = ifs.chars().next().map(String::from).unwrap_or_default();
+        let values = fields
+            .map(|field| match field {
+                PositionalField::Literal(value) => Some(value),
+                PositionalField::Word(_) => None,
+            })
+            .collect::<Option<Vec<String>>>()?;
+        return Some(posix_quote_argv_word(&values.join(&separator)));
+    }
+    let mut words = Vec::new();
+    for field in fields {
+        match field {
+            PositionalField::Word(word) => words.push(word),
+            PositionalField::Literal(value) if in_double_quote => {
+                words.push(posix_quote_argv_word(&value));
+            }
+            PositionalField::Literal(value) => {
+                if value_expands_when_unquoted(&value)
+                    || value
+                        .chars()
+                        .any(|ch| ifs.contains(ch) && !ch.is_ascii_whitespace())
+                {
+                    return None;
+                }
+                words.extend(
+                    value
+                        .split(|ch: char| ifs.contains(ch))
+                        .filter(|field| !field.is_empty())
+                        .map(posix_quote_argv_word),
+                );
+            }
+        }
+    }
+    Some(words.join(" "))
 }
 
 /// The assignment of `name` among the assignment words `words`, as its raw
@@ -35445,6 +35832,19 @@ fn deny_only_assignment_value(
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
         .unwrap_or(raw);
+    // `a=$1` copies a positional parameter.
+    if let Some((PositionalReference::One(_), name, consumed)) = positional_reference_at(token)
+        && consumed == token.len()
+    {
+        return deny_only_value_at(
+            source,
+            segment_ranges,
+            assignment_start,
+            earlier_words,
+            &token[name],
+            copy_depth - 1,
+        );
+    }
     let (prefix, name, suffix) = parse_posix_variable_with_literal_affixes(token)?;
     let copied = deny_only_value_at(
         source,
@@ -35801,6 +36201,47 @@ fn resolve_proven_variables_in_segment_with_ifs(
                                     posix_alternate_value_reference(tail)
                                 {
                                     (name, consumed, "", Some((colon, word)))
+                                } else if composite_only
+                                    && let Some((reference, name, consumed)) =
+                                        positional_reference_at(tail)
+                                {
+                                    // `$1` is a binding like `$X`; `$@` and
+                                    // `$*` expand to words of their own.
+                                    match reference {
+                                        PositionalReference::One(_) => {
+                                            (&tail[name], consumed, "", None)
+                                        }
+                                        PositionalReference::All { star, from, count } => {
+                                            let rendered = render_positional_parameters(
+                                                source,
+                                                segment_ranges,
+                                                segment_start,
+                                                (segment, tail, consumed),
+                                                in_double_quote,
+                                                ifs,
+                                                (star, from, count),
+                                            );
+                                            match rendered {
+                                                Some(text) if in_double_quote => {
+                                                    out.pop();
+                                                    out.push_str(&text);
+                                                    in_double_quote = false;
+                                                    rest = &tail[consumed + 1..];
+                                                    substituted = true;
+                                                }
+                                                Some(text) => {
+                                                    out.push_str(&text);
+                                                    rest = &tail[consumed..];
+                                                    substituted = true;
+                                                }
+                                                None => {
+                                                    out.push_str(&tail[..consumed]);
+                                                    rest = &tail[consumed..];
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
                                 } else {
                                     out.push('$');
                                     rest = &tail[1..];
@@ -54573,6 +55014,87 @@ mod tests {
                 manual_substitution.pattern_info
             );
         }
+    }
+
+    #[test]
+    fn function_frames_and_positional_parameters_on_indexed_and_unindexed_paths() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git", "rm"];
+        let ordered_packs = ["core.git".to_string(), "core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let settings = default_config().heredoc_settings();
+        let cases = [
+            ("f() { \"$@\"; }; f git reset --hard", true),
+            ("echo() { \"$@\"; }; echo git reset --hard", true),
+            ("f() { $*; }; f git reset --hard", true),
+            ("f() { \"$*\" reset --hard; }; f git", true),
+            ("set -- git reset --hard; \"$@\"", true),
+            ("f() { \"$1\" \"${@:2}\"; }; f git reset --hard", true),
+            (
+                "f() { local a=$1; shift; \"$a\" \"$@\"; }; f git reset --hard",
+                true,
+            ),
+            (
+                "f() { \"$@\"; }; g() { f \"$@\"; }; g git reset --hard",
+                true,
+            ),
+            ("x=git; f() { \"$@\"; }; f \"$x\" reset --hard", true),
+            ("x='git reset --hard'; bash <<< \"$x\"", true),
+            ("f() { \"$@\"; }; f ls", false),
+            ("f() { \"$*\"; }; f git reset --hard", false),
+            ("f() { \"$@\"; }; f 'git reset --hard'", false),
+            ("f() { :; }; f git reset --hard; \"$@\"", false),
+            ("f git reset --hard; f() { \"$@\"; }", false),
+            ("IFS=,; set -- git reset --hard; \"$*\"", false),
+            ("f() { \"$@\"; }; f \"$x\"", false),
+            ("retry() { \"$@\" || retry \"$@\"; }; retry make", false),
+            ("x='git reset --hard'; cat <<< \"$x\"", false),
+        ];
+        for index in [None, keyword_index.as_ref()] {
+            for (command, denied) in cases {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &settings,
+                    None,
+                    None,
+                    None,
+                    ShellDialect::Posix,
+                );
+                assert_eq!(
+                    result.is_denied(),
+                    denied,
+                    "{command:?} (indexed: {}): {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn function_frame_view_spells_each_visible_call() {
+        let view = |command: &str| crate::heredoc::shell_function_frame_view(command);
+        assert_eq!(
+            view("f() { \"$@\"; }; f git reset --hard").as_deref(),
+            Some("f() { \"$@\"; }; ( set -- git reset --hard;  \"$@\"; \n)")
+        );
+        assert_eq!(
+            view("f() ( \"$@\" ); f a").as_deref(),
+            Some("f() ( \"$@\" ); ( set -- a; ( \"$@\" )\n)")
+        );
+        // Not yet defined, defined in a child shell, removed, or no expansion.
+        assert_eq!(view("f a; f() { \"$@\"; }"), None);
+        assert_eq!(view("( f() { \"$@\"; } ); f a"), None);
+        assert_eq!(view("f() { \"$@\"; }; unset -f f; f a"), None);
+        assert_eq!(view("f() { ls; }; f a $x"), None);
     }
 
     #[test]
