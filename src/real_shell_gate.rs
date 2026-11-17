@@ -20,6 +20,8 @@
 // The shell tests are Unix-only, so elsewhere nothing calls the gate.
 #![cfg_attr(not(unix), allow(dead_code))]
 
+use std::io::Write as _;
+
 /// Set to `suite` by the shell-truth suite sandbox.
 pub const MARKER: &str = "SHELL_TRUTH_SANDBOX";
 
@@ -32,7 +34,11 @@ pub fn allowed(test: &str) -> bool {
     if marker && sandboxed {
         return true;
     }
-    eprintln!(
+    // Not eprintln!: libtest captures that and drops it when the test passes.
+    // A direct write to the stderr handle is not captured, so plain
+    // `cargo test` shows the skip.
+    let _ = writeln!(
+        std::io::stderr(),
         "{test}: SKIPPED its real-shell part ({MARKER}=suite: {marker}, kernel sandbox: \
          {sandboxed}). Shell text runs only inside `scripts/shell-truth --suite` \
          (frapbod/infra docs/runbooks/shell-ground-truth.md)."
