@@ -28064,8 +28064,10 @@ fn evaluate_packs_with_allowlists_at_depth(
                     ) {
                         return result;
                     }
-                    let safe_view =
-                        crate::packs::core::git::syntax_view_in_dialect(segment, shell_dialect);
+                    let safe_view = crate::packs::core::git::safe_syntax_view_in_dialect(
+                        segment,
+                        shell_dialect,
+                    );
                     if SafePatternInputs::new(core_git_command, input_command, shell_dialect)
                         .matches(
                             pack,
@@ -28147,7 +28149,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     ) {
                         return result;
                     }
-                    let safe_view = crate::packs::core::git::syntax_view_in_dialect(
+                    let safe_view = crate::packs::core::git::safe_syntax_view_in_dialect(
                         core_git_segment,
                         shell_dialect,
                     );

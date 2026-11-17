@@ -585,7 +585,7 @@ fn parameter_operand_fields_are_possible_git_argv() {
         "git clean ${X:--f -d -x}",
         "git push ${X:+--force} origin main",
         "git clean ${X:+-f -d -x}",
-        "git stash ${X:-x clear}",
+        "git stash ${X:-clear}",
         "git checkout ${X:--- .}",
         "git reset ${X:-x} ${Y:-HEAD --hard}",
     ];

@@ -5153,6 +5153,25 @@ fn frontend_bail_may_execute_git(words: &[GitSemanticWord], dialect: ShellDialec
 /// quoting cannot hide existing regex-backed `core.git` rules. Callers must not
 /// synthesize source spans from the decoded string.
 pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Option<String> {
+    syntax_view_with_split_words(command, dialect, false)
+}
+
+/// The decoded Git view that safe patterns may read.
+///
+/// An unquoted expansion whose text holds blanks (`${X:-foo --dry-run}`) may
+/// give those fields or an unknown value. Its text is not proof that a safe
+/// flag reaches Git, so this view reads such a word as one opaque value. The
+/// destructive patterns keep reading its fields through
+/// [`syntax_view_in_dialect`].
+pub(crate) fn safe_syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Option<String> {
+    syntax_view_with_split_words(command, dialect, true)
+}
+
+fn syntax_view_with_split_words(
+    command: &str,
+    dialect: ShellDialect,
+    opaque_split_words: bool,
+) -> Option<String> {
     let resolved_substitutions = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         .then(|| resolve_literal_printf_substitutions(command))
         .transpose()
@@ -5211,7 +5230,9 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
             .collect::<String>()
     };
     let regex_word = |decoded: &str, may_split: bool| {
-        if may_split || (dialect == ShellDialect::PowerShell && decoded.contains('"')) {
+        if opaque_split_words && may_split && decoded.contains(char::is_whitespace) {
+            PARAMETER_VALUE.to_string()
+        } else if may_split || (dialect == ShellDialect::PowerShell && decoded.contains('"')) {
             decoded.to_string()
         } else {
             preserve_word(decoded)
@@ -5259,12 +5280,15 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
     Some(crate::normalize::normalize_command(&decoded).into_owned())
 }
 
+/// An unknown parameter value in a reconstructed Git argv: one word that no
+/// rule reads as an option.
+const PARAMETER_VALUE: &str = "__dcg_parameter_value__";
+
 /// Possible argv fields of an unquoted `${NAME...}` argument, as two readings:
 /// `[unset or empty, set]`. A set parameter's value is unknown, so it reads as
 /// one opaque word. Returns `None` for any other dynamic word, and for operands
 /// that hold further expansions; those keep the conservative raw view.
 fn posix_parameter_argument_readings(word: &GitSemanticWord) -> Option<[Vec<String>; 2]> {
-    const VALUE: &str = "__dcg_parameter_value__";
     if !(word.dynamic
         && word.may_split
         && git_dynamic_fragments(&word.decoded, ShellDialect::Posix)
@@ -5282,7 +5306,7 @@ fn posix_parameter_argument_readings(word: &GitSemanticWord) -> Option<[Vec<Stri
         return None;
     }
     let operator = &inner[name_len..];
-    let value = vec![VALUE.to_string()];
+    let value = vec![PARAMETER_VALUE.to_string()];
     // A bare parameter and pattern substitution or removal yield nothing or
     // an unknown value.
     if operator.is_empty() || operator.starts_with(['/', '%', '#']) {
