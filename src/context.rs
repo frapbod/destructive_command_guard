@@ -2844,6 +2844,13 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
             break;
         }
 
+        // A line continuation between words is removed, so a word still
+        // starts after it (`echo a \` LF `# it's` is a comment).
+        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 2;
+            continue;
+        }
+
         // Newline is a separator
         if bytes[i] == b'\n' {
             tokens.push(SanitizeToken {

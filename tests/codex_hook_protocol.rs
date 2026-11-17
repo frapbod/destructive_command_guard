@@ -3599,6 +3599,21 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         "#it's\ngit push --force origin main",
         "  # it's\ngit reset --hard",
         "# it's\r\ngit reset --hard",
+        // `#` inside a word is data, not a comment: bash runs the git command.
+        "echo $((1))#; git reset --hard",
+        "echo $((1))#; git push --force origin main",
+        "echo $((1))#; git clean -fdx",
+        "echo $((1))#&& git reset --hard",
+        "echo $((1))#| git reset --hard",
+        "x=$((1))#; git reset --hard",
+        "echo $((1+2))#x; git reset --hard",
+        "$(true)#; git reset --hard",
+        "echo a\\ #; git reset --hard",
+        // A line continuation keeps the comment at a word start.
+        "echo a \\\n#it's\ngit reset --hard",
+        "\\\n#it's\ngit reset --hard",
+        // A comment that starts a command substitution body.
+        "echo $(#it's\ngit reset --hard)",
     ] {
         let codex = run_hook_raw(&multiline_payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -3612,6 +3627,8 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         "# it's here\ngit status",
         "# git reset --hard",
         "echo \"it's #1\"",
+        "echo a \\\n#it's\ngit status",
+        "echo a #$(git reset --hard)",
     ] {
         let codex = run_hook_raw(&multiline_payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
