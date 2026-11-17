@@ -11753,17 +11753,8 @@ fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
     if *dynamic {
         return false;
     }
-    let command = command.to_ascii_lowercase();
-    // `function NAME [(params)] { … }`, `filter NAME { … }` and
-    // `workflow NAME { … }` define a command whose body runs when the name is
-    // called, as POSIX function bodies are judged.
-    if matches!(command.as_str(), "function" | "filter" | "workflow") {
-        return words
-            .get(1)
-            .is_some_and(|(name, dynamic, _)| !*dynamic && !name.is_empty());
-    }
     matches!(
-        command.as_str(),
+        command.to_ascii_lowercase().as_str(),
         "if" | "elseif"
             | "else"
             | "switch"
@@ -11779,6 +11770,31 @@ fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
 }
 
 fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
+    powershell_block_bodies(command, |_| false)
+}
+
+/// The bodies of blocks that run and of `function`/`filter` definitions,
+/// whose bodies run when called (`evaluate_visible_powershell_function_invocations`).
+fn powershell_running_or_function_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
+    powershell_block_bodies(command, |prefix| {
+        let local = prefix
+            .rsplit([';', '\r', '\n', '|', '{', '}'])
+            .next()
+            .unwrap_or(prefix);
+        decoded_powershell_segment_words(local).is_some_and(|words| {
+            words.first().is_some_and(|(word, dynamic, _)| {
+                !*dynamic
+                    && (word.eq_ignore_ascii_case("function")
+                        || word.eq_ignore_ascii_case("filter"))
+            })
+        })
+    })
+}
+
+fn powershell_block_bodies(
+    command: &str,
+    also_opens: impl Fn(&str) -> bool,
+) -> Result<Vec<&str>, ()> {
     let mut bodies = Vec::new();
     let mut search_start = 0usize;
     while search_start < command.len() {
@@ -11788,7 +11804,8 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
         let Some(close) = find_powershell_script_block_close(command, open + 1) else {
             return Err(());
         };
-        if powershell_prefix_opens_executable_block(&command[..open]) {
+        let prefix = &command[..open];
+        if powershell_prefix_opens_executable_block(prefix) || also_opens(prefix) {
             if bodies.len() >= MAX_POWERSHELL_VISIBLE_STATEMENTS {
                 return Err(());
             }
@@ -14986,13 +15003,15 @@ fn unknown_dialect_fanout_candidate(
 /// Whether a PowerShell script block that runs names an enabled-pack keyword
 /// once PowerShell decodes its command words.
 ///
-/// A running block (`& { … }`, `if (…) { … }`, `foreach (…) { … }`,
-/// `function f { … }`) starts a command at its first word. The POSIX reading
+/// A running block (`& { … }`, `if (…) { … }`, `foreach (…) { … }`) or a
+/// called function body (`function f { … }; f`) starts a command at its first
+/// word. The POSIX reading
 /// sees that word as an argument of `&`, `if` or `function` and never decodes
 /// it, so the quoted word in `& { g"it" reset --hard }` stays `g"it"` there,
 /// while PowerShell runs Git. Only the PowerShell view reads these bodies as
-/// commands (`evaluate_powershell_executable_blocks`). Blocks nested in a body
-/// are asked too, up to the embedded-shell depth.
+/// commands (`evaluate_visible_powershell_function_invocations`,
+/// `evaluate_powershell_executable_blocks`). Blocks nested in a body are asked
+/// too, up to the embedded-shell depth.
 fn powershell_block_exposes_pack_keyword(
     command: &str,
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
@@ -15005,7 +15024,7 @@ fn powershell_block_exposes_pack_keyword(
         if depth > MAX_EMBEDDED_SHELL_DEPTH || !command.contains('{') {
             return false;
         }
-        let Ok(bodies) = powershell_executable_block_bodies(command) else {
+        let Ok(bodies) = powershell_running_or_function_block_bodies(command) else {
             return false;
         };
         bodies.into_iter().any(|body| {
@@ -15714,24 +15733,29 @@ fn evaluate_command_in_dialect_union(
     if powershell_block_exposes_pack_keyword(command, keyword_index)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
-        if deadline_exceeded(deadline) {
-            return EvaluationResult::indeterminate_due_to_budget();
-        }
-        if let Some(result) = evaluate_powershell_executable_blocks(
-            command,
-            nested_command_depth,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
-            compiled_overrides,
-            allowlists,
-            heredoc_settings,
-            allow_once_audit,
-            project_path,
-            deadline,
-            inherited_automated_stdin,
-        ) {
-            return result;
+        for pass in [
+            evaluate_visible_powershell_function_invocations,
+            evaluate_powershell_executable_blocks,
+        ] {
+            if deadline_exceeded(deadline) {
+                return EvaluationResult::indeterminate_due_to_budget();
+            }
+            if let Some(result) = pass(
+                command,
+                nested_command_depth,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                allow_once_audit,
+                project_path,
+                deadline,
+                inherited_automated_stdin,
+            ) {
+                return result;
+            }
         }
     }
 
