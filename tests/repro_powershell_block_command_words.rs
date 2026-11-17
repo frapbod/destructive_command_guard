@@ -43,13 +43,22 @@ const POWERSHELL_RUNS_GIT: &[&str] = &[
     "& { git reset --hard }",
 ];
 
-/// A quoted Git word with a separator after it. Bash and PowerShell both run
-/// these.
+/// A partly quoted Git word with a separator after it. Bash and PowerShell
+/// both run these.
 const SEPARATOR_AFTER_QUOTED_GIT: &[&str] = &[
-    r#""git" reset --hard;"#,
     r#"g"it" reset --hard;"#,
+    r#"gi"t" push --force origin main;"#,
+    r#"g"it" reset --hard ;"#,
+];
+
+/// Bash runs these; powershell.exe 5.1 refuses each line. It reads a leading
+/// string as an expression (`"git" --version` is a parse error) and has no
+/// trailing `&`.
+const SEPARATOR_AFTER_QUOTED_GIT_BASH_ONLY: &[&str] = &[
+    r#"g"it" reset --hard &"#,
+    r#""git" reset --hard;"#,
     r#""git" push --force origin main;"#,
-    r#""git" reset --hard ;"#,
+    r#"'git' reset --hard;"#,
 ];
 
 const HARMLESS: &[&str] = &[
@@ -213,7 +222,13 @@ fn bash_tool_judges_quoted_git_before_a_separator_both_protocols() {
         let decide = |command: &str| hook_decision(protocol, "Bash", command);
         let label = format!("{protocol:?} Bash");
         assert_all(SEPARATOR_AFTER_QUOTED_GIT, "deny", decide, &label);
-        assert_all(&[r#""git" status;"#, "git status;"], "allow", decide, &label);
+        assert_all(SEPARATOR_AFTER_QUOTED_GIT_BASH_ONLY, "deny", decide, &label);
+        assert_all(
+            &[r#""git" status;"#, "git status;"],
+            "allow",
+            decide,
+            &label,
+        );
     }
 }
 
@@ -245,6 +260,10 @@ fn powershell_and_unknown_dialects_judge_block_command_words() {
         assert_all(SEPARATOR_AFTER_QUOTED_GIT, "Deny", decide, &label);
         assert_all(HARMLESS, "Allow", decide, &label);
     }
-    let decide = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
-    assert_all(SEPARATOR_AFTER_QUOTED_GIT, "Deny", decide, "Posix");
+    for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+        let decide = |command: &str| format!("{:?}", decision_in(command, dialect));
+        let label = format!("{dialect:?}");
+        assert_all(SEPARATOR_AFTER_QUOTED_GIT, "Deny", decide, &label);
+        assert_all(SEPARATOR_AFTER_QUOTED_GIT_BASH_ONLY, "Deny", decide, &label);
+    }
 }

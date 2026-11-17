@@ -11758,7 +11758,9 @@ fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
     // `workflow NAME { … }` define a command whose body runs when the name is
     // called, as POSIX function bodies are judged.
     if matches!(command.as_str(), "function" | "filter" | "workflow") {
-        return words.get(1).is_some_and(|(name, dynamic, _)| !*dynamic && !name.is_empty());
+        return words
+            .get(1)
+            .is_some_and(|(name, dynamic, _)| !*dynamic && !name.is_empty());
     }
     matches!(
         command.as_str(),
@@ -15180,7 +15182,8 @@ fn dialect_view_may_expose_hidden_execution(
     if view_decode_exposes_pack_keyword(command, view, keyword_index) {
         return true;
     }
-    if view == ShellDialect::PowerShell && powershell_block_exposes_pack_keyword(command, keyword_index)
+    if view == ShellDialect::PowerShell
+        && powershell_block_exposes_pack_keyword(command, keyword_index)
     {
         return true;
     }
