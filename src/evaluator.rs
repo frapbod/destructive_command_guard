@@ -42375,7 +42375,11 @@ mod tests {
             ),
             // A nameref declaration that may not have run proves no alias.
             (r"X=' '; r=a; false && declare -n r=X; git${r}reset", None),
-            (r"X=' '; r=a; (declare -n r=X); git${r}reset", None),
+            // One declared in a subshell does not reach the parent: `r` is `a`.
+            (
+                r"X=' '; r=a; (declare -n r=X); git${r}reset",
+                Some(r"X=' '; r=a; (declare -n r=X); gitareset"),
+            ),
             // A command name that earlier state may rebind keeps its context.
             (
                 r#"X=gi; hash -p /usr/bin/printf git; "${X}t" reset --hard"#,
