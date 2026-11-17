@@ -342,6 +342,10 @@ fn start_process_lines_read_in_the_target_dialect() {
         "Start-Process cmd -ArgumentList '/c', 'git', reset, --hard",
         "Start-Process cmd -ArgumentList '/c', 'gi\rt', reset, --hard",
         "Start-Process cmd -ArgumentList @('/c' , 'git reset --hard')",
+        // A PowerShell host's comma list is joined too (t_a7d98548 review).
+        "Start-Process -FilePath pwsh -ArgumentList '-Command', 'git reset --hard'",
+        "Start-Process -FilePath powershell -ArgumentList '-Command', 'git reset --hard'",
+        "Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', 'git reset --hard'",
     ] {
         for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
             assert_eq!(
@@ -364,6 +368,7 @@ fn start_process_lines_read_in_the_target_dialect() {
         "Start-Process cmd -ArgumentList '/c echo ok&gi\rt status'",
         "Start-Process C:\\Windows\\System32\\cmd.exe -ArgumentList '/c dir'",
         "Start-Process cmd -ArgumentList '/c', 'echo', reset, --hard",
+        "Start-Process -FilePath pwsh -ArgumentList '-Command', 'git status'",
     ] {
         for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
             assert_eq!(
