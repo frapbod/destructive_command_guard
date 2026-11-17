@@ -17792,7 +17792,15 @@ fn posix_proven_variable_view(
         }
         // Splitting needs the IFS in force, proven like any other binding;
         // an IFS that cannot be proven leaves the segment as written.
-        let Some(ifs) = deny_only_variable_value(command, &ranges, start, "IFS") else {
+        let Some(ifs) = deny_only_value_at_for_splitting(
+            command,
+            &ranges,
+            start,
+            "",
+            "IFS",
+            MAX_DENY_ONLY_COPY_DEPTH,
+            true,
+        ) else {
             continue;
         };
         let resolve = |text: &str| {
@@ -17929,13 +17937,14 @@ fn resolve_proven_eval_arguments(
     arguments: &[&str],
     ifs: &str,
 ) -> Option<String> {
-    let body_ifs = deny_only_value_at(
+    let body_ifs = deny_only_value_at_for_splitting(
         source,
         segment_ranges,
         segment_start,
         prefix,
         "IFS",
         MAX_DENY_ONLY_COPY_DEPTH,
+        true,
     );
     let mut out = String::with_capacity(segment.len());
     let mut copied = 0usize;
@@ -29430,7 +29439,11 @@ enum VariableResolution {
     /// denial. A possibly stale candidate must never authorize an exemption.
     /// A copy of an earlier scalar (`X=$IFS`, `Y=${X}t`) consumes one level
     /// of `copy_depth`.
-    DenyOnlyLiteral { copy_depth: usize },
+    DenyOnlyLiteral {
+        copy_depth: usize,
+        /// Read IFS as field-splitting characters, not as an expansion value.
+        ifs_splitting: bool,
+    },
     /// Redirect-only extension; a copied value consumes one level of depth.
     Redirect { remaining_depth: usize },
 }
@@ -30288,7 +30301,11 @@ fn resolve_variable_bindings(
     if !scanned {
         return None;
     }
-    let VariableResolution::DenyOnlyLiteral { copy_depth } = mode else {
+    let VariableResolution::DenyOnlyLiteral {
+        copy_depth,
+        ifs_splitting,
+    } = mode
+    else {
         return values;
     };
     let mut value = match deny_only_base {
@@ -30300,6 +30317,9 @@ fn resolve_variable_bindings(
         // An unset name is empty once something is appended to it; before
         // that it is unset, which `${X+word}` tells apart from empty.
         Some(DenyOnlyBinding::Unset) if !deny_only_appends.is_empty() => String::new(),
+        Some(DenyOnlyBinding::Unset) if ifs_splitting && name == "IFS" => {
+            DEFAULT_POSIX_IFS.to_string()
+        }
         Some(DenyOnlyBinding::Unset) => return None,
         None if values.is_some() => {
             return deny_only_appends.is_empty().then_some(values).flatten();
@@ -31693,26 +31713,7 @@ fn deny_only_nameref_target<'a>(
     Some(current)
 }
 
-/// The single literal value a deny-only read of `name` has at
-/// `segment_start`, including the default value of an `IFS` that no earlier
-/// segment assigns.
-fn deny_only_variable_value(
-    source: &str,
-    segment_ranges: &[(usize, usize)],
-    segment_start: usize,
-    name: &str,
-) -> Option<String> {
-    deny_only_value_at(
-        source,
-        segment_ranges,
-        segment_start,
-        "",
-        name,
-        MAX_DENY_ONLY_COPY_DEPTH,
-    )
-}
-
-/// [`deny_only_variable_value`] with a copy budget, for a read at
+/// A single deny-only value with a copy budget, for a read at
 /// `segment_start` that follows the assignment words `earlier_words` of the
 /// same assignment-only segment (Bash performs them left to right, so
 /// `X=' ' Y=$X` copies the new `X`).
@@ -31723,6 +31724,28 @@ fn deny_only_value_at(
     earlier_words: &str,
     name: &str,
     copy_depth: usize,
+) -> Option<String> {
+    deny_only_value_at_for_splitting(
+        source,
+        segment_ranges,
+        segment_start,
+        earlier_words,
+        name,
+        copy_depth,
+        false,
+    )
+}
+
+/// The value of IFS as splitting characters differs from its expanded value
+/// when it is unset: Bash splits on the default characters in that case.
+fn deny_only_value_at_for_splitting(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    earlier_words: &str,
+    name: &str,
+    copy_depth: usize,
+    ifs_splitting: bool,
 ) -> Option<String> {
     let name = deny_only_nameref_target(source, segment_ranges, segment_start, name)?;
     if let Some((raw, before)) = earlier_assignment_word(earlier_words, name).ok()? {
@@ -31764,7 +31787,10 @@ fn deny_only_value_at(
         segment_ranges,
         segment_start,
         name,
-        VariableResolution::DenyOnlyLiteral { copy_depth },
+        VariableResolution::DenyOnlyLiteral {
+            copy_depth,
+            ifs_splitting,
+        },
     )?;
     let [value] = values.as_slice() else {
         return None;
@@ -42216,7 +42242,10 @@ mod tests {
                 r"IFS=,; X=a,b; git${X}reset",
                 Some(r"IFS=,; X=a,b; gita breset"),
             ),
-            (r"X=' '; unset IFS; git${X}reset", None),
+            (
+                r"X=' '; unset IFS; git${X}reset",
+                Some(r"X=' '; unset IFS; git reset"),
+            ),
             // A nameref declaration that may not have run proves no alias.
             (r"X=' '; r=a; false && declare -n r=X; git${r}reset", None),
             (r"X=' '; r=a; (declare -n r=X); git${r}reset", None),
