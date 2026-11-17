@@ -15780,49 +15780,39 @@ fn evaluate_command_in_dialect_union(
         primary
     };
 
-    // Unknown includes POSIX (for example a Windows Codex payload may request
-    // bash). Its generic normalization can lose quoting in command words, so
-    // retain the independently parsed POSIX reading when quotes or escapes can
-    // alter an executable. Only a denial or an incomplete read is adopted.
-    let primary = if shell_dialect == ShellDialect::Unknown
-        && nested_command_depth == 0
-        && primary.decision == EvaluationDecision::Allow
-        && primary.allowlist_override.is_none()
-        && command.contains(['\'', '"', '\\'])
-    {
-        let alternate = evaluate_command_in_single_dialect_view(
-            command,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
-            compiled_overrides,
-            allowlists,
-            heredoc_settings,
-            allow_once_audit,
-            project_path,
-            deadline,
-            ShellDialect::Posix,
-            nested_command_depth,
-            inherited_automated_stdin,
-        );
-        if alternate.decision != EvaluationDecision::Allow {
-            return alternate;
-        }
-        primary
-    } else {
-        primary
-    };
-
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
         || primary.decision != EvaluationDecision::Allow
-        || !unknown_dialect_fanout_candidate(command, keyword_index)
     {
         return primary;
     }
 
-    for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
-        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs) {
+    // Unknown also includes POSIX, including Windows Codex invoking Bash.
+    // Its generic normalization can lose quotes or escapes in command words.
+    // Feed that reading through the same deny-wins fan-out as the other views.
+    let posix_candidate =
+        primary.allowlist_override.is_none() && command.contains(['\'', '"', '\\']);
+    let other_candidate = unknown_dialect_fanout_candidate(command, keyword_index);
+    if !posix_candidate && !other_candidate {
+        return primary;
+    }
+    for view in [
+        ShellDialect::Posix,
+        ShellDialect::Cmd,
+        ShellDialect::PowerShell,
+    ] {
+        let needed = if view == ShellDialect::Posix {
+            posix_candidate
+        } else {
+            other_candidate
+                && dialect_view_may_expose_hidden_execution(
+                    command,
+                    view,
+                    keyword_index,
+                    ordered_packs,
+                )
+        };
+        if !needed {
             continue;
         }
         // An exhausted budget is never proof that the un-run views are clean.
