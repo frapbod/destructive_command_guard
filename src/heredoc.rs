@@ -1785,9 +1785,15 @@ static IEX_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
 /// quoted strings and bare words, optionally in `@( )`, which Start-Process
 /// joins with spaces (see [`START_PROCESS_ARGUMENT`]). A variable is not
 /// reconstructed (no extraction, no change).
+///
+/// The list is one grammar: a first element, then any number of
+/// `<blanks>,<blanks><element>`, so blanks before a comma do not end it. A
+/// lone bare word is not a list. Only the first element is a place where a
+/// new parameter (`-Wait`) can start, so only it may not begin with `-`;
+/// after a comma, `--hard` is an element PowerShell passes on.
 static START_PROCESS_INLINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:@\(\s*)?((?:"[^"]*"|'[^']*')|(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`-][^\s'",;|$()`]*)(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`-][^\s'",;|$()`]*))+)\s*\)?(?:\s|$|[;|&)])"#,
+        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:@\(\s*)?((?:"[^"]*"|'[^']*')(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`][^\s'",;|$()`]*))*|[^\s'",;|$()@{}`-][^\s'",;|$()`]*(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`][^\s'",;|$()`]*))+)\s*\)?(?:\s|$|[;|&)])"#,
     )
     .expect("start-process inline regex compiles")
 });
@@ -3269,15 +3275,43 @@ fn push_windows_inner(
     true
 }
 
+/// A Start-Process target's program name: last path component, lower case,
+/// without `.exe`.
+fn start_process_target_name(file: &str) -> String {
+    let name = file
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(file)
+        .to_ascii_lowercase();
+    if let Some(stem) = name.strip_suffix(".exe") {
+        return stem.to_string();
+    }
+    name
+}
+
 /// Whether a Start-Process target is a shell that reads its joined argument
 /// list as one command line.
 fn start_process_target_is_shell(file: &str) -> bool {
-    let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
-    let name = name.to_ascii_lowercase();
     matches!(
-        name.strip_suffix(".exe").unwrap_or(&name),
+        start_process_target_name(file).as_str(),
         "cmd" | "powershell" | "pwsh" | "bash" | "sh" | "wsl"
     )
+}
+
+/// The dialect that reads a line rebuilt from `Start-Process <file>
+/// -ArgumentList …` (an [`ExtractedContent`] with target `start-process`,
+/// whose first word is the file). The line is the target's own command
+/// line: cmd.exe reads it as cmd does (its operators, its CR removal, a
+/// `C:\…\cmd.exe` path kept as written), a PowerShell host as
+/// PowerShell, and anything else as POSIX, as before.
+#[must_use]
+pub fn start_process_line_dialect(line: &str) -> crate::normalize::ShellDialect {
+    let file = line.split_ascii_whitespace().next().unwrap_or("");
+    match start_process_target_name(file).as_str() {
+        "cmd" => crate::normalize::ShellDialect::Cmd,
+        "powershell" | "pwsh" => crate::normalize::ShellDialect::PowerShell,
+        _ => crate::normalize::ShellDialect::Posix,
+    }
 }
 
 /// Extract Windows-specific inline scripts that wrap an inner command line:
