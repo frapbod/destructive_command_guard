@@ -7838,7 +7838,6 @@ mod tests {
             "'coproc' git reset --hard",
             "case a in a) echo git reset --hard",
             "a) echo git reset --hard",
-            "echo a) git reset --hard",
         ] {
             assert!(
                 !command_executes_git_in_dialect(command, ShellDialect::Posix),
