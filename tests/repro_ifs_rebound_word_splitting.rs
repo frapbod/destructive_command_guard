@@ -214,6 +214,37 @@ fn rebound_ifs_splitting_denies_under_both_protocols() {
             "declare -a IFS=(g); \"${IFS}it\" reset --hard",
             "IFS=g; IFS+=(x); \"${IFS}it\" reset --hard",
             "IFS[0]=g; \"${IFS}it\" reset --hard",
+            // A declaration that makes no unset local leaves the value.
+            "f(){ IFS=g; declare -p IFS; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; declare -p IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; typeset -p IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; declare -f IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; declare -F IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; local -p IFS >/dev/null; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; declare -I IFS; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; local -I IFS; \"${IFS}it\" reset --hard; }; f",
+            "shopt -s localvar_inherit; f(){ IFS=g; local IFS; \"${IFS}it\" reset --hard; }; f",
+            "f(){ IFS=g; local IFS=$IFS; \"${IFS}it\" reset --hard; }; f",
+            // A write need not happen where it is written, or at all.
+            "IFS=g; (unset IFS); \"${IFS}it\" reset --hard",
+            "IFS=g; : $(unset IFS); \"${IFS}it\" reset --hard",
+            "IFS=g; true | unset IFS; \"${IFS}it\" reset --hard",
+            "IFS=g; IFS=x true; \"${IFS}it\" reset --hard",
+            "IFS=g; IFS=x \"${IFS}it\" reset --hard",
+            "IFS=g; (IFS=x); \"${IFS}it\" reset --hard",
+            "IFS=g; : $(IFS=x); \"${IFS}it\" reset --hard",
+            "IFS=g; : <(IFS=x); \"${IFS}it\" reset --hard",
+            "IFS=g; true | { IFS=x; }; \"${IFS}it\" reset --hard",
+            "IFS=g; true | IFS=x; \"${IFS}it\" reset --hard",
+            "IFS=g; IFS=x & wait; \"${IFS}it\" reset --hard",
+            "IFS=g; { IFS=x; } & wait; \"${IFS}it\" reset --hard",
+            "IFS=g; f(){ IFS=x; }; \"${IFS}it\" reset --hard",
+            "IFS=g; if false; then IFS=x; fi; \"${IFS}it\" reset --hard",
+            "IFS=g; false && IFS=x; \"${IFS}it\" reset --hard",
+            "IFS=g; case a in b) IFS=x;; esac; \"${IFS}it\" reset --hard",
+            "for i in 1 2; do \"${IFS}it\" reset --hard; IFS=g; done",
+            "unset IFS; (IFS=x); IFS+=g; \"${IFS}it\" reset --hard",
+            "f(){ IFS+=g; }; unset IFS; f; \"${IFS}it\" reset --hard",
             // More combinations than dcg checks.
             "echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f",
         ],
@@ -248,8 +279,46 @@ fn harmless_ifs_uses_stay_allowed_under_both_protocols() {
             "declare IFS; IFS+=g; \"${IFS}it\" reset --hard",
             "f(){ local IFS=,; echo \"$*\"; }; f a b",
             "old=$IFS; unset IFS; read -r a b; IFS=$old; echo \"$a\"",
+            "IFS=x true; \"${IFS}it\" reset --hard",
+            "old=$IFS; IFS=,; echo \"${arr[*]}\"; IFS=$old",
+            "while IFS=: read -r a b; do echo \"$a\"; done < /etc/passwd",
+            "f(){ declare -p IFS; }; f",
         ],
     );
+}
+
+/// Thousands of distinct IFS writes and uses pass the value and view caps
+/// early: the command is denied as unverified, quickly, instead of
+/// enumerating every value. A release build answers each in under 0.1 s;
+/// the bound leaves room for a loaded test machine.
+#[test]
+fn many_ifs_writes_and_uses_stay_bounded_under_both_protocols() {
+    let writes = (0..1_500)
+        .map(|i| format!("IFS=v{i}; IFS+=a{i}; "))
+        .collect::<Vec<_>>()
+        .concat();
+    let uses = (0..1_500)
+        .map(|i| format!("\"${{IFS:{i}}}x\" "))
+        .collect::<Vec<_>>()
+        .concat();
+    let commands = [
+        format!("{writes}echo {uses}"),
+        format!("{writes}echo \"${{IFS}}\""),
+        format!("echo {uses}"),
+    ];
+    for command in &commands {
+        assert!(command.len() < 64 * 1024, "{}", command.len());
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            let started = std::time::Instant::now();
+            let decision = hook_decision(protocol, command);
+            let elapsed = started.elapsed();
+            assert_eq!(decision, "deny", "{protocol:?}: {}", &command[..40]);
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "{protocol:?}: took {elapsed:?}"
+            );
+        }
+    }
 }
 
 /// Glob patterns in IFS operators that made a recursive, backtracking
