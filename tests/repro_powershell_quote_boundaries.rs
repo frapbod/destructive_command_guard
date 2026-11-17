@@ -18,6 +18,15 @@ const HOOK_TEST_TIMEOUT_MS: &str = "30000";
 const POWERSHELL_RUNS_THE_RESET: &[&str] = &[
     r#"Write-Output "C:\temp\"; git reset --hard; Write-Output "x""#,
     r#"echo "a\"; git reset --hard; echo "x""#,
+    r#"echo "a\"; & 'git' reset --hard"#,
+    r#"echo "a\"; & "git" reset --hard"#,
+    "echo \"a\\\";\u{00a0}git reset --hard",
+    "echo \"a\\\";\u{2003}git reset --hard",
+    r#"echo "a/"; & 'git' reset --hard"#,
+    "Write-Output x; & 'git' reset --hard",
+    "Write-Output x\n& \"git\" reset --hard",
+    "Write-Output x | & 'git' reset --hard",
+    "Write-Output x; & 'git' branch -D doomed",
     r#"cd "C:\Users\kaita\repo\"; git reset --hard; echo "done""#,
     r#"git -C "C:\Users\kaita\repo\" reset --hard"#,
     r#"git log --grep "C:\x\"; git reset --hard; echo "x""#,
@@ -34,6 +43,9 @@ const POWERSHELL_RUNS_THE_RESET: &[&str] = &[
 const HARMLESS: &[&str] = &[
     r#"Write-Output "C:\temp\""#,
     r#"cd "C:\x\"; git status"#,
+    "Write-Output x; & 'git' status",
+    "Write-Output x; & 'echo' 'git reset --hard'",
+    "Write-Output x; & 'git' commit -m 'reset --hard'",
     r#"git -C "C:\Users\kaita\repo\" status"#,
     r#"Get-ChildItem "C:\Users\kaita\repo\" -Recurse | Select-Object Name"#,
     r#"git commit -m "fix C:\path\ handling""#,
@@ -169,10 +181,10 @@ fn powershell_tool_reads_powershell_quotes_both_protocols() {
         }
         // A backtick escape is ordinary PowerShell (the Unknown union reads
         // it as an unparseable POSIX substitution, so it is checked here).
-        for command in HARMLESS
-            .iter()
-            .chain(&[r#"Write-Output "a`tb"; git status"#])
-        {
+        for command in HARMLESS.iter().chain(&[
+            r#"Write-Output "a`tb"; git status"#,
+            "Write-Output x; 'git reset --hard'",
+        ]) {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "allow",

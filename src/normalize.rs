@@ -3148,7 +3148,7 @@ pub(crate) fn without_backslash_escapes(command: &str) -> Option<String> {
             .map(|segment| (segment.as_ptr() as usize).saturating_sub(text.as_ptr() as usize))
             .filter(|start| {
                 text[..*start]
-                    .trim_end_matches([' ', '\t'])
+                    .trim_end_matches(|c: char| c.is_whitespace() && c != '\n')
                     .ends_with([';', '&', '|', '\n'])
             })
             .collect()
