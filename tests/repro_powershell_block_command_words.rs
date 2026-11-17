@@ -136,9 +136,43 @@ const HARMLESS: &[&str] = &[
     "if ($x) { git status }",
     r#"foreach ($i in 1) { "reset --hard" }"#,
     r#"$sb = { Write-Output "git reset --hard" }"#,
+    r#"$sb = { Write-Output 'git reset --hard' }"#,
+    r#"$sb = { Write-Output "git clean -fdx" }"#,
     r#"& { git commit -m "reset --hard" }"#,
     r#""git" status;"#,
     "git status;",
+];
+
+/// One quoted argument is one argv word, however many spaces it holds. The
+/// Git view removed the quotes and joined the words with spaces, so the text
+/// of one argument read as Git's own subcommand and flags. Bash runs none of
+/// these as `git reset --hard` or `git clean -f`.
+const QUOTED_TEXT_IN_ONE_ARGUMENT: &[&str] = &[
+    r#"$sb = { Write-Output "git reset --hard" }"#,
+    r#"$sb = { Write-Output 'git reset --hard' }"#,
+    r#"$X 'reset --hard'"#,
+    r#"git commit -m "x" "reset --hard""#,
+    r#"git -c "a=b reset --hard" status"#,
+    r#"git commit -m "fix: reset --hard bug""#,
+    r#"git log --grep "reset --hard""#,
+    r#"git stash push -m "clean -fdx later""#,
+    r#"X=git; $X commit -m "reset --hard""#,
+    r#"git clean -n -e "a b""#,
+    r#"git clean -e "x y" -n"#,
+];
+
+/// The same boundary must not hide real Git syntax next to a quoted argument
+/// with spaces, nor let its text supply a dry-run flag (`-e "-n foo"` is an
+/// exclude pattern, so Git still cleans).
+const GIT_NEXT_TO_QUOTED_TEXT: &[&str] = &[
+    r#"git clean -e "-n foo" -fdx"#,
+    r#"git clean -e '-n foo' -fdx"#,
+    r#"X=git; $X clean -e "-n foo" -fdx"#,
+    r#"git clean -fdx -- "a b""#,
+    r#"git -C "/tmp/a b" reset --hard"#,
+    r#"git -c "user.name=A B" reset --hard"#,
+    r#"git checkout -- "my file""#,
+    r#"git branch -D "x y""#,
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
@@ -429,5 +463,23 @@ fn unknown_dialect_judges_deeply_nested_blocks() {
             EvaluationDecision::Deny,
             "{command}"
         );
+    }
+}
+
+/// A quoted argument with spaces stays one argument in the POSIX reading, and
+/// in the union that adds it.
+#[test]
+fn quoted_argument_with_spaces_stays_one_word() {
+    for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+        let decide = |command: &str| format!("{:?}", decision_in(command, dialect));
+        let label = format!("{dialect:?}");
+        assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT, "Allow", decide, &label);
+        assert_all(GIT_NEXT_TO_QUOTED_TEXT, "Deny", decide, &label);
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        let decide = |command: &str| hook_decision(protocol, "Bash", command);
+        let label = format!("{protocol:?} Bash");
+        assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT, "allow", decide, &label);
+        assert_all(GIT_NEXT_TO_QUOTED_TEXT, "deny", decide, &label);
     }
 }

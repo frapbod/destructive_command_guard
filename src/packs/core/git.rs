@@ -5196,6 +5196,19 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         return None;
     }
 
+    // A decoded word is one argv element. Quote removal followed by
+    // `join(" ")` split `"git reset --hard"` back into three tokens, and the
+    // rules' `\S+\s+` walks then read argument text as Git syntax. Joining
+    // inside a word with U+001F keeps the word one `\S+` token: the regex
+    // engine and `char::is_whitespace` do not treat it as space, so no walk
+    // can step inside, and a literal U+001F in the input is also inside one
+    // word. The cost is conservative: `--hard<US>extra` still ends `--h\b`,
+    // so `git reset "--hard extra"` denies (Git rejects that option).
+    let preserve_word = |word: &str| {
+        word.chars()
+            .map(|ch| if ch.is_whitespace() { '\u{1f}' } else { ch })
+            .collect::<String>()
+    };
     let mut decoder = ShellTokenDecoder::new(dialect);
     let mut words = Vec::with_capacity(tokens.len());
     for token in tokens
@@ -5204,7 +5217,7 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
     {
         let raw = token.text(command)?;
         if let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) {
-            words.push(decoded.into_owned());
+            words.push(preserve_word(&decoded));
         }
     }
     if words.is_empty() {
@@ -5225,7 +5238,7 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         let mut words: Vec<_> = semantic
             .words
             .iter()
-            .map(|word| word.decoded.clone())
+            .map(|word| preserve_word(&word.decoded))
             .collect();
         words[executable_index] = "git".to_string();
         return Some(crate::normalize::normalize_command(&words.join(" ")).into_owned());
