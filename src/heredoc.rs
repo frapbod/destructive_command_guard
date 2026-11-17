@@ -8944,7 +8944,7 @@ fn unset_shadow_changes(arguments: &[String], target: &str) -> (ShadowChange, Sh
         .iter()
         .any(|name| shell_word_has_runtime_expansion(name));
     // `unset NAME` removes a function of that name when no variable has it.
-    let function = if !(options.contains('v') && !options.contains('f'))
+    let function = if (!options.contains('v') || options.contains('f'))
         && (dynamic || names.iter().any(|name| *name == target))
     {
         Clear
@@ -9017,6 +9017,9 @@ struct ShadowEvent {
     kind: ShadowEventKind,
 }
 
+/// [`shell_shadow_events`] of one command.
+type ShadowEvents = std::rc::Rc<Option<Vec<ShadowEvent>>>;
+
 enum ShadowEventKind {
     /// A function definition, with its name when it is static.
     Function(Option<String>),
@@ -9030,9 +9033,9 @@ enum ShadowEventKind {
 /// The [`ShadowEvent`]s of `command` in source order, or `None` when the
 /// parser could not read all of it. The view asks once per use, so the
 /// last command's events are kept.
-fn shell_shadow_events(command: &str) -> std::rc::Rc<Option<Vec<ShadowEvent>>> {
+fn shell_shadow_events(command: &str) -> ShadowEvents {
     thread_local! {
-        static LAST: std::cell::RefCell<Option<(String, std::rc::Rc<Option<Vec<ShadowEvent>>>)>> =
+        static LAST: std::cell::RefCell<Option<(String, ShadowEvents)>> =
             const { std::cell::RefCell::new(None) };
     }
     LAST.with(|last| {

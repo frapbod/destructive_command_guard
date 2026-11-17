@@ -17722,8 +17722,9 @@ impl IfsValue {
 ///
 /// The IFS in force is proven like any other binding (the default when
 /// nothing assigns it); a segment whose IFS cannot be proven is left as
-/// written. So is a segment whose command name earlier shell state may bind
-/// to another program. Unknown references stay as written. The original
+/// written. So is a segment whose command name earlier shell state proves
+/// to run something else ([`crate::heredoc::shell_name_proven_shadowed_before`]).
+/// Unknown references stay as written. The original
 /// command is still evaluated, so this only adds denials.
 ///
 /// A quoted heredoc body stays as written: the outer shell does not expand
