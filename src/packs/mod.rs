@@ -4336,17 +4336,25 @@ fn collect_command_segments<'a>(
     let mut segment_start = start;
     let mut i = start;
     let mut in_single = false;
+    let mut in_ansi_c = false;
     let mut in_double = false;
 
     while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < end {
+        if b == b'$' && !in_single && !in_double && bytes.get(i + 1) == Some(&b'\'') {
+            in_single = true;
+            in_ansi_c = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\\' && (!in_single || in_ansi_c) && i + 1 < end {
             i += 2;
             continue;
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            in_ansi_c = false;
             i += 1;
             continue;
         }
@@ -4541,12 +4549,19 @@ fn collect_quoted_shell_separator_offsets(
     let bytes = cmd.as_bytes();
     let mut i = start;
     let mut in_single = false;
+    let mut in_ansi_c = false;
     let mut in_double = false;
 
     while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < end {
+        if b == b'$' && !in_single && !in_double && bytes.get(i + 1) == Some(&b'\'') {
+            in_single = true;
+            in_ansi_c = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\\' && (!in_single || in_ansi_c) && i + 1 < end {
             if matches!(bytes[i + 1], b';' | b'|' | b'&') {
                 offsets.push(i + 1);
             }
@@ -4555,6 +4570,7 @@ fn collect_quoted_shell_separator_offsets(
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            in_ansi_c = false;
             i += 1;
             continue;
         }
@@ -4657,17 +4673,25 @@ fn find_matching_command_substitution(cmd: &str, start: usize, end: usize) -> Op
     let bytes = cmd.as_bytes();
     let mut i = start;
     let mut in_single = false;
+    let mut in_ansi_c = false;
     let mut in_double = false;
 
     while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < end {
+        if b == b'$' && !in_single && !in_double && bytes.get(i + 1) == Some(&b'\'') {
+            in_single = true;
+            in_ansi_c = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\\' && (!in_single || in_ansi_c) && i + 1 < end {
             i += 2;
             continue;
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            in_ansi_c = false;
             i += 1;
             continue;
         }
@@ -4737,17 +4761,25 @@ fn find_matching_arithmetic_expansion(cmd: &str, start: usize, end: usize) -> Op
     let mut i = start;
     let mut paren_depth = 0usize;
     let mut in_single = false;
+    let mut in_ansi_c = false;
     let mut in_double = false;
 
     while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < end {
+        if b == b'$' && !in_single && !in_double && bytes.get(i + 1) == Some(&b'\'') {
+            in_single = true;
+            in_ansi_c = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\\' && (!in_single || in_ansi_c) && i + 1 < end {
             i += 2;
             continue;
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            in_ansi_c = false;
             i += 1;
             continue;
         }

@@ -203,6 +203,7 @@ impl CommandSpans {
 enum TokenizerState {
     Normal,
     SingleQuote,
+    AnsiCQuote,
     DoubleQuote,
     CommandSubst,           // Inside $(...), scanning for matching )
     Backtick,               // Inside `...`, scanning for matching `
@@ -433,7 +434,8 @@ impl ContextClassifier {
             match current_state {
                 TokenizerState::Normal => {
                     match byte {
-                        b'\'' => {
+                        b'\'' | b'$' if byte == b'\'' || bytes.get(i + 1) == Some(&b'\'') => {
+                            let ansi_c = byte == b'$';
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
                                 // If we pushed content before the quote, we're past command position
@@ -441,7 +443,12 @@ impl ContextClassifier {
                                 in_command_position = false;
                             }
                             span_start = i;
-                            stack.push(TokenizerState::SingleQuote);
+                            stack.push(if ansi_c {
+                                i += 1;
+                                TokenizerState::AnsiCQuote
+                            } else {
+                                TokenizerState::SingleQuote
+                            });
                             let inline_here = if pending_inline_code {
                                 pending_inline_code = false;
                                 true
@@ -657,7 +664,7 @@ impl ContextClassifier {
                         _ => {}
                     }
                 }
-                TokenizerState::SingleQuote => {
+                TokenizerState::SingleQuote | TokenizerState::AnsiCQuote => {
                     if byte == b'\'' {
                         stack.pop();
                         // Only emit span if we are not inside a command substitution
@@ -706,6 +713,10 @@ impl ContextClassifier {
                             stack.push(TokenizerState::CommandSubst);
                         }
                         b'"' => stack.push(TokenizerState::DoubleQuote),
+                        b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                            stack.push(TokenizerState::AnsiCQuote);
+                            i += 1;
+                        }
                         b'\'' => stack.push(TokenizerState::SingleQuote),
                         b'`' => stack.push(TokenizerState::Backtick),
                         b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
@@ -779,7 +790,9 @@ impl ContextClassifier {
                         current_kind
                     }
                 }
-                Some(TokenizerState::SingleQuote) | None => SpanKind::Unknown,
+                Some(TokenizerState::SingleQuote | TokenizerState::AnsiCQuote) | None => {
+                    SpanKind::Unknown
+                }
                 Some(TokenizerState::Comment | TokenizerState::PowerShellBlockComment) => {
                     SpanKind::Comment
                 }
@@ -2972,8 +2985,11 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
         }
 
         match b {
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                i = skip_ansi_c_quoted(bytes, i + 2);
+            }
             b'\\' => {
-                // Handle CRLF escape (consumes 3 bytes: \, \r, \n)
+                // Handle CRLF escape (consumes 3 bytes: \\, \\r, \\n)
                 if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
                     i += 3;
                 } else {
