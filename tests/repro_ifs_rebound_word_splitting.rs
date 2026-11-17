@@ -13,6 +13,9 @@
 //! the command ran. Each case runs the built binary as each agent does and
 //! asserts a verdict, never a crash.
 
+// `${IFS:0:1}` in the shell commands below is not a format argument.
+#![allow(clippy::literal_string_with_formatting_args)]
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -156,6 +159,28 @@ fn rebound_ifs_splitting_denies_under_both_protocols() {
             "echo 'a\\'; git${IFS}reset${IFS}--hard",
             "echo hi # it's\ngit${IFS}reset${IFS}--hard",
             "cat <<EOF\nit's\nEOF\ngit${IFS}reset${IFS}--hard",
+            // `${IFS[0]}`, `${IFS[@]}` and `${IFS[*]}` are the value.
+            "git${IFS[0]}reset${IFS[0]}--hard",
+            "git${IFS[@]}reset${IFS[@]}--hard",
+            "git${IFS[*]}reset${IFS[*]}--hard",
+            "IFS=x; git${IFS[0]}reset${IFS[0]}--hard",
+            "git${IFS[0]:0:1}reset${IFS[0]:0:1}--hard",
+            // Case changes, transforms and substitutions keep IFS characters.
+            "git${IFS^^}reset${IFS^^}--hard",
+            "git${IFS,}reset${IFS,}--hard",
+            "git${IFS~~}reset${IFS~~}--hard",
+            "git${IFS@U}reset${IFS@U}--hard",
+            "IFS=,; git${IFS^}reset${IFS^}--hard",
+            "git${IFS/q/z}reset${IFS/q/z}--hard",
+            "git${IFS//q/z}reset${IFS//q/z}--hard",
+            // One use empty and another not, in the same command.
+            "gi${IFS:9}t${IFS:0:1}reset${IFS:0:1}--hard",
+            "gi${IFS#???}t${IFS::1}reset${IFS::1}--hard",
+            "r${IFS:9}m${IFS:0:1}-rf${IFS:0:1}~",
+            // A quoted slice of a literal value is that slice.
+            "IFS=xt; \"gi${IFS:1:1}\" reset --hard",
+            // More combinations than dcg checks.
+            "echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f",
         ],
     );
 }
@@ -178,6 +203,13 @@ fn harmless_ifs_uses_stay_allowed_under_both_protocols() {
             "echo${IFS}hello",
             "ls${IFS}-la",
             "git status",
+            "printf '%s' \"$IFS\" | od -c",
+            "echo \"${IFS@Q}\" ${#IFS} ${IFS:+set}",
+            "IFS=x; echo ${IFS^^}",
+            "echo \"$IFS\" \"$IFS\" \"$IFS\"",
+            "git${IFS[0]}status",
+            "git${IFS^^}log${IFS^^}--oneline",
+            "echo a$IFS b$IFS c$IFS d$IFS e$IFS f$IFS g",
         ],
     );
 }
