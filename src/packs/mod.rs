@@ -4279,6 +4279,15 @@ pub(crate) fn split_command_segments_in_dialect(
         {
             continue;
         }
+        // In PowerShell, an ampersand at the start of a statement is the
+        // call operator, not a separator. Keep it with its executable so
+        // downstream readers can distinguish invocation from quoted data.
+        if dialect == crate::normalize::ShellDialect::PowerShell
+            && token.text(cmd) == Some("&")
+            && cmd[segment_start..token.byte_range.start].trim().is_empty()
+        {
+            continue;
+        }
         push_trimmed_segment(cmd, segment_start, token.byte_range.start, &mut segments);
         segment_start = token.byte_range.end;
     }
@@ -5938,6 +5947,13 @@ destructive_patterns:
     fn split_command_segments_respects_windows_shell_dialects() {
         use crate::normalize::ShellDialect;
 
+        assert_eq!(
+            split_command_segments_in_dialect(
+                "Write-Host x; & 'git' reset --hard | & 'echo' done",
+                ShellDialect::PowerShell,
+            ),
+            vec!["Write-Host x", "& 'git' reset --hard", "& 'echo' done"]
+        );
         assert_eq!(
             split_command_segments_in_dialect(
                 "Write-Host x; g`it branch -`d feature",

@@ -15326,6 +15326,68 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             result = alternate;
         }
     }
+    // PowerShell (the shell Codex runs on Windows) has no backslash escape:
+    // `"C:\temp\"` is a complete string there. The shared scanners read `\"`
+    // as an escaped quote, so even the PowerShell view saw one string in
+    // `Write-Output "C:\temp\"; git reset --hard`. When the command may be
+    // PowerShell and its backslashes move a command boundary, read it again
+    // as PowerShell with them spelled `/`, which PowerShell parses the same
+    // way (see `without_backslash_escapes`), with `$'` read plainly too, as
+    // PowerShell does. Only the PowerShell view reads the copy: POSIX shells
+    // do give the backslashes meaning. Deny wins, as between dialect views.
+    // The spelling differs from the command as written, so what the user
+    // authorized as written stays authorized, and no allow-once grant is
+    // spent. Like the plain `$'` reading, nothing inside a second reading is
+    // read again.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        )
+        && !crate::context::PlainDollarQuoteReading::active()
+        && let Some(spelled) = crate::normalize::without_backslash_escapes(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            let _plain = crate::context::PlainDollarQuoteReading::enter();
+            evaluate_command_in_dialect_union(
+                &spelled,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                ShellDialect::PowerShell,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            result = alternate;
+            // The spelling is length preserving: show the command's own text.
+            if let Some(info) = result.pattern_info.as_mut()
+                && let Some(span) = info.matched_span.as_ref()
+                && span.end <= command.len()
+                && command.is_char_boundary(span.start)
+                && command.is_char_boundary(span.end)
+            {
+                info.matched_text_preview = Some(extract_match_preview(command, span));
+            }
+        }
+    }
     // A positive denial remains decisive. An exact-command grant explicitly
     // authorizes the whole request. Every other would-be allow (including a
     // warn/log result or a rule-scoped exemption) requires complete analysis.
@@ -51012,6 +51074,54 @@ mod tests {
             let dialect = resolve(command);
             assert_eq!(dialect, ShellDialect::Unknown, "{command:?}");
             let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+            assert!(
+                !result.is_denied(),
+                "must allow: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// Desktop Codex runs a `Bash`-labelled payload with
+    /// `powershell.exe -Command`, where a backslash escapes nothing:
+    /// `"C:\temp\"` is a complete string and the next command runs.
+    #[test]
+    fn codex_windows_bash_label_reads_powershell_quotes() {
+        use crate::hook::{HookProtocol, codex_host_shell_dialect};
+        let packs = ["core.git", "core.filesystem"];
+        let resolve = |command: &str| {
+            codex_host_shell_dialect(ShellDialect::Posix, HookProtocol::Codex, true, command)
+        };
+        for command in [
+            r#"Write-Output "C:\temp\"; git reset --hard; Write-Output "x""#,
+            r#"echo "a\"; git reset --hard; echo "x""#,
+            r#"cd "C:\Users\kaita\repo\"; git reset --hard; echo "done""#,
+            r#"git -C "C:\Users\kaita\repo\" reset --hard"#,
+            r"echo a\; git reset --hard",
+        ] {
+            let dialect = resolve(command);
+            assert!(
+                matches!(dialect, ShellDialect::Unknown | ShellDialect::PowerShell),
+                "{command:?}: {dialect:?}"
+            );
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+            assert!(result.is_denied(), "must deny: {command:?}");
+            let preview = result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.matched_text_preview.as_deref())
+                .unwrap_or_default();
+            assert!(
+                command.contains(preview),
+                "a preview shows the command's own text: {command:?}: {preview:?}"
+            );
+        }
+        for command in [
+            r#"Write-Output "C:\temp\""#,
+            r#"cd "C:\x\"; git status"#,
+            r#"git -C "C:\Users\kaita\repo\" status"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, resolve(command));
             assert!(
                 !result.is_denied(),
                 "must allow: {command:?}: {:?}",

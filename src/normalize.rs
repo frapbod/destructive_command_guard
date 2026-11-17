@@ -3117,6 +3117,45 @@ fn consume_powershell_here_string(bytes: &[u8], start: usize, len: usize) -> Opt
     Some(len)
 }
 
+/// `command` with every backslash spelled `/`, or `None` unless that moves a
+/// POSIX command boundary.
+///
+/// PowerShell has no backslash escape: `"C:\temp\"` is a complete string
+/// there (it escapes with a backtick). dcg's shared scanners read `\"` as an
+/// escaped quote, so the string ran on over `; git reset --hard` in
+/// `Write-Output "C:\temp\"; git reset --hard`. A backslash means nothing to
+/// PowerShell, and `/` is the other path separator Windows accepts, so this
+/// length-preserving spelling parses the same for PowerShell, while the
+/// POSIX scanners now find the separators PowerShell finds. A backslash
+/// before an ASCII letter, digit, `.`, `-` or `_` cannot move a boundary, so
+/// such paths skip the comparison.
+pub(crate) fn without_backslash_escapes(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let may_move_a_boundary = memchr::memchr_iter(b'\\', bytes).any(|at| {
+        !bytes
+            .get(at + 1)
+            .is_some_and(|next| next.is_ascii_alphanumeric() || b".-_".contains(next))
+    });
+    if !may_move_a_boundary {
+        return None;
+    }
+    let spelled = command.replace('\\', "/");
+    // Segments that follow a separator; a substitution (`\$(id)` in Bash
+    // prose) is a segment too, but no separator precedes it.
+    let starts = |text: &str| -> Vec<usize> {
+        crate::packs::split_command_segments(text)
+            .iter()
+            .map(|segment| (segment.as_ptr() as usize).saturating_sub(text.as_ptr() as usize))
+            .filter(|start| {
+                text[..*start]
+                    .trim_end_matches(|c: char| c.is_whitespace() && c != '\n')
+                    .ends_with([';', '&', '|', '\n'])
+            })
+            .collect()
+    };
+    (starts(&spelled) != starts(command)).then_some(spelled)
+}
+
 fn skip_powershell_header_whitespace(bytes: &[u8], mut i: usize, len: usize) -> usize {
     while i < len {
         let width = match bytes[i] {
@@ -4839,6 +4878,32 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backslashes_are_spelled_as_slashes_only_where_that_moves_a_command_boundary() {
+        for (command, spelled) in [
+            (r#"echo "C:\temp\"; x"#, r#"echo "C:/temp/"; x"#),
+            (r"echo a\; x", "echo a/; x"),
+            (r#"echo "a\" | x"#, r#"echo "a/" | x"#),
+            ("echo \"a\\\"\nx", "echo \"a/\"\nx"),
+        ] {
+            assert_eq!(
+                without_backslash_escapes(command).as_deref(),
+                Some(spelled),
+                "{command:?}"
+            );
+        }
+        for command in [
+            "git status",
+            r"cd C:\Users\kaita\repo",
+            r#"Write-Output "C:\temp\""#,
+            r#"git -C "C:\Users\kaita\repo\" status"#,
+            r#"gh pr comment 1 --body "see \$(id)""#,
+            r"echo a\>b",
+        ] {
+            assert_eq!(without_backslash_escapes(command), None, "{command:?}");
+        }
+    }
 
     fn raw_token_snapshot(
         command: &str,
