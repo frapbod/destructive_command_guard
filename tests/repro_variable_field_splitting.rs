@@ -157,6 +157,71 @@ fn proven_whitespace_values_split_the_command_word() {
 }
 
 #[test]
+fn unset_ifs_restores_default_field_splitting() {
+    assert_both(
+        "deny",
+        &[
+            r#"unset IFS; X=" "; git${X}reset${X}--hard"#,
+            r#"IFS=x; unset IFS; X=" "; git${X}reset${X}--hard"#,
+            r#"IFS=x; X=" "; unset IFS; git${X}reset${X}--hard"#,
+            r"unset IFS; X=$'\t'; git${X}reset${X}--hard",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"IFS=; X=" "; git${X}reset${X}--hard"#,
+            r"unset IFS; X=$IFS; git${X}reset${X}--hard",
+        ],
+    );
+}
+
+#[test]
+fn unconditional_bindings_after_hazards_can_be_proven() {
+    assert_both(
+        "deny",
+        &[
+            r"printf 'hi\n'; X=' '; git${X}reset${X}--hard",
+            r"export A=1; X=' '; git${X}reset${X}--hard",
+            r"X=a; read -r X <<< b; X=' '; git${X}reset${X}--hard",
+            r"{ X=a; }; X=' '; git${X}reset${X}--hard",
+            r#"source .venv/bin/activate; X=gi; "${X}t" reset --hard"#,
+            r"{ X=' '; }; git${X}reset${X}--hard",
+            r"if true; then X=a; fi; X=' '; git${X}reset${X}--hard",
+            r"X=' '; echo $(X=a); git${X}reset${X}--hard",
+        ],
+    );
+}
+
+#[test]
+fn variable_executables_respect_actual_override_kinds() {
+    assert_both(
+        "deny",
+        &[
+            r"PATH=/usr/local/bin:$PATH; X=' '; git${X}reset${X}--hard",
+            r#"PATH="$HOME/.cargo/bin:$PATH"; X=' '; git${X}reset${X}--hard"#,
+            r#"PATH=/usr/local/bin:$PATH; Y=git; X=$Y; "$X" reset --hard"#,
+            r#"alias git=echo; X=gi; "${X}t" reset --hard"#,
+            r#"alias git=echo; Y=git; X=$Y; "$X" reset --hard"#,
+            r#"git() { :; }; unset -f git; X=gi; "${X}t" reset --hard"#,
+            r#"PATH=/usr/local/bin:$PATH; X=git; "$X" reset --hard"#,
+            r#"alias git=echo; X=git; "$X" reset --hard"#,
+            r#"git() { :; }; unset -f git; X=git; "$X" reset --hard"#,
+            r"PATH=/usr/local/bin:$PATH; git reset --hard",
+            r"alias git=echo; git reset --hard",
+            r"git() { :; }; unset -f git; git reset --hard",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"Y=git; X=$Y; hash -p /usr/bin/printf git; "$X" reset --hard"#,
+            r#"git() { :; }; Y=git; X=$Y; "$X" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
 fn only_proven_bindings_and_the_ifs_in_force_split() {
     assert_both(
         "allow",
