@@ -319,7 +319,11 @@ fn powershell_comment_codex_bash_label() {
         "Write-Output `a; $a=@(1)[0]# it's here\ngit reset --hard",
         "Write-Output `a; Write-Output a,# it's\n'b'; git reset --hard",
     ] {
-        assert_eq!(hook_decision(Protocol::Codex, "Bash", command), "deny", "{command:?}");
+        assert_eq!(
+            hook_decision(Protocol::Codex, "Bash", command),
+            "deny",
+            "{command:?}"
+        );
     }
 }
 

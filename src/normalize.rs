@@ -2832,13 +2832,20 @@ pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
                 _ => c,
             })
             .collect();
-        Some(tokenize_powershell_with_comments(&spelled, true).1.unwrap_or(spelled))
+        Some(
+            tokenize_powershell_with_comments(&spelled, true)
+                .1
+                .unwrap_or(spelled),
+        )
     } else {
         tokenize_powershell_with_comments(command, true).1
     }
 }
 
-fn tokenize_powershell_with_comments(command: &str, read_comments: bool) -> (NormalizeTokens, Option<String>) {
+fn tokenize_powershell_with_comments(
+    command: &str,
+    read_comments: bool,
+) -> (NormalizeTokens, Option<String>) {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
