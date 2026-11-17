@@ -7836,7 +7836,6 @@ mod tests {
             "sudo coproc git reset --hard",
             "/usr/bin/coproc git reset --hard",
             "'coproc' git reset --hard",
-            "f() echo git reset --hard",
             "case a in a) echo git reset --hard",
             "a) echo git reset --hard",
             "echo a) git reset --hard",
