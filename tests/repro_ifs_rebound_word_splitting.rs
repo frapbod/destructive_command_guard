@@ -193,6 +193,27 @@ fn rebound_ifs_splitting_denies_under_both_protocols() {
             "IFS=xt; \"gi${IFS:1:1}\" reset --hard",
             // `+=` appends to the value in force.
             "IFS+=t; \"gi${IFS:3}\" reset --hard",
+            // After `unset IFS` or a valueless local in a function, `+=`
+            // starts from nothing and `${IFS-word}` is the word.
+            "unset IFS; IFS+=g; \"${IFS}it\" reset --hard",
+            "unset -v IFS; IFS+=g; \"${IFS}it\" reset --hard",
+            "IFS=x; unset IFS; IFS+=g; \"${IFS}it\" reset --hard",
+            "unset IFS; IFS+=gi; \"${IFS}t\" reset --hard",
+            "f(){ local IFS; IFS+=g; \"${IFS}it\" reset --hard; }; f",
+            "f(){ declare IFS; IFS+=g; \"${IFS}it\" reset --hard; }; f",
+            "unset IFS; IFS+=xt; \"gi${IFS:1}\" reset --hard",
+            "unset IFS; \"gi${IFS:-t}\" reset --hard",
+            "unset IFS; \"gi${IFS-t}\" reset --hard",
+            // A pattern that matches the empty value replaces it.
+            "IFS=; gi${IFS//*/t} reset --hard",
+            "IFS=; gi${IFS/*/t} reset --hard",
+            "IFS=; \"gi${IFS//*/t}\" reset --hard",
+            // `$IFS` is element 0 of the array.
+            "IFS=(g x); \"${IFS}it\" reset --hard",
+            "IFS=(g); \"${IFS}it\" reset --hard",
+            "declare -a IFS=(g); \"${IFS}it\" reset --hard",
+            "IFS=g; IFS+=(x); \"${IFS}it\" reset --hard",
+            "IFS[0]=g; \"${IFS}it\" reset --hard",
             // More combinations than dcg checks.
             "echo${IFS:0}a${IFS:1}b${IFS:2}c${IFS:3}d${IFS:4}e${IFS:5}f",
         ],
@@ -224,6 +245,9 @@ fn harmless_ifs_uses_stay_allowed_under_both_protocols() {
             "git${IFS[0]}status",
             "git${IFS^^}log${IFS^^}--oneline",
             "echo a$IFS b$IFS c$IFS d$IFS e$IFS f$IFS g",
+            "declare IFS; IFS+=g; \"${IFS}it\" reset --hard",
+            "f(){ local IFS=,; echo \"$*\"; }; f a b",
+            "old=$IFS; unset IFS; read -r a b; IFS=$old; echo \"$a\"",
         ],
     );
 }
