@@ -15790,8 +15790,17 @@ fn evaluate_command_in_dialect_union(
     // Unknown also includes POSIX, including Windows Codex invoking Bash.
     // Its generic normalization can lose quotes or escapes in command words.
     // Feed that reading through the same deny-wins fan-out as the other views.
+    // A PowerShell-only statement may contain bytes that are not valid POSIX
+    // source at all (for example `<# $(...) #>`). Do not turn an unsupported
+    // POSIX parse into a denial of an otherwise valid Unknown command. This
+    // uses the same heredoc masking and parse check as Windows Codex's shell
+    // resolver.
     let posix_candidate =
-        primary.allowlist_override.is_none() && command.contains(['\'', '"', '\\', '$']);
+        primary.allowlist_override.is_none() && command.contains(['\'', '"', '\\', '$']) && {
+            let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            let posix_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+            crate::heredoc::extract_posix_command_substitutions(posix_view.as_ref()).is_ok()
+        };
     let other_candidate = unknown_dialect_fanout_candidate(command, keyword_index);
     if !posix_candidate && !other_candidate {
         return primary;
