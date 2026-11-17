@@ -30001,7 +30001,8 @@ fn resolve_variable_bindings(
     let checkpoints = index.as_ref().filter(|_| aliases.is_empty());
     let resumed = checkpoints.and_then(|index| {
         let checkpoint = index.checkpoints.borrow().get(name).cloned()?;
-        (checkpoint.bound <= segment_start
+        (!checkpoint.refused
+            && checkpoint.bound <= segment_start
             && segment_ranges
                 .iter()
                 .enumerate()
@@ -30013,9 +30014,6 @@ fn resolve_variable_bindings(
         .then_some(checkpoint)
     });
     if let Some(resumed) = resumed.as_ref() {
-        if resumed.refused {
-            return None;
-        }
         deny_only_base = resumed.base.as_ref().map(|base| base.binding(source));
         deny_only_appends = resumed
             .appends
@@ -30094,6 +30092,12 @@ fn resolve_variable_bindings(
                         .and_then(|rest| rest.strip_prefix('=')),
                     AssignmentOnlyBinding::Binds(raw) => Some(raw),
                     AssignmentOnlyBinding::DoesNotBind => None,
+                    AssignmentOnlyBinding::Ambiguous if deny_only => {
+                        deny_only_base = Some(DenyOnlyBinding::Unknown);
+                        deny_only_appends.clear();
+                        values = None;
+                        continue;
+                    }
                     AssignmentOnlyBinding::Ambiguous => return None,
                 };
                 let binding = binding.or_else(|| {
@@ -30264,6 +30268,12 @@ fn resolve_variable_bindings(
                 || segment_text_may_assign(segment, name)
                 || (!deny_only && segment_text_may_assign(segment, "IFS"))
             {
+                if deny_only {
+                    deny_only_base = Some(DenyOnlyBinding::Unknown);
+                    deny_only_appends.clear();
+                    values = None;
+                    continue;
+                }
                 break 'scan false;
             }
         }
@@ -30321,6 +30331,7 @@ fn resolve_variable_bindings(
             DEFAULT_POSIX_IFS.to_string()
         }
         Some(DenyOnlyBinding::Unset) => return None,
+        Some(DenyOnlyBinding::Unknown) => return None,
         None if values.is_some() => {
             return deny_only_appends.is_empty().then_some(values).flatten();
         }
@@ -30354,6 +30365,9 @@ enum DenyOnlyBinding<'a> {
     },
     /// `unset NAME`.
     Unset,
+    /// An earlier statement may have changed the value. A later unconditional
+    /// assignment can prove it again.
+    Unknown,
 }
 
 /// `NAME+=word` as a whole segment: the raw word.
@@ -30502,6 +30516,7 @@ enum DenyOnlyBindingRange {
         raw: Range<usize>,
     },
     Unset,
+    Unknown,
 }
 
 impl DenyOnlyBindingRange {
@@ -30517,6 +30532,7 @@ impl DenyOnlyBindingRange {
                 raw: source.get(raw.clone()).unwrap_or_default(),
             },
             Self::Unset => DenyOnlyBinding::Unset,
+            Self::Unknown => DenyOnlyBinding::Unknown,
         }
     }
 }
@@ -30534,6 +30550,7 @@ impl DenyOnlyCheckpoint {
         let base = match base {
             None => None,
             Some(DenyOnlyBinding::Unset) => Some(DenyOnlyBindingRange::Unset),
+            Some(DenyOnlyBinding::Unknown) => Some(DenyOnlyBindingRange::Unknown),
             Some(DenyOnlyBinding::Assigned {
                 start,
                 earlier,
