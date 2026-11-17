@@ -15709,8 +15709,11 @@ fn evaluate_command_in_dialect_union(
     // reading takes for arguments (see `powershell_block_exposes_pack_keyword`).
     // Judge those bodies as PowerShell, deny wins. Only the bodies: the rest of
     // the line was read above, and reading all of it as PowerShell would add
-    // that view's own false positives to every line with a block.
-    if powershell_block_exposes_pack_keyword(command, keyword_index) {
+    // that view's own false positives to every line with a block. What the
+    // user allowed as written stays allowed, as for the other readings.
+    if powershell_block_exposes_pack_keyword(command, keyword_index)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
         if deadline_exceeded(deadline) {
             return EvaluationResult::indeterminate_due_to_budget();
         }
