@@ -2667,7 +2667,10 @@ fn evaluate_visible_powershell_function_invocations(
     inherited_automated_stdin: bool,
 ) -> Option<EvaluationResult> {
     let lower = command.to_ascii_lowercase();
-    if !lower.contains("function") && !lower.contains("filter") {
+    if !["function", "filter", "workflow", "configuration"]
+        .iter()
+        .any(|definer| lower.contains(definer))
+    {
         return None;
     }
     let statements = match split_top_level_powershell_statements(command) {
@@ -2697,9 +2700,7 @@ fn evaluate_visible_powershell_function_invocations(
         let Some((invoked, dynamic, range)) = words.first() else {
             continue;
         };
-        if !*dynamic
-            && (invoked.eq_ignore_ascii_case("function") || invoked.eq_ignore_ascii_case("filter"))
-        {
+        if !*dynamic && powershell_keyword_defines_function(invoked) {
             let Some((raw_name, name_dynamic, name_range)) = words.get(1) else {
                 return Some(EvaluationResult::denied_by_legacy(
                     "A visible PowerShell function has no statically verifiable name",
@@ -11728,48 +11729,131 @@ fn powershell_prefix_executes_scriptblock(prefix: &str) -> bool {
     true
 }
 
+/// The keyword that starts the statement a script block belongs to, lowercase.
+///
+/// `prefix` is the text before the block's `{`. The statement is read as
+/// PowerShell parses it: blank space and line breaks may stand between the
+/// keyword and its block (`try` + newline + `{`), the parenthesized header of
+/// `if`, `while`, `for`, `foreach` and `switch` may hold any statement text
+/// (the `;` in `for ($i=0; $i -lt 1; $i++)`), and a loop may carry a
+/// `:label`. None is a dynamic first word or no statement at all.
+fn powershell_block_statement_keyword(prefix: &str) -> Option<String> {
+    let mut head = prefix.trim_end();
+    if head.ends_with(')') {
+        let close = head.len() - 1;
+        // The `(` whose group ends at the final `)`. Past the bound, or when
+        // none matches, read the text as written.
+        if let Some(open) = head
+            .match_indices('(')
+            .rev()
+            .take(MAX_POWERSHELL_VISIBLE_STATEMENTS)
+            .map(|(open, _)| open)
+            .find(|&open| find_powershell_subexpression_close(head, open + 1) == Ok(close))
+        {
+            head = head[..open].trim_end();
+        }
+    }
+    let local = head
+        .rsplit([';', '\r', '\n', '|', '{', '}'])
+        .next()
+        .unwrap_or(head)
+        .trim();
+    let words = decoded_powershell_segment_words(local)?;
+    let mut first = words.first()?;
+    // A script block's attributes and `param(…)` precede its first named
+    // block with only blank space between: `[CmdletBinding()] param()
+    // dynamicparam { … }`.
+    if !first.1
+        && (first.0.starts_with('[') || first.0.to_ascii_lowercase().starts_with("param"))
+        && let Some(last) = words.last().filter(|last| {
+            !last.1
+                && ["begin", "process", "end", "clean", "dynamicparam"]
+                    .iter()
+                    .any(|named| last.0.eq_ignore_ascii_case(named))
+        })
+    {
+        first = last;
+    } else if first.0.starts_with(':') && !first.1 {
+        first = words.get(1)?;
+    }
+    (!first.1).then(|| first.0.to_ascii_lowercase())
+}
+
+/// Whether `keyword` defines a command whose body runs when it is called:
+/// `function`, `filter`, and in Windows PowerShell 5.1 `workflow` and
+/// `configuration`.
+fn powershell_keyword_defines_function(keyword: &str) -> bool {
+    ["function", "filter", "workflow", "configuration"]
+        .iter()
+        .any(|definer| keyword.eq_ignore_ascii_case(definer))
+}
+
 fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
     let local = prefix
         .rsplit([';', '\r', '\n', '|', '{', '}'])
         .next()
         .unwrap_or(prefix)
         .trim();
-    if local.is_empty() {
-        return false;
-    }
-    if powershell_prefix_ends_with_execution_operator(local)
-        || powershell_prefix_dot_sources_block(local)
-        || powershell_prefix_executes_scriptblock(local)
+    if !local.is_empty()
+        && (powershell_prefix_ends_with_execution_operator(local)
+            || powershell_prefix_dot_sources_block(local)
+            || powershell_prefix_executes_scriptblock(local))
     {
         return true;
     }
 
-    let Some(words) = decoded_powershell_segment_words(local) else {
-        return false;
-    };
-    let Some((command, dynamic, _)) = words.first() else {
-        return false;
-    };
-    if *dynamic {
-        return false;
-    }
-    matches!(
-        command.to_ascii_lowercase().as_str(),
-        "if" | "elseif"
-            | "else"
-            | "switch"
-            | "while"
-            | "for"
-            | "foreach"
-            | "do"
-            | "try"
-            | "catch"
-            | "finally"
-            | "trap"
-    )
+    // Control-flow bodies, and the named blocks of a script block or
+    // function (`begin`, `process`, `end`, `dynamicparam`, and `clean` in
+    // PowerShell 7.3+). A named block outside a script block's top level is a
+    // parse error, so reading one anywhere loses nothing.
+    powershell_block_statement_keyword(prefix).is_some_and(|keyword| {
+        matches!(
+            keyword.as_str(),
+            "if" | "elseif"
+                | "else"
+                | "switch"
+                | "while"
+                | "for"
+                | "foreach"
+                | "do"
+                | "try"
+                | "catch"
+                | "finally"
+                | "trap"
+                | "begin"
+                | "process"
+                | "end"
+                | "clean"
+                | "dynamicparam"
+        )
+    })
 }
 
 fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
+    powershell_block_bodies(command, false)
+}
+
+/// The bodies of blocks that run and of `function`/`filter` definitions,
+/// whose bodies run when called (`evaluate_visible_powershell_function_invocations`).
+fn powershell_running_or_function_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
+    powershell_block_bodies(command, true)
+}
+
+/// The bodies of the script blocks in `command` that run, outermost first;
+/// blocks nested in a body are the recursive evaluator's.
+///
+/// Inside a `switch` body every block runs: a clause's condition block and
+/// its action block. Inside a `class` body every block is a method or
+/// constructor body; dcg does not follow method calls, so each is read as
+/// running. With `with_function_bodies`, `function`-like definitions count too.
+fn powershell_block_bodies(command: &str, with_function_bodies: bool) -> Result<Vec<&str>, ()> {
+    fn push<'a>(body: Option<&'a str>, bodies: &mut Vec<&'a str>) -> Result<(), ()> {
+        if bodies.len() >= MAX_POWERSHELL_VISIBLE_STATEMENTS {
+            return Err(());
+        }
+        bodies.push(body.ok_or(())?);
+        Ok(())
+    }
     let mut bodies = Vec::new();
     let mut search_start = 0usize;
     while search_start < command.len() {
@@ -11779,11 +11863,29 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
         let Some(close) = find_powershell_script_block_close(command, open + 1) else {
             return Err(());
         };
-        if powershell_prefix_opens_executable_block(&command[..open]) {
-            if bodies.len() >= MAX_POWERSHELL_VISIBLE_STATEMENTS {
-                return Err(());
+        let prefix = &command[..open];
+        let keyword = powershell_block_statement_keyword(prefix);
+        if powershell_prefix_opens_executable_block(prefix)
+            || (with_function_bodies
+                && keyword
+                    .as_deref()
+                    .is_some_and(powershell_keyword_defines_function))
+        {
+            push(command.get(open + 1..close), &mut bodies)?;
+        }
+        if matches!(keyword.as_deref(), Some("switch" | "class")) {
+            let mut inner_start = open + 1;
+            while let Some(inner_open) = find_powershell_code_marker(command, "{", inner_start)
+                .filter(|&inner_open| inner_open < close)
+            {
+                let inner_close =
+                    find_powershell_script_block_close(command, inner_open + 1).ok_or(())?;
+                // A hashtable literal (`@{ … }`) is data.
+                if !command[..inner_open].ends_with('@') {
+                    push(command.get(inner_open + 1..inner_close), &mut bodies)?;
+                }
+                inner_start = inner_close + 1;
             }
-            bodies.push(command.get(open + 1..close).ok_or(())?);
         }
 
         // Nested blocks inside an executable body are visited by the recursive
@@ -14970,7 +15072,51 @@ fn unknown_dialect_fanout_candidate(
             || [ShellDialect::Cmd, ShellDialect::PowerShell]
                 .into_iter()
                 .any(|view| view_decode_exposes_pack_keyword(command, view, Some(index)))
+            || powershell_block_exposes_pack_keyword(command, Some(index))
     })
+}
+
+/// Whether a PowerShell script block that runs names an enabled-pack keyword
+/// once PowerShell decodes its command words.
+///
+/// A running block (`& { … }`, `if (…) { … }`, `foreach (…) { … }`) or a
+/// called function body (`function f { … }; f`) starts a command at its first
+/// word. The POSIX reading
+/// sees that word as an argument of `&`, `if` or `function` and never decodes
+/// it, so the quoted word in `& { g"it" reset --hard }` stays `g"it"` there,
+/// while PowerShell runs Git. Only the PowerShell view reads these bodies as
+/// commands (`evaluate_visible_powershell_function_invocations`,
+/// `evaluate_powershell_executable_blocks`). Blocks nested in a body are asked
+/// too, up to the embedded-shell depth.
+fn powershell_block_exposes_pack_keyword(
+    command: &str,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+) -> bool {
+    fn at_depth(
+        command: &str,
+        keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+        depth: usize,
+    ) -> bool {
+        if !command.contains('{') {
+            return false;
+        }
+        // Past the depth the PowerShell reading fails closed; so does this gate.
+        if depth > MAX_EMBEDDED_SHELL_DEPTH {
+            return true;
+        }
+        let Ok(bodies) = powershell_running_or_function_block_bodies(command) else {
+            return false;
+        };
+        bodies.into_iter().any(|body| {
+            keyword_index.is_none_or(|index| {
+                index.has_any_keyword(
+                    crate::normalize::normalize_command_in_dialect(body, ShellDialect::PowerShell)
+                        .as_ref(),
+                )
+            }) || at_depth(body, keyword_index, depth + 1)
+        })
+    }
+    at_depth(command, keyword_index, 0)
 }
 
 /// Whether `view`'s own decode of `command` reveals an enabled-pack keyword
@@ -15654,6 +15800,47 @@ fn evaluate_command_in_dialect_union(
                 if primary.effective_mode.is_none() && alternate.effective_mode.is_some() {
                     return alternate;
                 }
+            }
+        }
+    }
+
+    // A running PowerShell script block starts commands that the POSIX
+    // reading takes for arguments (see `powershell_block_exposes_pack_keyword`).
+    // Judge those bodies as PowerShell, deny wins. Only the bodies: the rest of
+    // the line was read above, and reading all of it as PowerShell would add
+    // that view's own false positives to every line with a block. What the
+    // user allowed as written stays allowed, as for the other readings.
+    // Heredoc data that feeds a data sink (`cat > x.ps1 <<'EOF'`, `gh pr
+    // comment --body-file - <<'EOF'`) runs in neither reading: POSIX passes it
+    // as data and PowerShell refuses `<<`. Look for blocks with it masked, as
+    // the POSIX reading does.
+    let block_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let block_view = block_view.as_ref();
+    if powershell_block_exposes_pack_keyword(block_view, keyword_index)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        for pass in [
+            evaluate_visible_powershell_function_invocations,
+            evaluate_powershell_executable_blocks,
+        ] {
+            if deadline_exceeded(deadline) {
+                return EvaluationResult::indeterminate_due_to_budget();
+            }
+            if let Some(result) = pass(
+                block_view,
+                nested_command_depth,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                allow_once_audit,
+                project_path,
+                deadline,
+                inherited_automated_stdin,
+            ) {
+                return result;
             }
         }
     }
@@ -27864,59 +28051,78 @@ fn evaluate_packs_with_allowlists_at_depth(
                     }
                 }
             } else {
-                let (core_git_segment, command_prefix_len) =
-                    crate::packs::core::git::command_after_posix_control_prefixes(
-                        core_git_command,
+                // Read the one segment without a separator after it, and the
+                // whole command; deny wins. The decoded view refuses text that
+                // holds a separator, so the quoted word in `"git" reset
+                // --hard;` stayed quoted in the whole-command reading. That
+                // reading still judges what the narrowed one does not peel
+                // (`sudo git reset --hard;` under PowerShell, where the raw
+                // text names the git command).
+                let whole = (0, core_git_command.len());
+                let single = core_git_segment_ranges.first().copied().unwrap_or(whole);
+                let readings: &[(usize, usize)] = if single == whole {
+                    &[whole]
+                } else {
+                    &[single, whole]
+                };
+                for &(single_start, single_end) in readings {
+                    let (core_git_segment, command_prefix_len) =
+                        crate::packs::core::git::command_after_posix_control_prefixes(
+                            &core_git_command[single_start..single_end],
+                            shell_dialect,
+                        );
+                    let command_prefix_len = single_start + command_prefix_len;
+                    if core_git_segment.is_empty() {
+                        continue;
+                    }
+                    if let Some(result) = evaluate_visible_git_shell_alias(
+                        pack_id,
+                        pack,
+                        core_git_segment,
+                        shell_dialect,
+                        ordered_packs,
+                        keyword_index,
+                        allowlists,
+                        project_path,
+                        &mut first_allowlist_hit,
+                        deadline,
+                        embedded_shell_depth,
+                        nested_context,
+                    ) {
+                        return result;
+                    }
+                    let safe_view = crate::packs::core::git::syntax_view_in_dialect(
+                        core_git_segment,
                         shell_dialect,
                     );
-                if core_git_segment.is_empty() {
-                    continue;
-                }
-                if let Some(result) = evaluate_visible_git_shell_alias(
-                    pack_id,
-                    pack,
-                    core_git_segment,
-                    shell_dialect,
-                    ordered_packs,
-                    keyword_index,
-                    allowlists,
-                    project_path,
-                    &mut first_allowlist_hit,
-                    deadline,
-                    embedded_shell_depth,
-                    nested_context,
-                ) {
-                    return result;
-                }
-                let safe_view = crate::packs::core::git::syntax_view_in_dialect(
-                    core_git_segment,
-                    shell_dialect,
-                );
-                if SafePatternInputs::new(core_git_command, input_command, shell_dialect).matches(
-                    pack,
-                    safe_view.as_deref().unwrap_or(core_git_segment),
-                    None,
-                    deadline,
-                ) {
-                    continue;
-                }
-                if let Some(result) = evaluate_pack_destructive_patterns(
-                    pack_id,
-                    pack,
-                    core_git_segment,
-                    shell_dialect,
-                    command_prefix_len,
-                    original_command,
-                    core_git_offset,
-                    original_len,
-                    allowlists,
-                    project_path,
-                    &mut first_allowlist_hit,
-                    deadline,
-                    &[],
-                    None,
-                ) {
-                    return result;
+                    if SafePatternInputs::new(core_git_command, input_command, shell_dialect)
+                        .matches(
+                            pack,
+                            safe_view.as_deref().unwrap_or(core_git_segment),
+                            None,
+                            deadline,
+                        )
+                    {
+                        continue;
+                    }
+                    if let Some(result) = evaluate_pack_destructive_patterns(
+                        pack_id,
+                        pack,
+                        core_git_segment,
+                        shell_dialect,
+                        command_prefix_len,
+                        original_command,
+                        core_git_offset,
+                        original_len,
+                        allowlists,
+                        project_path,
+                        &mut first_allowlist_hit,
+                        deadline,
+                        &[],
+                        None,
+                    ) {
+                        return result;
+                    }
                 }
             }
             continue;
