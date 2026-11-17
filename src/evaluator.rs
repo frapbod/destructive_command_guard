@@ -58405,38 +58405,87 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             let dir = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "evaluator::tests::cmd_cr_reading_does_not_spend_another_requests_grant", "--nocapture"])
+                .args([
+                    "--exact",
+                    "evaluator::tests::cmd_cr_reading_does_not_spend_another_requests_grant",
+                    "--nocapture",
+                ])
                 .env(CHILD, "1")
                 .env(ENV_ALLOW_ONCE_PATH, dir.path().join("allow_once.jsonl"))
-                .output().unwrap();
-            assert!(output.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("cmd-cr-grant-child-complete"));
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("cmd-cr-grant-child-complete")
+            );
             return;
         }
         let cwd = std::env::current_dir().unwrap();
         let cwd_text = cwd.to_string_lossy();
-        let store = AllowOnceStore::new(PathBuf::from(std::env::var_os(ENV_ALLOW_ONCE_PATH).unwrap()));
+        let store = AllowOnceStore::new(PathBuf::from(
+            std::env::var_os(ENV_ALLOW_ONCE_PATH).unwrap(),
+        ));
         let redaction = crate::logging::RedactionConfig::default();
         for dialect in [ShellDialect::Cmd, ShellDialect::Unknown] {
             let now = Utc::now();
             let granted = "git reset --hard";
-            let pending = PendingExceptionRecord::new(now, &cwd_text, granted, "test", &redaction, true, None);
-            let entry = AllowOnceEntry::from_pending(&pending, now, AllowOnceScopeKind::Cwd, &cwd_text, true, false, &redaction);
+            let pending = PendingExceptionRecord::new(
+                now, &cwd_text, granted, "test", &redaction, true, None,
+            );
+            let entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                &cwd_text,
+                true,
+                false,
+                &redaction,
+            );
             store.add_entry(&entry, now).unwrap();
-            let evaluate = |command| evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+            let evaluate =
+                |command| evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
             let result = evaluate("gi\rt reset --hard");
             assert!(result.is_denied(), "{dialect:?}: {result:?}");
             assert_eq!(store.preview_active(Utc::now()).unwrap().0.len(), 1);
             let result = evaluate(granted);
-            assert_eq!(result.bypass_method, Some(BypassMethod::AllowOnce), "{dialect:?}: {result:?}");
+            assert_eq!(
+                result.bypass_method,
+                Some(BypassMethod::AllowOnce),
+                "{dialect:?}: {result:?}"
+            );
             assert!(store.preview_active(Utc::now()).unwrap().0.is_empty());
 
             let now = Utc::now();
-            let pending = PendingExceptionRecord::new(now, &cwd_text, "gi\rt reset --hard", "test", &redaction, true, None);
-            let entry = AllowOnceEntry::from_pending(&pending, now, AllowOnceScopeKind::Cwd, &cwd_text, true, false, &redaction);
+            let pending = PendingExceptionRecord::new(
+                now,
+                &cwd_text,
+                "gi\rt reset --hard",
+                "test",
+                &redaction,
+                true,
+                None,
+            );
+            let entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                &cwd_text,
+                true,
+                false,
+                &redaction,
+            );
             store.add_entry(&entry, now).unwrap();
             let result = evaluate("gi\rt reset --hard");
-            assert_eq!(result.bypass_method, Some(BypassMethod::AllowOnce), "{dialect:?}: {result:?}");
+            assert_eq!(
+                result.bypass_method,
+                Some(BypassMethod::AllowOnce),
+                "{dialect:?}: {result:?}"
+            );
             assert!(store.preview_active(Utc::now()).unwrap().0.is_empty());
         }
         println!("cmd-cr-grant-child-complete");
