@@ -8643,11 +8643,24 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
         return !(is_trusted_os_data_sink_path(&lexical_target, target)
             || is_trusted_interpreter_path(&lexical_target, target));
     }
+    shell_name_may_be_overridden_before(command, redirection_start, target)
+}
+
+/// Whether shell state visible before `offset` (a function, alias, `hash`
+/// entry, `PATH` change, `enable`, or an opaque `eval`/`source`), or an
+/// exported Bash function, can make the bare command name `target` run
+/// something other than the program of that name. Fails closed when the
+/// command cannot be parsed.
+pub(crate) fn shell_name_may_be_overridden_before(
+    command: &str,
+    offset: usize,
+    target: &str,
+) -> bool {
     if std::env::var_os(format!("BASH_FUNC_{target}%%")).is_some() {
         return true;
     }
 
-    let Some(prefix) = command.get(..redirection_start) else {
+    let Some(prefix) = command.get(..offset) else {
         return true;
     };
     let ast = parse_shell_ast(prefix);
@@ -12395,6 +12408,26 @@ pub(crate) fn heredoc_bodies_with_operators(command: &str) -> Vec<(Range<usize>,
                 }
             };
             Some((body, heredoc.operator_start))
+        })
+        .collect()
+}
+
+/// Every heredoc and here-string body, with whether its delimiter is quoted:
+/// the outer shell neither expands nor runs anything in a quoted body.
+pub(crate) fn heredoc_bodies_with_quoting(command: &str) -> Vec<(Range<usize>, bool)> {
+    active_heredocs(command)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                delimiter_quoted,
+            } => Some((body_start..body_end, delimiter_quoted)),
+            ActiveHeredocBody::HereString => {
+                find_herestring_content_bounds(command, heredoc.operator_start + 3)
+                    .map(|(start, end)| (start..end, false))
+            }
         })
         .collect()
 }

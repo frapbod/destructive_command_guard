@@ -340,6 +340,9 @@ fn command_cache_rebinding_cannot_supply_false_writer_or_git_proofs() {
         "option=-p; hash \"$option\" /usr/bin/printf git; cp source \"$(git rev-parse --git-dir)\"",
         "f=/etc/sudoers; hash -p /usr/bin/printf tee; tee \"$f\"",
         "hash -p /usr/bin/printf tee; f=/etc/sudoers; tee \"$f\"",
+        // A composed word keeps the same command ownership.
+        "f=/etc/sudoer; hash -p /usr/bin/printf tee; tee \"${f}s\"",
+        "X=gi; hash -p /usr/bin/printf git; \"${X}t\" reset --hard",
     ] {
         fixture.allow(source);
     }

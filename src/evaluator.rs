@@ -15434,6 +15434,58 @@ fn evaluate_command_in_dialect_union(
         return primary;
     }
 
+    // A proven variable value is field-split and quote-removed where it is
+    // used, so `X=" "; git${X}reset${X}--hard` and `X=gi; "${X}t" reset
+    // --hard` run `git reset --hard`. When the command is otherwise allowed,
+    // evaluate the reconstruction with those values spliced in. Running it
+    // last keeps every existing denial's rule and span; only a denial (or an
+    // incomplete evaluation, which fails closed) is adopted.
+    let view = if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && primary.decision == EvaluationDecision::Allow
+        && primary.allowlist_override.is_none()
+    {
+        // An unfinished view is never proof that the command is safe.
+        match posix_proven_variable_view(command, deadline) {
+            Ok(view) => view,
+            Err(ProvenViewIncomplete::Budget) => {
+                return EvaluationResult::indeterminate_due_to_budget();
+            }
+        }
+    } else {
+        None
+    };
+    let primary = if let Some(expanded) = view
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &expanded,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            ShellDialect::Posix,
+            nested_command_depth + 1,
+            inherited_automated_stdin,
+        );
+        if result.decision == EvaluationDecision::Allow {
+            primary
+        } else {
+            // The nested span indexes the reconstructed text.
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.matched_span = None;
+                info.matched_text_preview = None;
+            }
+            result
+        }
+    } else {
+        primary
+    };
+
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
         || primary.decision != EvaluationDecision::Allow
@@ -17527,6 +17579,297 @@ impl IfsValue {
     }
 }
 
+/// A reconstruction of `command` with every statically proven variable value
+/// spliced in, for the evaluator to check alongside the original.
+///
+/// Field splitting and quote removal happen after parameter expansion, so a
+/// proven value can change which command runs even when no word of the
+/// source spells it: `X=" "; git${X}reset${X}--hard` and
+/// `X=gi; "${X}t" reset --hard` both run `git reset --hard`, and
+/// `X=--hard; git reset $X` passes the flag only through the variable. The
+/// executable model ([`model_literal_posix_executable_assignments`]) only
+/// reads a command word that is exactly one reference, and the rm classifier
+/// was the only consumer of the deny-only splice. This view applies that
+/// splice ([`resolve_proven_variables_in_segment_with_ifs`]) to every
+/// top-level segment, with the binding proofs of
+/// [`resolve_variable_bindings`]: an assignment the parent shell performs
+/// before the use, no later mutation, values free of shell metacharacters.
+/// Segments that only assign are left alone; their values reach the uses.
+///
+/// The IFS in force is proven like any other binding (the default when
+/// nothing assigns it); a segment whose IFS cannot be proven is left as
+/// written. So is a segment whose command name earlier shell state may bind
+/// to another program. Unknown references stay as written. The original
+/// command is still evaluated, so this only adds denials.
+///
+/// A quoted heredoc body stays as written: the outer shell does not expand
+/// it, and the heredoc analysis judges it as its own script.
+///
+/// Every statement is read; the evaluation deadline bounds the cost, and
+/// `Err` means it passed first: the command is then unchecked.
+fn posix_proven_variable_view(
+    command: &str,
+    deadline: Option<&Deadline>,
+) -> Result<Option<String>, ProvenViewIncomplete> {
+    // Every binding source spells `=` (an assignment word) or `printf -v`;
+    // IFS holds its default with none.
+    if !command.contains('$')
+        || !(command.contains('=') || command.contains("printf") || command.contains("IFS"))
+        || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+    {
+        return Ok(None);
+    }
+    let ranges = command_segment_ranges(command);
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+    let _deadline = DenyOnlyDeadlineScope::enter(deadline);
+    let quoted_bodies: Vec<Range<usize>> = if command.contains("<<") {
+        deny_only_heredoc_bodies(command)
+            .iter()
+            .filter(|(_, quoted)| *quoted)
+            .map(|(body, _)| body.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut out = String::with_capacity(command.len());
+    // (start, end, reconstruction, its command name)
+    let mut spliced: Vec<(usize, usize, String, String)> = Vec::new();
+    let mut copied = 0usize;
+    // The binding proof reads the same index; it holds each range's nesting.
+    let index = deny_only_segment_index(command, &ranges);
+    for (position, &(start, end)) in ranges.iter().enumerate() {
+        if deadline_exceeded(deadline) {
+            return Err(ProvenViewIncomplete::Budget);
+        }
+        let Some(segment) = command.get(start..end) else {
+            continue;
+        };
+        if start < copied
+            || !segment.contains('$')
+            || quoted_bodies
+                .iter()
+                .any(|body| body.start <= start && end <= body.end)
+            || index.nested.get(position).copied().unwrap_or(true)
+        {
+            continue;
+        }
+        let assignments = strip_assignment_declaration(segment.trim());
+        if posix_executable_assignment_parts(assignments).is_some()
+            || !matches!(
+                assignment_only_segment_binding(assignments, ""),
+                AssignmentOnlyBinding::NotAssignmentOnly
+            )
+        {
+            // Assignment words are not field-split; their values reach the
+            // uses through the binding proof instead.
+            continue;
+        }
+        // Splitting needs the IFS in force, proven like any other binding;
+        // an IFS that cannot be proven leaves the segment as written.
+        let Some(ifs) = deny_only_variable_value(command, &ranges, start, "IFS") else {
+            continue;
+        };
+        let resolve = |text: &str| {
+            resolve_proven_variables_in_segment_with_ifs(
+                command,
+                &ranges,
+                start,
+                text,
+                ResolutionDirection::DenyOnly,
+                Some(ProvenSplice {
+                    ifs: &ifs,
+                    earlier_words: "",
+                }),
+            )
+        };
+        let resolved = if quoted_bodies
+            .iter()
+            .any(|body| body.start < end && start < body.end)
+        {
+            // Resolve the text around each quoted body; keep the body.
+            let mut text = String::with_capacity(end - start);
+            let mut changed = false;
+            let mut cursor = start;
+            let mut bodies: Vec<&Range<usize>> = quoted_bodies
+                .iter()
+                .filter(|body| body.start < end && start < body.end)
+                .collect();
+            bodies.sort_by_key(|body| body.start);
+            let bounds = bodies
+                .iter()
+                .map(|body| (body.start, body.end.min(end)))
+                .chain(std::iter::once((end, end)));
+            for (body_start, body_end) in bounds {
+                let body_start = body_start.max(cursor);
+                let piece = command.get(cursor..body_start).unwrap_or_default();
+                match resolve(piece) {
+                    Some(piece) => {
+                        text.push_str(&piece);
+                        changed = true;
+                    }
+                    None => text.push_str(piece),
+                }
+                text.push_str(command.get(body_start..body_end).unwrap_or_default());
+                cursor = body_end.max(body_start);
+            }
+            changed.then_some(text)
+        } else {
+            match posix_eval_words(segment) {
+                Some((prefix, arguments)) => resolve_proven_eval_arguments(
+                    command, &ranges, start, segment, prefix, &arguments, &ifs,
+                ),
+                None => resolve(segment),
+            }
+        };
+        let Some(resolved) = resolved else {
+            continue;
+        };
+        let program = hazard_first_word(&resolved).into_owned();
+        spliced.push((start, end, resolved, program));
+        copied = end;
+    }
+    // A proof cut short leaves references as written that may matter.
+    if deadline_exceeded(deadline) {
+        return Err(ProvenViewIncomplete::Budget);
+    }
+    // The packs judge a command name as the program of that name. When
+    // earlier shell state can bind the name to something else
+    // (`hash -p /usr/bin/printf git`, a function, an alias), the
+    // reconstruction would name the wrong program; the variable-aware
+    // analyses that see the original keep that context. The check parses
+    // the source before the segment, so ask once per program at its last
+    // use: a source with no override there has none before its earlier
+    // uses either.
+    let mut overridable: HashMap<&str, bool> = HashMap::new();
+    for (start, _, _, program) in spliced.iter().rev() {
+        if !program.is_empty() && !overridable.contains_key(program.as_str()) {
+            let overridden =
+                crate::heredoc::shell_name_may_be_overridden_before(command, *start, program);
+            overridable.insert(program, overridden);
+        }
+    }
+    let mut copied = 0usize;
+    for (start, end, resolved, program) in &spliced {
+        if overridable.get(program.as_str()).copied().unwrap_or(false)
+            && crate::heredoc::shell_name_may_be_overridden_before(command, *start, program)
+        {
+            continue;
+        }
+        out.push_str(&command[copied..*start]);
+        out.push_str(resolved);
+        copied = *end;
+    }
+    if copied == 0 {
+        return Ok(None);
+    }
+    out.push_str(&command[copied..]);
+    Ok((out != command).then_some(out))
+}
+
+/// Why [`posix_proven_variable_view`] could not finish.
+#[derive(Debug)]
+enum ProvenViewIncomplete {
+    /// The deadline passed.
+    Budget,
+}
+
+/// `[NAME=value ...] eval ARG...`: the assignment words before `eval` (the
+/// text from the segment start up to `eval`) and the arguments.
+fn posix_eval_words(segment: &str) -> Option<(&str, Vec<&str>)> {
+    let words = split_assignment_words(segment)?;
+    let index = words.iter().position(|word| {
+        word.contains(['<', '>']) || !word_is_redirect_or_assignment_prefix(word)
+    })?;
+    (words[index] == "eval").then(|| {
+        (
+            text_before(segment, words[index]),
+            words[index + 1..].to_vec(),
+        )
+    })
+}
+
+/// [`posix_proven_variable_view`] for an `eval` segment. Bash expands the
+/// arguments first, with the shell's bindings, and then runs their text
+/// with the prefix assignments in force: in `X=t eval '"gi${X}" reset'` the
+/// single-quoted body is shell source that reads `X=t`. A single-quoted
+/// argument is therefore read as source with those words in force; every
+/// other argument as an ordinary word.
+fn resolve_proven_eval_arguments(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    prefix: &str,
+    arguments: &[&str],
+    ifs: &str,
+) -> Option<String> {
+    let body_ifs = deny_only_value_at(
+        source,
+        segment_ranges,
+        segment_start,
+        prefix,
+        "IFS",
+        MAX_DENY_ONLY_COPY_DEPTH,
+    );
+    let mut out = String::with_capacity(segment.len());
+    let mut copied = 0usize;
+    for argument in arguments {
+        let offset = text_before(segment, argument).len();
+        let body = argument
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+            .filter(|body| !body.contains('\''));
+        let replacement = match (body, body_ifs.as_deref()) {
+            (Some(body), Some(body_ifs)) => resolve_proven_variables_in_segment_with_ifs(
+                source,
+                segment_ranges,
+                segment_start,
+                body,
+                ResolutionDirection::DenyOnly,
+                Some(ProvenSplice {
+                    ifs: body_ifs,
+                    earlier_words: prefix,
+                }),
+            )
+            .filter(|resolved| {
+                // The body's own command name keeps its owner too.
+                let program = hazard_first_word(resolved);
+                program.is_empty()
+                    || !crate::heredoc::shell_name_may_be_overridden_before(
+                        source,
+                        segment_start,
+                        &program,
+                    )
+            })
+            .map(|resolved| format!("'{resolved}'")),
+            (Some(_), None) => None,
+            (None, _) => resolve_proven_variables_in_segment_with_ifs(
+                source,
+                segment_ranges,
+                segment_start,
+                argument,
+                ResolutionDirection::DenyOnly,
+                Some(ProvenSplice {
+                    ifs,
+                    earlier_words: "",
+                }),
+            ),
+        };
+        if let Some(replacement) = replacement {
+            out.push_str(&segment[copied..offset]);
+            out.push_str(&replacement);
+            copied = offset + argument.len();
+        }
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&segment[copied..]);
+    Some(out)
+}
+
 /// How an IFS reference produces its text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IfsReferenceKind {
@@ -18626,25 +18969,46 @@ fn command_byte_is_escaped(bytes: &[u8], index: usize) -> bool {
 /// value), and `${IFS@Q}`, `@A`, `@a`, `@K` and `@k` (quoted or descriptive
 /// text) do not match.
 fn ifs_reference_at(bytes: &[u8], index: usize) -> Option<IfsReference> {
+    let (name, reference) = scalar_parameter_reference_at(bytes, index)?;
+    (&bytes[name] == b"IFS").then_some(reference)
+}
+
+/// [`ifs_reference_at`] for any named scalar: the byte range of the name and
+/// the reference the `$` at `index` begins. The operator text is computed by
+/// [`ifs_operation_text`] over the scalar's value.
+fn scalar_parameter_reference_at(
+    bytes: &[u8],
+    index: usize,
+) -> Option<(Range<usize>, IfsReference)> {
     let braced = bytes.get(index + 1) == Some(&b'{');
     let name_start = index + if braced { 2 } else { 1 };
-    if bytes.get(name_start..name_start + 3) != Some(b"IFS") {
+    if !bytes
+        .get(name_start)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
         return None;
     }
-    let mut after_name = name_start + 3;
-    if !braced {
-        // A bare `$IFS` ends at any non-identifier byte or end of input.
-        let ends = bytes
-            .get(after_name)
-            .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
-        return ends.then_some(IfsReference {
-            range: index..after_name,
-            kind: IfsReferenceKind::Whole,
-            operation: after_name..after_name,
-            computable: true,
-        });
+    let mut after_name = name_start + 1;
+    while bytes
+        .get(after_name)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        after_name += 1;
     }
-    // `IFS` is a scalar, which Bash also reads as a one-element array.
+    let name = name_start..after_name;
+    if !braced {
+        // A bare `$NAME` ends at any non-identifier byte or end of input.
+        return Some((
+            name,
+            IfsReference {
+                range: index..after_name,
+                kind: IfsReferenceKind::Whole,
+                operation: after_name..after_name,
+                computable: true,
+            },
+        ));
+    }
+    // A scalar is also a one-element array.
     let mut subscript = None;
     if bytes.get(after_name) == Some(&b'[') {
         let close = after_name + 1 + memchr::memchr(b']', bytes.get(after_name + 1..)?)?;
@@ -18665,16 +19029,19 @@ fn ifs_reference_at(bytes: &[u8], index: usize) -> Option<IfsReference> {
     match (operator, next) {
         (b'}', _) => {
             let whole = element || all_elements;
-            return Some(IfsReference {
-                range: index..after_name + 1,
-                kind: if whole {
-                    IfsReferenceKind::Whole
-                } else {
-                    IfsReferenceKind::Derived
+            return Some((
+                name,
+                IfsReference {
+                    range: index..after_name + 1,
+                    kind: if whole {
+                        IfsReferenceKind::Whole
+                    } else {
+                        IfsReferenceKind::Derived
+                    },
+                    operation: after_name..after_name,
+                    computable: whole,
                 },
-                operation: after_name..after_name,
-                computable: whole,
-            });
+            ));
         }
         (b':', Some(b'+')) | (b'+', _) => return None,
         (b'@', Some(b'U' | b'u' | b'L' | b'E' | b'P'))
@@ -18692,12 +19059,15 @@ fn ifs_reference_at(bytes: &[u8], index: usize) -> Option<IfsReference> {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(IfsReference {
-                        range: index..cursor + 1,
-                        kind: IfsReferenceKind::Derived,
-                        operation: after_name..cursor,
-                        computable: element || all_elements,
-                    });
+                    return Some((
+                        name,
+                        IfsReference {
+                            range: index..cursor + 1,
+                            kind: IfsReferenceKind::Derived,
+                            operation: after_name..cursor,
+                            computable: element || all_elements,
+                        },
+                    ));
                 }
             }
             _ => {}
@@ -28934,7 +29304,9 @@ enum VariableResolution {
     Literal,
     /// Keep established literal candidates when propagation can only add a
     /// denial. A possibly stale candidate must never authorize an exemption.
-    DenyOnlyLiteral,
+    /// A copy of an earlier scalar (`X=$IFS`, `Y=${X}t`) consumes one level
+    /// of `copy_depth`.
+    DenyOnlyLiteral { copy_depth: usize },
     /// Redirect-only extension; a copied value consumes one level of depth.
     Redirect { remaining_depth: usize },
 }
@@ -29433,174 +29805,759 @@ fn resolve_variable_bindings(
     // change them without an assignment word (cd updates PWD, for example).
     // Every proof needs ordinary scalar bindings, including the literal proof
     // that can exempt rm or run before the extended redirect proof.
-    if (!matches!(mode, VariableResolution::DenyOnlyLiteral)
-        && shell_maintained_posix_variable(name))
+    let deny_only = matches!(mode, VariableResolution::DenyOnlyLiteral { .. });
+    if (!deny_only && shell_maintained_posix_variable(name))
         || matches!(mode, VariableResolution::Redirect { remaining_depth: 0 })
     {
         return None;
     }
-    let heredoc_bodies =
-        if !matches!(mode, VariableResolution::DenyOnlyLiteral) && source.contains("<<") {
-            if source.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
-                return None;
-            }
+    // (body, quoted delimiter)
+    let heredoc_bodies: HeredocBodies = if !source.contains("<<") {
+        Rc::default()
+    } else if deny_only {
+        deny_only_heredoc_bodies(source)
+    } else {
+        if source.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+            return None;
+        }
+        Rc::new(
             crate::heredoc::heredoc_bodies_with_operators(source)
+                .into_iter()
+                .map(|(body, _)| (body, false))
+                .collect(),
+        )
+    };
+    // Deny-only follows the shell: only the binding in force decides the
+    // value (`X=$(date); X=' '` holds `' '`), and it is evaluated once, after
+    // the scan, so copies of copies cost one lookup each.
+    let mut deny_only_base: Option<DenyOnlyBinding<'_>> = None;
+    let mut deny_only_appends: Vec<&str> = Vec::new();
+    let aliases = if deny_only {
+        deny_only_nameref_aliases(source, segment_ranges, segment_start, name)
+    } else {
+        Vec::new()
+    };
+    // Deny-only reads one name per reference, so it visits only the
+    // segments that may touch it ([`DenyOnlySegmentIndex`]).
+    let index = deny_only.then(|| deny_only_segment_index(source, segment_ranges));
+    let visits = index.as_ref().map(|index| {
+        let mut visits = vec![false; segment_ranges.len()];
+        let names = std::iter::once(name).chain(aliases.iter().copied());
+        for segment in names
+            .filter_map(|name| index.by_name.get(name))
+            .flatten()
+            .chain(&index.generic)
+        {
+            if let Some(visit) = visits.get_mut(*segment) {
+                *visit = true;
+            }
+        }
+        visits
+    });
+    let mut values: Option<Vec<String>> = None;
+    // The scan is a left-to-right fold over the earlier statements, and a
+    // command reads the same name once per reference. Resume from the state
+    // the last read of this name left ([`DenyOnlyCheckpoint`]) when the
+    // statements it adds all come after the ones it read, so the cost stays
+    // linear in the statements. A nameref alias changes what the scan
+    // visits, so those reads are not cached.
+    let checkpoints = index.as_ref().filter(|_| aliases.is_empty());
+    let resumed = checkpoints.and_then(|index| {
+        let checkpoint = index.checkpoints.borrow().get(name).cloned()?;
+        (checkpoint.bound <= segment_start
+            && segment_ranges
+                .iter()
+                .enumerate()
+                .all(|(position, &(_, end))| {
+                    end <= checkpoint.bound
+                        || end > segment_start
+                        || checkpoint.last_position.is_none_or(|last| position > last)
+                }))
+        .then_some(checkpoint)
+    });
+    if let Some(resumed) = resumed.as_ref() {
+        if resumed.refused {
+            return None;
+        }
+        deny_only_base = resumed.base.as_ref().map(|base| base.binding(source));
+        deny_only_appends = resumed
+            .appends
+            .iter()
+            .map(|range| source.get(range.clone()).unwrap_or_default())
+            .collect();
+        values.clone_from(&resumed.values);
+    }
+    let mut timed_out = false;
+    let mut last_position = resumed.as_ref().and_then(|resumed| resumed.last_position);
+    let resumed_bound = resumed.as_ref().map(|resumed| resumed.bound);
+    let scanned = 'scan: {
+        for (position, &(start, end)) in segment_ranges.iter().enumerate() {
+            if end > segment_start || resumed_bound.is_some_and(|bound| end <= bound) {
+                continue;
+            }
+            last_position = Some(position);
+            if visits
+                .as_ref()
+                .is_some_and(|visits| !visits.get(position).copied().unwrap_or(true))
+            {
+                continue;
+            }
+            if deny_only && deny_only_deadline_exceeded() {
+                timed_out = true;
+                break 'scan false;
+            }
+            // The outer shell runs nothing in a quoted heredoc body: it is data.
+            if deny_only
+                && heredoc_bodies
+                    .iter()
+                    .any(|(body, quoted)| *quoted && body.start <= start && end <= body.end)
+            {
+                continue;
+            }
+            let segment = source.get(start..end).map(str::trim)?;
+            if segment.is_empty() {
+                continue;
+            }
+            // A binding inside a command or process substitution runs in a
+            // subshell and cannot set `NAME` for this segment — the live value
+            // would come from the ambient environment instead
+            // (`x=$(for f in a b; do :; done); mv "$f" d/` must not be proven by
+            // the inner header). Nested segment ranges are strictly contained in
+            // their extraction parent, so containment identifies them; they are
+            // never binding sources but still run the mutation-hazard check
+            // below, keeping a nested `NAME=` an outright refusal.
+            let nested = match index.as_ref() {
+                Some(index) => index.nested.get(position).copied().unwrap_or(true),
+                None => segment_range_is_nested(segment_ranges, start, end),
+            };
+            // Being a top-level segment is not enough: the shell must actually
+            // perform the assignment, in this shell, before the use (#426). A
+            // segment that fails this still falls through to the hazard checks
+            // below, where `segment_text_may_assign` refuses the proof outright —
+            // which is the right answer, because an unprovable binding is exactly
+            // the case the exemption must not cover.
+            let binds_in_parent = !nested
+                // A heredoc is input to another command, not a parent-shell
+                // assignment scope. Keep its segments in the hazard checks below:
+                // an expanding body can still mutate the caller's shell state.
+                && !heredoc_bodies
+                    .iter()
+                    .any(|(body, _)| body.start < end && start < body.end)
+                && (segment_binding_reaches_parent_shell(source, start, end)
+                    || (matches!(mode, VariableResolution::Redirect { .. })
+                        && source
+                            .get(..start)
+                            .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
+                        && conditional_binding_dominates_redirect(source, end, segment_start)));
+            if binds_in_parent {
+                let assignments = strip_assignment_declaration(segment);
+                let binding = match assignment_only_segment_binding(assignments, name) {
+                    AssignmentOnlyBinding::NotAssignmentOnly => assignments
+                        .strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix('=')),
+                    AssignmentOnlyBinding::Binds(raw) => Some(raw),
+                    AssignmentOnlyBinding::DoesNotBind => None,
+                    AssignmentOnlyBinding::Ambiguous => return None,
+                };
+                let binding = binding.or_else(|| {
+                    deny_only
+                        .then(|| posix_printf_v_literal_binding(segment, name))
+                        .flatten()
+                });
+                if deny_only {
+                    // A later unconditional parent-shell binding replaces the
+                    // earlier one: `X=a; X=" "; git${X}reset${X}--hard` runs
+                    // `git reset --hard`. Permission-lifting proofs keep refusing
+                    // the ambiguity; the deny-only view follows the shell.
+                    if let Some(raw) = binding {
+                        // Words before this one in an assignment list run first.
+                        let earlier = text_before(assignments, raw)
+                            .strip_suffix('=')
+                            .and_then(|text| text.strip_suffix(name))
+                            .unwrap_or_default();
+                        deny_only_base = Some(DenyOnlyBinding::Assigned {
+                            start,
+                            earlier,
+                            raw,
+                        });
+                        deny_only_appends.clear();
+                        values = None;
+                        continue;
+                    }
+                    // `NAME+=word` appends to the value in force.
+                    if let Some(word) = posix_append_word(assignments, name) {
+                        deny_only_appends.push(word);
+                        continue;
+                    }
+                    if let Some(names) = posix_unset_names(segment) {
+                        if names.contains(&name) {
+                            deny_only_base = Some(DenyOnlyBinding::Unset);
+                            deny_only_appends.clear();
+                            values = None;
+                        } else if names.iter().any(|unset| aliases.contains(unset)) {
+                            // Unsetting a nameref unsets what it names.
+                            break 'scan false;
+                        }
+                        continue;
+                    }
+                } else if let Some(raw) = binding {
+                    // Permission-lifting proofs refuse a second binding.
+                    if values.is_some() {
+                        break 'scan false;
+                    }
+                    values = Some(match mode {
+                        VariableResolution::Literal
+                        | VariableResolution::DenyOnlyLiteral { .. } => {
+                            vec![
+                                literal_assignment_value(raw)
+                                    .or_else(|| mktemp_scratch_assignment_value(raw))?,
+                            ]
+                        }
+                        VariableResolution::Redirect { remaining_depth } => {
+                            redirect_assignment_values(
+                                source,
+                                segment_ranges,
+                                start,
+                                raw,
+                                remaining_depth,
+                            )?
+                        }
+                    });
+                    continue;
+                }
+                if posix_for_loop_binds(segment, name) {
+                    // A second binding (assignment or another loop) makes the
+                    // live value ambiguous; a header that is not statically
+                    // enumerable (globs, substitutions, `"$@"`) makes it
+                    // unprovable.
+                    if values.is_some() || deny_only_base.is_some() || !deny_only_appends.is_empty()
+                    {
+                        break 'scan false;
+                    }
+                    let (header_name, candidates) = parse_posix_for_loop_header(segment)?;
+                    if header_name != name {
+                        break 'scan false;
+                    }
+                    values = Some(candidates);
+                    continue;
+                }
+            }
+            if let Some((other, raw)) = posix_scalar_assignment(segment)
+                && other != name
+                && other != "IFS"
+                && raw.len() <= MAX_REDIRECT_VALUE_BYTES
+                && mktemp_scratch_assignment_value(raw)
+                    .or_else(|| mktemp_explicit_tmp_assignment_value(raw))
+                    .is_some()
+            {
+                // In a whole mktemp assignment, options belong to the substitution,
+                // not a parent-shell wrapper. It cannot mutate another scalar.
+                continue;
+            }
+            // A nameref declaration binds only its own name; reads through it are
+            // redirected by [`deny_only_nameref_target`].
+            if deny_only
+                && posix_nameref_declaration(segment).is_some_and(|(declared, _)| declared != name)
+            {
+                continue;
+            }
+            // Text of a quoted heredoc body in this segment is data to the outer
+            // shell; only the rest can mutate `NAME`.
+            let blanked;
+            let segment = if deny_only
+                && heredoc_bodies
+                    .iter()
+                    .any(|(body, quoted)| *quoted && body.start < end && start < body.end)
+            {
+                blanked = blank_quoted_heredoc_bodies(source, start, end, &heredoc_bodies);
+                blanked.trim()
+            } else {
+                segment
+            };
+            // A write through a nameref of `NAME` writes `NAME`
+            // (`declare -n r=X; r=a` sets X).
+            if !aliases.is_empty() {
+                let first = hazard_first_word(segment);
+                if aliases.iter().any(|alias| {
+                    segment_text_may_assign(segment, alias)
+                        || (first == "printf" && printf_can_bind_variable(source, alias))
+                        || (first == "read" && read_can_bind_variable(source, alias))
+                }) {
+                    break 'scan false;
+                }
+            }
+            let first = hazard_first_word(segment);
+            if !deny_only
+                && (first.contains(['$', '`'])
+                    || first.starts_with('-')
+                    || matches!(first.as_ref(), "command" | "builtin" | "time"))
+            {
+                // An expanded command word may invoke a mutating builtin, and an
+                // option-bearing wrapper is outside the simple first-word parser.
+                // Neither can establish that a prior binding remains intact.
+                break 'scan false;
+            }
+            // `Owned` means the command word carried shell quoting that had to be
+            // removed to recognise it. `printf_can_bind_variable` scans the raw
+            // source for the literal word, which a quoted spelling like `pri"ntf"`
+            // does not contain — so the argument scan would find nothing and report
+            // the segment inert. Fail closed instead, matching what that function
+            // already does for any argument list it cannot read statically.
+            let command_word_was_quoted = matches!(first, Cow::Owned(_));
+            let may_mutate_shell_variables = match first.as_ref() {
+                // Only `printf -v NAME` binds; a plain printf writes to stdout
+                // and cannot change what a later `$NAME` expands to (#422).
+                // Checked against `source`, not `segment`: printf's arguments are
+                // stripped as data before this scan, so the segment is bare.
+                "printf" => command_word_was_quoted || printf_can_bind_variable(source, name),
+                // `read` binds only the variables it names, `REPLY` when it names
+                // none, and its `-a` array (#574). Same source-level scan.
+                "read" => command_word_was_quoted || read_can_bind_variable(source, name),
+                // These invalidate permission-lifting proofs. The deny-only
+                // pass retains the earlier literal as a conservative candidate,
+                // so adding this guard cannot hide an existing sensitive target.
+                "trap" | "alias" => !deny_only,
+                other => builtin_may_mutate_unnamed_variables(other),
+            };
+            // A changed IFS alters how an unquoted use word-splits, which the
+            // substitution proof cannot reproduce (v0.9.1 review). The deny-only
+            // splice renders the separators itself
+            // ([`resolve_proven_variables_in_segment_with_ifs`]).
+            if may_mutate_shell_variables
+                || segment_text_may_assign(segment, name)
+                || (!deny_only && segment_text_may_assign(segment, "IFS"))
+            {
+                break 'scan false;
+            }
+        }
+        true
+    };
+    if let Some(index) = checkpoints.as_ref()
+        && !timed_out
+    {
+        let checkpoint = if scanned {
+            DenyOnlyCheckpoint::capture(
+                source,
+                segment_start,
+                last_position,
+                deny_only_base,
+                &deny_only_appends,
+                values.as_ref(),
+            )
+        } else {
+            Some(DenyOnlyCheckpoint {
+                bound: segment_start,
+                last_position,
+                base: None,
+                appends: Vec::new(),
+                values: None,
+                refused: true,
+            })
+        };
+        if let Some(checkpoint) = checkpoint {
+            index
+                .checkpoints
+                .borrow_mut()
+                .insert(name.to_string(), checkpoint);
+        }
+    }
+    if !scanned {
+        return None;
+    }
+    let VariableResolution::DenyOnlyLiteral { copy_depth } = mode else {
+        return values;
+    };
+    let mut value = match deny_only_base {
+        Some(DenyOnlyBinding::Assigned {
+            start,
+            earlier,
+            raw,
+        }) => deny_only_assignment_value(source, segment_ranges, start, earlier, raw, copy_depth)?,
+        // An unset name is empty once something is appended to it; before
+        // that it is unset, which `${X+word}` tells apart from empty.
+        Some(DenyOnlyBinding::Unset) if !deny_only_appends.is_empty() => String::new(),
+        Some(DenyOnlyBinding::Unset) => return None,
+        None if values.is_some() => {
+            return deny_only_appends.is_empty().then_some(values).flatten();
+        }
+        // Bash does not import IFS: before any binding it holds the default.
+        None if name == "IFS" => DEFAULT_POSIX_IFS.to_string(),
+        // An ambient value is unknown, and so is anything appended to it.
+        None => return None,
+    };
+    for word in deny_only_appends {
+        value.push_str(&deny_only_assignment_value(
+            source,
+            segment_ranges,
+            segment_start,
+            "",
+            word,
+            0,
+        )?);
+    }
+    Some(vec![value])
+}
+
+/// The binding in force for a deny-only read, evaluated after the scan.
+#[derive(Clone, Copy)]
+enum DenyOnlyBinding<'a> {
+    /// `NAME=raw` in the segment at `start`, after the assignment words
+    /// `earlier` of the same list.
+    Assigned {
+        start: usize,
+        earlier: &'a str,
+        raw: &'a str,
+    },
+    /// `unset NAME`.
+    Unset,
+}
+
+/// `NAME+=word` as a whole segment: the raw word.
+fn posix_append_word<'a>(assignments: &'a str, name: &str) -> Option<&'a str> {
+    let word = assignments.strip_prefix(name)?.strip_prefix("+=")?;
+    matches!(split_assignment_words(assignments)?.as_slice(), [whole] if *whole == assignments)
+        .then_some(word)
+}
+
+/// The names a plain `unset [-v] NAME...` removes.
+fn posix_unset_names(segment: &str) -> Option<Vec<&str>> {
+    let mut words = segment.split_ascii_whitespace();
+    if words.next()? != "unset" {
+        return None;
+    }
+    let mut names = Vec::new();
+    for word in words {
+        if word == "-v" {
+            continue;
+        }
+        let identifier = word
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && word
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !identifier {
+            return None;
+        }
+        names.push(word);
+    }
+    Some(names)
+}
+
+/// `segment` (the bytes `start..end` of `source`) with the text of every
+/// quoted heredoc body blanked.
+fn blank_quoted_heredoc_bodies(
+    source: &str,
+    start: usize,
+    end: usize,
+    bodies: &[(Range<usize>, bool)],
+) -> String {
+    let mut bytes = source.as_bytes()[start..end].to_vec();
+    for (body, quoted) in bodies {
+        let (from, to) = (body.start.max(start), body.end.min(end));
+        if *quoted && from < to {
+            bytes[from - start..to - start].fill(b' ');
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
+/// Names declared before `segment_start` as namerefs that reach `name`,
+/// directly or through another such name (`declare -n r=X`).
+fn deny_only_nameref_aliases<'a>(
+    source: &'a str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+) -> Vec<&'a str> {
+    let index = deny_only_segment_index(source, segment_ranges);
+    if index.nameref_positions.is_empty() {
+        return Vec::new();
+    }
+    let declarations: Vec<(&str, &str)> = index
+        .nameref_positions
+        .iter()
+        .filter_map(|&position| segment_ranges.get(position))
+        .filter(|&&(_, end)| end <= segment_start)
+        .filter_map(|&(start, end)| posix_nameref_declaration(source.get(start..end)?.trim()))
+        .collect();
+    let mut aliases: Vec<&str> = Vec::new();
+    loop {
+        let found = aliases.len();
+        for &(declared, target) in &declarations {
+            if declared != name
+                && !aliases.contains(&declared)
+                && (target == name || aliases.contains(&target))
+            {
+                aliases.push(declared);
+            }
+        }
+        if aliases.len() == found {
+            return aliases;
+        }
+    }
+}
+
+thread_local! {
+    /// The deadline of the [`posix_proven_variable_view`] in progress, which
+    /// the deny-only binding proof checks between segments.
+    static DENY_ONLY_DEADLINE: std::cell::Cell<Option<Deadline>> =
+        const { std::cell::Cell::new(None) };
+    /// The heredoc bodies of the source the deny-only proof last read: every
+    /// reference asks again for the same command.
+    static DENY_ONLY_HEREDOCS: std::cell::RefCell<Option<(String, HeredocBodies)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Heredoc and here-string bodies, each with whether its delimiter is quoted.
+type HeredocBodies = Rc<Vec<(Range<usize>, bool)>>;
+
+/// Which segments of a source a deny-only read of a name must visit: those
+/// spelling the name as a word of identifier characters, and those whose
+/// command, quoted or not, may set variables it does not name (`printf`
+/// and `read`, judged from the whole source, and
+/// [`builtin_may_mutate_unnamed_variables`]). Any other segment leaves the
+/// name's value as it was.
+struct DenyOnlySegmentIndex {
+    source: String,
+    ranges: Vec<(usize, usize)>,
+    by_name: HashMap<String, Vec<usize>>,
+    generic: Vec<usize>,
+    /// [`segment_range_is_nested`] of each segment.
+    nested: Vec<bool>,
+    /// The scan state the last deny-only read of each name left.
+    checkpoints: std::cell::RefCell<HashMap<String, DenyOnlyCheckpoint>>,
+    /// Segments that declare a nameref ([`posix_nameref_declaration`]).
+    nameref_positions: Vec<usize>,
+    /// Offset of the first `IFS` in the source.
+    first_ifs: Option<usize>,
+}
+
+/// Where a deny-only scan of one name stopped, in byte offsets of the
+/// source: the statements it read end at or before `bound`, the last of
+/// them at `last_position`. A later read of the name resumes from here.
+#[derive(Clone)]
+struct DenyOnlyCheckpoint {
+    bound: usize,
+    last_position: Option<usize>,
+    /// [`DenyOnlyBinding`] in force.
+    base: Option<DenyOnlyBindingRange>,
+    appends: Vec<Range<usize>>,
+    values: Option<Vec<String>>,
+    /// The scan refused a proof; every later read refuses too.
+    refused: bool,
+}
+
+/// [`DenyOnlyBinding`] as byte ranges of the source.
+#[derive(Clone)]
+enum DenyOnlyBindingRange {
+    Assigned {
+        start: usize,
+        earlier: Range<usize>,
+        raw: Range<usize>,
+    },
+    Unset,
+}
+
+impl DenyOnlyBindingRange {
+    fn binding<'a>(&self, source: &'a str) -> DenyOnlyBinding<'a> {
+        match self {
+            Self::Assigned {
+                start,
+                earlier,
+                raw,
+            } => DenyOnlyBinding::Assigned {
+                start: *start,
+                earlier: source.get(earlier.clone()).unwrap_or_default(),
+                raw: source.get(raw.clone()).unwrap_or_default(),
+            },
+            Self::Unset => DenyOnlyBinding::Unset,
+        }
+    }
+}
+
+impl DenyOnlyCheckpoint {
+    /// `None` when a piece of the state is not text of `source`.
+    fn capture(
+        source: &str,
+        bound: usize,
+        last_position: Option<usize>,
+        base: Option<DenyOnlyBinding<'_>>,
+        appends: &[&str],
+        values: Option<&Vec<String>>,
+    ) -> Option<Self> {
+        let base = match base {
+            None => None,
+            Some(DenyOnlyBinding::Unset) => Some(DenyOnlyBindingRange::Unset),
+            Some(DenyOnlyBinding::Assigned {
+                start,
+                earlier,
+                raw,
+            }) => Some(DenyOnlyBindingRange::Assigned {
+                start,
+                earlier: subslice_range(source, earlier)?,
+                raw: subslice_range(source, raw)?,
+            }),
+        };
+        Some(Self {
+            bound,
+            last_position,
+            base,
+            appends: appends
+                .iter()
+                .map(|word| subslice_range(source, word))
+                .collect::<Option<_>>()?,
+            values: values.cloned(),
+            refused: false,
+        })
+    }
+}
+
+/// The byte range of `part` inside `source`; an empty `part` from
+/// elsewhere is the empty range.
+fn subslice_range(source: &str, part: &str) -> Option<Range<usize>> {
+    let offset = (part.as_ptr() as usize).checked_sub(source.as_ptr() as usize);
+    match offset {
+        Some(offset) if offset + part.len() <= source.len() => Some(offset..offset + part.len()),
+        _ if part.is_empty() => Some(0..0),
+        _ => None,
+    }
+}
+
+/// [`DenyOnlySegmentIndex`] of `source`, cached for the last source: every
+/// reference in a command reads the same one.
+fn deny_only_segment_index(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+) -> Rc<DenyOnlySegmentIndex> {
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<Rc<DenyOnlySegmentIndex>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    LAST.with(|last| {
+        if let Some(index) = last.borrow().as_ref()
+            && index.source == source
+            && index.ranges == segment_ranges
+        {
+            return Rc::clone(index);
+        }
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut generic = Vec::new();
+        for (position, &(start, end)) in segment_ranges.iter().enumerate() {
+            let segment = source.get(start..end).unwrap_or_default();
+            let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+            let mut names: Vec<&str> = segment
+                .split(|ch: char| !ch.is_ascii() || !word(ch as u8))
+                .filter(|name| !name.is_empty())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            for name in names {
+                by_name.entry(name.to_string()).or_default().push(position);
+            }
+            let first = hazard_first_word(segment.trim());
+            if matches!(first.as_ref(), "printf" | "read")
+                || builtin_may_mutate_unnamed_variables(&first)
+            {
+                generic.push(position);
+            }
+        }
+        let nested = segment_ranges
+            .iter()
+            .map(|&(start, end)| segment_range_is_nested(segment_ranges, start, end))
+            .collect();
+        let nameref_positions = if ["declare", "typeset", "local"]
+            .iter()
+            .any(|keyword| source.contains(keyword))
+        {
+            segment_ranges
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(start, end))| {
+                    source
+                        .get(start..end)
+                        .and_then(|segment| posix_nameref_declaration(segment.trim()))
+                        .is_some()
+                })
+                .map(|(position, _)| position)
+                .collect()
         } else {
             Vec::new()
         };
-    let mut values: Option<Vec<String>> = None;
-    for &(start, end) in segment_ranges {
-        if end > segment_start {
-            continue;
-        }
-        let segment = source.get(start..end).map(str::trim)?;
-        if segment.is_empty() {
-            continue;
-        }
-        // A binding inside a command or process substitution runs in a
-        // subshell and cannot set `NAME` for this segment — the live value
-        // would come from the ambient environment instead
-        // (`x=$(for f in a b; do :; done); mv "$f" d/` must not be proven by
-        // the inner header). Nested segment ranges are strictly contained in
-        // their extraction parent, so containment identifies them; they are
-        // never binding sources but still run the mutation-hazard check
-        // below, keeping a nested `NAME=` an outright refusal.
-        let nested = segment_range_is_nested(segment_ranges, start, end);
-        // Being a top-level segment is not enough: the shell must actually
-        // perform the assignment, in this shell, before the use (#426). A
-        // segment that fails this still falls through to the hazard checks
-        // below, where `segment_text_may_assign` refuses the proof outright —
-        // which is the right answer, because an unprovable binding is exactly
-        // the case the exemption must not cover.
-        let binds_in_parent = !nested
-            // A heredoc is input to another command, not a parent-shell
-            // assignment scope. Keep its segments in the hazard checks below:
-            // an expanding body can still mutate the caller's shell state.
-            && !heredoc_bodies
-                .iter()
-                .any(|(body, _)| body.start < end && start < body.end)
-            && (segment_binding_reaches_parent_shell(source, start, end)
-                || (matches!(mode, VariableResolution::Redirect { .. })
-                    && source
-                        .get(..start)
-                        .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
-                    && conditional_binding_dominates_redirect(source, end, segment_start)));
-        if binds_in_parent {
-            let assignments = strip_assignment_declaration(segment);
-            let binding = match assignment_only_segment_binding(assignments, name) {
-                AssignmentOnlyBinding::NotAssignmentOnly => assignments
-                    .strip_prefix(name)
-                    .and_then(|rest| rest.strip_prefix('=')),
-                AssignmentOnlyBinding::Binds(raw) => Some(raw),
-                AssignmentOnlyBinding::DoesNotBind => None,
-                AssignmentOnlyBinding::Ambiguous => return None,
-            };
-            if let Some(raw) = binding {
-                if values.is_some() {
-                    return None;
-                }
-                values = Some(match mode {
-                    VariableResolution::Literal | VariableResolution::DenyOnlyLiteral => vec![
-                        literal_assignment_value(raw)
-                            .or_else(|| mktemp_scratch_assignment_value(raw))?,
-                    ],
-                    VariableResolution::Redirect { remaining_depth } => redirect_assignment_values(
-                        source,
-                        segment_ranges,
-                        start,
-                        raw,
-                        remaining_depth,
-                    )?,
-                });
-                continue;
-            }
-            if posix_for_loop_binds(segment, name) {
-                // A second binding (assignment or another loop) makes the
-                // live value ambiguous; a header that is not statically
-                // enumerable (globs, substitutions, `"$@"`) makes it
-                // unprovable.
-                if values.is_some() {
-                    return None;
-                }
-                let (header_name, candidates) = parse_posix_for_loop_header(segment)?;
-                if header_name != name {
-                    return None;
-                }
-                values = Some(candidates);
-                continue;
-            }
-        }
-        if let Some((other, raw)) = posix_scalar_assignment(segment)
-            && other != name
-            && other != "IFS"
-            && raw.len() <= MAX_REDIRECT_VALUE_BYTES
-            && mktemp_scratch_assignment_value(raw)
-                .or_else(|| mktemp_explicit_tmp_assignment_value(raw))
-                .is_some()
-        {
-            // In a whole mktemp assignment, options belong to the substitution,
-            // not a parent-shell wrapper. It cannot mutate another scalar.
-            continue;
-        }
-        let first = hazard_first_word(segment);
-        if !matches!(mode, VariableResolution::DenyOnlyLiteral)
-            && (first.contains(['$', '`'])
-                || first.starts_with('-')
-                || matches!(first.as_ref(), "command" | "builtin" | "time"))
-        {
-            // An expanded command word may invoke a mutating builtin, and an
-            // option-bearing wrapper is outside the simple first-word parser.
-            // Neither can establish that a prior binding remains intact.
-            return None;
-        }
-        // `Owned` means the command word carried shell quoting that had to be
-        // removed to recognise it. `printf_can_bind_variable` scans the raw
-        // source for the literal word, which a quoted spelling like `pri"ntf"`
-        // does not contain — so the argument scan would find nothing and report
-        // the segment inert. Fail closed instead, matching what that function
-        // already does for any argument list it cannot read statically.
-        let command_word_was_quoted = matches!(first, Cow::Owned(_));
-        let may_mutate_shell_variables = match first.as_ref() {
-            // Only `printf -v NAME` binds; a plain printf writes to stdout
-            // and cannot change what a later `$NAME` expands to (#422).
-            // Checked against `source`, not `segment`: printf's arguments are
-            // stripped as data before this scan, so the segment is bare.
-            "printf" => command_word_was_quoted || printf_can_bind_variable(source, name),
-            // `read` binds only the variables it names, `REPLY` when it names
-            // none, and its `-a` array (#574). Same source-level scan.
-            "read" => command_word_was_quoted || read_can_bind_variable(source, name),
-            // These invalidate permission-lifting proofs. The deny-only
-            // pass retains the earlier literal as a conservative candidate,
-            // so adding this guard cannot hide an existing sensitive target.
-            "trap" | "alias" => !matches!(mode, VariableResolution::DenyOnlyLiteral),
-            other => matches!(
-                other,
-                "readonly"
-                    | "declare"
-                    | "typeset"
-                    | "local"
-                    | "export"
-                    | "let"
-                    | "eval"
-                    | "source"
-                    | "."
-                    | "mapfile"
-                    | "readarray"
-                    | "unset"
-                    | "getopts"
-                    | "select"
-            ),
-        };
-        // A changed IFS alters how an unquoted use word-splits, which the
-        // substitution proof cannot reproduce (v0.9.1 review).
-        if may_mutate_shell_variables
-            || segment_text_may_assign(segment, name)
-            || segment_text_may_assign(segment, "IFS")
-        {
-            return None;
-        }
+        let index = Rc::new(DenyOnlySegmentIndex {
+            source: source.to_string(),
+            ranges: segment_ranges.to_vec(),
+            by_name,
+            generic,
+            nested,
+            checkpoints: std::cell::RefCell::default(),
+            nameref_positions,
+            first_ifs: source.find("IFS"),
+        });
+        *last.borrow_mut() = Some(Rc::clone(&index));
+        index
+    })
+}
+
+/// Holds [`DENY_ONLY_DEADLINE`] for one view and restores the outer value.
+struct DenyOnlyDeadlineScope(Option<Deadline>);
+
+impl DenyOnlyDeadlineScope {
+    fn enter(deadline: Option<&Deadline>) -> Self {
+        Self(DENY_ONLY_DEADLINE.with(|cell| cell.replace(deadline.copied())))
     }
-    values
+}
+
+impl Drop for DenyOnlyDeadlineScope {
+    fn drop(&mut self) {
+        DENY_ONLY_DEADLINE.with(|cell| cell.set(self.0));
+    }
+}
+
+fn deny_only_deadline_exceeded() -> bool {
+    DENY_ONLY_DEADLINE.with(|cell| deadline_exceeded(cell.get().as_ref()))
+}
+
+/// [`crate::heredoc::heredoc_bodies_with_quoting`] for a deny-only proof,
+/// cached for the last source. A source too large to scan has none, as
+/// before deny-only proofs read heredocs.
+fn deny_only_heredoc_bodies(source: &str) -> HeredocBodies {
+    if source.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+        return Rc::default();
+    }
+    DENY_ONLY_HEREDOCS.with(|cache| {
+        if let Some((cached, bodies)) = cache.borrow().as_ref()
+            && cached == source
+        {
+            return Rc::clone(bodies);
+        }
+        let bodies = Rc::new(crate::heredoc::heredoc_bodies_with_quoting(source));
+        *cache.borrow_mut() = Some((source.to_string(), Rc::clone(&bodies)));
+        bodies
+    })
+}
+
+/// Builtins whose effect on shell variables the binding scan does not read
+/// from their words: any of them may change any variable.
+fn builtin_may_mutate_unnamed_variables(word: &str) -> bool {
+    matches!(
+        word,
+        "readonly"
+            | "declare"
+            | "typeset"
+            | "local"
+            | "export"
+            | "let"
+            | "eval"
+            | "source"
+            | "."
+            | "mapfile"
+            | "readarray"
+            | "unset"
+            | "getopts"
+            | "select"
+    )
 }
 
 fn shell_maintained_posix_variable(name: &str) -> bool {
@@ -29650,6 +30607,59 @@ fn hazard_first_word(segment: &str) -> Cow<'_, str> {
             None => return Cow::Borrowed(""),
         }
     }
+}
+
+/// Whether `text`, the words of a segment before some word, leaves that word
+/// in command-name position: only the prefixes [`hazard_first_word`] skips
+/// (control-flow openers, grouping, negation, `command`/`builtin`/`time`,
+/// redirections and assignment words) come first.
+fn posix_words_precede_command_name(text: &str) -> bool {
+    text.split_ascii_whitespace().all(|word| {
+        matches!(
+            word,
+            "do" | "then"
+                | "else"
+                | "while"
+                | "until"
+                | "if"
+                | "elif"
+                | "{"
+                | "!"
+                | "command"
+                | "builtin"
+                | "time"
+        ) || word_is_redirect_or_assignment_prefix(word)
+    })
+}
+
+/// A command name that means the same quoted or bare: bytes no POSIX shell
+/// treats specially, not an option, and not a reserved word (a quoted `if`
+/// names a program; a bare one opens a statement).
+fn posix_command_name_is_plain(field: &str) -> bool {
+    !field.is_empty()
+        && !field.starts_with('-')
+        && field.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
+        })
+        && !matches!(
+            field,
+            "if" | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "while"
+                | "until"
+                | "for"
+                | "in"
+                | "select"
+                | "function"
+                | "time"
+                | "coproc"
+        )
 }
 
 /// Whether a word sits before the command word without being it: a redirection
@@ -30471,6 +31481,320 @@ fn mktemp_explicit_tmp_assignment_value(raw: &str) -> Option<String> {
     Some(path)
 }
 
+/// How many scalar copies (`Y=$X`) a deny-only binding proof follows.
+const MAX_DENY_ONLY_COPY_DEPTH: usize = 4;
+
+/// `printf -v NAME VALUE` whose format has no conversion or escape: Bash
+/// stores VALUE in NAME, as `NAME=VALUE` would. The raw value word.
+fn posix_printf_v_literal_binding<'a>(segment: &'a str, name: &str) -> Option<&'a str> {
+    let words = split_assignment_words(segment)?;
+    let ["printf", "-v", target, raw] = words.as_slice() else {
+        return None;
+    };
+    (*target == name && !raw.contains(['%', '\\'])).then_some(*raw)
+}
+
+/// `declare -n NAME=TARGET` (also `typeset`/`local`, any option cluster
+/// holding `n`): Bash makes every later read of `NAME` read `TARGET`.
+fn posix_nameref_declaration(segment: &str) -> Option<(&str, &str)> {
+    let mut words = segment.split_ascii_whitespace();
+    if !matches!(words.next()?, "declare" | "typeset" | "local") {
+        return None;
+    }
+    let mut nameref = false;
+    for word in words {
+        if let Some(flags) = word.strip_prefix('-') {
+            nameref |= flags.contains('n');
+            continue;
+        }
+        let (name, raw) = word.split_once('=')?;
+        let target = raw
+            .strip_prefix(['"', '\''])
+            .and_then(|rest| rest.strip_suffix(['"', '\'']))
+            .unwrap_or(raw);
+        let valid = |text: &str| {
+            text.bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        };
+        return (nameref && valid(name) && valid(target)).then_some((name, target));
+    }
+    None
+}
+
+/// The variable a deny-only read of `name` reaches: the latest earlier
+/// nameref declaration of it redirects it, up to the copy depth. `None` when
+/// that declaration may not have run in this shell before the read
+/// (`false && declare -n r=X`, a subshell): the alias is not proven.
+fn deny_only_nameref_target<'a>(
+    source: &'a str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &'a str,
+) -> Option<&'a str> {
+    let index = deny_only_segment_index(source, segment_ranges);
+    if index.nameref_positions.is_empty() {
+        return Some(name);
+    }
+    let mut current = name;
+    for _ in 0..MAX_DENY_ONLY_COPY_DEPTH {
+        // Segment ranges are in source order, so the first match from the
+        // end is the latest declaration.
+        let latest = index
+            .nameref_positions
+            .iter()
+            .rev()
+            .filter_map(|&position| segment_ranges.get(position))
+            .filter(|&&(_, end)| end <= segment_start)
+            .find_map(|&(start, end)| {
+                let (declared, target) = posix_nameref_declaration(source.get(start..end)?.trim())?;
+                (declared == current).then_some((start, end, target))
+            });
+        let Some((start, end, target)) = latest else {
+            break;
+        };
+        if segment_range_is_nested(segment_ranges, start, end)
+            || !segment_binding_reaches_parent_shell(source, start, end)
+        {
+            return None;
+        }
+        if target == current {
+            break;
+        }
+        current = target;
+    }
+    Some(current)
+}
+
+/// The single literal value a deny-only read of `name` has at
+/// `segment_start`, including the default value of an `IFS` that no earlier
+/// segment assigns.
+fn deny_only_variable_value(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+) -> Option<String> {
+    deny_only_value_at(
+        source,
+        segment_ranges,
+        segment_start,
+        "",
+        name,
+        MAX_DENY_ONLY_COPY_DEPTH,
+    )
+}
+
+/// [`deny_only_variable_value`] with a copy budget, for a read at
+/// `segment_start` that follows the assignment words `earlier_words` of the
+/// same assignment-only segment (Bash performs them left to right, so
+/// `X=' ' Y=$X` copies the new `X`).
+fn deny_only_value_at(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    earlier_words: &str,
+    name: &str,
+    copy_depth: usize,
+) -> Option<String> {
+    let name = deny_only_nameref_target(source, segment_ranges, segment_start, name)?;
+    if let Some((raw, before)) = earlier_assignment_word(earlier_words, name).ok()? {
+        return deny_only_assignment_value(
+            source,
+            segment_ranges,
+            segment_start,
+            before,
+            raw,
+            copy_depth,
+        );
+    }
+    if name == "IFS" {
+        // With no assignment to IFS and no command naming it as a word
+        // (`unset IFS`, `read IFS`, `printf -v IFS t`), it holds the default
+        // whatever else the earlier segments do. Both need the text `IFS`.
+        if deny_only_segment_index(source, segment_ranges)
+            .first_ifs
+            .is_none_or(|offset| offset + 3 > segment_start)
+        {
+            return Some(DEFAULT_POSIX_IFS.to_string());
+        }
+        let prefix = source.get(..segment_start)?;
+        let named_as_word = prefix.match_indices("IFS").any(|(start, _)| {
+            let end = start + 3;
+            let separator = |byte: u8| byte.is_ascii_whitespace() || b";|&()".contains(&byte);
+            (start == 0 || separator(prefix.as_bytes()[start - 1]))
+                && prefix
+                    .as_bytes()
+                    .get(end)
+                    .is_none_or(|byte| separator(*byte))
+        });
+        if !named_as_word && !segment_text_may_assign(prefix, "IFS") {
+            return Some(DEFAULT_POSIX_IFS.to_string());
+        }
+    }
+    let values = resolve_variable_bindings(
+        source,
+        segment_ranges,
+        segment_start,
+        name,
+        VariableResolution::DenyOnlyLiteral { copy_depth },
+    )?;
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    Some(value.clone())
+}
+
+/// The assignment of `name` among the assignment words `words`, as its raw
+/// value and the words before it: `Ok(None)` when they do not assign it,
+/// `Err` when they cannot be read or assign it other than once and whole.
+fn earlier_assignment_word<'a>(
+    words: &'a str,
+    name: &str,
+) -> Result<Option<(&'a str, &'a str)>, ()> {
+    if words.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut found = None;
+    for word in split_assignment_words(words).ok_or(())? {
+        let (target, raw) = word.split_once('=').ok_or(())?;
+        let base = target.trim_end_matches('+');
+        let base = base.split_once('[').map_or(base, |(base, _)| base);
+        if base != name {
+            continue;
+        }
+        if target != name || found.is_some() {
+            return Err(());
+        }
+        found = Some((raw, text_before(words, word)));
+    }
+    Ok(found)
+}
+
+/// The text of `outer` before `inner`, a subslice of it.
+fn text_before<'a>(outer: &'a str, inner: &str) -> &'a str {
+    let offset = (inner.as_ptr() as usize)
+        .saturating_sub(outer.as_ptr() as usize)
+        .min(outer.len());
+    outer.get(..offset).unwrap_or_default()
+}
+
+/// Whether the reference at the start of `tail` (its name at `name`) is
+/// `${X[@]}` or `${X[*]}` of a name that an earlier literal array assignment
+/// (`X=(g x)`) made an array: every element, not the element 0 that a
+/// deny-only proof reads for `$X`.
+fn reads_every_array_element(
+    source: &str,
+    segment_start: usize,
+    tail: &str,
+    name: &Range<usize>,
+) -> bool {
+    let subscript = &tail[name.end..];
+    if !(subscript.starts_with("[@]") || subscript.starts_with("[*]")) {
+        return false;
+    }
+    let name = &tail[name.clone()];
+    let before = source.get(..segment_start).unwrap_or(source);
+    before.contains(&format!("{name}=(")) || before.contains(&format!("{name}+=("))
+}
+
+/// `${NAME:+WORD}` or `${NAME+WORD}` at the start of `tail`, with a WORD of
+/// plain characters (none that quote, expand or split): the name, the bytes
+/// consumed, whether the colon form, and the word. The text is WORD when
+/// NAME is set (and, with the colon, non-empty), else nothing.
+fn posix_alternate_value_reference(tail: &str) -> Option<(&str, usize, bool, &str)> {
+    let body = tail.strip_prefix("${")?;
+    let name_len = body
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    if name_len == 0 || body.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    let (name, rest) = body.split_at(name_len);
+    let (colon, operand) = match rest.strip_prefix(":+") {
+        Some(operand) => (true, operand),
+        None => (false, rest.strip_prefix('+')?),
+    };
+    let close = operand.find('}')?;
+    let word = &operand[..close];
+    let plain = word
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_-./:@,%+=".contains(&byte));
+    let consumed = tail.len() - operand.len() + close + 1;
+    plain.then_some((name, consumed, colon, word))
+}
+
+/// The value a deny-only proof may take from one assignment.
+///
+/// Beyond [`literal_assignment_value`], this decodes any fully literal word
+/// (`' '`, `$'\x20'`, `a"b c"`) and follows a copy of one earlier scalar
+/// between literal affixes (`X=$IFS`, `Y="${X}t"`), including one assigned
+/// by `earlier_words`, the words before it in the same assignment list. An
+/// assignment word is never field-split, so the copy is the exact string.
+/// An `IFS` that nothing earlier assigns holds the shell's default.
+fn deny_only_assignment_value(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    assignment_start: usize,
+    earlier_words: &str,
+    raw: &str,
+    copy_depth: usize,
+) -> Option<String> {
+    // `X=` alone binds the empty string; in `X= cmd` it is only for `cmd`.
+    if raw.trim().is_empty() {
+        return Some(String::new());
+    }
+    if raw.starts_with(char::is_whitespace) {
+        return None;
+    }
+    if let Some(value) =
+        literal_assignment_value(raw).or_else(|| mktemp_scratch_assignment_value(raw))
+    {
+        return Some(value);
+    }
+    let raw = raw.trim();
+    // A literal array `NAME=(a b)`: `$NAME` reads element 0.
+    if let Some(elements) = raw
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let elements = split_assignment_words(elements.trim())?;
+        let first = elements.first()?;
+        if elements.iter().any(|element| element.starts_with('[')) {
+            return None;
+        }
+        return crate::normalize::decode_posix_literal_word(first).map(Cow::into_owned);
+    }
+    // One shell word: in `X=a b` the value `a` is only for the command `b`.
+    if !matches!(split_assignment_words(raw).as_deref(), Some([word]) if *word == raw) {
+        return None;
+    }
+    if let Some(value) = crate::normalize::decode_posix_literal_word(raw) {
+        return Some(value.into_owned());
+    }
+    if copy_depth == 0 {
+        return None;
+    }
+    let token = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(raw);
+    let (prefix, name, suffix) = parse_posix_variable_with_literal_affixes(token)?;
+    let copied = deny_only_value_at(
+        source,
+        segment_ranges,
+        assignment_start,
+        earlier_words,
+        name,
+        copy_depth - 1,
+    )?;
+    Some(format!("{prefix}{copied}{suffix}"))
+}
+
 /// A whole-segment assignment value that is one literal shell word.
 fn literal_assignment_value(raw: &str) -> Option<String> {
     let raw = raw.trim();
@@ -30597,9 +31921,77 @@ fn resolve_proven_variables_in_segment(
     segment: &str,
     direction: ResolutionDirection,
 ) -> Option<String> {
+    resolve_proven_variables_in_segment_with_ifs(
+        source,
+        segment_ranges,
+        segment_start,
+        segment,
+        direction,
+        None,
+    )
+}
+
+/// How [`posix_proven_variable_view`] reads one piece of a segment.
+#[derive(Clone, Copy)]
+struct ProvenSplice<'a> {
+    /// The IFS value in force.
+    ifs: &'a str,
+    /// Assignment words in force for this text and not visible to the
+    /// segment proofs: the prefix of `X=t eval '...'`, whose body runs with
+    /// them.
+    earlier_words: &'a str,
+}
+
+/// [`resolve_proven_variables_in_segment`] for the reconstruction view
+/// when `view` is given (otherwise the default IFS and every reference).
+///
+/// Under [`ResolutionDirection::DenyOnly`] the walk also tracks double
+/// quotes, reads every scalar parameter expansion whose text comes from the
+/// value (`${X:0:1}`, `${X%x}`, `${X:-w}`, `${X[0]}`; see
+/// [`ifs_operation_text`]), and renders the text the way the shell expands
+/// it there: inside double quotes it stays one word; unquoted, every
+/// character of `ifs` becomes a space, so `X=" "; git${X}reset${X}--hard`
+/// reads as `git reset --hard` and `X=gi; "${X}t" reset --hard` as
+/// `"git" reset --hard`. An unquoted value holding a blank that is not in
+/// `ifs` (any blank when IFS is empty) is not split there, which spliced
+/// text cannot spell, so it is left as written.
+///
+/// With `view`, only what the variable-aware analyses cannot see is
+/// spliced: a reference inside a larger word (`git${X}reset`, `"${X}t"`), or an
+/// unquoted whole word whose value yields other than one field
+/// (`X="reset --hard"; git $X`, an empty `$E`), or a command name
+/// (`Y=git; X=$Y; "$X" reset`, rendered bare when the value is a plain
+/// word). A whole single-field argument such as `tee "$f"` stays as
+/// written, because the destination and rm proofs already judge it with
+/// its shell context (unknown option fields, quoted heredoc data) that a
+/// literal spelling would lose; command-cache rebinding of a command name
+/// is checked by [`posix_proven_variable_view`].
+fn resolve_proven_variables_in_segment_with_ifs(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    segment: &str,
+    direction: ResolutionDirection,
+    view: Option<ProvenSplice<'_>>,
+) -> Option<String> {
+    let deny_only = direction == ResolutionDirection::DenyOnly;
+    let composite_only = view.is_some();
+    let ifs = view.map_or(DEFAULT_POSIX_IFS, |view| view.ifs);
+    let earlier_words = view.map_or("", |view| view.earlier_words);
+    let proven_value = |name: &str| {
+        deny_only_value_at(
+            source,
+            segment_ranges,
+            segment_start,
+            earlier_words,
+            name,
+            MAX_DENY_ONLY_COPY_DEPTH,
+        )
+    };
     let mut out = String::with_capacity(segment.len());
     let mut rest = segment;
     let mut substituted = false;
+    let mut in_double_quote = false;
     // Only a `$` the shell would actually expand may be replaced. Inside single
     // quotes, and after a backslash, a dollar is literal text — `rm -rf '$D'`
     // deletes a file named `$D`, so resolving it would describe a different
@@ -30612,10 +32004,63 @@ fn resolve_proven_variables_in_segment(
     // allow. The converse (resolving something the shell would not expand) is
     // what must never happen.
     let mut in_single_quote = false;
-    while let Some(index) = rest.find(['$', '\'', '\\']) {
+    let specials: &[char] = if deny_only {
+        &['$', '\'', '\\', '"', '(', ')']
+    } else {
+        &['$', '\'', '\\']
+    };
+    // DenyOnly: each open `$(`, with the double-quote state outside it and
+    // its count of unmatched inner `(`. Quotes inside a substitution start
+    // fresh: in `"$(tee "$f")"` the inner `"$f"` is its own quoted word.
+    let mut substitutions: Vec<(bool, usize)> = Vec::new();
+    while let Some(index) = rest.find(specials) {
         out.push_str(&rest[..index]);
         let tail = &rest[index..];
         match tail.as_bytes()[0] {
+            // `(` and `)` are only reached under DenyOnly.
+            b'(' => {
+                if !in_single_quote
+                    && !in_double_quote
+                    && let Some((_, depth)) = substitutions.last_mut()
+                {
+                    *depth += 1;
+                }
+                out.push('(');
+                rest = &tail[1..];
+            }
+            b')' => {
+                if !in_single_quote
+                    && !in_double_quote
+                    && let Some((outer_double, depth)) = substitutions.last_mut()
+                {
+                    if *depth > 0 {
+                        *depth -= 1;
+                    } else {
+                        in_double_quote = *outer_double;
+                        substitutions.pop();
+                    }
+                }
+                out.push(')');
+                rest = &tail[1..];
+            }
+            b'$' if deny_only && !in_single_quote && tail.starts_with("$(") => {
+                substitutions.push((in_double_quote, 0));
+                in_double_quote = false;
+                out.push_str("$(");
+                rest = &tail[2..];
+            }
+            b'"' => {
+                // Only reached under DenyOnly.
+                if !in_single_quote {
+                    in_double_quote = !in_double_quote;
+                }
+                out.push('"');
+                rest = &tail[1..];
+            }
+            b'\'' if in_double_quote => {
+                out.push('\'');
+                rest = &tail[1..];
+            }
             b'\'' => {
                 in_single_quote = !in_single_quote;
                 out.push('\'');
@@ -30639,47 +32084,215 @@ fn resolve_proven_variables_in_segment(
                     rest = &tail[1..];
                     continue;
                 }
-                let Some((name, consumed)) = parse_leading_posix_variable(tail) else {
-                    // Not a plain variable reference (`$(`, `$'`, a bare `$`):
-                    // leave it and let the caller's proof fail if it mattered.
-                    out.push('$');
-                    rest = &tail[1..];
-                    continue;
+                // DenyOnly also reads Bash's indirect `${!NAME}`: the value of
+                // the variable that NAME's proven value names.
+                let indirect = if deny_only {
+                    tail.strip_prefix("${!").and_then(|body| {
+                        let close = body.find('}')?;
+                        let pointer = &body[..close];
+                        let (_, parsed) = parse_leading_posix_variable(&format!("${pointer}"))?;
+                        (parsed == pointer.len() + 1).then_some((pointer, close + 4))
+                    })
+                } else {
+                    None
                 };
+                let indirect_target = indirect.and_then(|(pointer, _)| {
+                    let target = proven_value(pointer)?;
+                    parse_leading_posix_variable(&format!("${target}"))
+                        .is_some_and(|(_, parsed)| parsed == target.len() + 1)
+                        .then_some(target)
+                });
+                // DenyOnly reads every scalar parameter expansion whose text
+                // comes from the value (`${X[0]}`, `${X:0:1}`, `${X:-w}`,
+                // `${X%x}`, case changes), with the operators the IFS view
+                // computes ([`scalar_parameter_reference_at`]).
+                // `alternate` is `${X:+word}` / `${X+word}`: (colon, word).
+                let (name, consumed, operation, alternate): (&str, usize, &str, _) =
+                    match (indirect, indirect_target.as_deref()) {
+                        (Some((_, consumed)), Some(target)) => (target, consumed, "", None),
+                        _ if deny_only => match scalar_parameter_reference_at(tail.as_bytes(), 0) {
+                            Some((name, reference))
+                                if reference.computable
+                                    && !reads_every_array_element(
+                                        source,
+                                        segment_start,
+                                        tail,
+                                        &name,
+                                    ) =>
+                            {
+                                (
+                                    &tail[name],
+                                    reference.range.end,
+                                    &tail[reference.operation],
+                                    None,
+                                )
+                            }
+                            Some((_, reference)) => {
+                                // Another element (`${X[1]}`), or all of an
+                                // array (`${X[@]}`): not this value.
+                                out.push_str(&tail[..reference.range.end]);
+                                rest = &tail[reference.range.end..];
+                                continue;
+                            }
+                            None => {
+                                if let Some((name, consumed, colon, word)) =
+                                    posix_alternate_value_reference(tail)
+                                {
+                                    (name, consumed, "", Some((colon, word)))
+                                } else {
+                                    out.push('$');
+                                    rest = &tail[1..];
+                                    continue;
+                                }
+                            }
+                        },
+                        _ => {
+                            let Some((name, consumed)) = parse_leading_posix_variable(tail) else {
+                                // Not a plain variable reference (`$(`, `$'`, a
+                                // bare `$`): leave it and let the caller's proof
+                                // fail if it mattered.
+                                out.push('$');
+                                rest = &tail[1..];
+                                continue;
+                            };
+                            (name, consumed, "", None)
+                        }
+                    };
                 // `keep` leaves the reference exactly as the author wrote it, so
                 // the resolved text still describes that word as unresolved.
                 let keep = |out: &mut String| {
                     out.push_str(&tail[..consumed]);
                     &tail[consumed..]
                 };
-                let mode = match direction {
-                    ResolutionDirection::MayAllow => VariableResolution::Literal,
-                    ResolutionDirection::DenyOnly => VariableResolution::DenyOnlyLiteral,
+                let deny_only_value;
+                let may_allow_values;
+                let value: &String = if deny_only {
+                    deny_only_value = proven_value(name).and_then(|value| match alternate {
+                        // A proven value is set; `:+` also needs it non-empty.
+                        Some((colon, word)) => Some(if colon && value.is_empty() {
+                            String::new()
+                        } else {
+                            word.to_string()
+                        }),
+                        None => ifs_operation_text(operation, &value),
+                    });
+                    let Some(value) = deny_only_value.as_ref() else {
+                        rest = keep(&mut out);
+                        continue;
+                    };
+                    value
+                } else {
+                    may_allow_values = resolve_variable_bindings(
+                        source,
+                        segment_ranges,
+                        segment_start,
+                        name,
+                        VariableResolution::Literal,
+                    )?;
+                    let [value] = may_allow_values.as_slice() else {
+                        return None;
+                    };
+                    value
                 };
-                let values = match resolve_variable_bindings(
-                    source,
-                    segment_ranges,
-                    segment_start,
-                    name,
-                    mode,
-                ) {
-                    Some(values) => values,
-                    None if direction == ResolutionDirection::DenyOnly => {
+                let rendered: Cow<'_, str> = if !deny_only {
+                    Cow::Borrowed(value.as_str())
+                } else if in_double_quote {
+                    // One word either way; a newline would only change bytes.
+                    Cow::Owned(value.replace('\n', " "))
+                } else if value
+                    .chars()
+                    .any(|ch| matches!(ch, ' ' | '\t' | '\n') && !ifs.contains(ch))
+                {
+                    // A blank that is not an IFS character stays inside its
+                    // word (`IFS=x; X=' '; git${X}reset` runs `git reset`, one
+                    // word), which spliced text cannot spell.
+                    rest = keep(&mut out);
+                    continue;
+                } else {
+                    // Every IFS character ends a field.
+                    Cow::Owned(
+                        value
+                            .chars()
+                            .map(|ch| if ifs.contains(ch) { ' ' } else { ch })
+                            .collect(),
+                    )
+                };
+                if composite_only {
+                    let before = &segment[..segment.len() - tail.len()];
+                    let after = &tail[consumed..];
+                    let boundary = |ch: Option<char>| {
+                        ch.is_none_or(|ch| {
+                            ch.is_ascii_whitespace()
+                                || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`')
+                        })
+                    };
+                    let whole = if in_double_quote {
+                        before
+                            .strip_suffix('"')
+                            .is_some_and(|text| boundary(text.chars().next_back()))
+                            && after
+                                .strip_prefix('"')
+                                .is_some_and(|text| boundary(text.chars().next()))
+                    } else {
+                        boundary(before.chars().next_back()) && boundary(after.chars().next())
+                    };
+                    let fields = if in_double_quote {
+                        1
+                    } else {
+                        rendered
+                            .split(' ')
+                            .filter(|field| !field.is_empty())
+                            .count()
+                    };
+                    let word_start = before
+                        .rfind(|ch: char| {
+                            ch.is_ascii_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')')
+                        })
+                        .map_or(0, |index| index + 1);
+                    // A whole single-field argument keeps its variable-aware
+                    // analyses (destination, rm, option fields); a command
+                    // name does not, because the executable model proves
+                    // only one literal binding, while this proof also
+                    // follows copies, appends, operators and rebinding.
+                    // An assignment-shaped word is not split; an earlier
+                    // assignment in this segment (`$((f=0))`) can change the
+                    // value before this use. `out` holds that text with
+                    // spliced references already replaced, so an earlier
+                    // `${X[0]}` does not read as an assignment.
+                    let command_name = whole
+                        && fields == 1
+                        && posix_words_precede_command_name(&before[..word_start]);
+                    if (whole && fields == 1 && !command_name)
+                        || posix_word_is_assignment_prefix(&before[word_start..])
+                        || segment_text_may_assign(&out, name)
+                    {
                         rest = keep(&mut out);
                         continue;
                     }
-                    None => return None,
-                };
-                let [value] = values.as_slice() else {
-                    if direction == ResolutionDirection::DenyOnly {
-                        rest = keep(&mut out);
+                    // A plain command name is the same word quoted or bare;
+                    // render it bare, as the executable model does, so the
+                    // packs judge the program and not a quoted spelling.
+                    let field = rendered.trim_matches(' ');
+                    if command_name
+                        && in_double_quote
+                        && posix_command_name_is_plain(field)
+                        && value_is_safe_to_splice_for_denial(field)
+                    {
+                        out.pop();
+                        out.push_str(field);
+                        in_double_quote = false;
+                        rest = &tail[consumed + 1..];
+                        substituted = true;
                         continue;
                     }
-                    return None;
-                };
+                }
                 let splicable = match direction {
-                    ResolutionDirection::MayAllow => value_is_inert_when_substituted(value),
-                    ResolutionDirection::DenyOnly => value_is_safe_to_splice_for_denial(value),
+                    ResolutionDirection::MayAllow => value_is_inert_when_substituted(&rendered),
+                    // An empty or blank value vanishes from the word.
+                    ResolutionDirection::DenyOnly => {
+                        (composite_only && rendered.trim_matches(' ').is_empty())
+                            || value_is_safe_to_splice_for_denial(&rendered)
+                    }
                 };
                 if !splicable {
                     if direction == ResolutionDirection::DenyOnly {
@@ -30688,7 +32301,7 @@ fn resolve_proven_variables_in_segment(
                     }
                     return None;
                 }
-                out.push_str(value);
+                out.push_str(&rendered);
                 rest = &tail[consumed..];
                 substituted = true;
             }
@@ -39006,12 +40619,14 @@ mod tests {
         }
     }
 
-    /// Ambiguity still refuses, in every spelling (#479).
+    /// A second binding never lifts a denial, in every spelling (#479).
     ///
     /// The strip makes a declaration segment an ordinary binding, so a second
-    /// one has to make the value ambiguous exactly as two bare assignments do.
-    /// Without this the fix would turn "two possible values" into "the last one
-    /// I recognised".
+    /// one makes a permission-lifting proof refuse exactly as two bare
+    /// assignments do. In the deny-only direction the shell is not ambiguous:
+    /// sequential parent-shell assignments leave the last value, so
+    /// `T=/tmp/build; T=/home/user/.ssh/id_rsa; rm $T` removes the key and is
+    /// judged as `rm /home/user/.ssh/id_rsa`.
     #[test]
     fn two_bindings_still_refuse_the_proof_issue_479() {
         for command in [
@@ -39020,9 +40635,18 @@ mod tests {
             "export T=/tmp/build; declare T=/home/user/.ssh/id_rsa; rm $T",
         ] {
             assert!(
-                evaluate_with_pack_ids(command, &["core.filesystem"]).is_allowed(),
-                "{command:?}: two bindings make the value ambiguous, and an \
-                 unprovable binding must not resolve to either one"
+                evaluate_with_pack_ids(command, &["core.filesystem"]).is_denied(),
+                "{command:?}: the last parent-shell binding is the value rm receives"
+            );
+        }
+        // The reverse order must not borrow the temporary path's exemption.
+        for command in [
+            "T=/home/user/.ssh/id_rsa; T=/tmp/build; rm -rf $T",
+            "T=/tmp/a; T=/tmp/b; rm -rf \"$T\"",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["core.filesystem"]).is_denied(),
+                "{command:?}: two bindings must not prove a temporary path"
             );
         }
     }
@@ -40315,6 +41939,209 @@ mod tests {
         ] {
             let result = evaluate_with_pack_ids(command, &packs);
             assert!(result.is_allowed(), "{command} -> {result:?}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn posix_proven_variable_view_renders_shell_expansion() {
+        for (command, expected) in [
+            (
+                r#"X=" "; git${X}reset${X}--hard"#,
+                Some(r#"X=" "; git reset --hard"#),
+            ),
+            // Each default-IFS character separates.
+            (
+                r"X=$IFS; git${X}reset${X}--hard",
+                Some(r"X=$IFS; git   reset   --hard"),
+            ),
+            (
+                r#"X=gi; "${X}t" reset --hard"#,
+                Some(r#"X=gi; "git" reset --hard"#),
+            ),
+            (
+                r#"X=gi; "$X"t reset --hard"#,
+                Some(r#"X=gi; "gi"t reset --hard"#),
+            ),
+            // An unquoted whole word that splits, or that vanishes.
+            (
+                r#"X="reset --hard"; git $X"#,
+                Some(r#"X="reset --hard"; git reset --hard"#),
+            ),
+            (r"E=; $E git reset", Some(r"E=;  git reset")),
+            // Bash indirection and namerefs read the variable they name.
+            (r"v=IFS; git${!v}reset", Some(r"v=IFS; git   reset")),
+            (
+                r#"X=" "; v=X; git${!v}reset"#,
+                Some(r#"X=" "; v=X; git reset"#),
+            ),
+            (
+                r"declare -n r=IFS; git${r}reset",
+                Some(r"declare -n r=IFS; git   reset"),
+            ),
+            (
+                r#"X=" "; declare -n r=X; git${r}reset"#,
+                Some(r#"X=" "; declare -n r=X; git reset"#),
+            ),
+            // `$(` starts fresh quoting; `$((f=0))` rebinds before the use.
+            (
+                r#"X=" "; echo "$(git${X}reset)""#,
+                Some(r#"X=" "; echo "$(git reset)""#),
+            ),
+            (r#"X=" "; echo "$((X=1))" a${X}b"#, None),
+            // A whole single-field argument keeps its own analyses; a
+            // plain command name is rendered bare, a reserved word quoted.
+            (
+                r#"PY=/usr/bin/python3; "$PY" -c 'print(1)'"#,
+                Some(r"PY=/usr/bin/python3; /usr/bin/python3 -c 'print(1)'"),
+            ),
+            (
+                r#"Y=git; X=$Y; "$X" reset"#,
+                Some(r"Y=git; X=$Y; git reset"),
+            ),
+            (r"X=g; X+=it; $X reset", Some(r"X=g; X+=it; git reset")),
+            (r#"X=if; "$X" a"#, Some(r#"X=if; "if" a"#)),
+            (r#"f=/etc/sudoers; tee "$f""#, None),
+            (r"X=--hard; git reset $X", None),
+            (
+                r#"X=a; X=" "; git${X}reset"#,
+                Some(r#"X=a; X=" "; git reset"#),
+            ),
+            (r"IFS=x; X=x; git${X}reset", Some(r"IFS=x; X=x; git reset")),
+            // Inside double quotes the value stays inside the same word.
+            (r#"X=" "; "git${X}reset""#, Some(r#"X=" "; "git reset""#)),
+            // An apostrophe inside double quotes does not open a quote.
+            (
+                r#"X=" "; A="'" git${X}reset"#,
+                Some(r#"X=" "; A="'" git reset"#),
+            ),
+            // Single quotes and escapes do not expand.
+            (r#"X=" "; echo 'a${X}b'"#, None),
+            (r#"X=" "; echo a\${X}b"#, None),
+            // An empty IFS does not split, so a blank value stays as written.
+            (r#"IFS=; X=" "; git${X}reset"#, None),
+            // Assignment words are not split.
+            (r#"X=" "; Y=a${X}b"#, None),
+            // A conditional or unknown binding proves nothing.
+            (r#"X=" "; false && X=a; git${X}reset"#, None),
+            (r"git${X}reset", None),
+            // Values carrying shell syntax are never spliced.
+            (r#"X="a;b"; git${X}reset"#, None),
+            // Scalar operators whose text comes from the value.
+            (r"X=' '; git${X[0]}reset", Some(r"X=' '; git reset")),
+            (
+                r"X=' '; git${X[0]}reset${X[0]}--hard",
+                Some(r"X=' '; git reset --hard"),
+            ),
+            (r"X=' '; git${X:0:1}reset", Some(r"X=' '; git reset")),
+            (r"X=' '; git${X:-other}reset", Some(r"X=' '; git reset")),
+            (r"X=' x'; git${X%x}reset", Some(r"X=' x'; git reset")),
+            (r"X=' '; git${X[1]}reset", None),
+            // An alternate value is the word when the value is set (and,
+            // with the colon, non-empty).
+            (r"X=' '; git${X:+y}reset", Some(r"X=' '; gityreset")),
+            (
+                r#"X=a; "gi${X:+t}" reset --hard"#,
+                Some(r#"X=a; "git" reset --hard"#),
+            ),
+            (r#"X=a; "gi${X+t}" reset"#, Some(r#"X=a; "git" reset"#)),
+            (r#"X=; "gi${X:+t}" reset"#, Some(r#"X=; "gi" reset"#)),
+            (r#""gi${IFS:+t}" reset"#, Some(r#""git" reset"#)),
+            (r#""gi${HOME:+t}" reset"#, None),
+            (r#"X=a; "gi${X:+$Y}" reset"#, None),
+            // Appends fold onto a proven value; an ambient one is unknown.
+            (
+                r#"X=g; X+=i; "${X}t" reset"#,
+                Some(r#"X=g; X+=i; "git" reset"#),
+            ),
+            (
+                r#"unset X; X+=g; "${X}it" reset"#,
+                Some(r#"unset X; X+=g; "git" reset"#),
+            ),
+            (r#"X+=g; "${X}it" reset"#, None),
+            (r#"unset X; "${X+gi}t" reset"#, None),
+            // A literal array reads element 0, except for every element.
+            (
+                r#"X=(g x); "${X}it" reset"#,
+                Some(r#"X=(g x); "git" reset"#),
+            ),
+            (
+                r#"X=(g x); "${X[0]}it" reset"#,
+                Some(r#"X=(g x); "git" reset"#),
+            ),
+            (r#"X=(g x); "${X[@]}it" reset"#, None),
+            // Only the binding in force matters, even after an unknown one.
+            (
+                r"X=$(date); X=' '; git${X}reset",
+                Some(r"X=$(date); X=' '; git reset"),
+            ),
+            // A write through a nameref writes the variable it names.
+            (r"X=' '; declare -n r=X; r=a; git${X}reset", None),
+            (r"X=t; declare -n r=X; unset r; git${X}reset", None),
+            // The outer shell expands nothing in a quoted heredoc body, and
+            // its lines bind nothing.
+            ("X=' '; bash <<'EOF'\ngit${X}reset${X}--hard\nEOF", None),
+            ("cat > notes.txt <<'EOF'\nX=' '\nEOF\ngit${X}reset", None),
+            // An assignment list runs left to right.
+            (r"X=' ' Y=$X; git${Y}reset", Some(r"X=' ' Y=$X; git reset")),
+            (r"Y=$X X=' '; git${Y}reset", None),
+            // Only the characters of the IFS in force split.
+            (r"IFS=x; X=' '; git${X}reset", None),
+            (r"IFS=,; X=$'\n'; git${X}reset", None),
+            (
+                r"IFS=,; X=a,b; git${X}reset",
+                Some(r"IFS=,; X=a,b; gita breset"),
+            ),
+            (r"X=' '; unset IFS; git${X}reset", None),
+            // A nameref declaration that may not have run proves no alias.
+            (r"X=' '; r=a; false && declare -n r=X; git${r}reset", None),
+            (r"X=' '; r=a; (declare -n r=X); git${r}reset", None),
+            // A command name that earlier state may rebind keeps its context.
+            (
+                r#"X=gi; hash -p /usr/bin/printf git; "${X}t" reset --hard"#,
+                None,
+            ),
+            (
+                r#"f=/etc/sudoer; hash -p /usr/bin/printf tee; tee "${f}s""#,
+                None,
+            ),
+            (r#"tee() { :; }; f=/etc/sudoer; tee "${f}s""#, None),
+            // An eval body is source run with the prefix assignments in force.
+            (
+                r#"X=t eval '"gi${X}" reset --hard'"#,
+                Some(r#"X=t eval '"git" reset --hard'"#),
+            ),
+            (
+                r#"X=t; eval '"gi${X}" reset --hard'"#,
+                Some(r#"X=t; eval '"git" reset --hard'"#),
+            ),
+            (
+                r#"IFS=t eval '"gi${IFS}" reset --hard'"#,
+                Some(r#"IFS=t eval '"git" reset --hard'"#),
+            ),
+            (r#"X=t; eval 'X=a; "gi${X}" reset'"#, None),
+            (
+                r#"X=gi; hash -p /usr/bin/printf git; eval '"${X}t" reset'"#,
+                None,
+            ),
+            // `printf -v NAME VALUE` with a plain format binds like `NAME=VALUE`.
+            (
+                r#"printf -v X t; "gi${X}" reset --hard"#,
+                Some(r#"printf -v X t; "git" reset --hard"#),
+            ),
+            (
+                r#"printf -v IFS t; "gi${IFS}" reset --hard"#,
+                Some(r#"printf -v IFS t; "git" reset --hard"#),
+            ),
+            (r#"printf -v X %s t; "gi${X}" reset"#, None),
+        ] {
+            assert_eq!(
+                posix_proven_variable_view(command, None)
+                    .expect("no deadline")
+                    .as_deref(),
+                expected,
+                "{command:?}"
+            );
         }
     }
 
