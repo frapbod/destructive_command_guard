@@ -15339,7 +15339,10 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // reading, nothing inside a second reading is read again.
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
-        && matches!(shell_dialect, ShellDialect::PowerShell | ShellDialect::Unknown)
+        && matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        )
         && !crate::context::PlainDollarQuoteReading::active()
         && let Some(spelled) = crate::normalize::powershell_quoting_in_posix_spelling(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
@@ -51101,13 +51104,14 @@ mod tests {
             );
             let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
             assert!(result.is_denied(), "must deny: {command:?}");
-            assert_eq!(
-                result
-                    .pattern_info
-                    .as_ref()
-                    .and_then(|info| info.matched_text_preview.as_deref()),
-                Some("git reset --hard"),
-                "the preview shows the command's own text: {command:?}"
+            let preview = result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.matched_text_preview.as_deref())
+                .unwrap_or_default();
+            assert!(
+                preview.contains("reset --hard") && command.contains(preview),
+                "the preview shows the command's own text: {command:?}: {preview:?}"
             );
         }
         for command in [

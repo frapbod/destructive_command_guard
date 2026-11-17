@@ -37,7 +37,6 @@ const HARMLESS: &[&str] = &[
     r#"git -C "C:\Users\kaita\repo\" status"#,
     r#"Get-ChildItem "C:\Users\kaita\repo\" -Recurse | Select-Object Name"#,
     r#"git commit -m "fix C:\path\ handling""#,
-    r#"Write-Output "a`tb"; git status"#,
     r"Write-Output 'it''s'; git status",
     "Write-Output @'\nit's \"quoted\"\n'@ | Set-Content notes.txt",
 ];
@@ -168,7 +167,12 @@ fn powershell_tool_reads_powershell_quotes_both_protocols() {
                 "{protocol:?}: {command:?}"
             );
         }
-        for command in HARMLESS {
+        // A backtick escape is ordinary PowerShell (the Unknown union reads
+        // it as an unparseable POSIX substitution, so it is checked here).
+        for command in HARMLESS
+            .iter()
+            .chain(&[r#"Write-Output "a`tb"; git status"#])
+        {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "allow",

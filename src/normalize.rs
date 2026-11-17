@@ -4969,7 +4969,11 @@ mod tests {
             r"echo 'a\'; git status",
             r#"echo "it""s""#,
         ] {
-            assert_eq!(powershell_quoting_in_posix_spelling(command), None, "{command:?}");
+            assert_eq!(
+                powershell_quoting_in_posix_spelling(command),
+                None,
+                "{command:?}"
+            );
         }
     }
 
