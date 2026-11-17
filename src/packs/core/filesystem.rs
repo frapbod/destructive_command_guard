@@ -2984,37 +2984,13 @@ fn strip_leading_rm_prefixes(command: &str) -> (&str, bool) {
         .map_or((command, stdin_redirect), |suffix| (suffix, stdin_redirect))
 }
 
-fn strip_leading_posix_group_openers(mut command: &str) -> (&str, bool) {
-    let original = command;
-    loop {
-        command = command.trim_start();
-        if let Some(suffix) = command.strip_prefix('(') {
-            command = suffix;
-            continue;
-        }
-        if let Some(suffix) = command.strip_prefix('{').filter(|suffix| {
-            suffix
-                .as_bytes()
-                .first()
-                .is_none_or(u8::is_ascii_whitespace)
-        }) {
-            command = suffix;
-            continue;
-        }
-        if let Some(suffix) = ["do", "then", "else"].into_iter().find_map(|reserved| {
-            command.strip_prefix(reserved).and_then(|suffix| {
-                suffix
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_whitespace)
-                    .then_some(suffix)
-            })
-        }) {
-            command = suffix;
-            continue;
-        }
-        break;
-    }
+/// The command after leading shell syntax: subshell and group openers,
+/// reserved words, function declarations and case arms. The git pack owns
+/// the parser so both packs find the same command word.
+fn strip_leading_posix_group_openers(original: &str) -> (&str, bool) {
+    let (command, _) =
+        crate::packs::core::git::command_after_posix_control_prefixes(original, ShellDialect::Posix);
+    let command = command.trim_start();
     (command, command.as_ptr() != original.as_ptr())
 }
 

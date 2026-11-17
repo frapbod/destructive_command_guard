@@ -1056,12 +1056,60 @@ fn first_literal_posix_git_token_offset(segment: &str) -> Option<usize> {
         })
 }
 
+/// The first arm body of `case WORD in [(]PATTERN) BODY`. A `case` header
+/// alone (its arms on later lines) leaves no command in this segment.
+fn command_after_posix_case_prefix<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    case_index: usize,
+) -> Option<(&'a str, usize)> {
+    let word_index = next_posix_prefix_token(segment, tokens, case_index + 1)?;
+    let in_index = next_posix_prefix_token(segment, tokens, word_index + 1)?;
+    if tokens.get(word_index)?.kind != NormalizeTokenKind::Word
+        || tokens.get(in_index)?.text(segment) != Some("in")
+    {
+        return None;
+    }
+    let Some(mut arm_index) = next_posix_prefix_token(segment, tokens, in_index + 1) else {
+        return Some((&segment[segment.len()..], segment.len()));
+    };
+    if tokens.get(arm_index)?.text(segment) == Some("(") {
+        arm_index = next_posix_prefix_token(segment, tokens, arm_index + 1)?;
+    }
+    posix_case_arm_body(segment, tokens, arm_index)
+}
+
+/// The body of a case arm `PATTERN[|PATTERN]...) BODY`. Later arms start
+/// their own segments after `;;`, and the segmenter also splits at a
+/// pattern's `|`. Outside a case this spelling is a syntax error, so reading
+/// it as an arm cannot hide a command Bash would run.
+fn posix_case_arm_body<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    mut index: usize,
+) -> Option<(&'a str, usize)> {
+    loop {
+        if tokens.get(index)?.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let next = next_posix_prefix_token(segment, tokens, index + 1)?;
+        match tokens.get(next)?.text(segment)? {
+            ")" => {
+                let body = next_posix_prefix_token(segment, tokens, next + 1)?;
+                let start = tokens.get(body)?.byte_range.start;
+                return Some((&segment[start..], start));
+            }
+            "|" => index = next_posix_prefix_token(segment, tokens, next + 1)?,
+            _ => return None,
+        }
+    }
+}
+
 fn command_after_posix_function_prefix<'a>(
     segment: &'a str,
     tokens: &[crate::normalize::NormalizeToken],
-    function_index: usize,
+    name_index: usize,
 ) -> Option<(&'a str, usize)> {
-    let name_index = next_posix_prefix_token(segment, tokens, function_index + 1)?;
     if tokens.get(name_index)?.kind != NormalizeTokenKind::Word {
         return None;
     }
@@ -1160,9 +1208,21 @@ fn command_after_posix_control_prefixes_bounded(
             break;
         }
     }
-    if !prefix_probe.split_whitespace().next().is_some_and(|word| {
-        crate::context::is_shell_command_prefix_reserved_word(word) || word == "function"
-    }) {
+    // `(` opens a subshell, `NAME()` declares a function and `PATTERN)` opens
+    // a case arm. Each puts syntax before a body command, like the reserved
+    // words do.
+    let mut words = prefix_probe.split_whitespace();
+    let first = words.next();
+    if !prefix_probe.starts_with('(')
+        && !first.is_some_and(|word| {
+            crate::context::is_shell_command_prefix_reserved_word(word)
+                || matches!(word, "function" | "case")
+        })
+        && !first
+            .into_iter()
+            .chain(words.next())
+            .any(|word| word.contains(['(', ')']))
+    {
         return (segment, 0);
     }
 
@@ -1173,18 +1233,33 @@ fn command_after_posix_control_prefixes_bounded(
         let Some(token) = tokens.get(index) else {
             return (segment, 0);
         };
-        if token.kind != NormalizeTokenKind::Word {
-            return (segment, 0);
-        }
         let Some(raw) = token.text(segment) else {
             return (segment, 0);
         };
+        if token.kind != NormalizeTokenKind::Word {
+            if raw == "(" {
+                stripped_reserved_word = true;
+                token_index = next_posix_prefix_token(segment, &tokens, index + 1);
+                continue;
+            }
+            return (segment, 0);
+        }
 
-        if raw == "function" {
-            let Some((body, offset)) = command_after_posix_function_prefix(segment, &tokens, index)
-            else {
-                return (segment, 0);
-            };
+        let structural_body = match raw {
+            "function" => next_posix_prefix_token(segment, &tokens, index + 1)
+                .and_then(|name| command_after_posix_function_prefix(segment, &tokens, name)),
+            "case" => command_after_posix_case_prefix(segment, &tokens, index),
+            _ => posix_case_arm_body(segment, &tokens, index).or_else(|| {
+                // `NAME () BODY`: without `function`, both parentheses are required.
+                let open = next_posix_prefix_token(segment, &tokens, index + 1)?;
+                let close = next_posix_prefix_token(segment, &tokens, open + 1)?;
+                (tokens.get(open)?.text(segment) == Some("(")
+                    && tokens.get(close)?.text(segment) == Some(")"))
+                .then(|| command_after_posix_function_prefix(segment, &tokens, index))
+                .flatten()
+            }),
+        };
+        if let Some((body, offset)) = structural_body {
             if body.is_empty() {
                 return (body, offset);
             }
