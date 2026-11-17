@@ -51,8 +51,8 @@ use crate::heredoc::{
     ExtractionResult, SkipReason, TriggerResult, check_triggers, extract_content,
 };
 use crate::normalize::{
-    NormalizeTokenKind, PATH_NORMALIZER, QUOTED_PATH_NORMALIZER, ShellDialect, ShellTokenDecoder,
-    PowerShellHashRole, ShellTokenRole, powershell_hash_role, strip_wrapper_prefixes,
+    NormalizeTokenKind, PATH_NORMALIZER, PowerShellHashRole, QUOTED_PATH_NORMALIZER, ShellDialect,
+    ShellTokenDecoder, ShellTokenRole, powershell_hash_role, strip_wrapper_prefixes,
     tokenize_for_shell_dialect,
 };
 use crate::packs::{
@@ -15400,7 +15400,10 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // view. Keep the original tokenizer's decisions and grants intact.
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
-        && matches!(shell_dialect, ShellDialect::PowerShell | ShellDialect::Unknown)
+        && matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        )
         && let Some(masked) = crate::normalize::mask_powershell_comments(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
