@@ -114,6 +114,17 @@ fn quoted_executables_in_shell_groups_are_judged() {
         r#"f() { git reset --hard; }; f"#,
         r#"X=t; ( "gi${X}" reset --hard )"#,
         r#"X=t; f() { "gi${X}" reset --hard; }; f"#,
+        // t_49339710 review round 5: Bash runs `git` here.
+        r#"f(){ "${IFS}it" reset --hard; }; IFS=g; f"#,
+        r#"f(){ "git" reset --hard; }; f"#,
+        r#"f(){ 'git' reset --hard; }; f"#,
+        r#"f(){ g"it" reset --hard; }; f"#,
+        // t_416fd788 review round 4: case arms are compound bodies too.
+        r#"case a in a) "git" reset --hard;; esac"#,
+        r#"X=gi; case a in a) "${X}t" reset --hard;; esac"#,
+        r#"X=git; case a in a) $X reset --hard;; esac"#,
+        r#"X=git; case a in a) "$X" reset --hard;; esac"#,
+        r#"case a in a) git reset --hard;; esac"#,
     ]);
 }
 
@@ -127,5 +138,7 @@ fn safe_quoted_shell_groups_remain_allowed() {
         r#"( printf '%s' '"git" reset --hard' )"#,
         r#"f() { printf '%s' '"rm" -rf ~/'; }; f"#,
         r#"printf '%s' '( "git" reset --hard )'"#,
+        r#"case a in a) "git" status;; esac"#,
+        r#"case a in a) printf '%s' '"git" reset --hard';; esac"#,
     ]);
 }
