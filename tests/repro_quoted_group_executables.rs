@@ -139,6 +139,10 @@ fn quoted_executables_in_shell_groups_are_judged() {
             r#"function f { "git" reset --hard; }; f"#,
             r#"( "git" reset --hard ) >/dev/null"#,
             r#"if true; then ( "git" reset --hard ); fi"#,
+            r#"( "git" reset --hard ) 2>&1"#,
+            r#"( "git" reset --hard ) > /dev/null 2>&1"#,
+            r#"if ( "git" reset --hard ); then :; fi"#,
+            r#"( ( "git" reset --hard ) )"#,
         ],
     );
 }
@@ -161,6 +165,10 @@ fn safe_quoted_shell_groups_remain_allowed() {
             r#"( "git" commit -m "reset --hard" )"#,
             r#"f() { "git" log; }; f"#,
             r#"( git commit -m "reset --hard" )"#,
+            // PowerShell conditions: POSIX rejects a word after a subshell's
+            // `)`, so these are not subshells (Windows judges both dialects).
+            r"if ($n -ge 96 -and $n -le 107) { 'x' }",
+            r"while ($n -lt 3 -and $m) { $n++ }",
             r#"(git commit -m "reset --hard")"#,
             r#"( "git" log --grep "reset --hard" ) | cat"#,
             r#"printf '%s\n' 'a) "git" reset --hard'"#,

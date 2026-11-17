@@ -1170,14 +1170,20 @@ pub(crate) fn command_after_posix_control_prefixes(
     dialect: ShellDialect,
 ) -> (&str, usize) {
     let (command, offset) = command_after_posix_control_prefixes_bounded(segment, dialect, 0);
-    (end_at_subshell_close(segment, command, offset), offset)
+    match end_at_subshell_close(segment, command, offset) {
+        Some(command) => (command, offset),
+        None => (segment, 0),
+    }
 }
 
 /// End `command` at the `)` that closes a subshell its peeled prefix opened:
 /// the words after it redirect the subshell and are not the command's argv.
-fn end_at_subshell_close<'a>(segment: &str, command: &'a str, offset: usize) -> &'a str {
+/// `None` when other words follow that `)`: POSIX rejects the line, so it is
+/// not a subshell. PowerShell's `if (...) { ... }` is read this way on
+/// Windows, where both dialects are judged.
+fn end_at_subshell_close<'a>(segment: &str, command: &'a str, offset: usize) -> Option<&'a str> {
     if !segment[..offset].contains('(') {
-        return command;
+        return Some(command);
     }
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     let paren = |token: &crate::normalize::NormalizeToken, text: &str| {
@@ -1186,23 +1192,50 @@ fn end_at_subshell_close<'a>(segment: &str, command: &'a str, offset: usize) -> 
     let prefix = tokens.iter().filter(|token| token.byte_range.end <= offset);
     let opened = prefix.clone().filter(|token| paren(token, "(")).count();
     if opened <= prefix.filter(|token| paren(token, ")")).count() {
-        return command;
+        return Some(command);
     }
     let mut depth = 0usize;
-    for token in tokens
-        .iter()
-        .filter(|token| token.byte_range.start >= offset)
-    {
+    for (index, token) in tokens.iter().enumerate() {
+        if token.byte_range.start < offset {
+            continue;
+        }
         if paren(token, "(") {
             depth += 1;
         } else if paren(token, ")") {
             if depth == 0 {
-                return command
-                    .get(..token.byte_range.start - offset)
-                    .unwrap_or(command);
+                return only_redirections_follow(segment, &tokens[index + 1..])
+                    .then(|| command.get(..token.byte_range.start - offset))
+                    .flatten();
             }
             depth -= 1;
         }
+    }
+    Some(command)
+}
+
+/// Whether `tokens`, after a subshell's `)`, are only further `)` and
+/// redirections, the words POSIX allows after a compound command.
+fn only_redirections_follow(segment: &str, tokens: &[crate::normalize::NormalizeToken]) -> bool {
+    let mut target_pending = false;
+    tokens.iter().all(|token| {
+        let Some(text) = token.text(segment) else {
+            return false;
+        };
+        if token.kind == NormalizeTokenKind::Separator {
+            return text == ")" && !target_pending;
+        }
+        if std::mem::take(&mut target_pending) {
+            return true;
+        }
+        let operator = text.trim_start_matches(|ch: char| ch.is_ascii_digit());
+        let operator = operator.strip_prefix('&').unwrap_or(operator);
+        if !operator.starts_with(['<', '>']) {
+            return false;
+        }
+        target_pending = operator.trim_start_matches(['<', '>', '&', '|']).is_empty();
+        true
+    }) && !target_pending
+}
     }
     command
 }
