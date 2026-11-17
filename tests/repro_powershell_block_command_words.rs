@@ -36,6 +36,46 @@ const POWERSHELL_RUNS_GIT: &[&str] = &[
     r#"function f($a) { g"it" reset --hard }; f 1"#,
     r#"filter f { g"it" reset --hard }; f"#,
     r#"Get-ChildItem | ForEach-Object { g"it" -C $_ reset --hard }"#,
+    // One per kind of block that runs (each ran `g"it" --version` in
+    // powershell.exe 5.1): the statement keywords, whose header may hold
+    // any statement text and may be followed by a line break, a loop label,
+    // switch clause conditions and actions, a script block's named blocks,
+    // the function-like definitions, and class methods.
+    r#"if (0) {} elseif (1) { g"it" reset --hard }"#,
+    r#"if (0) {} else { g"it" reset --hard }"#,
+    "if (0) {}\nelse\n{ g\"it\" reset --hard }",
+    "if (1)\n{ g\"it\" reset --hard }",
+    r#"if ((1..2 | % { $_ }).Count) { g"it" reset --hard }"#,
+    r#"if (")" -eq ")") { g"it" reset --hard }"#,
+    r#"switch (1) { 1 { g"it" reset --hard } }"#,
+    r#"switch (1) { default { g"it" reset --hard } }"#,
+    r#"switch (1) { { $_ -eq 1 } { g"it" reset --hard } }"#,
+    r#"switch (1) { { g"it" reset --hard; $true } { } }"#,
+    r#"switch -Regex ("a") { "a" { g"it" reset --hard } }"#,
+    r#"for ($i=0; $i -lt 1; $i++) { g"it" reset --hard }"#,
+    "for ($i=0; $i -lt 1; $i++)\n{ g\"it\" reset --hard }",
+    r#"foreach ($i in @(1;2)) { g"it" reset --hard }"#,
+    r#"while(1){ g"it" reset --hard; break }"#,
+    r#":outer foreach ($i in 1) { g"it" reset --hard }"#,
+    r#":l for (;;) { g"it" reset --hard; break }"#,
+    r#"do { g"it" reset --hard } while ($false)"#,
+    r#"do { g"it" reset --hard } until (1)"#,
+    "try\n{ g\"it\" reset --hard } finally {}",
+    r#"try { throw "x" } catch [System.Exception] { g"it" reset --hard }"#,
+    r#"try {} finally { g"it" reset --hard }"#,
+    r#"trap { g"it" reset --hard; continue } throw "x""#,
+    r#"function f { begin {} process { g"it" reset --hard } end {} }; f"#,
+    r#"1 | & { process { g"it" reset --hard } }"#,
+    r#"& { begin { g"it" reset --hard } }"#,
+    r#"& { end { g"it" reset --hard } }"#,
+    r#"function f { [CmdletBinding()] param() dynamicparam { g"it" reset --hard } end {} }; f"#,
+    "function f\n{ g\"it\" reset --hard }; f",
+    r#"workflow w { g"it" reset --hard }; w"#,
+    r#"configuration c { g"it" reset --hard }; c"#,
+    r#"class C { static [void] m() { g"it" reset --hard } }; [C]::m()"#,
+    r#"class C { C() { g"it" reset --hard } }; [C]::new()"#,
+    r#"$null = & { g"it" reset --hard }"#,
+    r#"1 | ForEach-Object -Begin { g"it" reset --hard } -Process { }"#,
     // Controls that were already denied.
     r#"g"it" reset --hard"#,
     "function f { git reset --hard }; f",
@@ -61,8 +101,37 @@ const SEPARATOR_AFTER_QUOTED_GIT_BASH_ONLY: &[&str] = &[
     r"'git' reset --hard;",
 ];
 
+/// A command wrapper with a separator after the line. The whole-line reading
+/// denied these before the single segment was read without its separator;
+/// both readings are kept, deny wins.
+const WRAPPED_GIT_BEFORE_A_SEPARATOR: &[&str] = &[
+    "sudo git reset --hard;",
+    "sudo git reset --hard ;",
+    "sudo -u root git reset --hard;",
+    "nice git reset --hard;",
+    "sudo git clean -fdx;",
+    "sudo git push --force;",
+    "wsl git reset --hard;",
+];
+
+/// POSIX heredoc data that names a PowerShell block. Bash passes it to the
+/// data sink, and PowerShell refuses `<<`, so neither runs it.
+const BLOCK_TEXT_IN_HEREDOC_DATA: &[&str] = &[
+    "cat > x.ps1 <<'EOF'\nif ($x) { git reset --hard }\nEOF",
+    "cat > x.ps1 <<'EOF'\n& { git reset --hard }\nEOF",
+    "cat > x.ps1 <<'EOF'\nfunction f { git reset --hard }; f\nEOF",
+    "gh pr comment 9 --body-file - <<'EOF'\nPowerShell runs & { g\"it\" reset --hard }.\nEOF",
+];
+
 const HARMLESS: &[&str] = &[
     r#"function f { g"it" status }; f"#,
+    r#"switch (1) { 1 { g"it" status } }"#,
+    "for ($i=0; $i -lt 1; $i++) { git log -1 }",
+    "class C { [void] m() { git status } }",
+    "try\n{ git status } finally {}",
+    "& { process { git status } }",
+    "$h = @{ a = 1 }; switch (1) { 1 { $h } }",
+    "sudo git status;",
     r#"& { g"it" log -1 }"#,
     "if ($x) { git status }",
     r#"foreach ($i in 1) { "reset --hard" }"#,
@@ -210,6 +279,7 @@ fn powershell_tool_judges_block_command_words_both_protocols() {
         let label = format!("{protocol:?} PowerShell");
         assert_all(POWERSHELL_RUNS_GIT, "deny", decide, &label);
         assert_all(SEPARATOR_AFTER_QUOTED_GIT, "deny", decide, &label);
+        assert_all(WRAPPED_GIT_BEFORE_A_SEPARATOR, "deny", decide, &label);
         assert_all(HARMLESS, "allow", decide, &label);
     }
 }
@@ -223,6 +293,8 @@ fn bash_tool_judges_quoted_git_before_a_separator_both_protocols() {
         let label = format!("{protocol:?} Bash");
         assert_all(SEPARATOR_AFTER_QUOTED_GIT, "deny", decide, &label);
         assert_all(SEPARATOR_AFTER_QUOTED_GIT_BASH_ONLY, "deny", decide, &label);
+        assert_all(WRAPPED_GIT_BEFORE_A_SEPARATOR, "deny", decide, &label);
+        assert_all(BLOCK_TEXT_IN_HEREDOC_DATA, "allow", decide, &label);
         assert_all(
             &[r#""git" status;"#, "git status;"],
             "allow",
@@ -246,6 +318,18 @@ fn codex_bash_label_on_windows_judges_block_command_words() {
         decide,
         "Codex Bash on Windows",
     );
+    assert_all(
+        WRAPPED_GIT_BEFORE_A_SEPARATOR,
+        "deny",
+        decide,
+        "Codex Bash on Windows",
+    );
+    assert_all(
+        BLOCK_TEXT_IN_HEREDOC_DATA,
+        "allow",
+        decide,
+        "Codex Bash on Windows",
+    );
     assert_all(HARMLESS, "allow", decide, "Codex Bash on Windows");
 }
 
@@ -258,6 +342,7 @@ fn powershell_and_unknown_dialects_judge_block_command_words() {
         let label = format!("{dialect:?}");
         assert_all(POWERSHELL_RUNS_GIT, "Deny", decide, &label);
         assert_all(SEPARATOR_AFTER_QUOTED_GIT, "Deny", decide, &label);
+        assert_all(WRAPPED_GIT_BEFORE_A_SEPARATOR, "Deny", decide, &label);
         assert_all(HARMLESS, "Allow", decide, &label);
     }
     for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
@@ -265,5 +350,25 @@ fn powershell_and_unknown_dialects_judge_block_command_words() {
         let label = format!("{dialect:?}");
         assert_all(SEPARATOR_AFTER_QUOTED_GIT, "Deny", decide, &label);
         assert_all(SEPARATOR_AFTER_QUOTED_GIT_BASH_ONLY, "Deny", decide, &label);
+        assert_all(WRAPPED_GIT_BEFORE_A_SEPARATOR, "Deny", decide, &label);
+        assert_all(BLOCK_TEXT_IN_HEREDOC_DATA, "Allow", decide, &label);
+    }
+}
+
+/// Past the nesting depth the union's block gate fails closed, as the
+/// PowerShell reading does.
+#[test]
+fn unknown_dialect_judges_deeply_nested_blocks() {
+    for opener in ["& { ", "if (1) { "] {
+        let command = format!(
+            "{}g\"it\" reset --hard{}",
+            opener.repeat(10),
+            " }".repeat(10)
+        );
+        assert_eq!(
+            decision_in(&command, ShellDialect::Unknown),
+            EvaluationDecision::Deny,
+            "{command}"
+        );
     }
 }
