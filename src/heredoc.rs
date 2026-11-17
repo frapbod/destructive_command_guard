@@ -8712,6 +8712,404 @@ pub(crate) fn shell_name_may_be_overridden_before(
     overridden || parse_error
 }
 
+/// How a statement runs as seen from a later point of the same command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShellScope {
+    /// In the same shell, every time the later point runs.
+    Always,
+    /// Perhaps, or later: a branch, a loop, an `&&`/`||` operand or a
+    /// function body.
+    Conditional,
+    /// In a child shell that cannot change the later point's shell: a
+    /// subshell, a command or process substitution, a pipeline stage or a
+    /// background job. Bash runs every pipeline stage in a child unless
+    /// `lastpipe` is set.
+    Child,
+}
+
+/// One construct around a statement: the bytes it covers and what it makes
+/// of the statement for a point outside them. A point inside them shares
+/// the construct with the statement, so the construct changes nothing.
+#[derive(Clone, Debug)]
+pub(crate) struct ShellScopeStep {
+    range: std::ops::Range<usize>,
+    scope: ShellScope,
+}
+
+/// The constructs around `node`, innermost first.
+fn shell_scope_steps<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Vec<ShellScopeStep> {
+    let mut steps = Vec::new();
+    let mut current = node.clone();
+    while let Some(parent) = current.parent() {
+        if current.next().is_some_and(|next| next.kind() == "&") {
+            steps.push(ShellScopeStep {
+                range: current.range(),
+                scope: ShellScope::Child,
+            });
+        }
+        let step = match parent.kind().as_ref() {
+            "program" => break,
+            "compound_statement" => None,
+            "redirected_statement"
+                if parent
+                    .field("body")
+                    .is_some_and(|body| body.range() == current.range()) =>
+            {
+                None
+            }
+            "subshell" | "command_substitution" | "process_substitution" => {
+                Some((parent.range(), ShellScope::Child))
+            }
+            "pipeline" => Some((current.range(), ShellScope::Child)),
+            "list"
+                if parent
+                    .named_children()
+                    .next()
+                    .is_some_and(|first| first.range() == current.range()) =>
+            {
+                None
+            }
+            _ => Some((parent.range(), ShellScope::Conditional)),
+        };
+        if let Some((range, scope)) = step {
+            steps.push(ShellScopeStep { range, scope });
+        }
+        current = parent;
+    }
+    steps
+}
+
+/// [`ShellScope`] of a statement with constructs `steps`, seen from byte
+/// `point`.
+pub(crate) fn shell_scope_at(steps: &[ShellScopeStep], point: usize) -> ShellScope {
+    let mut scope = ShellScope::Always;
+    for step in steps.iter().filter(|step| !step.range.contains(&point)) {
+        match step.scope {
+            ShellScope::Child => return ShellScope::Child,
+            ShellScope::Conditional => scope = ShellScope::Conditional,
+            ShellScope::Always => {}
+        }
+    }
+    scope
+}
+
+/// The statements of a POSIX command, for the deny-only proofs.
+pub(crate) struct ShellScopeIndex {
+    /// Each statement's bytes and constructs, by start.
+    pub(crate) statements: Vec<(std::ops::Range<usize>, Vec<ShellScopeStep>)>,
+    /// Subshells and command and process substitutions.
+    pub(crate) child_shells: Vec<std::ops::Range<usize>>,
+    /// The statements of the whole command.
+    pub(crate) top_level: Vec<std::ops::Range<usize>>,
+}
+
+/// [`ShellScopeIndex`] of `command`, or `None` when the parser could not
+/// read all of it.
+pub(crate) fn shell_scope_index(command: &str) -> Option<ShellScopeIndex> {
+    const CONTAINERS: &[&str] = &[
+        "program",
+        "compound_statement",
+        "subshell",
+        "command_substitution",
+        "process_substitution",
+        "pipeline",
+        "list",
+        "if_statement",
+        "elif_clause",
+        "else_clause",
+        "do_group",
+        "case_item",
+        "negated_command",
+        "redirected_statement",
+    ];
+    let ast = try_parse_shell_ast(command).ok()?;
+    let root = ast.root();
+    let mut index = ShellScopeIndex {
+        statements: Vec::new(),
+        child_shells: Vec::new(),
+        top_level: root.named_children().map(|node| node.range()).collect(),
+    };
+    for node in root.dfs() {
+        if node.is_error() || node.is_missing() {
+            return None;
+        }
+        let kind = node.kind();
+        if matches!(
+            kind.as_ref(),
+            "subshell" | "command_substitution" | "process_substitution"
+        ) {
+            index.child_shells.push(node.range());
+        }
+        if node.is_named()
+            && node
+                .parent()
+                .is_some_and(|parent| CONTAINERS.contains(&parent.kind().as_ref()))
+        {
+            index
+                .statements
+                .push((node.range(), shell_scope_steps(&node)));
+        }
+    }
+    index.statements.sort_by_key(|(range, _)| range.start);
+    Some(index)
+}
+
+/// What one statement does to whether a bare command name runs a function
+/// or a hashed file in place of the program of that name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShadowChange {
+    Keep,
+    /// The name may no longer be shadowed.
+    Clear,
+    /// The name is shadowed from here on.
+    Shadow,
+}
+
+/// `(function, hash)` changes of a simple command.
+fn command_shadow_changes(tokens: &[String], target: &str) -> (ShadowChange, ShadowChange) {
+    use ShadowChange::{Clear, Keep, Shadow};
+    let Some((index, command)) = effective_shell_command(tokens) else {
+        return (Keep, Keep);
+    };
+    let arguments = &tokens[index + 1..];
+    if shell_word_has_runtime_expansion(command) {
+        // An expanded command word may be any builtin.
+        return (Clear, Clear);
+    }
+    match command {
+        "eval" | "source" | "." | "enable" | "trap" => (Clear, Clear),
+        "set" => (Keep, Clear),
+        "unset" => unset_shadow_changes(arguments, target),
+        "export" | "declare" | "typeset" | "local" | "readonly" => (
+            Keep,
+            if assignment_builtin_may_override_path(arguments) {
+                Clear
+            } else {
+                Keep
+            },
+        ),
+        "hash" => {
+            if arguments
+                .iter()
+                .any(|argument| shell_word_has_runtime_expansion(argument))
+            {
+                return (Keep, Clear);
+            }
+            let set = match arguments {
+                [option, path, names @ ..] if option == "-p" => Some((path.as_str(), names)),
+                [option, names @ ..] if option.len() > 2 && option.starts_with("-p") => {
+                    Some((&option[2..], names))
+                }
+                _ => None,
+            };
+            let change = match set {
+                Some((path, names)) if names.iter().all(|name| !name.starts_with('-')) => {
+                    if !names.iter().any(|name| name == target) {
+                        Keep
+                    } else if path.rsplit('/').next() == Some(target) {
+                        Clear
+                    } else {
+                        Shadow
+                    }
+                }
+                _ if arguments
+                    .iter()
+                    .any(|argument| argument == target || argument.starts_with('-')) =>
+                {
+                    Clear
+                }
+                _ => Keep,
+            };
+            (Keep, change)
+        }
+        _ => (Keep, Keep),
+    }
+}
+
+/// `(function, hash)` changes of `unset ARGUMENTS`.
+fn unset_shadow_changes(arguments: &[String], target: &str) -> (ShadowChange, ShadowChange) {
+    use ShadowChange::{Clear, Keep};
+    let options: String = arguments
+        .iter()
+        .filter(|argument| argument.starts_with('-'))
+        .map(|argument| argument.trim_start_matches('-'))
+        .collect();
+    let names: Vec<&String> = arguments
+        .iter()
+        .filter(|argument| !argument.starts_with('-'))
+        .collect();
+    let dynamic = names
+        .iter()
+        .any(|name| shell_word_has_runtime_expansion(name));
+    // `unset NAME` removes a function of that name when no variable has it.
+    let function = if (!options.contains('v') || options.contains('f'))
+        && (dynamic || names.iter().any(|name| *name == target))
+    {
+        Clear
+    } else {
+        Keep
+    };
+    let hash = if !options.contains('f') && (dynamic || names.iter().any(|name| *name == "PATH")) {
+        Clear
+    } else {
+        Keep
+    };
+    (function, hash)
+}
+
+/// Whether shell state set before `offset` proves that the bare command
+/// name `target` runs something other than the program of that name: a
+/// function of that name (exported, or defined in the shell that runs
+/// `offset`), or a `hash -p` entry for a file of another name, and nothing
+/// since has removed it.
+///
+/// This is the deny-only counterpart of
+/// [`shell_name_may_be_overridden_before`]. The proven-variable view judges
+/// a reconstructed command as the program it names, and it skips that only
+/// when this answers yes. Anything less certain (a definition in a branch,
+/// `eval`, `source`, a parse it cannot read) leaves the reconstruction to
+/// be judged. Aliases are ignored: Bash does not alias-expand a word that
+/// came from an expansion or quotes. A `PATH` change only chooses which
+/// file of that name runs, and it clears the hash table.
+pub(crate) fn shell_name_proven_shadowed_before(
+    command: &str,
+    offset: usize,
+    target: &str,
+) -> bool {
+    use ShadowChange::{Clear, Keep, Shadow};
+    let mut function = std::env::var_os(format!("BASH_FUNC_{target}%%")).is_some();
+    let mut hashed = false;
+    let events = shell_shadow_events(command);
+    let Some(events) = events.as_ref() else {
+        return false;
+    };
+    for event in events.iter().take_while(|event| event.range.start < offset) {
+        if event.range.end > offset {
+            continue;
+        }
+        let changes = match &event.kind {
+            ShadowEventKind::Function(Some(name)) if name == target => (Shadow, Keep),
+            ShadowEventKind::Function(Some(_)) => (Keep, Keep),
+            ShadowEventKind::Function(None) => (Clear, Keep),
+            ShadowEventKind::PathAssignment => (Keep, Clear),
+            ShadowEventKind::Words(tokens) => command_shadow_changes(tokens, target),
+            ShadowEventKind::Unreadable => (Clear, Clear),
+        };
+        let scope = shell_scope_at(&event.steps, offset);
+        let apply = |state: &mut bool, change: ShadowChange| match (change, scope) {
+            (_, ShellScope::Child) | (Keep, _) => {}
+            (Shadow, ShellScope::Always) => *state = true,
+            (Shadow | Clear, _) => *state = false,
+        };
+        apply(&mut function, changes.0);
+        apply(&mut hashed, changes.1);
+    }
+    function || hashed
+}
+
+/// A statement that can change what a bare command name runs, for
+/// [`shell_name_proven_shadowed_before`].
+struct ShadowEvent {
+    range: std::ops::Range<usize>,
+    steps: Vec<ShellScopeStep>,
+    kind: ShadowEventKind,
+}
+
+/// [`shell_shadow_events`] of one command.
+type ShadowEvents = std::rc::Rc<Option<Vec<ShadowEvent>>>;
+
+enum ShadowEventKind {
+    /// A function definition, with its name when it is static.
+    Function(Option<String>),
+    PathAssignment,
+    /// A builtin that may change it, as words.
+    Words(Vec<String>),
+    /// A command whose words cannot be read.
+    Unreadable,
+}
+
+/// The [`ShadowEvent`]s of `command` in source order, or `None` when the
+/// parser could not read all of it. The view asks once per use, so the
+/// last command's events are kept.
+fn shell_shadow_events(command: &str) -> ShadowEvents {
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(String, ShadowEvents)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    LAST.with(|last| {
+        if let Some((cached, events)) = last.borrow().as_ref()
+            && cached == command
+        {
+            return std::rc::Rc::clone(events);
+        }
+        let events = std::rc::Rc::new(read_shell_shadow_events(command));
+        *last.borrow_mut() = Some((command.to_string(), std::rc::Rc::clone(&events)));
+        events
+    })
+}
+
+fn read_shell_shadow_events(command: &str) -> Option<Vec<ShadowEvent>> {
+    let ast = try_parse_shell_ast(command).ok()?;
+    let root = ast.root();
+    let mut events = Vec::new();
+    for node in root.dfs() {
+        if node.is_error() || node.is_missing() {
+            return None;
+        }
+        let text = node.text();
+        let kind = match node.kind().as_ref() {
+            "function_definition" => ShadowEventKind::Function(
+                node.field("name")
+                    .map(|name| name.text().into_owned())
+                    .filter(|name| is_static_shell_name(name)),
+            ),
+            "variable_assignment" if shell_assignment_name(text.as_ref()) == Some("PATH") => {
+                ShadowEventKind::PathAssignment
+            }
+            "command" | "declaration_command" | "unset_command" => {
+                match shell_words::split(text.as_ref()) {
+                    Ok(tokens) => {
+                        let relevant =
+                            effective_shell_command(&tokens).is_some_and(|(_, command)| {
+                                shell_word_has_runtime_expansion(command)
+                                    || matches!(
+                                        command,
+                                        "eval"
+                                            | "source"
+                                            | "."
+                                            | "enable"
+                                            | "trap"
+                                            | "set"
+                                            | "unset"
+                                            | "export"
+                                            | "declare"
+                                            | "typeset"
+                                            | "local"
+                                            | "readonly"
+                                            | "hash"
+                                    )
+                            });
+                        if !relevant {
+                            continue;
+                        }
+                        ShadowEventKind::Words(tokens)
+                    }
+                    Err(_) => ShadowEventKind::Unreadable,
+                }
+            }
+            _ => continue,
+        };
+        events.push(ShadowEvent {
+            range: node.range(),
+            steps: shell_scope_steps(&node),
+            kind,
+        });
+    }
+    Some(events)
+}
+
 thread_local! {
     /// Whether a structural extraction is running on this thread: see
     /// [`StructuralExtractionScope`] (#628).

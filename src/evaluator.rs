@@ -17722,8 +17722,9 @@ impl IfsValue {
 ///
 /// The IFS in force is proven like any other binding (the default when
 /// nothing assigns it); a segment whose IFS cannot be proven is left as
-/// written. So is a segment whose command name earlier shell state may bind
-/// to another program. Unknown references stay as written. The original
+/// written. So is a segment whose command name earlier shell state proves
+/// to run something else ([`crate::heredoc::shell_name_proven_shadowed_before`]).
+/// Unknown references stay as written. The original
 /// command is still evaluated, so this only adds denials.
 ///
 /// A quoted heredoc body stays as written: the outer shell does not expand
@@ -17792,7 +17793,15 @@ fn posix_proven_variable_view(
         }
         // Splitting needs the IFS in force, proven like any other binding;
         // an IFS that cannot be proven leaves the segment as written.
-        let Some(ifs) = deny_only_variable_value(command, &ranges, start, "IFS") else {
+        let Some(ifs) = deny_only_value_at_for_splitting(
+            command,
+            &ranges,
+            start,
+            "",
+            "IFS",
+            MAX_DENY_ONLY_COPY_DEPTH,
+            true,
+        ) else {
             continue;
         };
         let resolve = |text: &str| {
@@ -17859,25 +17868,17 @@ fn posix_proven_variable_view(
         return Err(ProvenViewIncomplete::Budget);
     }
     // The packs judge a command name as the program of that name. When
-    // earlier shell state can bind the name to something else
-    // (`hash -p /usr/bin/printf git`, a function, an alias), the
-    // reconstruction would name the wrong program; the variable-aware
-    // analyses that see the original keep that context. The check parses
-    // the source before the segment, so ask once per program at its last
-    // use: a source with no override there has none before its earlier
-    // uses either.
-    let mut overridable: HashMap<&str, bool> = HashMap::new();
-    for (start, _, _, program) in spliced.iter().rev() {
-        if !program.is_empty() && !overridable.contains_key(program.as_str()) {
-            let overridden =
-                crate::heredoc::shell_name_may_be_overridden_before(command, *start, program);
-            overridable.insert(program, overridden);
-        }
-    }
+    // earlier shell state proves the name runs something else
+    // (`hash -p /usr/bin/printf git`, a function), the reconstruction would
+    // name the wrong program; the variable-aware analyses that see the
+    // original keep that context. State that only may have changed it
+    // (`PATH`, `source`, a removed function) leaves the reconstruction to be
+    // judged: this view only adds denials. The state can go back
+    // (`unset -f`, `hash -r`), so each use is asked on its own.
     let mut copied = 0usize;
     for (start, end, resolved, program) in &spliced {
-        if overridable.get(program.as_str()).copied().unwrap_or(false)
-            && crate::heredoc::shell_name_may_be_overridden_before(command, *start, program)
+        if !program.is_empty()
+            && crate::heredoc::shell_name_proven_shadowed_before(command, *start, program)
         {
             continue;
         }
@@ -17929,13 +17930,14 @@ fn resolve_proven_eval_arguments(
     arguments: &[&str],
     ifs: &str,
 ) -> Option<String> {
-    let body_ifs = deny_only_value_at(
+    let body_ifs = deny_only_value_at_for_splitting(
         source,
         segment_ranges,
         segment_start,
         prefix,
         "IFS",
         MAX_DENY_ONLY_COPY_DEPTH,
+        true,
     );
     let mut out = String::with_capacity(segment.len());
     let mut copied = 0usize;
@@ -17961,7 +17963,7 @@ fn resolve_proven_eval_arguments(
                 // The body's own command name keeps its owner too.
                 let program = hazard_first_word(resolved);
                 program.is_empty()
-                    || !crate::heredoc::shell_name_may_be_overridden_before(
+                    || !crate::heredoc::shell_name_proven_shadowed_before(
                         source,
                         segment_start,
                         &program,
@@ -29430,7 +29432,11 @@ enum VariableResolution {
     /// denial. A possibly stale candidate must never authorize an exemption.
     /// A copy of an earlier scalar (`X=$IFS`, `Y=${X}t`) consumes one level
     /// of `copy_depth`.
-    DenyOnlyLiteral { copy_depth: usize },
+    DenyOnlyLiteral {
+        copy_depth: usize,
+        /// Read IFS as field-splitting characters, not as an expansion value.
+        ifs_splitting: bool,
+    },
     /// Redirect-only extension; a copied value consumes one level of depth.
     Redirect { remaining_depth: usize },
 }
@@ -29985,10 +29991,23 @@ fn resolve_variable_bindings(
     // statements it adds all come after the ones it read, so the cost stays
     // linear in the statements. A nameref alias changes what the scan
     // visits, so those reads are not cached.
-    let checkpoints = index.as_ref().filter(|_| aliases.is_empty());
+    // How the shell runs an earlier statement depends on the constructs it
+    // shares with the use ([`deny_only_segment_scope`]), so only a use no
+    // construct holds can share another's state.
+    let scopes = index.as_ref().and_then(|index| index.scopes());
+    let use_at_top_level = scopes.is_none_or(|scopes| {
+        let after = scopes
+            .top_level
+            .partition_point(|range| range.start < segment_start);
+        after == 0 || scopes.top_level[after - 1].end <= segment_start
+    });
+    let checkpoints = index
+        .as_ref()
+        .filter(|_| aliases.is_empty() && use_at_top_level);
     let resumed = checkpoints.and_then(|index| {
         let checkpoint = index.checkpoints.borrow().get(name).cloned()?;
-        (checkpoint.bound <= segment_start
+        (!checkpoint.refused
+            && checkpoint.bound <= segment_start
             && segment_ranges
                 .iter()
                 .enumerate()
@@ -30000,9 +30019,6 @@ fn resolve_variable_bindings(
         .then_some(checkpoint)
     });
     if let Some(resumed) = resumed.as_ref() {
-        if resumed.refused {
-            return None;
-        }
         deny_only_base = resumed.base.as_ref().map(|base| base.binding(source));
         deny_only_appends = resumed
             .appends
@@ -30042,6 +30058,16 @@ fn resolve_variable_bindings(
             if segment.is_empty() {
                 continue;
             }
+            // Deny-only reads how the shell runs the segment from the parse:
+            // a child shell's statements cannot change the use's value, and
+            // only a statement the use's shell always runs binds it. Without
+            // a parse, the text rules below decide.
+            let scope = scopes.and_then(|scopes| {
+                deny_only_segment_scope(scopes, source, start, end, segment_start)
+            });
+            if matches!(scope, Some((crate::heredoc::ShellScope::Child, _))) {
+                continue;
+            }
             // A binding inside a command or process substitution runs in a
             // subshell and cannot set `NAME` for this segment — the live value
             // would come from the ambient environment instead
@@ -30060,20 +30086,39 @@ fn resolve_variable_bindings(
             // below, where `segment_text_may_assign` refuses the proof outright —
             // which is the right answer, because an unprovable binding is exactly
             // the case the exemption must not cover.
-            let binds_in_parent = !nested
+            //
+            // Deny-only also binds a statement the parse shows the use's shell
+            // always runs first, such as the first one in a brace group
+            // (`{ X=' '`). The text rule stays for the rest: a binding it takes
+            // from a branch is one value the shell may hold, which is enough
+            // to deny.
+            let parsed_statement = match &scope {
+                Some((crate::heredoc::ShellScope::Always, statement)) => Some(statement.clone()),
+                _ => None,
+            };
+            let binds_in_parent = (parsed_statement.is_some()
+                || (!nested
+                    && (segment_binding_reaches_parent_shell(source, start, end)
+                        || (matches!(mode, VariableResolution::Redirect { .. })
+                            && source
+                                .get(..start)
+                                .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
+                            && conditional_binding_dominates_redirect(
+                                source,
+                                end,
+                                segment_start,
+                            )))))
                 // A heredoc is input to another command, not a parent-shell
                 // assignment scope. Keep its segments in the hazard checks below:
                 // an expanding body can still mutate the caller's shell state.
                 && !heredoc_bodies
                     .iter()
-                    .any(|(body, _)| body.start < end && start < body.end)
-                && (segment_binding_reaches_parent_shell(source, start, end)
-                    || (matches!(mode, VariableResolution::Redirect { .. })
-                        && source
-                            .get(..start)
-                            .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
-                        && conditional_binding_dominates_redirect(source, end, segment_start)));
+                    .any(|(body, _)| body.start < end && start < body.end);
             if binds_in_parent {
+                // The statement without the `{` that opens its group.
+                let segment = parsed_statement
+                    .and_then(|statement| source.get(statement))
+                    .map_or(segment, str::trim);
                 let assignments = strip_assignment_declaration(segment);
                 let binding = match assignment_only_segment_binding(assignments, name) {
                     AssignmentOnlyBinding::NotAssignmentOnly => assignments
@@ -30081,6 +30126,12 @@ fn resolve_variable_bindings(
                         .and_then(|rest| rest.strip_prefix('=')),
                     AssignmentOnlyBinding::Binds(raw) => Some(raw),
                     AssignmentOnlyBinding::DoesNotBind => None,
+                    AssignmentOnlyBinding::Ambiguous if deny_only => {
+                        deny_only_base = Some(DenyOnlyBinding::Unknown);
+                        deny_only_appends.clear();
+                        values = None;
+                        continue;
+                    }
                     AssignmentOnlyBinding::Ambiguous => return None,
                 };
                 let binding = binding.or_else(|| {
@@ -30187,17 +30238,38 @@ fn resolve_variable_bindings(
             }
             // Text of a quoted heredoc body in this segment is data to the outer
             // shell; only the rest can mutate `NAME`.
+            // So is the text of a child shell inside it (`echo $(X=a)`) that
+            // does not hold the use.
+            let children: Vec<(Range<usize>, bool)> = scopes
+                .map(|scopes| {
+                    let from = scopes
+                        .child_shells
+                        .partition_point(|child| child.start < start);
+                    scopes.child_shells[from..]
+                        .iter()
+                        .take_while(|child| child.start < end)
+                        .filter(|child| child.end <= end && !child.contains(&segment_start))
+                        .map(|child| (child.clone(), true))
+                        .collect()
+                })
+                .unwrap_or_default();
             let blanked;
             let segment = if deny_only
-                && heredoc_bodies
-                    .iter()
-                    .any(|(body, quoted)| *quoted && body.start < end && start < body.end)
+                && (!children.is_empty()
+                    || heredoc_bodies
+                        .iter()
+                        .any(|(body, quoted)| *quoted && body.start < end && start < body.end))
             {
-                blanked = blank_quoted_heredoc_bodies(source, start, end, &heredoc_bodies);
+                let mut bodies = children;
+                bodies.extend(heredoc_bodies.iter().cloned());
+                blanked = blank_quoted_heredoc_bodies(source, start, end, &bodies);
                 blanked.trim()
             } else {
                 segment
             };
+            if segment.is_empty() {
+                continue;
+            }
             // A write through a nameref of `NAME` writes `NAME`
             // (`declare -n r=X; r=a` sets X).
             if !aliases.is_empty() {
@@ -30251,6 +30323,12 @@ fn resolve_variable_bindings(
                 || segment_text_may_assign(segment, name)
                 || (!deny_only && segment_text_may_assign(segment, "IFS"))
             {
+                if deny_only {
+                    deny_only_base = Some(DenyOnlyBinding::Unknown);
+                    deny_only_appends.clear();
+                    values = None;
+                    continue;
+                }
                 break 'scan false;
             }
         }
@@ -30288,7 +30366,11 @@ fn resolve_variable_bindings(
     if !scanned {
         return None;
     }
-    let VariableResolution::DenyOnlyLiteral { copy_depth } = mode else {
+    let VariableResolution::DenyOnlyLiteral {
+        copy_depth,
+        ifs_splitting,
+    } = mode
+    else {
         return values;
     };
     let mut value = match deny_only_base {
@@ -30300,7 +30382,11 @@ fn resolve_variable_bindings(
         // An unset name is empty once something is appended to it; before
         // that it is unset, which `${X+word}` tells apart from empty.
         Some(DenyOnlyBinding::Unset) if !deny_only_appends.is_empty() => String::new(),
+        Some(DenyOnlyBinding::Unset) if ifs_splitting && name == "IFS" => {
+            DEFAULT_POSIX_IFS.to_string()
+        }
         Some(DenyOnlyBinding::Unset) => return None,
+        Some(DenyOnlyBinding::Unknown) => return None,
         None if values.is_some() => {
             return deny_only_appends.is_empty().then_some(values).flatten();
         }
@@ -30334,6 +30420,9 @@ enum DenyOnlyBinding<'a> {
     },
     /// `unset NAME`.
     Unset,
+    /// An earlier statement may have changed the value. A later unconditional
+    /// assignment can prove it again.
+    Unknown,
 }
 
 /// `NAME+=word` as a whole segment: the raw word.
@@ -30350,8 +30439,14 @@ fn posix_unset_names(segment: &str) -> Option<Vec<&str>> {
         return None;
     }
     let mut names = Vec::new();
+    // `unset -f NAME` removes functions and leaves every variable alone.
+    let mut functions = false;
     for word in words {
         if word == "-v" {
+            continue;
+        }
+        if word == "-f" {
+            functions = true;
             continue;
         }
         let identifier = word
@@ -30365,6 +30460,9 @@ fn posix_unset_names(segment: &str) -> Option<Vec<&str>> {
             return None;
         }
         names.push(word);
+    }
+    if functions {
+        names.clear();
     }
     Some(names)
 }
@@ -30456,6 +30554,51 @@ struct DenyOnlySegmentIndex {
     nameref_positions: Vec<usize>,
     /// Offset of the first `IFS` in the source.
     first_ifs: Option<usize>,
+    /// [`crate::heredoc::shell_scope_index`] of the source, parsed on first
+    /// use.
+    scopes: std::cell::OnceCell<Option<crate::heredoc::ShellScopeIndex>>,
+}
+
+impl DenyOnlySegmentIndex {
+    fn scopes(&self) -> Option<&crate::heredoc::ShellScopeIndex> {
+        self.scopes
+            .get_or_init(|| {
+                (self.source.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
+                    .then(|| crate::heredoc::shell_scope_index(&self.source))
+                    .flatten()
+            })
+            .as_ref()
+    }
+}
+
+/// How the shell runs the segment `start..end` as seen from `point`, and
+/// the statement it holds, when the parse places it. A segment can start
+/// with the `{` or `(` that opens its group (`{ X=' '; }` splits into
+/// `{ X=' '` and `}`).
+fn deny_only_segment_scope(
+    scopes: &crate::heredoc::ShellScopeIndex,
+    source: &str,
+    start: usize,
+    end: usize,
+    point: usize,
+) -> Option<(crate::heredoc::ShellScope, Range<usize>)> {
+    let segment = source.get(start..end)?;
+    let inner =
+        segment.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '{' || ch == '(');
+    let first = start + (segment.len() - inner.len());
+    let from = scopes
+        .statements
+        .partition_point(|(range, _)| range.start < first);
+    let (range, steps) = scopes.statements[from..]
+        .iter()
+        .take_while(|(range, _)| range.start == first)
+        .filter(|(range, _)| range.end <= end)
+        .max_by_key(|(range, _)| range.end)?;
+    source
+        .get(range.end..end)?
+        .bytes()
+        .all(|byte| byte.is_ascii_whitespace() || matches!(byte, b'}' | b')'))
+        .then(|| (crate::heredoc::shell_scope_at(steps, point), range.clone()))
 }
 
 /// Where a deny-only scan of one name stopped, in byte offsets of the
@@ -30482,6 +30625,7 @@ enum DenyOnlyBindingRange {
         raw: Range<usize>,
     },
     Unset,
+    Unknown,
 }
 
 impl DenyOnlyBindingRange {
@@ -30497,6 +30641,7 @@ impl DenyOnlyBindingRange {
                 raw: source.get(raw.clone()).unwrap_or_default(),
             },
             Self::Unset => DenyOnlyBinding::Unset,
+            Self::Unknown => DenyOnlyBinding::Unknown,
         }
     }
 }
@@ -30514,6 +30659,7 @@ impl DenyOnlyCheckpoint {
         let base = match base {
             None => None,
             Some(DenyOnlyBinding::Unset) => Some(DenyOnlyBindingRange::Unset),
+            Some(DenyOnlyBinding::Unknown) => Some(DenyOnlyBindingRange::Unknown),
             Some(DenyOnlyBinding::Assigned {
                 start,
                 earlier,
@@ -30618,6 +30764,7 @@ fn deny_only_segment_index(
             checkpoints: std::cell::RefCell::default(),
             nameref_positions,
             first_ifs: source.find("IFS"),
+            scopes: std::cell::OnceCell::new(),
         });
         *last.borrow_mut() = Some(Rc::clone(&index));
         index
@@ -31693,26 +31840,7 @@ fn deny_only_nameref_target<'a>(
     Some(current)
 }
 
-/// The single literal value a deny-only read of `name` has at
-/// `segment_start`, including the default value of an `IFS` that no earlier
-/// segment assigns.
-fn deny_only_variable_value(
-    source: &str,
-    segment_ranges: &[(usize, usize)],
-    segment_start: usize,
-    name: &str,
-) -> Option<String> {
-    deny_only_value_at(
-        source,
-        segment_ranges,
-        segment_start,
-        "",
-        name,
-        MAX_DENY_ONLY_COPY_DEPTH,
-    )
-}
-
-/// [`deny_only_variable_value`] with a copy budget, for a read at
+/// A single deny-only value with a copy budget, for a read at
 /// `segment_start` that follows the assignment words `earlier_words` of the
 /// same assignment-only segment (Bash performs them left to right, so
 /// `X=' ' Y=$X` copies the new `X`).
@@ -31723,6 +31851,28 @@ fn deny_only_value_at(
     earlier_words: &str,
     name: &str,
     copy_depth: usize,
+) -> Option<String> {
+    deny_only_value_at_for_splitting(
+        source,
+        segment_ranges,
+        segment_start,
+        earlier_words,
+        name,
+        copy_depth,
+        false,
+    )
+}
+
+/// The value of IFS as splitting characters differs from its expanded value
+/// when it is unset: Bash splits on the default characters in that case.
+fn deny_only_value_at_for_splitting(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    earlier_words: &str,
+    name: &str,
+    copy_depth: usize,
+    ifs_splitting: bool,
 ) -> Option<String> {
     let name = deny_only_nameref_target(source, segment_ranges, segment_start, name)?;
     if let Some((raw, before)) = earlier_assignment_word(earlier_words, name).ok()? {
@@ -31764,7 +31914,10 @@ fn deny_only_value_at(
         segment_ranges,
         segment_start,
         name,
-        VariableResolution::DenyOnlyLiteral { copy_depth },
+        VariableResolution::DenyOnlyLiteral {
+            copy_depth,
+            ifs_splitting,
+        },
     )?;
     let [value] = values.as_slice() else {
         return None;
@@ -42216,10 +42369,17 @@ mod tests {
                 r"IFS=,; X=a,b; git${X}reset",
                 Some(r"IFS=,; X=a,b; gita breset"),
             ),
-            (r"X=' '; unset IFS; git${X}reset", None),
+            (
+                r"X=' '; unset IFS; git${X}reset",
+                Some(r"X=' '; unset IFS; git reset"),
+            ),
             // A nameref declaration that may not have run proves no alias.
             (r"X=' '; r=a; false && declare -n r=X; git${r}reset", None),
-            (r"X=' '; r=a; (declare -n r=X); git${r}reset", None),
+            // One declared in a subshell does not reach the parent: `r` is `a`.
+            (
+                r"X=' '; r=a; (declare -n r=X); git${r}reset",
+                Some(r"X=' '; r=a; (declare -n r=X); gitareset"),
+            ),
             // A command name that earlier state may rebind keeps its context.
             (
                 r#"X=gi; hash -p /usr/bin/printf git; "${X}t" reset --hard"#,

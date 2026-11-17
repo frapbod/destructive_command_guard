@@ -100,15 +100,18 @@ fn hook_decision(protocol: Protocol, command: &str) -> String {
 }
 
 fn assert_both(decision: &str, commands: &[&str]) {
+    let mut failures = Vec::new();
     for command in commands {
         for protocol in [Protocol::Claude, Protocol::Codex] {
-            assert_eq!(
-                hook_decision(protocol, command),
-                decision,
-                "{protocol:?}: {command:?}"
-            );
+            let actual = hook_decision(protocol, command);
+            if actual != decision {
+                failures.push(format!(
+                    "{protocol:?}: {command:?}: expected {decision}, got {actual}"
+                ));
+            }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -152,6 +155,183 @@ fn proven_whitespace_values_split_the_command_word() {
             r"X=' x'; git${X%x}reset${X%x}--hard",
             // An assignment list runs left to right.
             r"X=' ' Y=$X; git${Y}reset${Y}--hard",
+        ],
+    );
+}
+
+#[test]
+fn unset_ifs_restores_default_field_splitting() {
+    assert_both(
+        "deny",
+        &[
+            r#"unset IFS; X=" "; git${X}reset${X}--hard"#,
+            r#"IFS=x; unset IFS; X=" "; git${X}reset${X}--hard"#,
+            r#"IFS=x; X=" "; unset IFS; git${X}reset${X}--hard"#,
+            r"unset IFS; X=$'\t'; git${X}reset${X}--hard",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"IFS=; X=" "; git${X}reset${X}--hard"#,
+            r"unset IFS; X=$IFS; git${X}reset${X}--hard",
+        ],
+    );
+}
+
+#[test]
+fn unconditional_bindings_after_hazards_can_be_proven() {
+    assert_both(
+        "deny",
+        &[
+            r"printf 'hi\n'; X=' '; git${X}reset${X}--hard",
+            r"export A=1; X=' '; git${X}reset${X}--hard",
+            r"X=a; read -r X <<< b; X=' '; git${X}reset${X}--hard",
+            r"{ X=a; }; X=' '; git${X}reset${X}--hard",
+            r#"source .venv/bin/activate; X=gi; "${X}t" reset --hard"#,
+            r"{ X=' '; }; git${X}reset${X}--hard",
+            r"if true; then X=a; fi; X=' '; git${X}reset${X}--hard",
+            r"X=' '; echo $(X=a); git${X}reset${X}--hard",
+        ],
+    );
+}
+
+#[test]
+fn variable_executables_respect_actual_override_kinds() {
+    assert_both(
+        "deny",
+        &[
+            r"PATH=/usr/local/bin:$PATH; X=' '; git${X}reset${X}--hard",
+            r#"PATH="$HOME/.cargo/bin:$PATH"; X=' '; git${X}reset${X}--hard"#,
+            r#"PATH=/usr/local/bin:$PATH; Y=git; X=$Y; "$X" reset --hard"#,
+            r#"alias git=echo; X=gi; "${X}t" reset --hard"#,
+            r#"alias git=echo; Y=git; X=$Y; "$X" reset --hard"#,
+            r#"git() { :; }; unset -f git; X=gi; "${X}t" reset --hard"#,
+            r#"PATH=/usr/local/bin:$PATH; X=git; "$X" reset --hard"#,
+            r#"alias git=echo; X=git; "$X" reset --hard"#,
+            r#"git() { :; }; unset -f git; X=git; "$X" reset --hard"#,
+            r"PATH=/usr/local/bin:$PATH; git reset --hard",
+            r"alias git=echo; git reset --hard",
+            r"git() { :; }; unset -f git; git reset --hard",
+            // Bash clears its command hash with hash -r or a PATH assignment.
+            r#"hash -p /usr/bin/printf git; hash -r; X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; PATH="$PATH"; X=gi; "${X}t" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn command_override_state_is_scoped_and_nonmonotonic() {
+    assert_both(
+        "deny",
+        &[
+            // The first use is overridden, but the later use is not.
+            r#"git() { :; }; X=gi; "${X}t" reset --hard; unset -f git; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; X=gi; "${X}t" reset --hard; hash -r; "${X}t" reset --hard"#,
+            // An uncalled function's body does not define its nested function.
+            r#"outer() { git() { :; }; }; X=gi; "${X}t" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn command_override_invalidation_in_child_or_skipped_branch_does_not_leak() {
+    assert_both(
+        "allow",
+        &[
+            // A child shell cannot clear the parent's function or hash entry.
+            r#"git() { :; }; (unset -f git); X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; (hash -r); X=gi; "${X}t" reset --hard"#,
+            r#"git() { :; }; echo $(unset -f git); X=gi; "${X}t" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn command_override_removed_in_a_branch_is_not_proof() {
+    // A removal in a branch may have run, so the view judges the command
+    // that names git. `false &&` is read the same way: an accepted extra
+    // denial.
+    assert_both(
+        "deny",
+        &[
+            r#"git() { :; }; test -n "$C" && unset -f git; X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; test -n "$C" && hash -r; X=gi; "${X}t" reset --hard"#,
+            r#"test -n "$C" && git() { :; }; X=gi; "${X}t" reset --hard"#,
+            r#"(git() { :; }); X=gi; "${X}t" reset --hard"#,
+            r#"git() { :; } & X=gi; "${X}t" reset --hard"#,
+            r#"source ./env.sh; X=gi; "${X}t" reset --hard"#,
+        ],
+    );
+}
+
+#[test]
+fn eval_uses_live_override_state() {
+    assert_both(
+        "deny",
+        &[
+            r#"git() { :; }; unset -f git; X=gi; eval '"${X}t" reset --hard'"#,
+            r#"hash -p /usr/bin/printf git; hash -r; X=gi; eval '"${X}t" reset --hard'"#,
+        ],
+    );
+}
+
+#[test]
+fn eval_preserves_active_override_state() {
+    assert_both(
+        "allow",
+        &[
+            r#"git() { :; }; X=gi; eval '"${X}t" reset --hard'"#,
+            r#"hash -p /usr/bin/printf git; X=gi; eval '"${X}t" reset --hard'"#,
+        ],
+    );
+}
+
+#[test]
+fn child_shell_write_does_not_change_parent_binding() {
+    // A child shell cannot change its parent's binding.
+    assert_both("allow", &[r"X=a; (X=' '); git${X}reset${X}--hard"]);
+}
+
+#[test]
+fn scope_controls_for_proven_bindings() {
+    assert_both(
+        "deny",
+        &[
+            r"{ X=' '; }; git${X}reset${X}--hard",
+            r"X=' '; echo $(X=a); git${X}reset${X}--hard",
+            r"X=' '; (X=a); git${X}reset${X}--hard",
+            r"( { X=' '; }; git${X}reset${X}--hard )",
+        ],
+    );
+}
+
+#[test]
+fn scope_controls_keep_harmless_commands() {
+    assert_both(
+        "allow",
+        &[
+            r"X=a; false && { X=' '; }; git${X}reset${X}--hard",
+            r"X=a; if false; then { X=' '; }; fi; git${X}reset${X}--hard",
+            r"X=a; { X=' '; } | cat; git${X}reset${X}--hard",
+            r"X=a; { X=' '; } & wait; git${X}reset${X}--hard",
+            r"X=a; ( { X=' '; }; : ); git${X}reset${X}--hard",
+            r"X=a; echo $(X=' '); git${X}reset${X}--hard",
+            r"{ X=' '; }; echo${X}reset${X}--hard",
+            r"X=' '; echo $(X=a); git${X}status",
+        ],
+    );
+}
+
+#[test]
+fn executable_overrides_and_non_git_values_keep_harmless_commands() {
+    assert_both(
+        "allow",
+        &[
+            r#"Y=git; X=$Y; hash -p /usr/bin/printf git; "$X" reset --hard"#,
+            r#"git() { :; }; Y=git; X=$Y; "$X" reset --hard"#,
+            r#"X=echo; sudo "$X" reset --hard"#,
+            r#"X=not_git; "${X}t" reset --hard"#,
         ],
     );
 }
@@ -410,5 +590,82 @@ fn many_references_to_one_name_are_read_in_linear_time() {
         started.elapsed() < std::time::Duration::from_secs(20),
         "four hook runs took {:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+fn child_shell_and_group_scope_follow_bash() {
+    // Bash runs a pipeline stage, a background job, a process substitution
+    // and a backquoted substitution in a child shell, and a brace group in
+    // the current shell, so each of these runs `git reset --hard`.
+    assert_both(
+        "deny",
+        &[
+            r"X=' '; echo a | read X; git${X}reset${X}--hard",
+            r"X=' '; X=a & git${X}reset${X}--hard",
+            r"X=' '; cat <(X=a); git${X}reset${X}--hard",
+            r"X=' '; echo `X=a`; git${X}reset${X}--hard",
+            r"X=a; ( X=' '; git${X}reset${X}--hard )",
+            r"{ { X=' '; }; }; git${X}reset${X}--hard",
+            r"{ X=' '; } > /dev/null; git${X}reset${X}--hard",
+            r"{ unset IFS; }; X=' '; git${X}reset${X}--hard",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            // Arithmetic assigns in the current shell: `git1reset1--hard`.
+            r"X=' '; echo $((X=1)); git${X}reset${X}--hard",
+            // The function call sets X=a first.
+            r"X=' '; f() { X=a; }; f; git${X}reset${X}--hard",
+            // Inside the substitution X is a.
+            r"X=' '; echo $(X=a; git${X}reset${X}--hard)",
+            r"unset -f IFS; IFS=x; X=' '; git${X}reset${X}--hard",
+        ],
+    );
+}
+
+#[test]
+fn only_a_proven_function_or_hash_entry_skips_the_view() {
+    assert_both(
+        "deny",
+        &[
+            // A function of another name, or one defined after the use.
+            r#"ls() { :; }; X=gi; "${X}t" reset --hard"#,
+            r#"X=gi; "${X}t" reset --hard; git() { :; }"#,
+            // A hash entry for a file named git still runs a git.
+            r#"hash -p /usr/bin/git git; X=gi; "${X}t" reset --hard"#,
+            r#"hash -p /usr/bin/printf git; hash -d git; X=gi; "${X}t" reset --hard"#,
+            r"export PATH=/opt/bin:$PATH; X=' '; git${X}reset${X}--hard",
+        ],
+    );
+}
+
+#[test]
+fn permission_lifting_proofs_keep_refusing_group_and_child_bindings() {
+    // The deny-only scope rules must not reach the proofs that can exempt
+    // a command: each of these stays denied, as in 0.16.0.
+    assert_both(
+        "deny",
+        &[
+            r#"D=$HOME; { D=/tmp/build; }; rm -rf "$D""#,
+            r#"if test -n "$C"; then D=/tmp/build; fi; rm -rf "$D""#,
+            r"F=/etc/passwd; { F=/dev/null; }; echo x > $F",
+            r"F=/dev/null; echo $(F=/etc/passwd); echo x > $F",
+            r"F=/etc/passwd; true && F=/dev/null; echo x > $F",
+        ],
+    );
+}
+
+#[test]
+fn a_binding_in_a_branch_is_still_one_value_the_shell_may_hold() {
+    // 0.16.0 denies these: when the branch runs, Bash runs `git reset
+    // --hard`. Reading the parse must not lose that denial.
+    assert_both(
+        "deny",
+        &[
+            r#"X=a; if test -n "$C"; then :; X=' '; fi; git${X}reset${X}--hard"#,
+            r#"X=a; while test -n "$C"; do :; X=' '; done; git${X}reset${X}--hard"#,
+        ],
     );
 }
