@@ -1672,6 +1672,15 @@ fn consume_word_token_inner(
             continue;
         }
 
+        // `${…}` is one piece of the word through its matching `}`: a blank
+        // in it is no word break and a `#` in it is no comment (`x=${y:- #}`).
+        if b == b'$'
+            && let Some(close) = posix_braced_parameter_end(bytes, i, len, false)
+        {
+            i = close;
+            continue;
+        }
+
         if matches!(b, b'<' | b'>') && i + 1 < len && bytes[i + 1] == b'(' {
             i = consume_shell_paren_construct(bytes, i + 2, len);
             continue;
@@ -1757,6 +1766,12 @@ fn consume_word_token_inner(
                         b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
                             i = consume_shell_paren_construct(bytes, i + 2, len);
                         }
+                        // Quotes nest inside `${…}`: `"${y:-" #"}"` is one string.
+                        b'$' if let Some(close) =
+                            posix_braced_parameter_end(bytes, i, len, true) =>
+                        {
+                            i = close;
+                        }
                         _ => {
                             i += 1;
                         }
@@ -1770,6 +1785,21 @@ fn consume_word_token_inner(
     }
 
     i
+}
+
+/// End of the `${…}` at `i` through its matching `}`, within `bytes[..len]`;
+/// `None` when it is not one or no `}` closes it. See
+/// [`crate::context::braced_parameter_span`].
+fn posix_braced_parameter_end(
+    bytes: &[u8],
+    i: usize,
+    len: usize,
+    in_double_quotes: bool,
+) -> Option<usize> {
+    if bytes.get(i + 1) != Some(&b'{') || i + 1 >= len {
+        return None;
+    }
+    crate::context::braced_parameter_span(&bytes[..len], i, in_double_quotes)
 }
 
 pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
@@ -5054,6 +5084,62 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 
 #[cfg(test)]
 mod tests {
+    /// A `#` inside `${…}` is data in the POSIX tokenizer: the blank before it
+    /// ends no word, so no comment starts. After the `}` a comment starts again.
+    #[test]
+    fn posix_tokenizer_keeps_braced_parameter_whole() {
+        let words = |command: &str| -> Vec<String> {
+            tokenize_for_shell_dialect(command, ShellDialect::Posix)
+                .iter()
+                .map(|token| {
+                    let kind = match token.kind {
+                        NormalizeTokenKind::Separator => "sep",
+                        _ => "word",
+                    };
+                    format!("{kind}:{}", &command[token.byte_range.clone()])
+                })
+                .collect()
+        };
+        for (command, expected) in [
+            (
+                "x=${y:- #}; git status",
+                vec!["word:x=${y:- #}", "sep:;", "word:git", "word:status"],
+            ),
+            (
+                "x=${y:-\t#}; ls",
+                vec!["word:x=${y:-\t#}", "sep:;", "word:ls"],
+            ),
+            ("x=${y/ #/} ls", vec!["word:x=${y/ #/}", "word:ls"]),
+            (
+                "x=${y:-${z:- #} #}; ls",
+                vec!["word:x=${y:-${z:- #} #}", "sep:;", "word:ls"],
+            ),
+            (
+                "x=${y:-\"a #\"}; ls",
+                vec!["word:x=${y:-\"a #\"}", "sep:;", "word:ls"],
+            ),
+            (
+                "x=${y:-$(echo a)} #c\nls",
+                vec!["word:x=${y:-$(echo a)}", "sep:\n", "word:ls"],
+            ),
+            (
+                "echo \"${y:-\" #\"}\"; ls",
+                vec!["word:echo", "word:\"${y:-\" #\"}\"", "sep:;", "word:ls"],
+            ),
+            (
+                "echo \"${y:-it's}\"; ls",
+                vec!["word:echo", "word:\"${y:-it's}\"", "sep:;", "word:ls"],
+            ),
+            // No closing `}`: read as before, the `;` still separates.
+            (
+                "echo ${y:- ; ls",
+                vec!["word:echo", "word:${y:-", "sep:;", "word:ls"],
+            ),
+        ] {
+            assert_eq!(words(command), expected, "{command:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

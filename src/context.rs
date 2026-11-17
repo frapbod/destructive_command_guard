@@ -3038,6 +3038,18 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
                             has_inline_code = true;
                             i = consume_backticks(command, i);
                         }
+                        // Quotes nest inside `${…}`: `"${y:-" #"}"` is one
+                        // string, so the `#` after the blank is no comment.
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                            let (end, inline, closed) =
+                                consume_braced_parameter_core(bytes, i, true);
+                            if closed {
+                                has_inline_code |= inline;
+                                i = end;
+                            } else {
+                                i += 1;
+                            }
+                        }
                         _ => {
                             i += 1;
                         }
@@ -3138,17 +3150,21 @@ fn consume_process_substitution(command: &str, start: usize) -> usize {
 }
 
 #[must_use]
-fn consume_dollar_paren(command: &str, start: usize) -> usize {
+fn consume_dollar_paren<T: AsRef<[u8]> + ?Sized>(command: &T, start: usize) -> usize {
     consume_dollar_paren_recursive(command, start, 0)
 }
 
-fn consume_dollar_paren_recursive(command: &str, start: usize, recursion_depth: usize) -> usize {
+fn consume_dollar_paren_recursive<T: AsRef<[u8]> + ?Sized>(
+    command: &T,
+    start: usize,
+    recursion_depth: usize,
+) -> usize {
+    let bytes: &[u8] = command.as_ref();
     // Prevent stack overflow on pathological input
     if recursion_depth > 500 {
-        return command.len(); // Fail safe: consume rest of command to ensure masking
+        return bytes.len(); // Fail safe: consume rest of command to ensure masking
     }
 
-    let bytes = command.as_bytes();
     let len = bytes.len();
 
     debug_assert_eq!(bytes.get(start), Some(&b'$'));
@@ -3217,8 +3233,8 @@ fn consume_dollar_paren_recursive(command: &str, start: usize, recursion_depth: 
 }
 
 #[must_use]
-fn consume_backticks(command: &str, start: usize) -> usize {
-    let bytes = command.as_bytes();
+fn consume_backticks<T: AsRef<[u8]> + ?Sized>(command: &T, start: usize) -> usize {
+    let bytes: &[u8] = command.as_ref();
     let len = bytes.len();
 
     debug_assert_eq!(bytes.get(start), Some(&b'`'));
@@ -3256,9 +3272,41 @@ fn consume_backticks(command: &str, start: usize) -> usize {
 /// readers take each body apart from the lines around it (see
 /// [`heredoc_body_ranges`]).
 #[must_use]
-pub(crate) fn consume_braced_parameter(command: &str, start: usize) -> (usize, bool) {
-    let bytes = command.as_bytes();
+pub(crate) fn consume_braced_parameter<T: AsRef<[u8]> + ?Sized>(
+    command: &T,
+    start: usize,
+) -> (usize, bool) {
+    let (end, has_inline_code, _closed) =
+        consume_braced_parameter_core(command.as_ref(), start, false);
+    (end, has_inline_code)
+}
+
+/// End of a `${…}` that really closes, for the scanners that must keep a
+/// word whole across it (`#` inside is data, a blank inside is no word
+/// break). `None` when no `}` closes it: the shell reports a syntax error
+/// and runs nothing, and the scanners then keep reading the line as before.
+///
+/// `in_double_quotes` is for an expansion that opens inside `"…"`. There
+/// dash reads a `'` as an ordinary character where bash reads a quote, so
+/// it is read as ordinary: if bash would have quoted, the scan only splits
+/// or blocks more, never less.
+#[must_use]
+pub(crate) fn braced_parameter_span(
+    bytes: &[u8],
+    start: usize,
+    in_double_quotes: bool,
+) -> Option<usize> {
+    let (end, _code, closed) = consume_braced_parameter_core(bytes, start, in_double_quotes);
+    closed.then_some(end)
+}
+
+fn consume_braced_parameter_core(
+    bytes: &[u8],
+    start: usize,
+    single_quote_is_literal: bool,
+) -> (usize, bool, bool) {
     let len = bytes.len();
+    let command = bytes;
 
     debug_assert_eq!(bytes.get(start..start + 2), Some(&b"${"[..]));
 
@@ -3278,9 +3326,10 @@ pub(crate) fn consume_braced_parameter(command: &str, start: usize) -> (usize, b
                 i += 1;
                 depth -= 1;
                 if depth == 0 {
-                    return (i, has_inline_code);
+                    return (i, has_inline_code, true);
                 }
             }
+            b'\'' if single_quote_is_literal => i += 1,
             b'\'' => {
                 i += 1;
                 while i < len && bytes[i] != b'\'' {
@@ -3320,7 +3369,7 @@ pub(crate) fn consume_braced_parameter(command: &str, start: usize) -> (usize, b
             _ => i += 1,
         }
     }
-    (len, has_inline_code)
+    (len, has_inline_code, false)
 }
 
 // =============================================================================
