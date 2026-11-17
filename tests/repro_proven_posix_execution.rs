@@ -108,7 +108,7 @@ fn proven_command_arguments_and_source_are_judged() {
         "deny",
         &[
             r#"f() { "$@"; }; f git reset --hard"#,
-            r#"f() { $*; }; f git reset --hard"#,
+            r"f() { $*; }; f git reset --hard",
             r#"f() { "$*" reset --hard; }; f git"#,
             r#"f() { exec "$@"; }; f git reset --hard"#,
             r#"f() { command "$@"; }; f git reset --hard"#,
@@ -137,7 +137,7 @@ fn function_frames_and_positional_bindings_are_judged() {
             r#"set -- git reset --hard; exec "$@""#,
             r#"x=git; f() { "$@"; }; f "$x" reset --hard"#,
             r#"retry() { "$@"; }; retry git push --force "$branch""#,
-            r#"x='git reset --hard'; bash <<< $x"#,
+            r"x='git reset --hard'; bash <<< $x",
             r#"x='git reset --hard'; bash <<< "${x}""#,
             r#"x='git reset --hard'; bash -s <<< "$x""#,
             r#"X='git reset --hard'; bash <<< " $X""#,
@@ -196,7 +196,7 @@ fn proven_plain_argument_values_are_judged() {
         "deny",
         &[
             r#"x=--hard; git reset "$x""#,
-            r#"x=--hard; git reset $x"#,
+            r"x=--hard; git reset $x",
             r#"x=-f; git push "$x""#,
             r#"x=--force; git push origin "$x""#,
             r#"x=-D; git branch "$x" main"#,

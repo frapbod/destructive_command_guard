@@ -35510,25 +35510,31 @@ enum PositionalField {
     Word(String),
 }
 
-/// `set [OPTIONS] [--] WORDS`: the words it binds as positional parameters,
-/// `Some(None)` when it binds none (`set -e`, `set -o pipefail`), `None`
-/// when its options cannot be read.
-fn posix_set_positional_words<'a, 'w>(words: &'w [&'a str]) -> Option<Option<&'w [&'a str]>> {
+/// How a `set` command affects positional parameters.
+enum PositionalSet<'a, 'w> {
+    Bind(&'w [&'a str]),
+    Unchanged,
+    Unknown,
+}
+
+/// `set [OPTIONS] [--] WORDS` binds the words, leaves positionals unchanged
+/// when given only options, or makes them unknown if its options cannot be read.
+fn posix_set_positional_words<'a, 'w>(words: &'w [&'a str]) -> PositionalSet<'a, 'w> {
     let mut index = 1;
     while let Some(word) = words.get(index) {
         if matches!(*word, "--" | "-") {
-            return Some(Some(&words[index + 1..]));
+            return PositionalSet::Bind(&words[index + 1..]);
         }
         if !(word.starts_with('-') || word.starts_with('+')) {
-            return Some(Some(&words[index..]));
+            return PositionalSet::Bind(&words[index..]);
         }
         if !word[1..].bytes().all(|byte| byte.is_ascii_alphabetic()) {
-            return None;
+            return PositionalSet::Unknown;
         }
         // `-o NAME` takes the next word.
         index += if word[1..].contains('o') { 2 } else { 1 };
     }
-    Some(None)
+    PositionalSet::Unchanged
 }
 
 /// The positional parameters in force at `point`, for a deny-only proof.
@@ -35589,9 +35595,9 @@ fn positional_fields_at(
         let words = split_assignment_words(text);
         match (first, words.as_deref()) {
             ("set", Some(words)) => match posix_set_positional_words(words) {
-                Some(Some(set)) => bound = Some((range.start, set.to_vec())),
-                Some(None) => {}
-                None => bound = None,
+                PositionalSet::Bind(set) => bound = Some((range.start, set.to_vec())),
+                PositionalSet::Unchanged => {}
+                PositionalSet::Unknown => bound = None,
             },
             ("shift", Some([_, count @ ..])) => {
                 let count = match count {
