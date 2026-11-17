@@ -3269,6 +3269,17 @@ fn push_windows_inner(
     true
 }
 
+/// Whether a Start-Process target is a shell that reads its joined argument
+/// list as one command line.
+fn start_process_target_is_shell(file: &str) -> bool {
+    let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.strip_suffix(".exe").unwrap_or(&name),
+        "cmd" | "powershell" | "pwsh" | "bash" | "sh" | "wsl"
+    )
+}
+
 /// Extract Windows-specific inline scripts that wrap an inner command line:
 /// `cmd /c "..."` / `cmd /k ...`, `iex` / `Invoke-Expression "..."`, and
 /// `powershell -EncodedCommand <base64>` (decoded from base64 UTF-16LE). The inner
@@ -3344,7 +3355,10 @@ fn extract_windows_inline_scripts(
     // same deletion as the denied `cmd /c rd /s /q C:\src`. The reconstructed
     // line is not a substring of the command, so there is no content_range.
     // A comma list (`-ArgumentList '/c', 'rd /s /q C:\src'`) runs the same
-    // line: Start-Process joins its elements with spaces.
+    // line: Start-Process joins its elements with spaces. Only a shell reads
+    // that line as a command; another program's list is its own argv, which
+    // this POSIX re-reading would misread (`C:\work\f` as host `C`), and
+    // which its pack reads (`powershell_start_process_scp`).
     for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
@@ -3353,16 +3367,23 @@ fn extract_windows_inline_scripts(
             continue;
         };
         let full = cap.get(0).expect("group 0 always present");
+        let elements: Vec<&str> = START_PROCESS_ARGUMENT
+            .captures_iter(text(args))
+            .filter_map(|element| {
+                element
+                    .get(1)
+                    .or_else(|| element.get(2))
+                    .or_else(|| element.get(3))
+                    .map(|value| value.as_str())
+            })
+            .collect();
+        if elements.len() > 1 && !start_process_target_is_shell(text(file)) {
+            continue;
+        }
         let mut line = text(file).to_string();
-        for element in START_PROCESS_ARGUMENT.captures_iter(text(args)) {
-            if let Some(value) = element
-                .get(1)
-                .or_else(|| element.get(2))
-                .or_else(|| element.get(3))
-            {
-                line.push(' ');
-                line.push_str(value.as_str());
-            }
+        for element in elements {
+            line.push(' ');
+            line.push_str(element);
         }
         if !push_windows_inner(
             extracted,
