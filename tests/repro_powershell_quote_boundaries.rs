@@ -259,6 +259,9 @@ fn powershell_comments_do_not_hide_following_commands() {
         "# note",
         "echo a # it's\ngit status",
         "Write-Output hi#there",
+        "# git reset --hard",
+        "<# git reset --hard #>",
+        "Write-Output x <# git reset --hard #>",
     ];
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
         for command in dangerous {
