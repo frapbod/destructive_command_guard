@@ -4525,17 +4525,31 @@ fn powershell_host_option_value(raw: &str, outer_dialect: ShellDialect) -> Optio
     shell_word_value(raw, outer_dialect)
 }
 
+/// The switch prefix a PowerShell host reads on an argument, if it reads one.
+///
+/// The host trims the argument, then takes `-`, an en dash, an em dash, a
+/// horizontal bar or `/` as the switch prefix (`GetSwitchKey` and
+/// `CharExtensions.IsDash` in PowerShell's console host). Measured with
+/// PowerShell 7.5 on Linux: `/c`, `/Command`, `–c` and `—Command` each run
+/// the following command, and so does `' -c'`.
+fn powershell_switch_prefix(decoded: &str) -> Option<(char, &str)> {
+    let mut chars = decoded.trim().chars();
+    let prefix = chars.next()?;
+    matches!(prefix, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}' | '/')
+        .then(|| (prefix, chars.as_str()))
+}
+
 fn powershell_host_option(raw: &str, outer_dialect: ShellDialect) -> PowerShellHostOption {
     let Some(decoded) = powershell_host_option_value(raw, outer_dialect) else {
         return PowerShellHostOption::Unknown;
     };
-    let Some(name) = decoded.strip_prefix('-') else {
+    let Some((prefix, name)) = powershell_switch_prefix(&decoded) else {
         return PowerShellHostOption::Unknown;
     };
     // pwsh additionally accepts exactly two GNU-style spellings, both
     // print-and-exit informational flags (issue #304). Any other
     // double-dash token is not a pwsh host option.
-    if let Some(gnu) = name.strip_prefix('-') {
+    if let Some(gnu) = name.strip_prefix(prefix).filter(|_| prefix != '/') {
         return if gnu.eq_ignore_ascii_case("version") || gnu.eq_ignore_ascii_case("help") {
             PowerShellHostOption::NoValue
         } else {
@@ -4966,8 +4980,49 @@ fn decode_powershell_encoded_payload(
     validate_launcher_payload(decoded, ShellDialect::PowerShell, max_payload_bytes)
 }
 
+/// The `-Command` payload that starts at `words[start]`: every later word,
+/// joined with spaces, as the host joins them.
+fn powershell_command_payload(
+    words: &[&str],
+    start: usize,
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+    launcher: &'static str,
+) -> WindowsLauncherParse {
+    if words
+        .get(start)
+        .and_then(|raw| shell_word_value(raw, outer_dialect))
+        .is_some_and(|payload| payload == "-")
+    {
+        return WindowsLauncherParse::Unverified(
+            "PowerShell -Command - executes commands read dynamically from stdin".to_string(),
+        );
+    }
+    let Some(command) = decoded_shell_tail(words, start, outer_dialect) else {
+        return WindowsLauncherParse::Unverified(
+            "PowerShell -Command has no statically inspectable payload".to_string(),
+        );
+    };
+    let command = if raw_payload_is_outer_powershell_script_block(words, start, outer_dialect) {
+        trim_powershell_script_block(&command).to_string()
+    } else {
+        command
+    };
+    match validate_launcher_payload(command, ShellDialect::PowerShell, max_payload_bytes) {
+        Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
+            command,
+            dialect: ShellDialect::PowerShell,
+            launcher,
+        }),
+        Err(reason) => WindowsLauncherParse::Unverified(reason),
+    }
+}
+
+/// `executable` is the launcher's lower-case base name without `.exe`:
+/// `powershell` (Windows PowerShell 5.1) or `pwsh` (PowerShell 6+).
 fn parse_powershell_launcher(
     words: &[&str],
+    executable: &str,
     outer_dialect: ShellDialect,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
@@ -4975,42 +5030,13 @@ fn parse_powershell_launcher(
     while let Some(raw) = words.get(index) {
         match powershell_host_option(raw, outer_dialect) {
             PowerShellHostOption::Command => {
-                if words
-                    .get(index + 1)
-                    .and_then(|raw| shell_word_value(raw, outer_dialect))
-                    .is_some_and(|payload| payload == "-")
-                {
-                    return WindowsLauncherParse::Unverified(
-                        "PowerShell -Command - executes commands read dynamically from stdin"
-                            .to_string(),
-                    );
-                }
-                let Some(command) = decoded_shell_tail(words, index + 1, outer_dialect) else {
-                    return WindowsLauncherParse::Unverified(
-                        "PowerShell -Command has no statically inspectable payload".to_string(),
-                    );
-                };
-                let command = if raw_payload_is_outer_powershell_script_block(
+                return powershell_command_payload(
                     words,
                     index + 1,
                     outer_dialect,
-                ) {
-                    trim_powershell_script_block(&command).to_string()
-                } else {
-                    command
-                };
-                return match validate_launcher_payload(
-                    command,
-                    ShellDialect::PowerShell,
                     max_payload_bytes,
-                ) {
-                    Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
-                        command,
-                        dialect: ShellDialect::PowerShell,
-                        launcher: "PowerShell -Command",
-                    }),
-                    Err(reason) => WindowsLauncherParse::Unverified(reason),
-                };
+                    "PowerShell -Command",
+                );
             }
             PowerShellHostOption::EncodedCommand => {
                 let Some(raw_payload) = words.get(index + 1) else {
@@ -5066,10 +5092,30 @@ fn parse_powershell_launcher(
                 index += 2;
             }
             PowerShellHostOption::Unknown => {
-                if raw.trim_start().starts_with('-') {
+                let prefix = powershell_host_option_value(raw, outer_dialect)
+                    .as_deref()
+                    .and_then(powershell_switch_prefix)
+                    .map(|(prefix, _)| prefix);
+                if prefix.is_some_and(|prefix| prefix != '/') || raw.trim_start().starts_with('-') {
                     return WindowsLauncherParse::Unverified(format!(
                         "PowerShell host option {raw:?} is unknown or ambiguous"
                     ));
+                }
+                // The first argument the host does not read as a switch
+                // starts the command line. Windows PowerShell 5.1 reads it
+                // and every later argument as `-Command`; PowerShell 6+
+                // reads it as `-File` (a script path, which carries no inline
+                // payload; pwsh's documented default changed from Command to
+                // File). An unrecognized `/name` is such an argument too: in
+                // pwsh it is the absolute path of a script.
+                if executable == "powershell" {
+                    return powershell_command_payload(
+                        words,
+                        index,
+                        outer_dialect,
+                        max_payload_bytes,
+                        "PowerShell positional command",
+                    );
                 }
                 return WindowsLauncherParse::NotLauncher;
             }
@@ -5914,7 +5960,7 @@ fn parse_windows_launcher_segment(
     };
     match executable.as_str() {
         "powershell" | "pwsh" => {
-            parse_powershell_launcher(&words, outer_dialect, max_payload_bytes)
+            parse_powershell_launcher(&words, &executable, outer_dialect, max_payload_bytes)
         }
         "cmd" => parse_cmd_launcher(&words, outer_dialect, max_payload_bytes),
         "call" if outer_dialect == ShellDialect::Cmd => {

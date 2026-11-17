@@ -2924,7 +2924,7 @@ pub(crate) fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHash
 fn powershell_comment_predecessor_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
     if index == 0
         || bytes[index - 1].is_ascii_whitespace()
-        || bytes[..index].ends_with("\u{00a0}".as_bytes())
+        || powershell_horizontal_space_ends_at(bytes, index)
         || matches!(
             bytes[index - 1],
             b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}' | b'[' | b']' | b','
@@ -2981,7 +2981,7 @@ fn tokenize_powershell_with_comments(
     let mut literal_mode = false;
 
     while i < len {
-        i = skip_shell_horizontal_whitespace(bytes, i, len);
+        i = skip_powershell_horizontal_whitespace(bytes, i, len);
         if i >= len {
             break;
         }
@@ -3164,6 +3164,53 @@ fn skip_shell_horizontal_whitespace(bytes: &[u8], mut i: usize, len: usize) -> u
     i
 }
 
+/// Byte length of the PowerShell word separator that starts at `i`, if any.
+///
+/// PowerShell separates words on every Unicode `White_Space` character except
+/// the line breaks `\r` and `\n`: its tokenizer's `IsWhitespace` takes ASCII
+/// space, tab, vertical tab and form feed, U+0085 and U+00A0, and every Zs, Zl
+/// and Zp character. That is `char::is_whitespace` without the line breaks.
+/// Measured with PowerShell 7.5: `git<VT>reset<VT>--hard`, the U+00A0, U+3000,
+/// U+2028 and U+0085 spellings all run `git reset --hard`, while U+200B,
+/// U+FEFF and U+180E stay inside the word. Every such character's UTF-8 lead
+/// byte is ASCII, 0xC2 or 0xE1..=0xE3, so a scan that steps byte by byte
+/// meets the lead byte first.
+#[inline]
+pub(crate) fn powershell_horizontal_space_len(bytes: &[u8], i: usize) -> Option<usize> {
+    let lead = *bytes.get(i)?;
+    let width = match lead {
+        b' ' | b'\t' | 0x0b | 0x0c => return Some(1),
+        0xc2 => 2,
+        0xe1..=0xe3 => 3,
+        _ => return None,
+    };
+    let character = std::str::from_utf8(bytes.get(i..i + width)?)
+        .ok()?
+        .chars()
+        .next()?;
+    character.is_whitespace().then_some(width)
+}
+
+/// Whether a PowerShell word separator ends just before `index`.
+#[inline]
+fn powershell_horizontal_space_ends_at(bytes: &[u8], index: usize) -> bool {
+    (1..=3).any(|width| {
+        index
+            .checked_sub(width)
+            .is_some_and(|start| powershell_horizontal_space_len(bytes, start) == Some(width))
+    })
+}
+
+#[inline]
+fn skip_powershell_horizontal_whitespace(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    while i < len
+        && let Some(width) = powershell_horizontal_space_len(bytes, i)
+    {
+        i += width;
+    }
+    i
+}
+
 fn consume_raw_newline(
     bytes: &[u8],
     i: usize,
@@ -3250,7 +3297,8 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments
         let byte = bytes[i];
         match quote {
             PowerShellQuote::Unquoted => {
-                if byte.is_ascii_whitespace()
+                if matches!(byte, b'\r' | b'\n')
+                    || powershell_horizontal_space_len(bytes, i).is_some()
                     || powershell_separator_end(bytes, i, len).is_some()
                     || (read_comments
                         && byte == b'#'
@@ -5698,6 +5746,40 @@ mod tests {
                 (NormalizeTokenKind::Word, "$second".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn powershell_raw_tokenizer_splits_words_on_every_unicode_space() {
+        let words = |command: &str| -> Vec<String> {
+            raw_token_snapshot(command, ShellDialect::PowerShell)
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect()
+        };
+        // PowerShell 7.5 splits on each of these (measured); the word
+        // reader must too, between words and before the first one.
+        for space in [
+            '\u{b}', '\u{c}', '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2003}', '\u{200a}',
+            '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+        ] {
+            let command = format!("{space}git{space}reset{space}{space}--hard{space}");
+            assert_eq!(words(&command), ["git", "reset", "--hard"], "{space:?}");
+        }
+        // These are not separators: the word stays whole.
+        for joiner in ['\u{200b}', '\u{feff}', '\u{180e}', '\u{1c}'] {
+            let command = format!("git{joiner}reset");
+            assert_eq!(words(&command), [command.as_str()], "{joiner:?}");
+        }
+        // Quoted and backtick-escaped spaces stay inside their word.
+        assert_eq!(
+            words("echo \"a\u{a0}b\" 'c\u{3000}d' e`\u{a0}f"),
+            ["echo", "\"a\u{a0}b\"", "'c\u{3000}d'", "e`\u{a0}f"]
+        );
+        // A comment after a Unicode space is a comment, so its quote opens
+        // nothing.
+        let masked = mask_powershell_comments("echo a\u{3000}# it's\ngit reset --hard")
+            .expect("comment is masked");
+        assert!(masked.ends_with("\ngit reset --hard"), "{masked:?}");
     }
 
     #[test]
