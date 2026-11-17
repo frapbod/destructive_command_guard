@@ -794,6 +794,65 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
     }
 }
 
+/// Bash and zsh read `((…))` as arithmetic, where `#` starts no comment, so
+/// the git command after it runs; dash reads nested subshells, where it
+/// does. Every blocked command below runs its git command in Bash 5.2 or
+/// dash 0.5.12 (measured with a `git` that only prints its arguments).
+#[test]
+fn bash_arithmetic_command_hash_hides_no_later_git_command() {
+    let payload = |command: &str, codex: bool| {
+        let mut payload = serde_json::json!({
+            "session_id": "sess-arithmetic-hash",
+            "cwd": "/tmp/test-workdir",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_use_id": "call_arithmetic_hash",
+        });
+        if codex {
+            payload["turn_id"] = serde_json::json!("turn-arithmetic-hash");
+        }
+        payload.to_string().into_bytes()
+    };
+    for command in [
+        "(( x = 1 #)); git reset --hard",
+        "(( x = 1 # )); git reset --hard",
+        "((x=1 #)); git push --force origin main",
+        "((x=1 #)) && git clean -fdx",
+        "(( 1 \n #)); git reset --hard",
+        "for (( i=0 #; i<1; i++ )); do :; done; git reset --hard",
+        "for ((i=0;i<1;i++ #)); do :; done; git reset --hard",
+        "if (( 1 #)); then :; fi; git reset --hard",
+        "x=1; (( x #)) || git reset --hard",
+        "echo $( (( 1 #)) ; git reset --hard )",
+        "echo `(( 1 #)); git reset --hard`",
+        "(( 1 #'x' )); git reset --hard",
+        "(( 1 #'x\n' )); git reset --hard",
+        // dash's reading: the comment ends at the line end and the quote in
+        // it opens nothing; Bash reads one arithmetic command to the end.
+        "(( 1 #'\ngit reset --hard))\n'))",
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(
+            claude.is_claude_block_shape(),
+            "claude {command:?}\n{claude}"
+        );
+    }
+    for command in [
+        "(( x = 1 )); git status",
+        "(( x = 1 )) # git reset --hard",
+        "(( x = 1 #)); git status",
+        "echo $(( 2#101 ))",
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+}
+
 #[test]
 fn vscode_copilot_terminal_tool_variants_block_destructive_commands() {
     for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {

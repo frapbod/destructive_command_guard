@@ -4085,7 +4085,7 @@ impl Drop for PlainDollarQuoteReading {
 /// text is arithmetic only when the `)` that closes its own level is followed
 /// at once by another `)`; otherwise (`((cd x) && ls)`) the parentheses open
 /// nested subshells, and `None` is returned.
-fn arithmetic_end(bytes: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn arithmetic_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = start;
     while i < bytes.len() {

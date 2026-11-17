@@ -15630,6 +15630,64 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             }
         }
     }
+    // Bash and zsh read `((…))` as arithmetic, where `#` starts no comment:
+    // `(( x = 1 #)); git reset --hard` runs `git reset --hard`. dash reads
+    // nested subshells there, where it does, and so do the shared readers.
+    // When a `#` inside one may start a comment, read the command again with
+    // it spelled as data (see `bash_arithmetic_hashes_as_data`), through
+    // this whole function, as the lone-CR spelling above is read; that
+    // spelling has no such `#` left. Deny wins. What the user authorized as
+    // written stays authorized, and the spelling spends no allow-once grant.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && let Some(spelled) = crate::normalize::bash_arithmetic_hashes_as_data(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        // The copy's incomplete analyses count only if its result is used.
+        let alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                &spelled,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            drop(alternate_scope);
+            result = alternate;
+            // The spelling is length preserving: show the command's own text.
+            if let Some(info) = result.pattern_info.as_mut()
+                && let Some(span) = info.matched_span.as_ref()
+                && span.end <= command.len()
+                && command.is_char_boundary(span.start)
+                && command.is_char_boundary(span.end)
+            {
+                info.matched_text_preview = Some(extract_match_preview(command, span));
+            }
+        } else {
+            alternate_scope.discard();
+        }
+    }
     // A program name in another case runs the same program on a
     // case-insensitive filesystem (`RM -rf ~` runs `rm`), while the packs and
     // the shell analysis compare lower-case names. Read the command again with
