@@ -42,6 +42,13 @@ const RUNS_IT: &[&str] = &[
     "pwsh -Command \"git`u{3000}reset`u{3000}--hard\"",
     "iex \"git`vreset`v--hard\"",
     "powershell -Command \"git\u{a0}reset\u{a0}--hard\"",
+    // The `iex` / `Invoke-Expression` string reader decodes `` `u{hex} `` too
+    // (pwsh 7.5 measured: `iex "git`u{a0}reset`u{a0}--hard"` ran it).
+    "iex \"git`u{a0}reset`u{a0}--hard\"",
+    "iex \"git`u{20}reset`u{20}--hard\"",
+    "Invoke-Expression \"git`u{3000}reset`u{3000}--hard\"",
+    "iex (\"git`u{a0}reset\" + \"`u{a0}--hard\")",
+    "pwsh -Command 'iex \"git`u{a0}reset`u{a0}--hard\"'",
     // Windows PowerShell 5.1's first non-switch argument is `-Command`.
     "powershell \"git reset --hard\"",
     "powershell git reset --hard",
@@ -98,6 +105,13 @@ const HARMLESS: &[&str] = &[
     "git\u{200b}reset\u{200b}--hard",
     "git\u{a0}status",
     "Get-ChildItem\u{a0}-Recurse",
+    // An odd number of backticks in an `iex` string is denied by the POSIX
+    // substitution reading before this one (fail-closed), so these use pairs.
+    "iex \"git`u{a0}status`u{a0}--short\"",
+    "iex \"Write-Output`u{a0}a`u{a0}b\"",
+    // A malformed `` `u{...} `` is the letter `u` (and 5.1 reads every one so).
+    "iex \"git`u{zz}reset`u{zz}--hard\"",
+    "iex \"git`u{110000}reset`u{110000}--hard\"",
     // The quote is inside a comment, not an open string.
     "Write-Output a\u{3000}# it's here",
     "pwsh \"git reset --hard\"",
