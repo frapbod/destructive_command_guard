@@ -2881,6 +2881,53 @@ fn segment_is_format_drive_invocation(segment: &str) -> bool {
     })
 }
 
+/// Return whether a segment holds a PowerShell static member access on a type
+/// literal, `[Name]::Member`, at a word start: `[IO.Directory]::Delete(…)`,
+/// `$null = [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(…)`.
+///
+/// It is PowerShell-only syntax: no POSIX command is spelled that way, and the
+/// .NET calls it makes delete trees with no cmdlet or program name in sight, so
+/// none of the other shapes saw them and the `windows.*` readers never ran off
+/// Windows. A quoted spelling (`grep '[IO.Path]::'`) is not at a word start.
+/// Casts glued before the type literal (`[void][IO.Directory]::Delete(…)`)
+/// belong to the same access.
+fn segment_has_powershell_static_member_access(segment: &str) -> bool {
+    fn member_access_at(mut text: &str) -> bool {
+        loop {
+            let rest = text.trim_start();
+            let name_len = rest
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+                .count();
+            if name_len == 0 || !rest.as_bytes()[0].is_ascii_alphabetic() {
+                return false;
+            }
+            let Some(rest) = rest[name_len..].trim_start().strip_prefix(']') else {
+                return false;
+            };
+            let rest = rest.trim_start();
+            if let Some(next) = rest.strip_prefix('[') {
+                text = next;
+                continue;
+            }
+            return rest
+                .strip_prefix("::")
+                .and_then(|member| member.trim_start().bytes().next())
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+        }
+    }
+    let bytes = segment.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| {
+        *byte == b'['
+            && (index == 0
+                || matches!(
+                    bytes[index - 1],
+                    b' ' | b'\t' | b'=' | b'(' | b',' | b'!' | b'+'
+                ))
+            && member_access_at(&segment[index + 1..])
+    })
+}
+
 /// Return whether any statement/pipeline segment of `command` is unmistakably
 /// Windows shell: a PowerShell cmdlet-shaped leading token (`Remove-Item …`,
 /// `… ; Clear-Content …`), a destructive alias carrying a Windows-shell-only
@@ -2948,6 +2995,7 @@ fn segment_has_windows_shape(segment: &str) -> bool {
         || segment_is_windows_only_executable(segment)
         || segment_command_word_is_cmd_assembled(segment)
         || segment_is_format_drive_invocation(segment)
+        || segment_has_powershell_static_member_access(segment)
 }
 
 /// Down-trust a `Bash`-labeled dialect when the command itself is
@@ -5264,12 +5312,14 @@ mod tests {
         let input: HookInput = serde_json::from_str(json).unwrap();
         let extracted = extract_command_with_context(&input).expect("shell command");
         assert_eq!(extracted.protocol, HookProtocol::Codex);
+        // Off Windows its `[IO.File]::` type-literal access is PowerShell
+        // shape, so the mislabeled `Bash` payload widens to the union (#322).
         assert_eq!(
             extracted.dialect,
             if cfg!(windows) {
                 ShellDialect::PowerShell
             } else {
-                ShellDialect::Posix
+                ShellDialect::Unknown
             }
         );
         // A POSIX-parseable Codex payload takes the union on Windows.
@@ -5286,12 +5336,14 @@ mod tests {
             }
         );
         // Without `turn_id` the payload is Claude Code's, whose Windows
-        // `Bash` tool is Git Bash: the POSIX label stands on every host.
+        // `Bash` tool is Git Bash: it is never re-mapped to PowerShell. Its
+        // PowerShell shape still widens it to the union on every host, as
+        // `Remove-Item` does (#322).
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"$a=[IO.File]::ReadAllLines('x'); [string]::Join(\"`n\",$a[239..($a.Length-1)])"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         let extracted = extract_command_with_context(&input).expect("shell command");
         assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
-        assert_eq!(extracted.dialect, ShellDialect::Posix);
+        assert_eq!(extracted.dialect, ShellDialect::Unknown);
     }
 
     #[test]
@@ -5678,6 +5730,46 @@ mod tests {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),
                 ShellDialect::Posix
+            );
+        }
+    }
+
+    /// A PowerShell static member access on a type literal is a Windows
+    /// payload on every host: the .NET delete it makes names no cmdlet or
+    /// program (card t_02cc8a24).
+    #[test]
+    fn powershell_type_literal_member_access_is_a_windows_payload() {
+        for command in [
+            r"[IO.Directory]::Delete('C:\Users', $true)",
+            r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\Users', 'DeleteAllContents')",
+            r"$null = [System.IO.Directory]::Delete('C:\Users', $true)",
+            "using namespace System.IO\n[Directory]::Delete('C:\\Users', $true)",
+            r"[void][IO.Directory]::Delete('C:\Users', $true)",
+            r"$x=1;[void] [System.IO.Directory]::Delete('C:\Users',$true)",
+            "[IO.Path]::Combine('a','b')",
+        ] {
+            assert!(
+                command_is_windows_shell_payload_on_host(command, false),
+                "{command:?}"
+            );
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+        }
+        for command in [
+            "grep -n '[IO.Directory]::Delete' src/a.rs",
+            "echo \"[IO.Path]::Combine\"",
+            "[ -f x ] && echo ok",
+            "[[ $a == b ]] && echo ok",
+            "ls [a-z]::x",
+            "[ -f x ][ -f y ]::z",
+            "ls [a][b]",
+        ] {
+            assert!(
+                !command_is_windows_shell_payload_on_host(command, false),
+                "{command:?}"
             );
         }
     }
