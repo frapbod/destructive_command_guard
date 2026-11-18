@@ -5,6 +5,8 @@
 //! `Get-Date | . git reset --hard`, `try { . git reset --hard } catch {}` and
 //! `& { . git reset --hard }`, and `. Remove-Item -Recurse -Force victim`
 //! deleted `victim`. dcg judged the `&` forms and let the dot forms pass.
+//! The operator also runs a command on the right of every assignment form,
+//! after `return`, `throw` and `exit` (shell-truth pwsh, Nov 18 2026).
 //! Dot-sourcing a script (`. ./x.ps1`, `. $profile`) and a `.` inside
 //! arguments stay allowed.
 
@@ -42,6 +44,28 @@ const POWERSHELL_RUNS_IT: &[&str] = &[
     "& { . git reset --hard }",
     "$r = . git reset --hard",
     "$r=. git reset --hard",
+    // Every assignment form, and the operand of `return`, `throw` and `exit`
+    // (shell-truth pwsh, Nov 18 2026: each ran `git reset --hard`).
+    "$r += . git reset --hard",
+    "$r -= . git reset --hard",
+    "$r *= . git reset --hard",
+    "$r /= . git reset --hard",
+    "$r %= . git reset --hard",
+    "$r ??= . git reset --hard",
+    "$r =. git reset --hard",
+    "[string]$r = . git reset --hard",
+    "[string] $r = . git reset --hard",
+    "[int][string]$r = . git reset --hard",
+    "$script:r = . git reset --hard",
+    "$x.p = . git reset --hard",
+    "$x[0] = . git reset --hard",
+    "$a, $b = . git reset --hard",
+    "$a,$b=. git reset --hard",
+    "$a = $b = . git reset --hard",
+    "return . git reset --hard",
+    "if ($true) { return . git reset --hard }",
+    "throw . git reset --hard",
+    "exit . git reset --hard",
     ". git branch -D doomed",
     ". git push --force origin main",
     ". Remove-Item -Recurse -Force C:\\Users\\kaita",
@@ -75,6 +99,12 @@ const HARMLESS: &[&str] = &[
     "git log -- .",
     "Write-Output \"x . git reset --hard\"",
     "git commit -m 'fix. git reset --hard is bad'",
+    // PowerShell 7.5 ran no Git for these (shell-truth pwsh, Nov 18 2026):
+    // an argument, a word joined to the dot, and a parse error.
+    "Write-Output . git reset --hard",
+    "return. git reset --hard",
+    "$r=.git reset --hard",
+    "$r -eq . git reset --hard",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
@@ -256,4 +286,138 @@ fn posix_dot_builtin_is_not_a_git_invocation() {
         decision_in(". git reset --hard", ShellDialect::Posix),
         EvaluationDecision::Allow
     );
+}
+
+struct GrantStore {
+    temp: tempfile::TempDir,
+}
+
+impl GrantStore {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(temp.path().join("home")).unwrap();
+        std::fs::create_dir_all(temp.path().join("repo")).unwrap();
+        Self { temp }
+    }
+
+    fn command(&self) -> Command {
+        let home = self.temp.path().join("home");
+        let mut command = Command::new(dcg_binary());
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .env("DCG_HOOK_TIMEOUT_MS", HOOK_TEST_TIMEOUT_MS)
+            .env("DCG_HEREDOC_TIMEOUT_MS", HOOK_TEST_TIMEOUT_MS)
+            .env("DCG_AST_TIMEOUT_MS", HOOK_TEST_TIMEOUT_MS)
+            .env(
+                "DCG_PENDING_EXCEPTIONS_PATH",
+                self.temp.path().join("pending.jsonl"),
+            )
+            .env(
+                "DCG_ALLOW_ONCE_PATH",
+                self.temp.path().join("allow_once.jsonl"),
+            )
+            .current_dir(self.temp.path().join("repo"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// The hook's verdict on `command` under the PowerShell label, and its
+    /// allow-once code when it denies.
+    fn hook(&self, command: &str) -> (String, Option<String>) {
+        let payload = payload(
+            Protocol::Claude,
+            "PowerShell",
+            command,
+            &self.temp.path().join("repo"),
+        )
+        .to_string();
+        let mut child = self
+            .command()
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn dcg");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+            .expect("write payload");
+        let out = child.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.trim().is_empty() {
+            return ("allow".to_string(), None);
+        }
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("hook JSON");
+        let output = &parsed["hookSpecificOutput"];
+        (
+            output["permissionDecision"]
+                .as_str()
+                .unwrap_or("<missing>")
+                .to_string(),
+            output["allowOnceCode"].as_str().map(str::to_string),
+        )
+    }
+
+    /// Deny `command`, then grant it once with its code.
+    fn grant(&self, command: &str) {
+        let (decision, code) = self.hook(command);
+        assert_eq!(decision, "deny", "{command:?}");
+        let code = code.expect("a denial carries an allow-once code");
+        let out = self
+            .command()
+            .args(["allow-once", &code, "--yes", "--single-use", "--json"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run allow-once");
+        assert!(
+            out.status.success(),
+            "allow-once failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(self.unspent(), vec![command.to_string()]);
+    }
+
+    /// The commands of the grants not yet spent.
+    fn unspent(&self) -> Vec<String> {
+        let Ok(contents) = std::fs::read_to_string(self.temp.path().join("allow_once.jsonl"))
+        else {
+            return Vec::new();
+        };
+        contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("grant JSON"))
+            .filter(|grant| grant["consumed_at"].is_null())
+            .map(|grant| {
+                grant["command_raw"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+}
+
+/// The dot reading is not a request the user made, so it spends no grant:
+/// a grant for the `&` spelling belongs to that request (GH#537). A grant for
+/// the dot spelling itself allows it once.
+#[test]
+fn the_dot_reading_spends_no_allow_once_grant_of_another_request() {
+    let store = GrantStore::new();
+    store.grant("& git reset --hard");
+    assert_eq!(store.hook(". git reset --hard").0, "deny");
+    assert_eq!(store.unspent(), vec!["& git reset --hard".to_string()]);
+    assert_eq!(store.hook("& git reset --hard").0, "allow");
+    assert!(store.unspent().is_empty());
+
+    let store = GrantStore::new();
+    store.grant(". git reset --hard");
+    assert_eq!(store.hook(". git reset --hard").0, "allow");
+    assert!(store.unspent().is_empty());
+    assert_eq!(store.hook(". git reset --hard").0, "deny");
 }

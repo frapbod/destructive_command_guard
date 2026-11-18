@@ -3201,7 +3201,7 @@ fn decode_powershell_pattern_view(command: &str) -> Cow<'_, str> {
     Cow::Owned(output)
 }
 
-/// Read each statement-leading PowerShell dot-source operator as the call
+/// Read each PowerShell dot-source operator in command position as the call
 /// operator.
 ///
 /// `. git reset --hard` runs Git exactly as `& git reset --hard` does: the dot
@@ -3209,10 +3209,13 @@ fn decode_powershell_pattern_view(command: &str) -> Cow<'_, str> {
 /// call operator can judge the dot form once the `.` byte becomes `&`. The
 /// view has the same length as `command`, so spans still address it.
 ///
-/// Only a static command word is rewritten. Dot-sourcing a variable or an
-/// expandable string (`. $profile`, `. "$PSScriptRoot\x.ps1"`) loads a script
-/// whose name is not known here, and keeps the reading it had. A `.` in an
-/// argument (`git add .`) is data. Returns `None` when nothing changes.
+/// A command position is the start of a statement, the right side of an
+/// assignment (see [`powershell_assignment_rhs`]) and the operand of
+/// `return`, `throw` or `exit`. Only a static command word is rewritten.
+/// Dot-sourcing a variable or an expandable string (`. $profile`,
+/// `. "$PSScriptRoot\x.ps1"`) loads a script whose name is not known here,
+/// and keeps the reading it had. A `.` in an argument (`git add .`) is data.
+/// Returns `None` when nothing changes.
 #[must_use]
 pub(crate) fn powershell_dot_source_call_view(command: &str) -> Option<String> {
     if !command.contains('.') {
@@ -3220,57 +3223,45 @@ pub(crate) fn powershell_dot_source_call_view(command: &str) -> Option<String> {
     }
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
     let mut dots = Vec::new();
-    // `None` at a statement start; otherwise whether the statement so far is
-    // only an assignment target (`$x =`), after which a command starts again.
-    let mut statement: Option<bool> = None;
+    // Where the current statement starts; `None` after a closing parenthesis,
+    // which completes an expression that no command follows.
+    let mut statement_start = Some(0);
     let mut iter = tokens.iter().peekable();
     while let Some(token) = iter.next() {
         let raw = token.text(command)?;
+        let range = &token.byte_range;
         if token.kind == NormalizeTokenKind::Separator {
-            // A closing parenthesis completes an expression; what follows it
-            // is not a new statement.
-            statement = (raw == ")").then_some(false);
+            statement_start = (raw != ")").then_some(range.end);
             continue;
         }
-        match statement {
-            Some(true) if raw == "=" => statement = None,
-            Some(_) => {
-                // Block braces start statements of their own.
-                if matches!(raw, "{" | "}") {
-                    statement = None;
-                } else {
-                    statement = Some(false);
-                }
-            }
-            None if matches!(raw, "{" | "}") => {}
-            None => {
-                let assignment = raw.starts_with('$') && !raw.contains('(');
-                // `$r=.` is one word: the target, `=` and the operator.
-                let operator = if raw == "." {
-                    Some(token.byte_range.start)
-                } else if assignment && raw.ends_with("=.") {
-                    Some(token.byte_range.end - 1)
-                } else {
-                    None
-                };
-                if let Some(operator) = operator {
-                    let static_operand = iter.peek().is_some_and(|next| {
-                        next.kind == NormalizeTokenKind::Word
-                            && next.byte_range.start > token.byte_range.end
-                            && next.text(command).is_some_and(|word| {
-                                !word.contains('$') && !word.starts_with(['@', '{'])
-                            })
-                    });
-                    if static_operand {
-                        dots.push(operator);
-                    }
-                    statement = Some(false);
-                } else if assignment && raw.ends_with('=') {
-                    statement = None;
-                } else {
-                    statement = Some(assignment);
-                }
-            }
+        // Block braces start statements of their own.
+        if matches!(raw, "{" | "}") {
+            statement_start = Some(range.end);
+            continue;
+        }
+        let Some(start) = statement_start else {
+            continue;
+        };
+        // `$r=.` and `=.` glue the operator onto the assignment.
+        let operator = if raw == "." {
+            Some(range.start)
+        } else if raw.ends_with("=.") {
+            Some(range.end - 1)
+        } else {
+            None
+        };
+        let Some(operator) = operator else {
+            continue;
+        };
+        let static_operand = iter.peek().is_some_and(|next| {
+            next.kind == NormalizeTokenKind::Word
+                && next.byte_range.start > range.end
+                && next
+                    .text(command)
+                    .is_some_and(|word| !word.contains('$') && !word.starts_with(['@', '{']))
+        });
+        if static_operand && powershell_command_position(&command[start..operator]) {
+            dots.push(operator);
         }
     }
     if dots.is_empty() {
@@ -3281,6 +3272,27 @@ pub(crate) fn powershell_dot_source_call_view(command: &str) -> Option<String> {
         view[dot] = b'&';
     }
     String::from_utf8(view).ok()
+}
+
+/// Whether a PowerShell command may follow `prefix`, the text of a statement
+/// so far: nothing, `return`, `throw`, `exit`, or one or more assignment
+/// targets each followed by an assignment operator (`$a = $b +=`).
+fn powershell_command_position(prefix: &str) -> bool {
+    let mut prefix = prefix.trim();
+    if prefix.is_empty()
+        || ["return", "throw", "exit"]
+            .iter()
+            .any(|keyword| prefix.eq_ignore_ascii_case(keyword))
+    {
+        return true;
+    }
+    while let Some(rest) = powershell_assignment_rhs(prefix) {
+        if rest.is_empty() {
+            return true;
+        }
+        prefix = rest;
+    }
+    false
 }
 
 /// Return the executable right-hand side of a simple PowerShell variable
@@ -3310,17 +3322,11 @@ pub(crate) fn powershell_assignment_rhs(candidate: &str) -> Option<&str> {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
             '=' if !in_single && !in_double => {
-                let mut lhs = candidate[..idx].trim();
-                lhs = lhs.trim_end_matches(['+', '-', '*', '/', '%', '?']);
-                lhs = lhs.trim_end();
-
-                if let Some(after_type) = lhs.strip_prefix('[').and_then(|rest| {
-                    let close = rest.find(']')?;
-                    Some(rest[close + 1..].trim_start())
-                }) {
-                    lhs = after_type;
-                }
-                if lhs.starts_with('$') && !lhs.bytes().any(|byte| byte.is_ascii_whitespace()) {
+                let lhs = candidate[..idx]
+                    .trim()
+                    .trim_end_matches(['+', '-', '*', '/', '%', '?'])
+                    .trim_end();
+                if powershell_assignment_targets(lhs) {
                     return Some(candidate[idx + 1..].trim());
                 }
             }
@@ -3329,6 +3335,45 @@ pub(crate) fn powershell_assignment_rhs(candidate: &str) -> Option<&str> {
     }
 
     None
+}
+
+/// Whether `lhs` is a list of PowerShell assignment targets: comma-separated
+/// variables (`$a`, `$script:a`, `$a.b`, `$a[0]`), each after any number of
+/// type constraints (`[string]$a`, `[int] [string]$a`).
+fn powershell_assignment_targets(lhs: &str) -> bool {
+    let mut depth = 0usize;
+    let mut item_start = 0;
+    let mut items = Vec::new();
+    for (idx, ch) in lhs.char_indices() {
+        match ch {
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                items.push(&lhs[item_start..idx]);
+                item_start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&lhs[item_start..]);
+    items.into_iter().all(|item| {
+        let mut target = item.trim();
+        while target.starts_with('[') {
+            let mut depth = 0usize;
+            let Some(close) = target.char_indices().find_map(|(idx, ch)| {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(idx)
+            }) else {
+                return false;
+            };
+            target = target[close + 1..].trim_start();
+        }
+        target.starts_with('$') && !target.chars().any(char::is_whitespace)
+    })
 }
 
 /// Tokenize a command while preserving every raw token's byte span.
@@ -8407,6 +8452,17 @@ mod tests {
             ("if ($true) { . git x }", "if ($true) { & git x }"),
             ("$r = . git x", "$r = & git x"),
             ("$r=. git x", "$r=& git x"),
+            ("$r += . git x", "$r += & git x"),
+            ("$r ??= . git x", "$r ??= & git x"),
+            ("$r =. git x", "$r =& git x"),
+            ("[string]$r = . git x", "[string]$r = & git x"),
+            ("[int] [string]$r = . git x", "[int] [string]$r = & git x"),
+            ("$a, $b = . git x", "$a, $b = & git x"),
+            ("$a = $b = . git x", "$a = $b = & git x"),
+            ("$x[1,2] = . git x", "$x[1,2] = & git x"),
+            ("return . git x", "return & git x"),
+            ("THROW . git x", "THROW & git x"),
+            ("exit . git x", "exit & git x"),
             (".\u{a0}git x", "&\u{a0}git x"),
             (". ./x.ps1", "& ./x.ps1"),
         ] {
@@ -8427,6 +8483,12 @@ mod tests {
             ".\u{200b}git x",
             "(Get-Item x) . git",
             "Write-Output '. git x'",
+            "Write-Output . git x",
+            "return. git x",
+            "$r=.git x",
+            "$r -eq . git x",
+            "$r = 1 + . git x",
+            "git config a= . git x",
         ] {
             assert_eq!(
                 powershell_dot_source_call_view(command),
