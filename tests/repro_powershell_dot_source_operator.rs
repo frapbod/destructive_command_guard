@@ -129,20 +129,21 @@ const HARMLESS: &[&str] = &[
     "Write-Output \"x . git reset --hard\"",
     "git commit -m 'fix. git reset --hard is bad'",
     // PowerShell 7.5 ran no Git for these (shell-truth pwsh, Nov 18 2026):
-    // an argument, a word joined to the dot, member access, and a parse error.
+    // an argument and member access.
     "Write-Output .'git' reset --hard",
     "'x'.'git'",
     "$r.'git'",
+];
+
+/// Harmless in PowerShell, which ran no Git for these (shell-truth pwsh, Nov
+/// 18 2026): an argument, a word joined to the dot, a parse error and a
+/// comparison. The Unknown union denies each on base/v0.16.0 too (8bf24148),
+/// so only the PowerShell dialect is asserted.
+const HARMLESS_IN_POWERSHELL: &[&str] = &[
+    "Write-Output . git reset --hard",
     "return. git reset --hard",
     "$r=.git reset --hard",
     "$r -eq . git reset --hard",
-];
-
-/// Harmless in PowerShell, which ran no Git for it (shell-truth pwsh, Nov 18
-/// 2026). The Unknown union denies it on base/v0.16.0 too (8bf24148), so only
-/// the PowerShell dialect is asserted.
-const HARMLESS_IN_POWERSHELL: &[&str] = &[
-    "Write-Output . git reset --hard",
     "$x = & 'Write-Output' git reset --hard",
 ];
 
