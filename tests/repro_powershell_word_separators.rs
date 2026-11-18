@@ -49,6 +49,20 @@ const RUNS_IT: &[&str] = &[
     "Invoke-Expression \"git`u{3000}reset`u{3000}--hard\"",
     "iex (\"git`u{a0}reset\" + \"`u{a0}--hard\")",
     "pwsh -Command 'iex \"git`u{a0}reset`u{a0}--hard\"'",
+    // Windows PowerShell 5.1 reads `` `u `` and `` `e `` as letters, so these
+    // run the reset there after "u: The term 'u' is not recognized" (the same
+    // text measured with pwsh 7.5; real 5.1 unmeasured). PowerShell 6+ reads
+    // a comment (`#`, `<#`) and runs nothing.
+    "iex (\"`u{23}`u{20}\" + \"; git reset --hard\")",
+    "iex (\"`u{23}`u{20}\" + '; git reset --hard')",
+    "Invoke-Expression (\"`u{23}`u{23}\" + \"; git reset --hard\")",
+    "powershell -Command 'iex (\"`u{23}`u{20}\" + \"; git reset --hard\")'",
+    "powershell -NoProfile 'iex (\"`u{23}`u{20}\" + \"; git reset --hard\")'",
+    "iex (\"`u{3c}`u{23}x\" + \"; git reset --hard\")",
+    "Invoke-Command -ScriptBlock ([scriptblock]::Create(\"`u{23}`u{20}\" + \"; git reset --hard\"))",
+    "& ([scriptblock]::Create(\"`u{23}`u{20}\" + \"; git reset --hard\"))",
+    "iex (\"git r`es`et\" + \" --hard\")",
+    "powershell -Command 'iex (\"git r`es`et\" + \" --hard\")'",
     // Windows PowerShell 5.1's first non-switch argument is `-Command`.
     "powershell \"git reset --hard\"",
     "powershell git reset --hard",
@@ -112,6 +126,8 @@ const HARMLESS: &[&str] = &[
     // A malformed `` `u{...} `` is the letter `u` (and 5.1 reads every one so).
     "iex \"git`u{zz}reset`u{zz}--hard\"",
     "iex \"git`u{110000}reset`u{110000}--hard\"",
+    // A comment under PowerShell 6+, `git status` under 5.1: harmless in both.
+    "iex (\"`u{23}`u{20}\" + \"; git status\")",
     // The quote is inside a comment, not an open string.
     "Write-Output a\u{3000}# it's here",
     "pwsh \"git reset --hard\"",
