@@ -738,3 +738,63 @@ fn quoted_cmd_program_names_are_cmd_calls() {
         misses.join("\n")
     );
 }
+
+/// A cmd call at the start of an option value (`--exec=cmd.exe /c …`,
+/// `--exec='cmd.exe /c …'`) is read from its `cmd` word, as the scanner's
+/// POSIX reading of the same call is.
+#[test]
+fn cmd_calls_at_the_start_of_an_option_value() {
+    let posix = [ShellDialect::Posix, ShellDialect::Unknown];
+    let ps = [ShellDialect::PowerShell, ShellDialect::Unknown];
+    // Each form with a CR and its CR-free twin.
+    let twins = |forms: &[&str]| -> Vec<String> {
+        forms
+            .iter()
+            .flat_map(|form| [form.replace("<CR>", "\r"), form.replace("<CR>", "")])
+            .collect()
+    };
+    let mut misses = expect_everywhere(
+        &twins(&[
+            "nodemon --exec='cmd.exe /c gi<CR>t reset --hard'",
+            "nodemon --exec=\"cmd.exe /c gi<CR>t reset --hard\"",
+            "npx nodemon --exec='cmd.exe /c gi<CR>t reset --hard'",
+            "git rebase --exec='cmd.exe /c gi<CR>t reset --hard' HEAD~1",
+            "git rebase --exec=\"cmd.exe /c gi<CR>t reset --hard\" HEAD~1",
+            "nodemon --exec=cmd.exe /c gi<CR>t reset --hard",
+        ]),
+        &posix,
+        "Bash",
+        EvaluationDecision::Deny,
+    );
+    misses.extend(expect_everywhere(
+        &twins(&[
+            "nodemon --exec=\"cmd /c gi<CR>t reset --hard\"",
+            "npx nodemon --exec='cmd /c gi<CR>t reset --hard'",
+            "git rebase --exec=\"cmd /c gi<CR>t reset --hard\" HEAD~1",
+        ]),
+        &ps,
+        "PowerShell",
+        EvaluationDecision::Deny,
+    ));
+    misses.extend(expect_everywhere(
+        &with_cr(&[
+            "nodemon --exec='cmd.exe /c gi<CR>t status'",
+            "git rebase --exec='cmd.exe /c cargo test' HEAD~3",
+        ]),
+        &[ShellDialect::Posix],
+        "Bash",
+        EvaluationDecision::Allow,
+    ));
+    misses.extend(expect_everywhere(
+        &with_cr(&["nodemon --exec=\"cmd /c gi<CR>t status\""]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Allow,
+    ));
+    assert!(
+        misses.is_empty(),
+        "{} misses:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
+}
