@@ -20388,8 +20388,29 @@ mod tests {
         fn iexplore_does_not_falsely_trigger_iex() {
             // The `iex` alias must be a standalone token, not a prefix of `iexplore`.
             assert_eq!(
-                check_triggers("start iexplore.exe https://example.com"),
+                check_triggers("iexplore.exe https://example.com"),
                 TriggerResult::NoTrigger
+            );
+            // `start` is Start-Process, a trigger of its own: its reading is
+            // the browser's argv, and nothing is read as `iex`.
+            let contents = match extract_content(
+                "start iexplore.exe https://example.com",
+                &ExtractionLimits::default(),
+            ) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{other:?}"),
+            };
+            assert!(
+                contents
+                    .iter()
+                    .all(|content| content.target_command.as_deref() != Some("iex")),
+                "{contents:?}"
+            );
+            assert!(
+                contents
+                    .iter()
+                    .any(|content| content.content == "& 'iexplore.exe' 'https://example.com'"),
+                "{contents:?}"
             );
         }
 

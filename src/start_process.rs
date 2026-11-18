@@ -552,13 +552,22 @@ fn split_top_level<'a>(inner: &'a str, separators: &[u8]) -> Vec<&'a str> {
     parts
 }
 
+/// Literal groups nested deeper than this are not reduced (read as not a
+/// literal), which bounds the recursion below.
+const GROUP_DEPTH: usize = 8;
+
 /// The strings an element stands for, or `None` when it is not a literal
 /// (a variable, a call, an expression dcg does not reduce).
 fn element_strings(raw: &str) -> Option<Vec<String>> {
+    element_strings_within(raw, GROUP_DEPTH)
+}
+
+fn element_strings_within(raw: &str, depth: usize) -> Option<Vec<String>> {
     use crate::packs::careful_company_running_windows::transfer::{
         decode_powershell_literal_expression, decode_powershell_static_word,
     };
     let raw = raw.trim();
+    let depth = depth.checked_sub(1)?;
     if raw.eq_ignore_ascii_case("$null") {
         return Some(Vec::new());
     }
@@ -572,7 +581,7 @@ fn element_strings(raw: &str) -> Option<Vec<String>> {
         let mut strings = Vec::new();
         for part in split_top_level(inner, b",;\r\n") {
             if !part.trim().is_empty() {
-                strings.extend(element_strings(part)?);
+                strings.extend(element_strings_within(part, depth)?);
             }
         }
         return Some(strings);
@@ -585,14 +594,14 @@ fn element_strings(raw: &str) -> Option<Vec<String>> {
         if parts.len() > 1 {
             let mut strings = Vec::new();
             for part in parts {
-                strings.extend(element_strings(part)?);
+                strings.extend(element_strings_within(part, depth)?);
             }
             return Some(strings);
         }
         if let Some(text) = decode_powershell_literal_expression(raw) {
             return Some(vec![text]);
         }
-        return element_strings(inner);
+        return element_strings_within(inner, depth);
     }
     decode_powershell_static_word(raw).map(|text| vec![text])
 }
@@ -942,6 +951,19 @@ mod tests {
         assert_eq!(
             lines("Start-Process git -ArgumentList 'push',$remote,'--force'"),
             vec!["& 'git' 'push' 'DCG_START_PROCESS_ARGUMENT' '--force'".to_string()]
+        );
+    }
+
+    /// Deeply nested groups are not reduced, and do not exhaust the stack.
+    #[test]
+    fn nested_groups_are_bounded() {
+        assert_eq!(element_strings("((('x')))"), Some(vec!["x".to_string()]));
+        let deep = format!("{}'x'{}", "(".repeat(40_000), ")".repeat(40_000));
+        assert_eq!(element_strings(&deep), None);
+        let deep = format!("git -ArgumentList {deep},'--hard'");
+        assert_eq!(
+            lines(&format!("Start-Process {deep}")),
+            vec!["& 'git' 'DCG_START_PROCESS_ARGUMENT' '--hard'".to_string()]
         );
     }
 
