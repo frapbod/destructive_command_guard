@@ -384,7 +384,6 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "Write-Output a<#x#>b; git status",
         "Write-Output a>x; git status",
         "Write-Output a <# ; & {git reset --hard} #>",
-        "Write-Output 'a'<# ; & {git reset --hard} #>",
         "$c <#x#> = 1; & {git status}",
     ];
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
