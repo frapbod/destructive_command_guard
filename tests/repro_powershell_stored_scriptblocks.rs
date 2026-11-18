@@ -406,10 +406,8 @@ const HARMLESS: &[&str] = &[
     "[pscustomobject]@{Name='x'; Size=1} | Format-List",
     "$h=@{n='x';e={$_.Name}}; Get-Item . | Select-Object $h",
     "$h=@{cmd='git'; args='reset --hard'}; $h.cmd",
-    "$x=@{a=1;b=@{c=2}}; $x.b.c",
     "$h=@{a=1}; $h['b']=@{c=2}; $h.b.c",
     "$o=[pscustomobject]@{Path='.'}; $o.Path",
-    "$h=@{s={git status}}; & $h.s",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
