@@ -798,3 +798,66 @@ fn cmd_calls_at_the_start_of_an_option_value() {
         misses.join("\n")
     );
 }
+
+/// The `cmd` program name ends a larger word whose quoting or expansion comes
+/// before it (`--exec="cmd.exe" /c …`, `"$WINDIR/System32/cmd.exe" /c …`):
+/// the call is that program and the words after its word.
+#[test]
+fn cmd_calls_whose_program_name_ends_a_quoted_word() {
+    let posix = [ShellDialect::Posix, ShellDialect::Unknown];
+    let ps = [ShellDialect::PowerShell, ShellDialect::Unknown];
+    // Each form with a CR and its CR-free twin.
+    let twins = |forms: &[&str]| -> Vec<String> {
+        forms
+            .iter()
+            .flat_map(|form| [form.replace("<CR>", "\r"), form.replace("<CR>", "")])
+            .collect()
+    };
+    let mut misses = expect_everywhere(
+        &twins(&[
+            r#"nodemon --exec="cmd.exe" /c gi<CR>t reset --hard"#,
+            r"nodemon --exec='cmd.exe' /c gi<CR>t reset --hard",
+            r"nodemon --exec=\cmd.exe /c gi<CR>t reset --hard",
+            r#"nodemon --exec="cmd.exe" /c "gi<CR>t reset --hard""#,
+            r#"nodemon --exec="$WINDIR/System32/cmd.exe" /c gi<CR>t reset --hard"#,
+            r#"("$WINDIR/System32/cmd.exe" /c gi<CR>t reset --hard)"#,
+            r#"v=$("$WINDIR/System32/cmd.exe" /c gi<CR>t reset --hard)"#,
+            r#"for i in 1; do "$WINDIR\\System32\\cmd.exe" /c gi<CR>t reset --hard; done"#,
+            r#"wsl "$WINDIR/System32/cmd.exe" /c gi<CR>t reset --hard"#,
+        ]),
+        &posix,
+        "Bash",
+        EvaluationDecision::Deny,
+    );
+    misses.extend(expect_everywhere(
+        &twins(&[
+            r#"nodemon --exec="cmd" /c "gi<CR>t reset --hard""#,
+            r#"nodemon --exec='cmd' /c "gi<CR>t reset --hard""#,
+            r#"npx nodemon --exec="cmd.exe" /c "gi<CR>t reset --hard""#,
+        ]),
+        &ps,
+        "PowerShell",
+        EvaluationDecision::Deny,
+    ));
+    misses.extend(expect_everywhere(
+        &with_cr(&[
+            r#"nodemon --exec="cmd.exe" /c gi<CR>t status"#,
+            r#"("$WINDIR/System32/cmd.exe" /c echo %PATH%)"#,
+        ]),
+        &[ShellDialect::Posix],
+        "Bash",
+        EvaluationDecision::Allow,
+    ));
+    misses.extend(expect_everywhere(
+        &with_cr(&[r#"nodemon --exec="cmd" /c "gi<CR>t status""#]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Allow,
+    ));
+    assert!(
+        misses.is_empty(),
+        "{} misses:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
+}
