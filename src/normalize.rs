@@ -4728,29 +4728,56 @@ impl PowerShellParseState {
 
     /// Whether a `#` or `<#` at `i` starts a comment. `arg_start` is where
     /// the current argument began; `quoted_end` is where a string that began
-    /// it closed.
+    /// it closed; `braced_end` is where the last `${…}` variable closed.
     fn comment_starts(
         &self,
         bytes: &[u8],
         i: usize,
         arg_start: usize,
         quoted_end: Option<usize>,
+        braced_end: Option<usize>,
     ) -> bool {
         let block = bytes.get(i..i + 2) == Some(b"<#");
         if bytes[i] != b'#' && !block {
             return false;
         }
-        let role = powershell_comment_predecessor_role(bytes, i);
-        if role == PowerShellHashRole::Comment || self.mode != PowerShellParseMode::Command {
+        if self.mode != PowerShellParseMode::Command {
+            return true;
+        }
+        // The `}` of a `${…}` variable ends a name, not a group: `${c}#x` is
+        // text in argument mode, like `$c#x`.
+        let role = match powershell_comment_predecessor_role(bytes, i) {
+            PowerShellHashRole::Comment if braced_end == Some(i) => PowerShellHashRole::Literal,
+            role => role,
+        };
+        if role == PowerShellHashRole::Comment {
             return true;
         }
         // In argument mode a word absorbs `#` (`a#x`, `$c#x`, `a'b'#x`), but
         // a member access (`$c.p#x`, `(…).p#x`) or a string that began the
         // argument (`'a'#x`) is an expression token, and the comment starts.
         quoted_end == Some(i)
-            || powershell_member_access_ends_at(bytes, arg_start, i)
+            || powershell_member_access_ends_at(bytes, arg_start, i, quoted_end)
             || (block && role == PowerShellHashRole::Ambiguous)
     }
+}
+
+/// Whether PowerShell ends the text of `word`, a command argument, at a `#`,
+/// `<#`, `<` or `>` glued at `index`. It reads all four the same way: as text
+/// after a bareword or a variable (`a>x`, `$c<#`, `${c}#x`), and as a comment
+/// or an operator after a string that began the argument, a member access or
+/// a closing bracket (`'a'>x`, `$c.p>x`, `(1)>x`).
+pub(crate) fn powershell_argument_text_ends_at(word: &str, index: usize) -> bool {
+    let Some(prefix) = word.as_bytes().get(..index) else {
+        return false;
+    };
+    let mut probe = prefix.to_vec();
+    probe.push(b'#');
+    let mut parse = PowerShellParseState {
+        mode: PowerShellParseMode::Command,
+        enclosing: Vec::new(),
+    };
+    consume_powershell_word(&probe, 0, probe.len(), Some(&mut parse)) == index
 }
 
 /// Whether the token starting at `i`, first in its statement, is an
@@ -4763,10 +4790,16 @@ fn powershell_starts_expression(bytes: &[u8], i: usize) -> bool {
     }
 }
 
-/// Whether `bytes[arg_start..index]` ends in a member access on a variable
-/// or a parenthesized expression: `$c.p`, `${c}.p`, `$c[0].p`, `$c::p`,
-/// `(…).p`. `x$c.p` and `[int]::p` stay text in argument mode.
-fn powershell_member_access_ends_at(bytes: &[u8], arg_start: usize, index: usize) -> bool {
+/// Whether `bytes[arg_start..index]` ends in a member access on a variable,
+/// a parenthesized expression or a string that began the argument (closed at
+/// `quoted_end`): `$c.p`, `${c}.p`, `$c[0].p`, `$c::p`, `(…).p`, `'a'.p`.
+/// `x$c.p` and `[int]::p` stay text in argument mode.
+fn powershell_member_access_ends_at(
+    bytes: &[u8],
+    arg_start: usize,
+    index: usize,
+    quoted_end: Option<usize>,
+) -> bool {
     let is_name = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
     let mut j = index;
     while j > arg_start && is_name(bytes[j - 1]) {
@@ -4788,6 +4821,7 @@ fn powershell_member_access_ends_at(bytes: &[u8], arg_start: usize, index: usize
         Some((b'$', rest)) => rest
             .iter()
             .all(|&byte| is_name(byte) || b":.[]{}?".contains(&byte)),
+        Some((b'\'' | b'"', _)) => quoted_end == Some(j),
         Some(_) => false,
     }
 }
@@ -4805,6 +4839,7 @@ fn consume_powershell_word(
     let mut arg_start = i;
     let mut quoted_end = None;
     let mut quote_began_argument = false;
+    let mut braced_end = None;
 
     while i < len {
         let byte = bytes[i];
@@ -4813,9 +4848,9 @@ fn consume_powershell_word(
                 if matches!(byte, b'\r' | b'\n')
                     || powershell_horizontal_space_len(bytes, i).is_some()
                     || powershell_separator_end(bytes, i, len).is_some()
-                    || parse
-                        .as_deref()
-                        .is_some_and(|parse| parse.comment_starts(bytes, i, arg_start, quoted_end))
+                    || parse.as_deref().is_some_and(|parse| {
+                        parse.comment_starts(bytes, i, arg_start, quoted_end, braced_end)
+                    })
                 {
                     break;
                 }
@@ -4841,6 +4876,7 @@ fn consume_powershell_word(
                             };
                         }
                         i = (i + 1).min(len);
+                        braced_end = Some(i);
                     }
                     b'@' => {
                         i = consume_powershell_here_string(bytes, i, len).unwrap_or(i + 1);
@@ -9076,6 +9112,8 @@ mod tests {
             ("echo a,$c.p#'\nz", "echo a,$c.p  \nz"),
             ("echo -x:$c.p#'\nz", "echo -x:$c.p  \nz"),
             ("echo 'a'#'\nz", "echo 'a'  \nz"),
+            ("echo 'a'.p#'\nz", "echo 'a'.p  \nz"),
+            ("echo \"a\".p<#x#>z", "echo \"a\".p     z"),
             ("echo \"a\"#'\nz", "echo \"a\"  \nz"),
         ] {
             assert_eq!(masked(command), expected, "{command:?}");
@@ -9087,6 +9125,9 @@ mod tests {
             "echo $c#'\nz\n#'",
             "echo $c<#'\nz\n#>'",
             "echo ${c}#x",
+            "echo x${c}#y",
+            "echo ${c}<#'\nz\n#>'",
+            "echo 'a'b<#x#>",
             "echo $global:c#x",
             "echo x$c#y",
             "echo x$c.p#y",
@@ -9106,6 +9147,60 @@ mod tests {
                 mask_powershell_comments(command).is_none(),
                 "{command:?}: {:?}",
                 mask_powershell_comments(command)
+            );
+        }
+    }
+
+    /// PowerShell reads a `<` or `>` glued inside a command argument as it
+    /// reads a glued `#`: as text after a bareword or a variable, as an
+    /// operator after a string that began the argument, a member access or a
+    /// closing bracket. Each row was measured with pwsh 7.5
+    /// (`scripts/shell-truth`, `Write-Output <word>` and `Test-Path x`).
+    #[test]
+    fn powershell_glued_redirects_follow_the_argument_text() {
+        let at = |word: &str| word.find(['<', '>']).expect("operator");
+        for word in [
+            "'a'>x",
+            "\"a\">x",
+            "'a'>>x",
+            "$c.p>x",
+            "$d[0]>x",
+            "$d.Length>x",
+            "'a'.Length>x",
+            "{a}>x",
+            "a,'b'>x",
+            "-x:'a'>x",
+            "'a'<x",
+            "$c.p<x",
+        ] {
+            assert!(powershell_argument_text_ends_at(word, at(word)), "{word:?}");
+        }
+        for word in [
+            "a>x",
+            "a>>x",
+            "a<x",
+            "a<#",
+            "a'b'>x",
+            "a\"b\">x",
+            "'a'b>x",
+            "$d>x",
+            "${d}>x",
+            "$global:d>x",
+            "a$d>x",
+            "$d'b'>x",
+            "-a>x",
+            "-x:a>x",
+            "1.5>x",
+            "a.>x",
+            "a->x",
+            "a:>x",
+            "a=>x",
+            "a.b>x",
+            "*a>x",
+        ] {
+            assert!(
+                !powershell_argument_text_ends_at(word, at(word)),
+                "{word:?}"
             );
         }
     }
