@@ -461,8 +461,6 @@ fn values_the_shell_does_not_use_there_are_not_read() {
             // A quoted heredoc body is not expanded by the outer shell, and X
             // is not exported: the inner bash runs `gitreset--hard`.
             "X=' '; bash <<'EOF'\ngit${X}reset${X}--hard\nEOF",
-            // Heredoc lines are data, not bindings: X is unset.
-            "cat > notes.txt <<'EOF'\nX=' '\nEOF\ngit${X}reset${X}--hard",
             // A write through a nameref changes the variable it names.
             r"X=' '; declare -n r=X; r=a; git${X}reset${X}--hard",
             r#"X=t; declare -n r=X; r=x; "gi${X}" reset --hard"#,
@@ -666,6 +664,135 @@ fn a_binding_in_a_branch_is_still_one_value_the_shell_may_hold() {
         &[
             r#"X=a; if test -n "$C"; then :; X=' '; fi; git${X}reset${X}--hard"#,
             r#"X=a; while test -n "$C"; do :; X=' '; done; git${X}reset${X}--hard"#,
+        ],
+    );
+}
+
+/// The binding proof follows how the shell runs each statement before the
+/// use (t_f1b91fbb; Bash 5.2 runs `git reset --hard` for each, reviewer
+/// measurements on t_a3a90c17 and t_2f35818a). A statement it always runs
+/// first replaces the value: the first operand of `&&`, every operand of an
+/// `&&` list the use follows, `!`, an `if` or `while` condition, and a body
+/// the condition `true` enters.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn bindings_the_shell_runs_before_the_use_are_read() {
+    assert_both(
+        "deny",
+        &[
+            r"cd /tmp && X=' '; git${X}reset${X}--hard",
+            r#"cd /tmp && Y=git && X=$Y && "$X" reset --hard"#,
+            r#"cd /tmp && X=gi && "${X}t" reset --hard"#,
+            r"true && X=' '; git${X}reset${X}--hard",
+            r"false || X=' '; git${X}reset${X}--hard",
+            r"! X=' '; git${X}reset${X}--hard",
+            r"if X=' '; then :; fi; git${X}reset${X}--hard",
+            r"while X=' '; false; do :; done; git${X}reset${X}--hard",
+            r"X=a; if true; then X=' '; git${X}reset${X}--hard; fi",
+            r"X=a; if true; then X=' '; fi; git${X}reset${X}--hard",
+            r"X=a; while true; do X=' '; git${X}reset${X}--hard; break; done",
+        ],
+    );
+}
+
+/// A binding the shell may skip is one more value the name may hold, not a
+/// replacement for the one before it: when the branch does not run, Bash
+/// runs `git reset --hard`. `false &&` and `true ||` never run their right
+/// operand.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn a_binding_that_may_run_adds_a_value() {
+    assert_both(
+        "deny",
+        &[
+            r#"X=' '; if test -n "$C"; then X=a; fi; git${X}reset${X}--hard"#,
+            r#"X=' '; if test -n "$C"; then X=a; else X=b; fi; git${X}reset${X}--hard"#,
+            r#"X=' '; test -n "$C" && X=a; git${X}reset${X}--hard"#,
+            r"X=' '; case $C in y) X=a;; esac; git${X}reset${X}--hard",
+            r#"X=" "; false && X=a; git${X}reset${X}--hard"#,
+            r"X=' '; true || X=a; git${X}reset${X}--hard",
+            r#"Y=echo; if test -n "$C"; then Y=git; fi; X=$Y; "$X" reset --hard"#,
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"X=a; if test -n "$C"; then X=b; fi; git${X}reset${X}--hard"#,
+            r#"X=echo; test -n "$C" && X=printf; "$X" reset --hard"#,
+            r"X=a; true && X=b; git${X}reset${X}--hard",
+        ],
+    );
+}
+
+/// Assignment words before a command name are that command's own, except
+/// before a special builtin, which may keep them. A redirection can fail
+/// and skip the assignment it carries. The words a command expands are
+/// read before its own assignments take effect.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn assignment_words_before_a_command_and_redirected_assignments() {
+    assert_both(
+        "deny",
+        &[
+            r"X=' '; X=a true; git${X}reset${X}--hard",
+            r"X=' '; X=a :; git${X}reset${X}--hard",
+            r"X=' ' >/dev/null; git${X}reset${X}--hard",
+            r"X=' ' 2>/dev/null; git${X}reset${X}--hard",
+            r#"X=1 "$X" reset --hard"#,
+        ],
+    );
+    assert_both("allow", &[r"X=a; X=' ' true; git${X}reset${X}--hard"]);
+}
+
+/// A function body runs where the function is called, in the caller's
+/// shell unless the body is in parentheses; a definition alone may still
+/// be called in ways the command does not show.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn function_bodies_run_where_the_function_is_called() {
+    assert_both(
+        "deny",
+        &[
+            r"X=a; f() { X=' '; }; f; git${X}reset${X}--hard",
+            r"f() { X=' '; git${X}reset${X}--hard; }; f",
+            r"f() { X=' '; }; f; git${X}reset${X}--hard",
+            r"f() ( X=a ); X=' '; f; git${X}reset${X}--hard",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r"X=a; f() ( X=' ' ); f; git${X}reset${X}--hard",
+            r"X=' '; f() { X=a; }; f; git${X}reset${X}--hard",
+        ],
+    );
+}
+
+/// Command output, a line `read` takes and the environment's value are text
+/// the command does not show: a command name made of them is read as the
+/// bare spelling already is (`X=$(command -v git); $X reset --hard`). A
+/// heredoc's lines are data, so `X` there is the environment's.
+#[test]
+fn values_the_command_does_not_show_are_unknown() {
+    assert_both(
+        "deny",
+        &[
+            r#"X=$(command -v git); "$X" reset --hard"#,
+            r#"GIT=$(which git) && "$GIT" reset --hard"#,
+            r#"GIT=`which git`; "$GIT" reset --hard"#,
+            r#"X=$(command -v git); "$X" clean -fdx"#,
+            r#"read -r Y; "$Y" reset --hard"#,
+            r#"export GIT; "$GIT" reset --hard"#,
+            "cat > notes.txt <<'EOF'\nX=' '\nEOF\ngit${X}reset${X}--hard",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"X=$(command -v kubectl); "$X" get pods"#,
+            r#"PY=$(which python3) && "$PY" script.py"#,
+            r#"read -r NAME; echo "$NAME""#,
+            r#"GIT=$(command -v git); "$GIT" status"#,
         ],
     );
 }

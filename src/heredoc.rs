@@ -8720,6 +8720,9 @@ pub(crate) enum ShellScope {
     /// Perhaps, or later: a branch, a loop, an `&&`/`||` operand or a
     /// function body.
     Conditional,
+    /// Never before the later point: an operand or body that a fixed status
+    /// skips (`false && ...`, `if false; then ...`).
+    Never,
     /// In a child shell that cannot change the later point's shell: a
     /// subshell, a command or process substitution, a pipeline stage or a
     /// background job. Bash runs every pipeline stage in a child unless
@@ -8727,31 +8730,188 @@ pub(crate) enum ShellScope {
     Child,
 }
 
-/// One construct around a statement: the bytes it covers and what it makes
-/// of the statement for a point outside them. A point inside them shares
-/// the construct with the statement, so the construct changes nothing.
+/// One construct around a statement: the bytes it covers and how the
+/// statement sits in it. A point inside the bytes shares the construct
+/// with the statement; [`shell_scope_at`] reads the edge there.
 #[derive(Clone, Debug)]
 pub(crate) struct ShellScopeStep {
     range: std::ops::Range<usize>,
-    scope: ShellScope,
+    edge: ShellScopeEdge,
 }
 
-/// The constructs around `node`, innermost first.
+/// How a statement sits in one construct around it.
+#[derive(Clone, Debug)]
+enum ShellScopeEdge {
+    /// A child shell. Seen from outside it, its statements cannot change
+    /// the point's shell; inside it, they run in order.
+    Child,
+    /// One statement of a list that runs in order; `last` gives the list
+    /// its status.
+    Sequence { last: bool },
+    /// The left operand of `&&` (`and`) or `||`.
+    ListLeft { and: bool },
+    /// The right operand of `&&` (`and`) or `||`; `left` is the status
+    /// the left operand always has, when its text fixes it.
+    ListRight { and: bool, left: Option<bool> },
+    /// The command of `!`.
+    Negated,
+    /// A condition statement of `if`, `elif`, `while` or `until`. The
+    /// bytes `on_true` run only once the condition succeeded, `on_false`
+    /// once it failed; `last` gives the condition its status.
+    Condition {
+        last: bool,
+        on_true: std::ops::Range<usize>,
+        on_false: std::ops::Range<usize>,
+    },
+    /// A statement of the body `body` that a condition guards: `runs` is
+    /// whether it always (`Some(true)`) or never (`Some(false)`) runs when
+    /// the construct runs, when the condition's text fixes it.
+    Guarded {
+        runs: Option<bool>,
+        body: std::ops::Range<usize>,
+        last: bool,
+    },
+    /// A function body: it runs when the function is called.
+    Function,
+    /// Any other construct: perhaps, or later.
+    Opaque,
+}
+
+/// The status `node` always ends with, when its text fixes it: `true`,
+/// `:` and `false`, and `!`, `&&`, `||` and groups over them. A function
+/// or alias named `true` or `false` is not read.
+fn static_shell_status<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Option<bool> {
+    let last_statement = || {
+        node.children()
+            .filter(|child| child.is_named() && child.kind() != "comment")
+            .last()
+    };
+    match node.kind().as_ref() {
+        "command" => match node.field("name")?.text().as_ref() {
+            "true" | ":" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        "negated_command" => last_statement()
+            .and_then(|inner| static_shell_status(&inner))
+            .map(|status| !status),
+        "compound_statement" | "subshell" => {
+            last_statement().and_then(|inner| static_shell_status(&inner))
+        }
+        "list" => {
+            let mut operands = node
+                .children()
+                .filter(|child| child.is_named() && child.kind() != "comment");
+            let left = static_shell_status(&operands.next()?);
+            let right = static_shell_status(&operands.next()?);
+            let and = node.children().any(|child| child.kind() == "&&");
+            match (and, left) {
+                (true, Some(false)) => Some(false),
+                (false, Some(true)) => Some(true),
+                (_, Some(_)) => right,
+                (true, None) => (right == Some(false)).then_some(false),
+                (false, None) => (right == Some(true)).then_some(true),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The parts of an `if`, `elif` or `while`/`until` statement: the status
+/// its condition always has, and the byte ranges that run once the
+/// condition succeeded and once it failed. The condition is every
+/// statement before `then` (`if`, `elif`) or before the body (loops).
+struct ShellConditionParts {
+    status: Option<bool>,
+    condition_end: usize,
+    on_true: std::ops::Range<usize>,
+    on_false: std::ops::Range<usize>,
+}
+
+fn shell_condition_parts<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    fixed: bool,
+) -> Option<ShellConditionParts> {
+    let static_shell_status =
+        |node: &ast_grep_core::Node<'_, D>| fixed.then(|| static_shell_status(node)).flatten();
+    let children: Vec<_> = node.children().collect();
+    let end = node.range().end;
+    let statement =
+        |child: &ast_grep_core::Node<'_, D>| child.is_named() && child.kind() != "comment";
+    match node.kind().as_ref() {
+        "if_statement" | "elif_clause" => {
+            let then = children.iter().position(|child| child.kind() == "then")?;
+            let status = children[..then]
+                .iter()
+                .filter(|child| statement(child))
+                .last()
+                .and_then(&static_shell_status);
+            let alternative = children[then..]
+                .iter()
+                .find(|child| matches!(child.kind().as_ref(), "elif_clause" | "else_clause" | "fi"))
+                .map_or(end, |child| child.range().start);
+            let then_end = children[then].range().end;
+            Some(ShellConditionParts {
+                status,
+                condition_end: children[then].range().start,
+                on_true: then_end..alternative,
+                on_false: alternative..end,
+            })
+        }
+        "while_statement" => {
+            let body = node.field("body")?;
+            let status = children
+                .iter()
+                .filter(|child| statement(child) && child.range().end <= body.range().start)
+                .last()
+                .and_then(static_shell_status);
+            let until = children
+                .first()
+                .is_some_and(|keyword| keyword.kind() == "until");
+            let (on_true, on_false) = if until {
+                (end..end, body.range())
+            } else {
+                (body.range(), end..end)
+            };
+            Some(ShellConditionParts {
+                status,
+                condition_end: body.range().start,
+                on_true,
+                on_false,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The constructs around `node`, innermost first. With `fixed`, a status
+/// that `true`, `:` or `false` fixes is read ([`static_shell_status`]).
 fn shell_scope_steps<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
+    fixed: bool,
 ) -> Vec<ShellScopeStep> {
+    let status =
+        |node: &ast_grep_core::Node<'_, D>| fixed.then(|| static_shell_status(node)).flatten();
     let mut steps = Vec::new();
     let mut current = node.clone();
+    let statement =
+        |child: &ast_grep_core::Node<'_, D>| child.is_named() && child.kind() != "comment";
     while let Some(parent) = current.parent() {
         if current.next().is_some_and(|next| next.kind() == "&") {
             steps.push(ShellScopeStep {
                 range: current.range(),
-                scope: ShellScope::Child,
+                edge: ShellScopeEdge::Child,
             });
         }
+        let last = || {
+            parent
+                .children()
+                .filter(|child| statement(child))
+                .last()
+                .is_some_and(|last| last.range() == current.range())
+        };
         let step = match parent.kind().as_ref() {
             "program" => break,
-            "compound_statement" => None,
             "redirected_statement"
                 if parent
                     .field("body")
@@ -8759,22 +8919,96 @@ fn shell_scope_steps<D: ast_grep_core::Doc>(
             {
                 None
             }
+            "compound_statement" | "do_group" | "case_item" | "else_clause" => {
+                Some((parent.range(), ShellScopeEdge::Sequence { last: last() }))
+            }
             "subshell" | "command_substitution" | "process_substitution" => {
-                Some((parent.range(), ShellScope::Child))
+                Some((parent.range(), ShellScopeEdge::Child))
             }
-            "pipeline" => Some((current.range(), ShellScope::Child)),
-            "list"
-                if parent
-                    .named_children()
-                    .next()
-                    .is_some_and(|first| first.range() == current.range()) =>
-            {
-                None
+            "pipeline" => Some((current.range(), ShellScopeEdge::Child)),
+            "list" => {
+                let and = parent.children().any(|child| child.kind() == "&&");
+                let left = parent.children().find(|child| statement(child));
+                if left
+                    .as_ref()
+                    .is_some_and(|left| left.range() == current.range())
+                {
+                    Some((parent.range(), ShellScopeEdge::ListLeft { and }))
+                } else {
+                    let left = left.and_then(|left| status(&left));
+                    Some((parent.range(), ShellScopeEdge::ListRight { and, left }))
+                }
             }
-            _ => Some((parent.range(), ShellScope::Conditional)),
+            "negated_command" => Some((parent.range(), ShellScopeEdge::Negated)),
+            "function_definition" => Some((parent.range(), ShellScopeEdge::Function)),
+            "if_statement" | "elif_clause" | "while_statement" => {
+                Some((
+                    parent.range(),
+                    match shell_condition_parts(&parent, fixed) {
+                        None => ShellScopeEdge::Opaque,
+                        Some(parts) if current.range().end <= parts.condition_end => {
+                            let later = parent.children().any(|child| {
+                                statement(&child)
+                                    && child.range().start >= current.range().end
+                                    && child.range().end <= parts.condition_end
+                            });
+                            ShellScopeEdge::Condition {
+                                last: !later,
+                                on_true: parts.on_true,
+                                on_false: parts.on_false,
+                            }
+                        }
+                        Some(parts) if parts.on_true.contains(&current.range().start) => {
+                            let later = parent.children().any(|child| {
+                                statement(&child)
+                                    && child.range().start >= current.range().end
+                                    && child.range().end <= parts.on_true.end
+                            });
+                            ShellScopeEdge::Guarded {
+                                runs: parts.status,
+                                body: parts.on_true,
+                                last: !later,
+                            }
+                        }
+                        // A loop body that runs while the condition fails, and
+                        // an `elif` or `else` after a condition.
+                        Some(parts) => {
+                            let runs = match current.kind().as_ref() {
+                                "elif_clause" | "else_clause" => {
+                                    // The first alternative runs exactly when
+                                    // the condition fails.
+                                    let first = parts.on_false.start == current.range().start;
+                                    match parts.status {
+                                        Some(true) => Some(false),
+                                        Some(false) if first => Some(true),
+                                        _ => None,
+                                    }
+                                }
+                                _ => parts.status.map(|status| !status),
+                            };
+                            ShellScopeEdge::Guarded {
+                                runs,
+                                body: current.range(),
+                                last: true,
+                            }
+                        }
+                    },
+                ))
+            }
+            "for_statement" | "c_style_for_statement" | "select_statement" | "case_statement" => {
+                Some((
+                    parent.range(),
+                    ShellScopeEdge::Guarded {
+                        runs: None,
+                        body: current.range(),
+                        last: true,
+                    },
+                ))
+            }
+            _ => Some((parent.range(), ShellScopeEdge::Opaque)),
         };
-        if let Some((range, scope)) = step {
-            steps.push(ShellScopeStep { range, scope });
+        if let Some((range, edge)) = step {
+            steps.push(ShellScopeStep { range, edge });
         }
         current = parent;
     }
@@ -8782,27 +9016,151 @@ fn shell_scope_steps<D: ast_grep_core::Doc>(
 }
 
 /// [`ShellScope`] of a statement with constructs `steps`, seen from byte
-/// `point`.
+/// `point`, which comes after it.
+///
+/// Walking out from the statement, it tracks whether the statement has
+/// run whenever the construct reached so far ran, succeeded or failed.
+/// `a && b` succeeded only when both ran, so `b` follows a statement of `a`
+/// that ran whenever `a` succeeded; `a || b` reaches `b` only when `a`
+/// failed; an `if` condition always runs, its body only perhaps. The first
+/// construct that also holds `point` decides: there the point follows the
+/// statement in order, after a condition or in another branch.
 pub(crate) fn shell_scope_at(steps: &[ShellScopeStep], point: usize) -> ShellScope {
-    let mut scope = ShellScope::Always;
-    for step in steps.iter().filter(|step| !step.range.contains(&point)) {
-        match step.scope {
-            ShellScope::Child => return ShellScope::Child,
-            ShellScope::Conditional => scope = ShellScope::Conditional,
-            ShellScope::Always => {}
+    let (mut ran, mut ran_if_true, mut ran_if_false) = (true, true, true);
+    let mut never = false;
+    let finish = |never: bool, ran: bool| {
+        if never {
+            ShellScope::Never
+        } else if ran {
+            ShellScope::Always
+        } else {
+            ShellScope::Conditional
+        }
+    };
+    for step in steps {
+        if step.range.contains(&point) {
+            let shared = match &step.edge {
+                ShellScopeEdge::ListLeft { and: true } => ran_if_true,
+                ShellScopeEdge::ListLeft { and: false } => ran_if_false,
+                ShellScopeEdge::Condition {
+                    last,
+                    on_true,
+                    on_false,
+                } => match (on_true.contains(&point), on_false.contains(&point)) {
+                    (true, _) if *last => ran_if_true,
+                    (_, true) if *last => ran_if_false,
+                    _ => ran,
+                },
+                // Another branch may have run in an earlier iteration.
+                ShellScopeEdge::Guarded { body, .. } => ran && body.contains(&point),
+                ShellScopeEdge::Function | ShellScopeEdge::Opaque => false,
+                _ => ran,
+            };
+            return finish(never, shared);
+        }
+        match step.edge {
+            ShellScopeEdge::Child => return ShellScope::Child,
+            ShellScopeEdge::Sequence { last } => {
+                if !last {
+                    ran_if_true = ran;
+                    ran_if_false = ran;
+                }
+            }
+            ShellScopeEdge::ListLeft { and: true } => ran_if_false = ran_if_false && ran_if_true,
+            ShellScopeEdge::ListLeft { and: false } => ran_if_true = ran_if_true && ran_if_false,
+            ShellScopeEdge::ListRight { and, left } => {
+                never |= left == Some(!and);
+                ran = false;
+                if and {
+                    ran_if_false = false;
+                } else {
+                    ran_if_true = false;
+                }
+            }
+            ShellScopeEdge::Negated => std::mem::swap(&mut ran_if_true, &mut ran_if_false),
+            ShellScopeEdge::Condition { .. } => {
+                ran_if_true = ran;
+                ran_if_false = ran;
+            }
+            ShellScopeEdge::Guarded { runs, last, .. } => match runs {
+                Some(false) => never = true,
+                Some(true) => {
+                    if !last {
+                        ran_if_true = ran;
+                        ran_if_false = ran;
+                    }
+                }
+                None => (ran, ran_if_true, ran_if_false) = (false, false, false),
+            },
+            ShellScopeEdge::Function | ShellScopeEdge::Opaque => {
+                (ran, ran_if_true, ran_if_false) = (false, false, false);
+            }
         }
     }
-    scope
+    finish(never, ran)
 }
 
 /// The statements of a POSIX command, for the deny-only proofs.
 pub(crate) struct ShellScopeIndex {
-    /// Each statement's bytes and constructs, by start.
-    pub(crate) statements: Vec<(std::ops::Range<usize>, Vec<ShellScopeStep>)>,
+    /// Each statement's bytes, constructs and assignment words, by start.
+    pub(crate) statements: Vec<(
+        std::ops::Range<usize>,
+        Vec<ShellScopeStep>,
+        Option<ShellAssignments>,
+    )>,
     /// Subshells and command and process substitutions.
     pub(crate) child_shells: Vec<std::ops::Range<usize>>,
     /// The statements of the whole command.
     pub(crate) top_level: Vec<std::ops::Range<usize>>,
+    /// The functions the command defines: each static name, with the
+    /// bytes of the definition and of its body, by start.
+    pub(crate) functions: Vec<(String, std::ops::Range<usize>, std::ops::Range<usize>)>,
+}
+
+/// The assignment words a simple statement starts with.
+#[derive(Clone, Debug)]
+pub(crate) struct ShellAssignments {
+    /// The bytes from the first assignment word to the end of the last.
+    pub(crate) words: std::ops::Range<usize>,
+    /// The command name after them, when there is one: its start and text.
+    pub(crate) command: Option<(usize, String)>,
+    /// Whether the statement carries a redirection.
+    pub(crate) redirected: bool,
+}
+
+/// [`ShellAssignments`] of `node`, when it is a simple statement that
+/// starts with assignment words.
+fn shell_assignments<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Option<ShellAssignments> {
+    let (node, mut redirected) = if node.kind() == "redirected_statement" {
+        (node.field("body")?, true)
+    } else {
+        (node.clone(), false)
+    };
+    let words: Vec<std::ops::Range<usize>> = match node.kind().as_ref() {
+        "variable_assignment" => vec![node.range()],
+        "variable_assignments" | "command" => node
+            .children()
+            .filter(|child| child.kind() == "variable_assignment")
+            .map(|child| child.range())
+            .collect(),
+        _ => return None,
+    };
+    redirected |= node
+        .children()
+        .any(|child| child.kind().ends_with("_redirect"));
+    let command = if node.kind() == "command" {
+        let name = node.field("name")?;
+        Some((name.range().start, name.text().into_owned()))
+    } else {
+        None
+    };
+    Some(ShellAssignments {
+        words: words.first()?.start..words.last()?.end,
+        command,
+        redirected,
+    })
 }
 
 /// [`ShellScopeIndex`] of `command`, or `None` when the parser could not
@@ -8819,6 +9177,7 @@ pub(crate) fn shell_scope_index(command: &str) -> Option<ShellScopeIndex> {
         "if_statement",
         "elif_clause",
         "else_clause",
+        "while_statement",
         "do_group",
         "case_item",
         "negated_command",
@@ -8826,10 +9185,24 @@ pub(crate) fn shell_scope_index(command: &str) -> Option<ShellScopeIndex> {
     ];
     let ast = try_parse_shell_ast(command).ok()?;
     let root = ast.root();
+    // `true`, `:` and `false` fix a status unless the command (or an
+    // exported function) can make them run something else.
+    let fixed = !command.contains("alias")
+        && !command.contains("enable")
+        && ["true", "false"]
+            .iter()
+            .all(|name| std::env::var_os(format!("BASH_FUNC_{name}%%")).is_none())
+        && !root.dfs().any(|node| {
+            node.kind() == "function_definition"
+                && node
+                    .field("name")
+                    .is_some_and(|name| matches!(name.text().as_ref(), "true" | "false" | ":"))
+        });
     let mut index = ShellScopeIndex {
         statements: Vec::new(),
         child_shells: Vec::new(),
         top_level: root.named_children().map(|node| node.range()).collect(),
+        functions: Vec::new(),
     };
     for node in root.dfs() {
         if node.is_error() || node.is_missing() {
@@ -8842,17 +9215,42 @@ pub(crate) fn shell_scope_index(command: &str) -> Option<ShellScopeIndex> {
         ) {
             index.child_shells.push(node.range());
         }
-        if node.is_named()
+        if kind == "function_definition"
+            && let (Some(name), Some(body)) = (node.field("name"), node.field("body"))
+        {
+            index
+                .functions
+                .push((name.text().into_owned(), node.range(), body.range()));
+        }
+        // Redirections, comments and case patterns sit in the same
+        // constructs but are not statements.
+        let statement = !matches!(
+            kind.as_ref(),
+            "comment"
+                | "word"
+                | "concatenation"
+                | "string"
+                | "raw_string"
+                | "number"
+                | "simple_expansion"
+                | "expansion"
+                | "extglob_pattern"
+                | "heredoc_body"
+        ) && !kind.ends_with("_redirect");
+        if statement
+            && node.is_named()
             && node
                 .parent()
                 .is_some_and(|parent| CONTAINERS.contains(&parent.kind().as_ref()))
         {
-            index
-                .statements
-                .push((node.range(), shell_scope_steps(&node)));
+            index.statements.push((
+                node.range(),
+                shell_scope_steps(&node, fixed),
+                shell_assignments(&node),
+            ));
         }
     }
-    index.statements.sort_by_key(|(range, _)| range.start);
+    index.statements.sort_by_key(|(range, _, _)| range.start);
     Some(index)
 }
 
@@ -8999,7 +9397,7 @@ pub(crate) fn shell_name_proven_shadowed_before(
         };
         let scope = shell_scope_at(&event.steps, offset);
         let apply = |state: &mut bool, change: ShadowChange| match (change, scope) {
-            (_, ShellScope::Child) | (Keep, _) => {}
+            (_, ShellScope::Child | ShellScope::Never) | (Keep, _) => {}
             (Shadow, ShellScope::Always) => *state = true,
             (Shadow | Clear, _) => *state = false,
         };
@@ -9103,7 +9501,8 @@ fn read_shell_shadow_events(command: &str) -> Option<Vec<ShadowEvent>> {
         };
         events.push(ShadowEvent {
             range: node.range(),
-            steps: shell_scope_steps(&node),
+            // A shadow proof skips the view, so it reads no fixed status.
+            steps: shell_scope_steps(&node, false),
             kind,
         });
     }

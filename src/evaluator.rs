@@ -18509,8 +18509,8 @@ fn posix_proven_variable_view(
         Vec::new()
     };
     let mut out = String::with_capacity(command.len());
-    // (start, end, reconstruction, its command name)
-    let mut spliced: Vec<(usize, usize, String, String)> = Vec::new();
+    // (start, end, readings)
+    let mut spliced: Vec<(usize, usize, SegmentReadings)> = Vec::new();
     let mut copied = 0usize;
     // The binding proof reads the same index; it holds each range's nesting.
     let index = deny_only_segment_index(command, &ranges);
@@ -18542,9 +18542,12 @@ fn posix_proven_variable_view(
             continue;
         }
         // Splitting needs the IFS in force, proven like any other binding;
-        // an IFS that cannot be proven leaves the segment as written.
-        let ifs = if bindings_possible {
-            let Some(ifs) = deny_only_value_at_for_splitting(
+        // an IFS that cannot be proven leaves the segment as written. A name
+        // that may hold several values (one bound in a branch) is read with
+        // each of them ([`ViewChoices`]), and so is IFS: the shell runs one
+        // of these renderings, so each is judged.
+        let ifs_values: Vec<String> = if bindings_possible {
+            deny_only_alternatives_at(
                 command,
                 &ranges,
                 start,
@@ -18552,91 +18555,133 @@ fn posix_proven_variable_view(
                 "IFS",
                 MAX_DENY_ONLY_COPY_DEPTH,
                 true,
-            ) else {
-                continue;
-            };
-            ifs
-        } else {
-            DEFAULT_POSIX_IFS.to_string()
-        };
-        let resolve = |text: &str| {
-            resolve_proven_variables_in_segment_with_ifs(
-                command,
-                &ranges,
-                start,
-                text,
-                ResolutionDirection::DenyOnly,
-                Some(ProvenSplice {
-                    ifs: &ifs,
-                    earlier_words: "",
-                }),
             )
-        };
-        let resolved = if quoted_bodies
-            .iter()
-            .any(|body| body.start < end && start < body.end)
-        {
-            // Resolve the text around each quoted body; keep the body.
-            let mut text = String::with_capacity(end - start);
-            let mut changed = false;
-            let mut cursor = start;
-            let mut bodies: Vec<&Range<usize>> = quoted_bodies
-                .iter()
-                .filter(|body| body.start < end && start < body.end)
-                .collect();
-            bodies.sort_by_key(|body| body.start);
-            let bounds = bodies
-                .iter()
-                .map(|body| (body.start, body.end.min(end)))
-                .chain(std::iter::once((end, end)));
-            for (body_start, body_end) in bounds {
-                let body_start = body_start.max(cursor);
-                let piece = command.get(cursor..body_start).unwrap_or_default();
-                match resolve(piece) {
-                    Some(piece) => {
-                        text.push_str(&piece);
-                        changed = true;
-                    }
-                    None => text.push_str(piece),
-                }
-                text.push_str(command.get(body_start..body_end).unwrap_or_default());
-                cursor = body_end.max(body_start);
-            }
-            changed.then_some(text)
+            .into_iter()
+            .rev()
+            .filter_map(|value| match value {
+                DenyOnlyValue::Known(ifs) => Some(ifs),
+                _ => None,
+            })
+            .collect()
         } else {
-            match posix_eval_words(segment) {
-                Some((prefix, arguments)) => resolve_proven_eval_arguments(
-                    command, &ranges, start, segment, prefix, &arguments, &ifs,
-                ),
-                None => {
-                    let resolved = if bindings_possible {
-                        resolve(segment)
-                    } else {
-                        None
-                    };
-                    // A name the command never binds is unknown.
-                    unknown_names
-                        .then(|| {
-                            posix_unknown_command_word_view(
-                                resolved.as_deref().unwrap_or(segment),
-                                &ifs,
-                                |before, name| {
-                                    !name.is_empty()
-                                        && (posix_text_may_bind_name(&command[..start], name)
-                                            || posix_text_may_bind_name(before, name))
-                                },
-                            )
-                        })
-                        .flatten()
-                        .or(resolved)
+            vec![DEFAULT_POSIX_IFS.to_string()]
+        };
+        let render = |ifs: &str| -> Option<String> {
+            let resolve = |text: &str| {
+                resolve_proven_variables_in_segment_with_ifs(
+                    command,
+                    &ranges,
+                    start,
+                    text,
+                    ResolutionDirection::DenyOnly,
+                    Some(ProvenSplice {
+                        ifs,
+                        earlier_words: "",
+                    }),
+                )
+            };
+            if quoted_bodies
+                .iter()
+                .any(|body| body.start < end && start < body.end)
+            {
+                // Resolve the text around each quoted body; keep the body.
+                let mut text = String::with_capacity(end - start);
+                let mut changed = false;
+                let mut cursor = start;
+                let mut bodies: Vec<&Range<usize>> = quoted_bodies
+                    .iter()
+                    .filter(|body| body.start < end && start < body.end)
+                    .collect();
+                bodies.sort_by_key(|body| body.start);
+                let bounds = bodies
+                    .iter()
+                    .map(|body| (body.start, body.end.min(end)))
+                    .chain(std::iter::once((end, end)));
+                for (body_start, body_end) in bounds {
+                    let body_start = body_start.max(cursor);
+                    let piece = command.get(cursor..body_start).unwrap_or_default();
+                    match resolve(piece) {
+                        Some(piece) => {
+                            text.push_str(&piece);
+                            changed = true;
+                        }
+                        None => text.push_str(piece),
+                    }
+                    text.push_str(command.get(body_start..body_end).unwrap_or_default());
+                    cursor = body_end.max(body_start);
+                }
+                changed.then_some(text)
+            } else {
+                match posix_eval_words(segment) {
+                    Some((prefix, arguments)) => resolve_proven_eval_arguments(
+                        command, &ranges, start, segment, prefix, &arguments, ifs,
+                    ),
+                    None => {
+                        let resolved = if bindings_possible {
+                            resolve(segment)
+                        } else {
+                            None
+                        };
+                        // A name the command never binds is unknown.
+                        unknown_names
+                            .then(|| {
+                                posix_unknown_command_word_view(
+                                    resolved.as_deref().unwrap_or(segment),
+                                    ifs,
+                                    |name| {
+                                        !name.is_empty()
+                                            && !matches!(
+                                                deny_only_view_value(
+                                                    deny_only_alternatives_at(
+                                                        command,
+                                                        &ranges,
+                                                        start,
+                                                        "",
+                                                        name,
+                                                        MAX_DENY_ONLY_COPY_DEPTH,
+                                                        false,
+                                                    ),
+                                                    name,
+                                                ),
+                                                DenyOnlyValue::Unknown
+                                            )
+                                    },
+                                )
+                            })
+                            .flatten()
+                            .or(resolved)
+                    }
                 }
             }
         };
-        let Some(resolved) = resolved else {
+        let mut renderings: SegmentReadings = Vec::new();
+        'renderings: for ifs in &ifs_values {
+            let mut pending = vec![HashMap::new()];
+            let mut first = true;
+            while let Some(chosen) = pending.pop() {
+                if renderings.len() >= MAX_VIEW_RENDERINGS {
+                    break 'renderings;
+                }
+                if deadline_exceeded(deadline) {
+                    return Err(ProvenViewIncomplete::Budget);
+                }
+                let (rendered, met) = with_view_choices(chosen, || render(ifs));
+                if first {
+                    first = false;
+                    pending = view_choice_combinations(&met);
+                }
+                if let Some(rendered) = rendered
+                    && !renderings.iter().any(|(seen, _)| *seen == rendered)
+                {
+                    let program = hazard_first_word(&rendered).into_owned();
+                    renderings.push((rendered, program));
+                }
+            }
+        }
+        if renderings.is_empty() {
             continue;
-        };
-        let program = hazard_first_word(&resolved).into_owned();
-        spliced.push((start, end, resolved, program));
+        }
+        spliced.push((start, end, renderings));
         copied = end;
     }
     // A proof cut short leaves references as written that may matter.
@@ -18652,14 +18697,21 @@ fn posix_proven_variable_view(
     // judged: this view only adds denials. The state can go back
     // (`unset -f`, `hash -r`), so each use is asked on its own.
     let mut copied = 0usize;
-    for (start, end, resolved, program) in &spliced {
-        if !program.is_empty()
-            && crate::heredoc::shell_name_proven_shadowed_before(command, *start, program)
-        {
+    for (start, end, renderings) in &spliced {
+        let kept: Vec<&str> = renderings
+            .iter()
+            .filter(|(_, program)| {
+                program.is_empty()
+                    || !crate::heredoc::shell_name_proven_shadowed_before(command, *start, program)
+            })
+            .map(|(rendering, _)| rendering.as_str())
+            .collect();
+        if kept.is_empty() {
             continue;
         }
+        // Each reading is its own command line.
         out.push_str(&command[copied..*start]);
-        out.push_str(resolved);
+        out.push_str(&kept.join("\n"));
         copied = *end;
     }
     if copied == 0 {
@@ -18667,6 +18719,95 @@ fn posix_proven_variable_view(
     }
     out.push_str(&command[copied..]);
     Ok((out != command).then_some(out))
+}
+
+/// The readings of one segment in [`posix_proven_variable_view`]: each
+/// reconstruction with its command name.
+type SegmentReadings = Vec<(String, String)>;
+
+/// Most renderings [`posix_proven_variable_view`] reads for one segment.
+const MAX_VIEW_RENDERINGS: usize = 16;
+
+/// For the rendering of a segment in progress: the value each name that may
+/// hold several takes (an index into its alternatives; the binding in force
+/// last when not chosen), and the names with several values it read.
+#[derive(Default)]
+struct ViewChoices {
+    chosen: HashMap<String, usize>,
+    met: Vec<(String, usize)>,
+}
+
+thread_local! {
+    static VIEW_CHOICES: std::cell::RefCell<Option<ViewChoices>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `render` with the values `chosen`, and returns what it rendered
+/// and the names with several values it read, with their counts.
+fn with_view_choices<T>(
+    chosen: HashMap<String, usize>,
+    render: impl FnOnce() -> T,
+) -> (T, Vec<(String, usize)>) {
+    let previous = VIEW_CHOICES.with(|choices| {
+        choices.replace(Some(ViewChoices {
+            chosen,
+            met: Vec::new(),
+        }))
+    });
+    let rendered = render();
+    let met = VIEW_CHOICES.with(|choices| choices.replace(previous));
+    (rendered, met.map(|choices| choices.met).unwrap_or_default())
+}
+
+/// Every choice of values for the names `met` other than the default one,
+/// at most [`MAX_VIEW_RENDERINGS`].
+fn view_choice_combinations(met: &[(String, usize)]) -> Vec<HashMap<String, usize>> {
+    let mut combinations = vec![HashMap::new()];
+    for (name, count) in met {
+        let mut next = Vec::new();
+        for combination in &combinations {
+            for index in 0..*count {
+                if next.len() > MAX_VIEW_RENDERINGS {
+                    break;
+                }
+                let mut extended: HashMap<String, usize> = combination.clone();
+                extended.insert(name.clone(), index);
+                next.push(extended);
+            }
+        }
+        combinations = next;
+    }
+    combinations.retain(|combination| {
+        met.iter()
+            .any(|(name, count)| combination.get(name) != Some(&(count - 1)))
+    });
+    combinations.truncate(MAX_VIEW_RENDERINGS);
+    combinations
+}
+
+/// The value of `name`, one of `alternatives`, that the rendering in
+/// progress reads ([`ViewChoices`]); outside a rendering, the binding in
+/// force last.
+fn deny_only_view_value(mut alternatives: Vec<DenyOnlyValue>, name: &str) -> DenyOnlyValue {
+    let last = alternatives.len().saturating_sub(1);
+    let index = if alternatives.len() > 1 {
+        VIEW_CHOICES.with(|choices| {
+            let mut choices = choices.borrow_mut();
+            let choices = choices.as_mut()?;
+            if !choices.met.iter().any(|(met, _)| met == name) {
+                choices.met.push((name.to_string(), alternatives.len()));
+            }
+            choices.chosen.get(name).copied()
+        })
+    } else {
+        None
+    };
+    let index = index.filter(|&index| index <= last).unwrap_or(last);
+    if index < alternatives.len() {
+        alternatives.swap_remove(index)
+    } else {
+        DenyOnlyValue::Opaque
+    }
 }
 
 /// Upper bound on the words [`posix_unknown_command_word_view`] reads before
@@ -18697,16 +18838,17 @@ const MAX_UNKNOWN_COMMAND_WORD_PREFIX: usize = 32;
 /// Literal text must be plain (letters, digits, `/._-+`) so the rendering
 /// cannot change its meaning; anything else (other quoting, escapes,
 /// command substitution, operators inside `${...}`) leaves the word as
-/// written. `bound(before, name)` says whether the command may bind `name`
-/// before the use (`before` is the text of `segment` ahead of the command
-/// name; see [`posix_text_may_bind_name`]); such a name belongs to the
-/// binding proof, which has already spliced in the values it could prove,
-/// and what it left as written keeps its spelling. Only a name nothing
-/// before the use binds is unknown here.
+/// written. `bound(name)` says whether the binding proof reads `name` as
+/// other than unknown text; such a name belongs to the proof, which has
+/// already spliced in the values it could prove, and what it left as written
+/// keeps its spelling. Only a name the proof finds unknown (the
+/// environment's value, command output, `read`) is unknown here. The
+/// expansions of a command run before its own assignment words take effect,
+/// so `X=1 "$X"` reads the value from before.
 fn posix_unknown_command_word_view(
     segment: &str,
     ifs: &str,
-    bound: impl Fn(&str, &str) -> bool,
+    bound: impl Fn(&str) -> bool,
 ) -> Option<String> {
     if !segment.contains('$') {
         return None;
@@ -18768,7 +18910,7 @@ fn posix_unknown_command_word_view(
                 if double && reference.contains([' ', '\t']) {
                     return None;
                 }
-                if bound(&segment[..range.start], name) {
+                if bound(name) {
                     // The command may bind it: the binding proof judges
                     // it, and what that proof left as written stays so.
                     if double {
@@ -30946,6 +31088,42 @@ fn resolve_variable_bindings(
     name: &str,
     mode: VariableResolution,
 ) -> Option<Vec<String>> {
+    match scan_variable_bindings(source, segment_ranges, segment_start, name, mode)? {
+        BindingValues::Literal(values) => Some(values),
+        BindingValues::DenyOnly(_) => None,
+    }
+}
+
+/// What [`scan_variable_bindings`] proves: the literal values of the
+/// permission-lifting proofs, or every value a deny-only read may find.
+enum BindingValues {
+    Literal(Vec<String>),
+    DenyOnly(Vec<DenyOnlyValue>),
+}
+
+/// One value a deny-only read may find.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DenyOnlyValue {
+    Known(String),
+    /// Text the command does not show: the environment's value, command
+    /// output (`X=$(command -v git)`) or a line `read` takes. It may be
+    /// anything.
+    Unknown,
+    /// A value the proof cannot read; the reference keeps its spelling.
+    Opaque,
+}
+
+/// Most bindings a deny-only read keeps for one name; past it the oldest
+/// is dropped.
+const MAX_DENY_ONLY_ALTERNATIVES: usize = 8;
+
+fn scan_variable_bindings(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+    mode: VariableResolution,
+) -> Option<BindingValues> {
     // These names are maintained by the shell, so ordinary commands can
     // change them without an assignment word (cd updates PWD, for example).
     // Every proof needs ordinary scalar bindings, including the literal proof
@@ -30972,11 +31150,11 @@ fn resolve_variable_bindings(
                 .collect(),
         )
     };
-    // Deny-only follows the shell: only the binding in force decides the
-    // value (`X=$(date); X=' '` holds `' '`), and it is evaluated once, after
-    // the scan, so copies of copies cost one lookup each.
-    let mut deny_only_base: Option<DenyOnlyBinding<'_>> = None;
-    let mut deny_only_appends: Vec<&str> = Vec::new();
+    // Deny-only follows the shell: the bindings in force decide the value
+    // (`X=$(date); X=' '` holds `' '`), every one the shell may hold at the
+    // use ([`DenyOnlyAlternative`]). They are evaluated once, after the
+    // scan, so copies of copies cost one lookup each.
+    let mut alternatives: Vec<DenyOnlyAlternative<'_>> = vec![DenyOnlyAlternative::default()];
     let aliases = if deny_only {
         deny_only_nameref_aliases(source, segment_ranges, segment_start, name)
     } else {
@@ -31034,26 +31212,53 @@ fn resolve_variable_bindings(
         .then_some(checkpoint)
     });
     if let Some(resumed) = resumed.as_ref() {
-        deny_only_base = resumed.base.as_ref().map(|base| base.binding(source));
-        deny_only_appends = resumed
-            .appends
-            .iter()
-            .map(|range| source.get(range.clone()).unwrap_or_default())
-            .collect();
+        alternatives = resumed.alternatives(source);
         values.clone_from(&resumed.values);
     }
     let mut timed_out = false;
     let mut last_position = resumed.as_ref().and_then(|resumed| resumed.last_position);
     let resumed_bound = resumed.as_ref().map(|resumed| resumed.bound);
     let scanned = 'scan: {
-        for (position, &(start, end)) in segment_ranges.iter().enumerate() {
-            if end > segment_start || resumed_bound.is_some_and(|bound| end <= bound) {
+        // Deny-only reads a call of a function the command defined as its
+        // body, read again at the call from the body's end: in
+        // `X=' '; f() { X=a; }; f` the shell holds `a`. `(position,
+        // conditional)` of the body's segments, last first.
+        let mut called: Vec<(usize, bool)> = Vec::new();
+        let mut called_point = segment_start;
+        let mut ordered = segment_ranges.iter().enumerate();
+        loop {
+            let (position, call) = match called.pop() {
+                Some((position, conditional)) => (position, Some(conditional)),
+                None => match ordered.next() {
+                    Some((position, _)) => (position, None),
+                    None => break,
+                },
+            };
+            let Some(&(start, end)) = segment_ranges.get(position) else {
                 continue;
-            }
-            last_position = Some(position);
+            };
+            let point = if call.is_some() {
+                called_point
+            } else {
+                if end > segment_start || resumed_bound.is_some_and(|bound| end <= bound) {
+                    continue;
+                }
+                last_position = Some(position);
+                segment_start
+            };
+            // A segment that may call a function the command defined is read
+            // too: the body may bind the name.
             if visits
                 .as_ref()
                 .is_some_and(|visits| !visits.get(position).copied().unwrap_or(true))
+                && !scopes.is_some_and(|scopes| {
+                    let first = source.get(start..end).map(hazard_first_word);
+                    scopes.functions.iter().any(|(function, _, _)| {
+                        first
+                            .as_ref()
+                            .is_some_and(|first| first.as_ref() == function)
+                    })
+                })
             {
                 continue;
             }
@@ -31073,14 +31278,39 @@ fn resolve_variable_bindings(
             if segment.is_empty() {
                 continue;
             }
-            // Deny-only reads how the shell runs the segment from the parse:
-            // a child shell's statements cannot change the use's value, and
-            // only a statement the use's shell always runs binds it. Without
-            // a parse, the text rules below decide.
-            let scope = scopes.and_then(|scopes| {
-                deny_only_segment_scope(scopes, source, start, end, segment_start)
-            });
-            if matches!(scope, Some((crate::heredoc::ShellScope::Child, _))) {
+            // Deny-only reads how the shell runs the statement from the parse:
+            // a child shell's statements cannot change the use's value, one a
+            // fixed status skips never runs (`false && X=a`), one the use's
+            // shell always runs first replaces the bindings in force, and any
+            // other adds its binding to them: a branch, an `&&` operand or a
+            // function body may run. Without a parse, the text rules below
+            // decide.
+            let scope = scopes
+                .and_then(|scopes| deny_only_segment_scope(scopes, source, start, end, point));
+            if matches!(
+                scope,
+                Some((
+                    crate::heredoc::ShellScope::Child | crate::heredoc::ShellScope::Never,
+                    _,
+                    _
+                ))
+            ) {
+                continue;
+            }
+            if call.is_none()
+                && let (Some(scopes), Some((_, statement, _))) = (scopes, scope.as_ref())
+                && let Some(body) = deny_only_called_body(scopes, source, statement)
+                // A body in parentheses runs in a child shell.
+                && source.as_bytes().get(body.start) == Some(&b'{')
+            {
+                let conditional =
+                    matches!(scope, Some((crate::heredoc::ShellScope::Conditional, _, _)));
+                called_point = body.end.saturating_sub(1);
+                for (inner, &(inner_start, inner_end)) in segment_ranges.iter().enumerate().rev() {
+                    if inner_start < body.end && body.start < inner_end && inner_end <= body.end {
+                        called.push((inner, conditional));
+                    }
+                }
                 continue;
             }
             // A binding inside a command or process substitution runs in a
@@ -31101,17 +31331,7 @@ fn resolve_variable_bindings(
             // below, where `segment_text_may_assign` refuses the proof outright —
             // which is the right answer, because an unprovable binding is exactly
             // the case the exemption must not cover.
-            //
-            // Deny-only also binds a statement the parse shows the use's shell
-            // always runs first, such as the first one in a brace group
-            // (`{ X=' '`). The text rule stays for the rest: a binding it takes
-            // from a branch is one value the shell may hold, which is enough
-            // to deny.
-            let parsed_statement = match &scope {
-                Some((crate::heredoc::ShellScope::Always, statement)) => Some(statement.clone()),
-                _ => None,
-            };
-            let binds_in_parent = (parsed_statement.is_some()
+            let binds_in_parent = (scope.is_some()
                 || (!nested
                     && (segment_binding_reaches_parent_shell(source, start, end)
                         || (matches!(mode, VariableResolution::Redirect { .. })
@@ -31129,11 +31349,55 @@ fn resolve_variable_bindings(
                 && !heredoc_bodies
                     .iter()
                     .any(|(body, _)| body.start < end && start < body.end);
-            if binds_in_parent {
-                // The statement without the `{` that opens its group.
-                let segment = parsed_statement
-                    .and_then(|statement| source.get(statement))
-                    .map_or(segment, str::trim);
+            let mut conditional = call == Some(true)
+                || matches!(scope, Some((crate::heredoc::ShellScope::Conditional, _, _)));
+            // The parsed statement, without the words that open its construct
+            // (`{`, `then`, `!`, `f() {`).
+            let (start, end, segment, shape) = match scope {
+                Some((_, statement, shape)) => (
+                    statement.start,
+                    statement.end,
+                    source.get(statement).map(str::trim)?,
+                    shape,
+                ),
+                None => (start, end, segment, None),
+            };
+            // Assignment words before a command name are that command's alone
+            // (`X=a true`) unless the shell may keep them: before a special
+            // builtin or a function. A redirection that fails skips the
+            // assignments it carries (`X=' ' >/dev/null`).
+            let mut command_start = None;
+            let binding_text = match &shape {
+                Some(shape) => {
+                    conditional |= shape.redirected;
+                    let words = source.get(shape.words.clone()).unwrap_or_default();
+                    match &shape.command {
+                        None => words,
+                        Some((at, program)) => {
+                            command_start = Some(*at);
+                            if posix_assignments_may_persist(program, scopes) {
+                                conditional = true;
+                                words
+                            } else {
+                                ""
+                            }
+                        }
+                    }
+                }
+                // Without a parse, assignment words before a redirection.
+                None => match deny_only
+                    .then(|| posix_assignments_before_redirection(segment))
+                    .flatten()
+                {
+                    Some(words) => {
+                        conditional = true;
+                        words
+                    }
+                    None => segment,
+                },
+            };
+            if binds_in_parent && !binding_text.is_empty() {
+                let segment = binding_text;
                 let assignments = strip_assignment_declaration(segment);
                 let binding = match assignment_only_segment_binding(assignments, name) {
                     AssignmentOnlyBinding::NotAssignmentOnly => assignments
@@ -31142,9 +31406,7 @@ fn resolve_variable_bindings(
                     AssignmentOnlyBinding::Binds(raw) => Some(raw),
                     AssignmentOnlyBinding::DoesNotBind => None,
                     AssignmentOnlyBinding::Ambiguous if deny_only => {
-                        deny_only_base = Some(DenyOnlyBinding::Unknown);
-                        deny_only_appends.clear();
-                        values = None;
+                        deny_only_bind(&mut alternatives, conditional, DenyOnlyBinding::Unknown);
                         continue;
                     }
                     AssignmentOnlyBinding::Ambiguous => return None,
@@ -31157,33 +31419,37 @@ fn resolve_variable_bindings(
                 if deny_only {
                     // A later unconditional parent-shell binding replaces the
                     // earlier one: `X=a; X=" "; git${X}reset${X}--hard` runs
-                    // `git reset --hard`. Permission-lifting proofs keep refusing
-                    // the ambiguity; the deny-only view follows the shell.
+                    // `git reset --hard`. One that may not run adds a value.
+                    // Permission-lifting proofs keep refusing the ambiguity; the
+                    // deny-only view follows the shell. A special builtin after
+                    // the words still has its own effects, read below.
                     if let Some(raw) = binding {
                         // Words before this one in an assignment list run first.
                         let earlier = text_before(assignments, raw)
                             .strip_suffix('=')
                             .and_then(|text| text.strip_suffix(name))
                             .unwrap_or_default();
-                        deny_only_base = Some(DenyOnlyBinding::Assigned {
-                            start,
-                            earlier,
-                            raw,
-                        });
-                        deny_only_appends.clear();
-                        values = None;
-                        continue;
-                    }
-                    // `NAME+=word` appends to the value in force.
-                    if let Some(word) = posix_append_word(assignments, name) {
-                        deny_only_appends.push(word);
-                        continue;
-                    }
-                    if let Some(names) = posix_unset_names(segment) {
+                        deny_only_bind(
+                            &mut alternatives,
+                            conditional,
+                            DenyOnlyBinding::Assigned {
+                                start,
+                                earlier,
+                                raw,
+                            },
+                        );
+                        if command_start.is_none() {
+                            continue;
+                        }
+                    } else if let Some(word) = posix_append_word(assignments, name) {
+                        // `NAME+=word` appends to the value in force.
+                        deny_only_append(&mut alternatives, conditional, word);
+                        if command_start.is_none() {
+                            continue;
+                        }
+                    } else if let Some(names) = posix_unset_names(segment) {
                         if names.contains(&name) {
-                            deny_only_base = Some(DenyOnlyBinding::Unset);
-                            deny_only_appends.clear();
-                            values = None;
+                            deny_only_bind(&mut alternatives, conditional, DenyOnlyBinding::Unset);
                         } else if names.iter().any(|unset| aliases.contains(unset)) {
                             // Unsetting a nameref unsets what it names.
                             break 'scan false;
@@ -31220,7 +31486,10 @@ fn resolve_variable_bindings(
                     // live value ambiguous; a header that is not statically
                     // enumerable (globs, substitutions, `"$@"`) makes it
                     // unprovable.
-                    if values.is_some() || deny_only_base.is_some() || !deny_only_appends.is_empty()
+                    if values.is_some()
+                        || alternatives
+                            .iter()
+                            .any(|alternative| *alternative != DenyOnlyAlternative::default())
                     {
                         break 'scan false;
                     }
@@ -31229,9 +31498,21 @@ fn resolve_variable_bindings(
                         break 'scan false;
                     }
                     values = Some(candidates);
+                    if deny_only {
+                        alternatives = vec![DenyOnlyAlternative {
+                            base: Some(DenyOnlyBinding::Loop),
+                            appends: Vec::new(),
+                        }];
+                    }
                     continue;
                 }
             }
+            // Assignment words that are a command's own change nothing here;
+            // the command itself still may.
+            let (start, segment) = match command_start {
+                Some(at) => (at, source.get(at..end).map(str::trim)?),
+                None => (start, segment),
+            };
             if let Some((other, raw)) = posix_scalar_assignment(segment)
                 && other != name
                 && other != "IFS"
@@ -31263,7 +31544,7 @@ fn resolve_variable_bindings(
                     scopes.child_shells[from..]
                         .iter()
                         .take_while(|child| child.start < end)
-                        .filter(|child| child.end <= end && !child.contains(&segment_start))
+                        .filter(|child| child.end <= end && !child.contains(&point))
                         .map(|child| (child.clone(), true))
                         .collect()
                 })
@@ -31328,7 +31609,11 @@ fn resolve_variable_bindings(
                 // pass retains the earlier literal as a conservative candidate,
                 // so adding this guard cannot hide an existing sensitive target.
                 "trap" | "alias" => !deny_only,
-                other => builtin_may_mutate_unnamed_variables(other),
+                // `export NAME` without a value keeps the value.
+                other => {
+                    builtin_may_mutate_unnamed_variables(other)
+                        && !(deny_only && posix_declares_names_only(segment))
+                }
             };
             // A changed IFS alters how an unquoted use word-splits, which the
             // substitution proof cannot reproduce (v0.9.1 review). The deny-only
@@ -31339,9 +31624,13 @@ fn resolve_variable_bindings(
                 || (!deny_only && segment_text_may_assign(segment, "IFS"))
             {
                 if deny_only {
-                    deny_only_base = Some(DenyOnlyBinding::Unknown);
-                    deny_only_appends.clear();
-                    values = None;
+                    // `read` binds the text it reads: any value.
+                    let binding = if first == "read" && !command_word_was_quoted {
+                        DenyOnlyBinding::Arbitrary
+                    } else {
+                        DenyOnlyBinding::Unknown
+                    };
+                    deny_only_bind(&mut alternatives, conditional, binding);
                     continue;
                 }
                 break 'scan false;
@@ -31357,16 +31646,14 @@ fn resolve_variable_bindings(
                 source,
                 segment_start,
                 last_position,
-                deny_only_base,
-                &deny_only_appends,
+                &alternatives,
                 values.as_ref(),
             )
         } else {
             Some(DenyOnlyCheckpoint {
                 bound: segment_start,
                 last_position,
-                base: None,
-                appends: Vec::new(),
+                alternatives: Vec::new(),
                 values: None,
                 refused: true,
             })
@@ -31386,45 +31673,141 @@ fn resolve_variable_bindings(
         ifs_splitting,
     } = mode
     else {
-        return values;
+        return values.map(BindingValues::Literal);
     };
-    let mut value = match deny_only_base {
-        Some(DenyOnlyBinding::Assigned {
-            start,
-            earlier,
-            raw,
-        }) => deny_only_assignment_value(source, segment_ranges, start, earlier, raw, copy_depth)?,
-        // An unset name is empty once something is appended to it; before
-        // that it is unset, which `${X+word}` tells apart from empty.
-        Some(DenyOnlyBinding::Unset) if !deny_only_appends.is_empty() => String::new(),
-        Some(DenyOnlyBinding::Unset) if ifs_splitting && name == "IFS" => {
-            DEFAULT_POSIX_IFS.to_string()
+    let mut found: Vec<DenyOnlyValue> = Vec::new();
+    for alternative in &alternatives {
+        let base = match alternative.base {
+            Some(DenyOnlyBinding::Assigned {
+                start,
+                earlier,
+                raw,
+            }) => deny_only_assignment_alternatives(
+                source,
+                segment_ranges,
+                start,
+                earlier,
+                raw,
+                copy_depth,
+            ),
+            // An unset name is empty once something is appended to it; before
+            // that it is unset, which `${X+word}` tells apart from empty.
+            Some(DenyOnlyBinding::Unset) if !alternative.appends.is_empty() => {
+                vec![DenyOnlyValue::Known(String::new())]
+            }
+            Some(DenyOnlyBinding::Unset) if ifs_splitting && name == "IFS" => {
+                vec![DenyOnlyValue::Known(DEFAULT_POSIX_IFS.to_string())]
+            }
+            Some(DenyOnlyBinding::Unset | DenyOnlyBinding::Unknown) => vec![DenyOnlyValue::Opaque],
+            Some(DenyOnlyBinding::Arbitrary) => vec![DenyOnlyValue::Unknown],
+            Some(DenyOnlyBinding::Loop) => match values.as_deref() {
+                Some([value]) if alternative.appends.is_empty() => {
+                    vec![DenyOnlyValue::Known(value.clone())]
+                }
+                _ => vec![DenyOnlyValue::Opaque],
+            },
+            // Bash does not import IFS: before any binding it holds the default.
+            None if name == "IFS" => vec![DenyOnlyValue::Known(DEFAULT_POSIX_IFS.to_string())],
+            // The environment's value.
+            None => vec![DenyOnlyValue::Unknown],
+        };
+        for value in base {
+            // Text appended to an unknown value leaves it unknown.
+            let value = match value {
+                DenyOnlyValue::Known(mut value) => {
+                    let mut appended = true;
+                    for word in &alternative.appends {
+                        match deny_only_assignment_value(
+                            source,
+                            segment_ranges,
+                            segment_start,
+                            "",
+                            word,
+                            0,
+                        ) {
+                            Some(text) => value.push_str(&text),
+                            None => {
+                                appended = false;
+                                break;
+                            }
+                        }
+                    }
+                    if appended {
+                        DenyOnlyValue::Known(value)
+                    } else {
+                        DenyOnlyValue::Opaque
+                    }
+                }
+                other => other,
+            };
+            if !found.contains(&value) {
+                found.push(value);
+            }
         }
-        Some(DenyOnlyBinding::Unset) => return None,
-        Some(DenyOnlyBinding::Unknown) => return None,
-        None if values.is_some() => {
-            return deny_only_appends.is_empty().then_some(values).flatten();
-        }
-        // Bash does not import IFS: before any binding it holds the default.
-        None if name == "IFS" => DEFAULT_POSIX_IFS.to_string(),
-        // An ambient value is unknown, and so is anything appended to it.
-        None => return None,
-    };
-    for word in deny_only_appends {
-        value.push_str(&deny_only_assignment_value(
-            source,
-            segment_ranges,
-            segment_start,
-            "",
-            word,
-            0,
-        )?);
     }
-    Some(vec![value])
+    Some(BindingValues::DenyOnly(found))
+}
+
+/// One binding a deny-only read may find in force at the use (none: the
+/// environment's value), with the words appended to it since.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct DenyOnlyAlternative<'a> {
+    base: Option<DenyOnlyBinding<'a>>,
+    appends: Vec<&'a str>,
+}
+
+/// Records `binding`: a statement the shell always runs before the use
+/// replaces every binding in force; one it may run adds to them.
+fn deny_only_bind<'a>(
+    alternatives: &mut Vec<DenyOnlyAlternative<'a>>,
+    conditional: bool,
+    binding: DenyOnlyBinding<'a>,
+) {
+    let added = DenyOnlyAlternative {
+        base: Some(binding),
+        appends: Vec::new(),
+    };
+    if !conditional {
+        alternatives.clear();
+    }
+    alternatives.retain(|alternative| *alternative != added);
+    alternatives.push(added);
+    if alternatives.len() > MAX_DENY_ONLY_ALTERNATIVES {
+        alternatives.remove(0);
+    }
+}
+
+/// Records `NAME+=word`, which a statement the shell may skip adds to the
+/// bindings in force rather than changing each.
+fn deny_only_append<'a>(
+    alternatives: &mut Vec<DenyOnlyAlternative<'a>>,
+    conditional: bool,
+    word: &'a str,
+) {
+    let appended: Vec<DenyOnlyAlternative<'a>> = alternatives
+        .iter()
+        .cloned()
+        .map(|mut alternative| {
+            alternative.appends.push(word);
+            alternative
+        })
+        .collect();
+    if !conditional {
+        *alternatives = appended;
+        return;
+    }
+    for alternative in appended {
+        if !alternatives.contains(&alternative) {
+            alternatives.push(alternative);
+        }
+    }
+    while alternatives.len() > MAX_DENY_ONLY_ALTERNATIVES {
+        alternatives.remove(0);
+    }
 }
 
 /// The binding in force for a deny-only read, evaluated after the scan.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DenyOnlyBinding<'a> {
     /// `NAME=raw` in the segment at `start`, after the assignment words
     /// `earlier` of the same list.
@@ -31435,9 +31818,121 @@ enum DenyOnlyBinding<'a> {
     },
     /// `unset NAME`.
     Unset,
-    /// An earlier statement may have changed the value. A later unconditional
-    /// assignment can prove it again.
+    /// An earlier statement may have changed the value in a way the proof
+    /// does not read. A later unconditional assignment can prove it again.
     Unknown,
+    /// Bound to text the command does not show (`read NAME`): any value.
+    Arbitrary,
+    /// One of the values of a literal `for NAME in ...` header.
+    Loop,
+}
+
+/// Whether the shell may keep assignment words written before `program`
+/// once it has run: POSIX keeps them for a special builtin, shells differ
+/// for a function, and an expanded name may be either. Any other command
+/// sees them alone.
+fn posix_assignments_may_persist(
+    program: &str,
+    scopes: Option<&crate::heredoc::ShellScopeIndex>,
+) -> bool {
+    program.contains(['$', '`', '"', '\'', '\\'])
+        || matches!(
+            program,
+            "break"
+                | ":"
+                | "."
+                | "source"
+                | "continue"
+                | "eval"
+                | "exec"
+                | "exit"
+                | "export"
+                | "readonly"
+                | "return"
+                | "set"
+                | "shift"
+                | "times"
+                | "trap"
+                | "unset"
+        )
+        || scopes.is_some_and(|scopes| {
+            scopes
+                .functions
+                .iter()
+                .any(|(function, _, _)| function == program)
+        })
+}
+
+/// The body of the function `statement` calls, when the command defined
+/// it before: its static name is the command name.
+fn deny_only_called_body(
+    scopes: &crate::heredoc::ShellScopeIndex,
+    source: &str,
+    statement: &Range<usize>,
+) -> Option<Range<usize>> {
+    let program = hazard_first_word(source.get(statement.clone())?);
+    scopes
+        .functions
+        .iter()
+        .rev()
+        .find(|(name, definition, _)| {
+            name.as_str() == program.as_ref() && definition.end <= statement.start
+        })
+        .map(|(_, _, body)| body.clone())
+}
+
+/// The assignment words of `text` when only redirections follow them
+/// (`X=' ' >/dev/null`, `X=a 2>&1`).
+fn posix_assignments_before_redirection(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let (mut single, mut double) = (false, false);
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !single => index += 1,
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            b'<' | b'>' if !single && !double => {
+                let words = text[..index]
+                    .trim_end_matches(|ch: char| ch.is_ascii_digit() || ch == '&')
+                    .trim_end();
+                let split = split_assignment_words(words)?;
+                let assignments = !split.is_empty()
+                    && split.iter().all(|word| {
+                        word.split_once('=').is_some_and(|(name, _)| {
+                            name.bytes()
+                                .next()
+                                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                                && name
+                                    .bytes()
+                                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        })
+                    });
+                return assignments.then_some(words);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// `export NAME...`, `declare NAME...`, `typeset NAME...` or
+/// `readonly NAME...` with plain names only: no option, no value. Each name
+/// keeps the value it had.
+fn posix_declares_names_only(segment: &str) -> bool {
+    let mut words = segment.split_ascii_whitespace();
+    matches!(
+        words.next(),
+        Some("export" | "declare" | "typeset" | "readonly")
+    ) && words.all(|word| {
+        word.bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && word
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
 }
 
 /// `NAME+=word` as a whole segment: the raw word.
@@ -31586,34 +32081,53 @@ impl DenyOnlySegmentIndex {
     }
 }
 
-/// How the shell runs the segment `start..end` as seen from `point`, and
-/// the statement it holds, when the parse places it. A segment can start
-/// with the `{` or `(` that opens its group (`{ X=' '; }` splits into
-/// `{ X=' '` and `}`).
+/// How the shell runs the statement the segment `start..end` holds, as
+/// seen from `point`, with its bytes and its assignment words, when the
+/// parse places it. A segment can start with the words that open its
+/// construct (`{ X=' '`, `then X=' '`, `! X=' '`, `f() { X=' '`, a case
+/// pattern), so the statement is the innermost one that ends the segment;
+/// one inside a command or process substitution belongs to another
+/// statement.
 fn deny_only_segment_scope(
     scopes: &crate::heredoc::ShellScopeIndex,
     source: &str,
     start: usize,
     end: usize,
     point: usize,
-) -> Option<(crate::heredoc::ShellScope, Range<usize>)> {
-    let segment = source.get(start..end)?;
-    let inner =
-        segment.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '{' || ch == '(');
-    let first = start + (segment.len() - inner.len());
+) -> Option<(
+    crate::heredoc::ShellScope,
+    Range<usize>,
+    Option<crate::heredoc::ShellAssignments>,
+)> {
+    let ends_segment = |at: usize| {
+        source.get(at..end).is_some_and(|tail| {
+            tail.bytes()
+                .all(|byte| byte.is_ascii_whitespace() || matches!(byte, b'}' | b')'))
+        })
+    };
+    let in_substitution = |range: &Range<usize>| {
+        scopes.child_shells.iter().any(|child| {
+            child.start >= start
+                && child.start < range.start
+                && range.end <= child.end
+                && source.as_bytes().get(child.start) != Some(&b'(')
+        })
+    };
     let from = scopes
         .statements
-        .partition_point(|(range, _)| range.start < first);
-    let (range, steps) = scopes.statements[from..]
+        .partition_point(|(range, _, _)| range.start < start);
+    let (range, steps, assignments) = scopes.statements[from..]
         .iter()
-        .take_while(|(range, _)| range.start == first)
-        .filter(|(range, _)| range.end <= end)
-        .max_by_key(|(range, _)| range.end)?;
-    source
-        .get(range.end..end)?
-        .bytes()
-        .all(|byte| byte.is_ascii_whitespace() || matches!(byte, b'}' | b')'))
-        .then(|| (crate::heredoc::shell_scope_at(steps, point), range.clone()))
+        .take_while(|(range, _, _)| range.start < end)
+        .filter(|(range, _, _)| {
+            range.end <= end && ends_segment(range.end) && !in_substitution(range)
+        })
+        .max_by_key(|(range, _, _)| (range.start, range.end))?;
+    Some((
+        crate::heredoc::shell_scope_at(steps, point),
+        range.clone(),
+        assignments.clone(),
+    ))
 }
 
 /// Where a deny-only scan of one name stopped, in byte offsets of the
@@ -31623,9 +32137,8 @@ fn deny_only_segment_scope(
 struct DenyOnlyCheckpoint {
     bound: usize,
     last_position: Option<usize>,
-    /// [`DenyOnlyBinding`] in force.
-    base: Option<DenyOnlyBindingRange>,
-    appends: Vec<Range<usize>>,
+    /// [`DenyOnlyAlternative`]s in force, as byte ranges.
+    alternatives: Vec<(Option<DenyOnlyBindingRange>, Vec<Range<usize>>)>,
     values: Option<Vec<String>>,
     /// The scan refused a proof; every later read refuses too.
     refused: bool,
@@ -31641,6 +32154,8 @@ enum DenyOnlyBindingRange {
     },
     Unset,
     Unknown,
+    Arbitrary,
+    Loop,
 }
 
 impl DenyOnlyBindingRange {
@@ -31657,42 +32172,66 @@ impl DenyOnlyBindingRange {
             },
             Self::Unset => DenyOnlyBinding::Unset,
             Self::Unknown => DenyOnlyBinding::Unknown,
+            Self::Arbitrary => DenyOnlyBinding::Arbitrary,
+            Self::Loop => DenyOnlyBinding::Loop,
         }
     }
 }
 
 impl DenyOnlyCheckpoint {
+    /// The [`DenyOnlyAlternative`]s the checkpoint holds.
+    fn alternatives<'a>(&self, source: &'a str) -> Vec<DenyOnlyAlternative<'a>> {
+        self.alternatives
+            .iter()
+            .map(|(base, appends)| DenyOnlyAlternative {
+                base: base.as_ref().map(|base| base.binding(source)),
+                appends: appends
+                    .iter()
+                    .map(|range| source.get(range.clone()).unwrap_or_default())
+                    .collect(),
+            })
+            .collect()
+    }
+
     /// `None` when a piece of the state is not text of `source`.
     fn capture(
         source: &str,
         bound: usize,
         last_position: Option<usize>,
-        base: Option<DenyOnlyBinding<'_>>,
-        appends: &[&str],
+        alternatives: &[DenyOnlyAlternative<'_>],
         values: Option<&Vec<String>>,
     ) -> Option<Self> {
-        let base = match base {
-            None => None,
-            Some(DenyOnlyBinding::Unset) => Some(DenyOnlyBindingRange::Unset),
-            Some(DenyOnlyBinding::Unknown) => Some(DenyOnlyBindingRange::Unknown),
-            Some(DenyOnlyBinding::Assigned {
-                start,
-                earlier,
-                raw,
-            }) => Some(DenyOnlyBindingRange::Assigned {
-                start,
-                earlier: subslice_range(source, earlier)?,
-                raw: subslice_range(source, raw)?,
-            }),
-        };
+        let alternatives = alternatives
+            .iter()
+            .map(|alternative| {
+                let base = match alternative.base {
+                    None => None,
+                    Some(DenyOnlyBinding::Unset) => Some(DenyOnlyBindingRange::Unset),
+                    Some(DenyOnlyBinding::Unknown) => Some(DenyOnlyBindingRange::Unknown),
+                    Some(DenyOnlyBinding::Arbitrary) => Some(DenyOnlyBindingRange::Arbitrary),
+                    Some(DenyOnlyBinding::Loop) => Some(DenyOnlyBindingRange::Loop),
+                    Some(DenyOnlyBinding::Assigned {
+                        start,
+                        earlier,
+                        raw,
+                    }) => Some(DenyOnlyBindingRange::Assigned {
+                        start,
+                        earlier: subslice_range(source, earlier)?,
+                        raw: subslice_range(source, raw)?,
+                    }),
+                };
+                let appends = alternative
+                    .appends
+                    .iter()
+                    .map(|word| subslice_range(source, word))
+                    .collect::<Option<_>>()?;
+                Some((base, appends))
+            })
+            .collect::<Option<_>>()?;
         Some(Self {
             bound,
             last_position,
-            base,
-            appends: appends
-                .iter()
-                .map(|word| subslice_range(source, word))
-                .collect::<Option<_>>()?,
+            alternatives,
             values: values.cloned(),
             refused: false,
         })
@@ -32901,28 +33440,9 @@ fn deny_only_nameref_target<'a>(
 /// A single deny-only value with a copy budget, for a read at
 /// `segment_start` that follows the assignment words `earlier_words` of the
 /// same assignment-only segment (Bash performs them left to right, so
-/// `X=' ' Y=$X` copies the new `X`).
-fn deny_only_value_at(
-    source: &str,
-    segment_ranges: &[(usize, usize)],
-    segment_start: usize,
-    earlier_words: &str,
-    name: &str,
-    copy_depth: usize,
-) -> Option<String> {
-    deny_only_value_at_for_splitting(
-        source,
-        segment_ranges,
-        segment_start,
-        earlier_words,
-        name,
-        copy_depth,
-        false,
-    )
-}
-
-/// The value of IFS as splitting characters differs from its expanded value
-/// when it is unset: Bash splits on the default characters in that case.
+/// `X=' ' Y=$X` copies the new `X`). With `ifs_splitting`, IFS is read as
+/// splitting characters, which differ from its expanded value when it is
+/// unset: Bash splits on the default characters in that case.
 fn deny_only_value_at_for_splitting(
     source: &str,
     segment_ranges: &[(usize, usize)],
@@ -32932,33 +33452,71 @@ fn deny_only_value_at_for_splitting(
     copy_depth: usize,
     ifs_splitting: bool,
 ) -> Option<String> {
-    let name = deny_only_nameref_target(source, segment_ranges, segment_start, name)?;
-    if let Some((raw, before)) = earlier_assignment_word(earlier_words, name).ok()? {
-        return deny_only_assignment_value(
-            source,
-            segment_ranges,
-            segment_start,
-            before,
-            raw,
-            copy_depth,
-        );
+    match deny_only_alternatives_at(
+        source,
+        segment_ranges,
+        segment_start,
+        earlier_words,
+        name,
+        copy_depth,
+        ifs_splitting,
+    )
+    .as_slice()
+    {
+        [DenyOnlyValue::Known(value)] => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Every value `name` may hold at `segment_start` for a deny-only read
+/// (see [`deny_only_value_at_for_splitting`]), the binding in force last
+/// at the end.
+fn deny_only_alternatives_at(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    earlier_words: &str,
+    name: &str,
+    copy_depth: usize,
+    ifs_splitting: bool,
+) -> Vec<DenyOnlyValue> {
+    let opaque = || vec![DenyOnlyValue::Opaque];
+    let Some(name) = deny_only_nameref_target(source, segment_ranges, segment_start, name) else {
+        return opaque();
+    };
+    match earlier_assignment_word(earlier_words, name) {
+        Err(()) => return opaque(),
+        Ok(Some((raw, before))) => {
+            return deny_only_assignment_alternatives(
+                source,
+                segment_ranges,
+                segment_start,
+                before,
+                raw,
+                copy_depth,
+            );
+        }
+        Ok(None) => {}
     }
     if name == "IFS" {
         // With no assignment to IFS and no command naming it as a word
         // (`unset IFS`, `read IFS`, `printf -v IFS t`), it holds the default
         // whatever else the earlier segments do. Both need the text `IFS`.
+        let default = || vec![DenyOnlyValue::Known(DEFAULT_POSIX_IFS.to_string())];
         if deny_only_segment_index(source, segment_ranges)
             .first_ifs
             .is_none_or(|offset| offset + 3 > segment_start)
         {
-            return Some(DEFAULT_POSIX_IFS.to_string());
+            return default();
         }
-        let prefix = source.get(..segment_start)?;
+        let Some(prefix) = source.get(..segment_start) else {
+            return opaque();
+        };
         if !posix_text_may_bind_name(prefix, "IFS") {
-            return Some(DEFAULT_POSIX_IFS.to_string());
+            return default();
         }
     }
-    let values = resolve_variable_bindings(
+    match scan_variable_bindings(
         source,
         segment_ranges,
         segment_start,
@@ -32967,11 +33525,10 @@ fn deny_only_value_at_for_splitting(
             copy_depth,
             ifs_splitting,
         },
-    )?;
-    let [value] = values.as_slice() else {
-        return None;
-    };
-    Some(value.clone())
+    ) {
+        Some(BindingValues::DenyOnly(values)) if !values.is_empty() => values,
+        _ => opaque(),
+    }
 }
 
 /// The assignment of `name` among the assignment words `words`, as its raw
@@ -33070,17 +33627,46 @@ fn deny_only_assignment_value(
     raw: &str,
     copy_depth: usize,
 ) -> Option<String> {
+    match deny_only_assignment_alternatives(
+        source,
+        segment_ranges,
+        assignment_start,
+        earlier_words,
+        raw,
+        copy_depth,
+    )
+    .as_slice()
+    {
+        [DenyOnlyValue::Known(value)] => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Every value one assignment may give ([`deny_only_assignment_value`]):
+/// a copy of a name that may hold several values holds each of them. A
+/// word that runs a command (`$(command -v git)`, backquotes) gives text
+/// the command does not show.
+fn deny_only_assignment_alternatives(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    assignment_start: usize,
+    earlier_words: &str,
+    raw: &str,
+    copy_depth: usize,
+) -> Vec<DenyOnlyValue> {
+    let known = |value: String| vec![DenyOnlyValue::Known(value)];
+    let opaque = || vec![DenyOnlyValue::Opaque];
     // `X=` alone binds the empty string; in `X= cmd` it is only for `cmd`.
     if raw.trim().is_empty() {
-        return Some(String::new());
+        return known(String::new());
     }
     if raw.starts_with(char::is_whitespace) {
-        return None;
+        return opaque();
     }
     if let Some(value) =
         literal_assignment_value(raw).or_else(|| mktemp_scratch_assignment_value(raw))
     {
-        return Some(value);
+        return known(value);
     }
     let raw = raw.trim();
     // A literal array `NAME=(a b)`: `$NAME` reads element 0.
@@ -33088,37 +33674,53 @@ fn deny_only_assignment_value(
         .strip_prefix('(')
         .and_then(|rest| rest.strip_suffix(')'))
     {
-        let elements = split_assignment_words(elements.trim())?;
-        let first = elements.first()?;
-        if elements.iter().any(|element| element.starts_with('[')) {
-            return None;
-        }
-        return crate::normalize::decode_posix_literal_word(first).map(Cow::into_owned);
+        let first = split_assignment_words(elements.trim()).and_then(|elements| {
+            if elements.iter().any(|element| element.starts_with('[')) {
+                return None;
+            }
+            crate::normalize::decode_posix_literal_word(elements.first()?).map(Cow::into_owned)
+        });
+        return first.map_or_else(opaque, known);
     }
     // One shell word: in `X=a b` the value `a` is only for the command `b`.
     if !matches!(split_assignment_words(raw).as_deref(), Some([word]) if *word == raw) {
-        return None;
+        return opaque();
     }
     if let Some(value) = crate::normalize::decode_posix_literal_word(raw) {
-        return Some(value.into_owned());
+        return known(value.into_owned());
+    }
+    if raw.contains('`')
+        || raw
+            .match_indices("$(")
+            .any(|(at, _)| !raw[at + 2..].starts_with('('))
+    {
+        return vec![DenyOnlyValue::Unknown];
     }
     if copy_depth == 0 {
-        return None;
+        return opaque();
     }
     let token = raw
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
         .unwrap_or(raw);
-    let (prefix, name, suffix) = parse_posix_variable_with_literal_affixes(token)?;
-    let copied = deny_only_value_at(
+    let Some((prefix, name, suffix)) = parse_posix_variable_with_literal_affixes(token) else {
+        return opaque();
+    };
+    deny_only_alternatives_at(
         source,
         segment_ranges,
         assignment_start,
         earlier_words,
         name,
         copy_depth - 1,
-    )?;
-    Some(format!("{prefix}{copied}{suffix}"))
+        false,
+    )
+    .into_iter()
+    .map(|value| match value {
+        DenyOnlyValue::Known(copied) => DenyOnlyValue::Known(format!("{prefix}{copied}{suffix}")),
+        other => other,
+    })
+    .collect()
 }
 
 /// A whole-segment assignment value that is one literal shell word.
@@ -33304,15 +33906,22 @@ fn resolve_proven_variables_in_segment_with_ifs(
     let composite_only = view.is_some();
     let ifs = view.map_or(DEFAULT_POSIX_IFS, |view| view.ifs);
     let earlier_words = view.map_or("", |view| view.earlier_words);
-    let proven_value = |name: &str| {
-        deny_only_value_at(
+    // A name that may hold several values reads the one the rendering in
+    // progress chose ([`ViewChoices`]).
+    let proven_value = |name: &str| match deny_only_view_value(
+        deny_only_alternatives_at(
             source,
             segment_ranges,
             segment_start,
             earlier_words,
             name,
             MAX_DENY_ONLY_COPY_DEPTH,
-        )
+            false,
+        ),
+        name,
+    ) {
+        DenyOnlyValue::Known(value) => Some(value),
+        DenyOnlyValue::Unknown | DenyOnlyValue::Opaque => None,
     };
     let mut out = String::with_capacity(segment.len());
     let mut rest = segment;
@@ -43440,8 +44049,16 @@ mod tests {
             (r#"IFS=; X=" "; git${X}reset"#, None),
             // Assignment words are not split.
             (r#"X=" "; Y=a${X}b"#, None),
-            // A conditional binding proves nothing.
-            (r#"X=" "; false && X=a; git${X}reset"#, None),
+            // A binding a fixed status skips never runs.
+            (
+                r#"X=" "; false && X=a; git${X}reset"#,
+                Some(r#"X=" "; false && X=a; git reset"#),
+            ),
+            // A binding that may run adds a value: each reading is a line.
+            (
+                r#"X=' '; test -n "$C" && X=a; git${X}reset"#,
+                Some("X=' '; test -n \"$C\" && X=a; gitareset\ngit reset"),
+            ),
             // A name the command never binds is unknown and may hold a
             // blank ([`posix_unknown_command_word_view`]).
             (r"git${X}reset", Some(r"git reset")),
@@ -43478,7 +44095,7 @@ mod tests {
                 r#"unset X; X+=g; "${X}it" reset"#,
                 Some(r#"unset X; X+=g; "git" reset"#),
             ),
-            (r#"X+=g; "${X}it" reset"#, None),
+            (r#"X+=g; "${X}it" reset"#, Some(r"X+=g; ${X}it reset")),
             (r#"unset X; "${X+gi}t" reset"#, None),
             // A literal array reads element 0, except for every element.
             (
@@ -43499,12 +44116,15 @@ mod tests {
             (r"X=' '; declare -n r=X; r=a; git${X}reset", None),
             (r"X=t; declare -n r=X; unset r; git${X}reset", None),
             // The outer shell expands nothing in a quoted heredoc body, and
-            // its lines bind nothing.
+            // its lines bind nothing: X is the environment's.
             ("X=' '; bash <<'EOF'\ngit${X}reset${X}--hard\nEOF", None),
-            ("cat > notes.txt <<'EOF'\nX=' '\nEOF\ngit${X}reset", None),
+            (
+                "cat > notes.txt <<'EOF'\nX=' '\nEOF\ngit${X}reset",
+                Some("cat > notes.txt <<'EOF'\nX=' '\nEOF\ngit reset"),
+            ),
             // An assignment list runs left to right.
             (r"X=' ' Y=$X; git${Y}reset", Some(r"X=' ' Y=$X; git reset")),
-            (r"Y=$X X=' '; git${Y}reset", None),
+            (r"Y=$X X=' '; git${Y}reset", Some(r"Y=$X X=' '; git reset")),
             // Only the characters of the IFS in force split.
             (r"IFS=x; X=' '; git${X}reset", None),
             (r"IFS=,; X=$'\n'; git${X}reset", None),
@@ -43639,7 +44259,10 @@ mod tests {
                 Some(r#"echo "GIT is $GIT"; $GIT reset --hard"#),
             ),
             (r#"unset X; "$X" reset --hard"#, None),
-            (r#"read X; "$X" reset --hard"#, None),
+            (
+                r#"read X; "$X" reset --hard"#,
+                Some(r"read X; $X reset --hard"),
+            ),
             // Unchanged: already bare, an argument, an empty IFS, a proven
             // value, other expansion forms.
             (r"$X reset --hard", None),
