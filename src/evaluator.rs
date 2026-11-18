@@ -7760,7 +7760,9 @@ fn posix_eval_single_substitution_body(arguments: &str) -> Option<&str> {
 }
 
 fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
-    for segment in crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix) {
+    for whole_segment in
+        crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix)
+    {
         if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
             sinks.push(ExecutableTextSink::Unverified {
                 rule: SINK_ANALYSIS_BOUNDS_RULE,
@@ -7768,6 +7770,9 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
             });
             return;
         }
+        // A function body or case arm shares its segment with the syntax
+        // that opens it (`f() { eval …`, `case a in a) eval …`).
+        let (segment, peeled) = posix_segment_command(whole_segment);
         let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
         let words: Vec<_> = tokens
             .iter()
@@ -7844,10 +7849,12 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
                 //    command-execution / redirection / chaining metacharacters
                 //    at all. A bare `$VAR`/`${VAR}` parameter expansion runs no
                 //    command and stays eligible. (Fourth-round review of #261.)
-                let is_whole_command = segment.trim() == command.trim();
-                let prefix_is_inert = segment.get(..token.byte_range.start).is_none_or(|prefix| {
-                    !prefix.contains(['(', ')', '`', '<', '>', '|', '&', ';', '\n', '\r'])
-                });
+                let is_whole_command = whole_segment.trim() == command.trim();
+                let prefix_is_inert = whole_segment
+                    .get(..peeled + token.byte_range.start)
+                    .is_none_or(|prefix| {
+                        !prefix.contains(['(', ')', '`', '<', '>', '|', '&', ';', '\n', '\r'])
+                    });
                 if is_whole_command
                     && prefix_is_inert
                     && let Some(idiom) =
@@ -19534,7 +19541,8 @@ fn posix_alias_definition_bodies(command: &str) -> Vec<String> {
     }
     let mut bodies = Vec::new();
     for (start, end) in top_level_segment_ranges(command) {
-        let Ok(tokens) = shell_words::split(command[start..end].trim()) else {
+        let (segment, _) = posix_segment_command(&command[start..end]);
+        let Ok(tokens) = shell_words::split(segment.trim()) else {
             continue;
         };
         let mut words = tokens.iter().skip_while(|token| {
@@ -19608,8 +19616,10 @@ fn posix_deferred_command_views(command: &str) -> Vec<String> {
         if views.len() >= MAX_VIEWS {
             break;
         }
+        // The view keeps the text before the segment, not the syntax that
+        // opens a function body or case arm in it (`case a in a) trap …`).
         let prefix = &command[..start];
-        let segment = &command[start..end];
+        let (segment, _) = posix_segment_command(&command[start..end]);
         if brace && let Some(expanded) = crate::heredoc::brace_expanded_command(segment) {
             views.push(format!("{prefix}{expanded}"));
         }
@@ -20405,6 +20415,15 @@ fn collect_heredoc_pipeline_flows<D: Doc>(
             source = static_producer_source(consumer);
         }
     }
+}
+
+/// One POSIX segment's simple command and its offset in `segment`: the
+/// syntax that opens a subshell, group, reserved word, function body or case
+/// arm in the same segment is peeled ([`crate::packs::core::git::command_after_posix_control_prefixes`]),
+/// so readers that look at a segment's first words see the command the
+/// shell runs. A segment with no such prefix comes back whole.
+fn posix_segment_command(segment: &str) -> (&str, usize) {
+    crate::packs::core::git::command_after_posix_control_prefixes(segment, ShellDialect::Posix)
 }
 
 fn top_level_segment_ranges(command: &str) -> Vec<(usize, usize)> {
