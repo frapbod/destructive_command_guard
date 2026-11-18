@@ -8190,7 +8190,14 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
         // A function body or case arm shares its segment with the syntax
         // that opens it (`f() { eval …`, `case a in a) eval …`).
         let (segment, peeled) = posix_segment_command(whole_segment);
-        let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+        // A redirection is not a command word and may stand anywhere in the
+        // command (`2>/dev/null eval …`, `command 2>&1 eval …`). Find the
+        // command word in the length-preserving view without redirections;
+        // offsets and the arguments still come from `segment`, and the
+        // redirect targets themselves are read by the substitution scanners.
+        let words_view = crate::heredoc::redirection_free_view(segment);
+        let words_source = words_view.as_deref().unwrap_or(segment);
+        let tokens = tokenize_for_shell_dialect(words_source, ShellDialect::Posix);
         let words: Vec<_> = tokens
             .iter()
             .filter(|token| token.kind == NormalizeTokenKind::Word)
@@ -8216,8 +8223,31 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
                 index += 1;
                 continue;
             }
-            if matches!(decoded.as_ref(), "command" | "builtin") {
+            // `command [-p] [--]` and `builtin [--]` run the next word, and
+            // chain (`command builtin eval`). `command -v`/`-V` only describe
+            // it: the query option is left as the command word.
+            if let wrapper @ ("command" | "builtin") = decoded.as_ref() {
+                let command_wrapper = wrapper == "command";
                 index += 1;
+                while let Some(option) = words
+                    .get(index)
+                    .and_then(|word| word.text(segment))
+                    .and_then(|raw| decoder.decode(raw, ShellTokenRole::Syntax))
+                {
+                    let option = option.as_ref();
+                    let path_search = command_wrapper
+                        && option.strip_prefix('-').is_some_and(|flags| {
+                            !flags.is_empty() && flags.bytes().all(|b| b == b'p')
+                        });
+                    if option != "--" && !path_search {
+                        break;
+                    }
+                    index += 1;
+                    if option == "--" {
+                        break;
+                    }
+                }
+                continue;
             }
             break;
         }
@@ -53572,6 +53602,90 @@ mod tests {
                 "an unpiped substitution retains terminal-driven interactive confirmation: {:?}",
                 manual_substitution.pattern_info
             );
+        }
+    }
+
+    #[test]
+    fn eval_after_function_headers_wrappers_and_redirections_is_a_sink_on_both_paths() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git", "rm"];
+        let ordered_packs = ["core.git".to_string(), "core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let settings = default_config().heredoc_settings();
+        let cases = [
+            ("echo() { eval \"$*\"; }; echo 'git reset --hard'", true),
+            ("printf() { eval \"$*\"; }; printf 'git reset --hard'", true),
+            ("f() { eval \"$*\"; }; f hi", true),
+            ("function f { eval \"$*\"; }; f hi", true),
+            (
+                "echo \\\n () \\\n { eval \"$*\"; }; echo 'git reset --hard'",
+                true,
+            ),
+            ("case x in x) eval \"$y\";; esac", true),
+            ("time eval \"$y\"", true),
+            ("f() { eval 'git reset --hard'; }; f", true),
+            (
+                "echo() { command -p eval \"$*\"; }; echo 'git reset --hard'",
+                true,
+            ),
+            (
+                "echo() { command -- eval \"$*\"; }; echo 'git reset --hard'",
+                true,
+            ),
+            (
+                "echo() { builtin -- eval \"$*\"; }; echo 'git reset --hard'",
+                true,
+            ),
+            (
+                "echo() { command builtin eval \"$*\"; }; echo 'git reset --hard'",
+                true,
+            ),
+            (
+                "echo() { 2>/dev/null eval \"$*\"; }; echo 'git reset --hard'",
+                true,
+            ),
+            ("f() { command 2>&1 -p eval \"$*\"; }; f hi", true),
+            ("x='git reset --hard'; 2>/dev/null eval \"$x\"", true),
+            ("x='git reset --hard'; eval \"$x\" 2>/dev/null", true),
+            ("command -v eval", false),
+            ("command -V eval", false),
+            ("command -pv eval", false),
+            ("command -p -v eval >/dev/null", false),
+            ("echo 2>/dev/null eval 'git reset --hard'", false),
+            ("f() { eval 'echo hi'; }; f", false),
+            ("2>/dev/null eval 'echo hi'", false),
+            ("echo 'git reset --hard'", false),
+            (
+                "echo() { command echo \"$@\"; }; echo 'git reset --hard'",
+                false,
+            ),
+        ];
+        for index in [None, keyword_index.as_ref()] {
+            for (command, denied) in cases {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &settings,
+                    None,
+                    None,
+                    None,
+                    ShellDialect::Posix,
+                );
+                assert_eq!(
+                    result.is_denied(),
+                    denied,
+                    "{command:?} (indexed: {}): {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+            }
         }
     }
 
