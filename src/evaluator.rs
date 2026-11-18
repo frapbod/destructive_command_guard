@@ -768,6 +768,30 @@ impl<'a> SafePatternInputs<'a> {
     }
 }
 
+/// Whether a `core.git` safe pattern exempts `segment`. The exemption must
+/// hold under every reading of the decoded Git argv
+/// ([`crate::packs::core::git::safe_syntax_views_in_dialect`]); a word with
+/// no reading grants none. Without a decoded view the segment is read as
+/// written.
+fn core_git_safe_exemption(
+    pack: &crate::packs::Pack,
+    segment: &str,
+    dialect: ShellDialect,
+    inputs: SafePatternInputs<'_>,
+    range: Option<(usize, usize)>,
+    deadline: Option<&Deadline>,
+) -> bool {
+    match crate::packs::core::git::safe_syntax_views_in_dialect(segment, dialect) {
+        None => inputs.matches(pack, segment, range, deadline),
+        Some(views) => {
+            !views.is_empty()
+                && views
+                    .iter()
+                    .all(|view| inputs.matches(pack, view, range, deadline))
+        }
+    }
+}
+
 fn compute_normalized_offset(command_for_match: &str, normalized: &str) -> Option<usize> {
     if normalized == command_for_match {
         return Some(0);
@@ -15837,13 +15861,45 @@ fn evaluate_command_in_dialect_union(
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
         || primary.decision != EvaluationDecision::Allow
-        || !unknown_dialect_fanout_candidate(command, keyword_index)
     {
         return primary;
     }
 
-    for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
-        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs) {
+    // Unknown also includes POSIX, including Windows Codex invoking Bash.
+    // Its generic normalization can lose quotes or escapes in command words.
+    // Feed that reading through the same deny-wins fan-out as the other views.
+    // A PowerShell-only statement may contain bytes that are not valid POSIX
+    // source at all (for example `<# $(...) #>`). Do not turn an unsupported
+    // POSIX parse into a denial of an otherwise valid Unknown command. This
+    // uses the same heredoc masking and parse check as Windows Codex's shell
+    // resolver.
+    let posix_candidate =
+        primary.allowlist_override.is_none() && command.contains(['\'', '"', '\\', '$']) && {
+            let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            let posix_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+            crate::heredoc::extract_posix_command_substitutions(posix_view.as_ref()).is_ok()
+        };
+    let other_candidate = unknown_dialect_fanout_candidate(command, keyword_index);
+    if !posix_candidate && !other_candidate {
+        return primary;
+    }
+    for view in [
+        ShellDialect::Posix,
+        ShellDialect::Cmd,
+        ShellDialect::PowerShell,
+    ] {
+        let needed = if view == ShellDialect::Posix {
+            posix_candidate
+        } else {
+            other_candidate
+                && dialect_view_may_expose_hidden_execution(
+                    command,
+                    view,
+                    keyword_index,
+                    ordered_packs,
+                )
+        };
+        if !needed {
             continue;
         }
         // An exhausted budget is never proof that the un-run views are clean.
@@ -28086,16 +28142,14 @@ fn evaluate_packs_with_allowlists_at_depth(
                     ) {
                         return result;
                     }
-                    let safe_view =
-                        crate::packs::core::git::syntax_view_in_dialect(segment, shell_dialect);
-                    if SafePatternInputs::new(core_git_command, input_command, shell_dialect)
-                        .matches(
-                            pack,
-                            safe_view.as_deref().unwrap_or(segment),
-                            Some((segment_start - command_prefix_len, segment_end)),
-                            deadline,
-                        )
-                    {
+                    if core_git_safe_exemption(
+                        pack,
+                        segment,
+                        shell_dialect,
+                        SafePatternInputs::new(core_git_command, input_command, shell_dialect),
+                        Some((segment_start - command_prefix_len, segment_end)),
+                        deadline,
+                    ) {
                         continue;
                     }
 
@@ -28169,18 +28223,14 @@ fn evaluate_packs_with_allowlists_at_depth(
                     ) {
                         return result;
                     }
-                    let safe_view = crate::packs::core::git::syntax_view_in_dialect(
+                    if core_git_safe_exemption(
+                        pack,
                         core_git_segment,
                         shell_dialect,
-                    );
-                    if SafePatternInputs::new(core_git_command, input_command, shell_dialect)
-                        .matches(
-                            pack,
-                            safe_view.as_deref().unwrap_or(core_git_segment),
-                            None,
-                            deadline,
-                        )
-                    {
+                        SafePatternInputs::new(core_git_command, input_command, shell_dialect),
+                        None,
+                        deadline,
+                    ) {
                         continue;
                     }
                     if let Some(result) = evaluate_pack_destructive_patterns(
@@ -31165,10 +31215,17 @@ fn hazard_first_word(segment: &str) -> Cow<'_, str> {
 }
 
 /// Whether `text`, the words of a segment before some word, leaves that word
-/// in command-name position: only the prefixes [`hazard_first_word`] skips
-/// (control-flow openers, grouping, negation, `command`/`builtin`/`time`,
+/// in command-name position: only shell syntax that opens a body (subshell,
+/// group, function declaration, case arm, control-flow words) and the
+/// prefixes [`hazard_first_word`] skips (negation, `command`/`builtin`/`time`,
 /// redirections and assignment words) come first.
 fn posix_words_precede_command_name(text: &str) -> bool {
+    // Peel the syntax with the parser the packs use, ahead of a stand-in for
+    // the word, so both agree where the command name is.
+    let probe = format!("{text}x");
+    let (rest, _) =
+        crate::packs::core::git::command_after_posix_control_prefixes(&probe, ShellDialect::Posix);
+    let text = rest.strip_suffix('x').unwrap_or(rest);
     text.split_ascii_whitespace().all(|word| {
         matches!(
             word,

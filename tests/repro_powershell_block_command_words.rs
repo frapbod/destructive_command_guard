@@ -7,6 +7,9 @@
 //! separator after it (`"git" reset --hard;`) was allowed in every dialect
 //! but the union, which also hid a block body ending in `;`.
 
+// Shell parameter expansions such as `${X:-word}` are case data here.
+#![allow(clippy::literal_string_with_formatting_args)]
+
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
 use destructive_command_guard::packs::REGISTRY;
@@ -136,9 +139,48 @@ const HARMLESS: &[&str] = &[
     "if ($x) { git status }",
     r#"foreach ($i in 1) { "reset --hard" }"#,
     r#"$sb = { Write-Output "git reset --hard" }"#,
+    r"$sb = { Write-Output 'git reset --hard' }",
+    r#"$sb = { Write-Output "git clean -fdx" }"#,
     r#"& { git commit -m "reset --hard" }"#,
     r#""git" status;"#,
     "git status;",
+];
+
+/// One quoted argument is one argv word, however many spaces it holds. The
+/// Git view removed the quotes and joined the words with spaces, so the text
+/// of one argument read as Git's own subcommand and flags. Bash runs none of
+/// these as `git reset --hard` or `git clean -f`.
+const QUOTED_TEXT_IN_ONE_ARGUMENT: &[&str] = &[
+    r#"$sb = { Write-Output "git reset --hard" }"#,
+    r"$sb = { Write-Output 'git reset --hard' }",
+    r"$X 'reset --hard'",
+    r#"git commit -m "x" "reset --hard""#,
+    r#"git commit -m "fix: reset --hard bug""#,
+    r#"git log --grep "reset --hard""#,
+    r#"git stash push -m "clean -fdx later""#,
+    r#"X=git; $X commit -m "reset --hard""#,
+    r#"git clean -n -e "a b""#,
+    r#"git clean -e "x y" -n"#,
+];
+
+/// POSIX only. Under `Unknown` the Git view is the raw text (the dialect may
+/// be PowerShell), so the `-c` value's words still read as `reset --hard`
+/// there. That over-deny predates this boundary (v0.16.0 and PR #9 block it
+/// too) and errs safe; the Bash hook reads POSIX and allows it.
+const QUOTED_TEXT_IN_ONE_ARGUMENT_POSIX: &[&str] = &[r#"git -c "a=b reset --hard" status"#];
+
+/// The same boundary must not hide real Git syntax next to a quoted argument
+/// with spaces, nor let its text supply a dry-run flag (`-e "-n foo"` is an
+/// exclude pattern, so Git still cleans).
+const GIT_NEXT_TO_QUOTED_TEXT: &[&str] = &[
+    r#"git clean -e "-n foo" -fdx"#,
+    r"git clean -e '-n foo' -fdx",
+    r#"X=git; $X clean -e "-n foo" -fdx"#,
+    r#"git clean -fdx -- "a b""#,
+    r#"git -C "/tmp/a b" reset --hard"#,
+    r#"git -c "user.name=A B" reset --hard"#,
+    r#"git checkout -- "my file""#,
+    r#"git branch -D "x y""#,
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
@@ -429,5 +471,135 @@ fn unknown_dialect_judges_deeply_nested_blocks() {
             EvaluationDecision::Deny,
             "{command}"
         );
+    }
+}
+
+/// Expansions may produce several argv words, unlike a quoted literal. These
+/// are shell source sent as hook data: this test never runs the commands.
+#[test]
+fn split_expansions_and_powershell_native_quote_boundaries() {
+    let split = [
+        "git reset ${X:-HEAD --hard}",
+        "git reset ${X=HEAD --hard}",
+        "git reset ${X:=HEAD --hard}",
+        "git reset ${X:-HEAD  --hard}",
+        "git reset ${X:-HEAD\t--hard}",
+        "git reset ${X:-x} ${Y:-HEAD --hard}",
+        "git push ${X:-origin main --force}",
+        "git push origin ${X:-main --force}",
+        "git checkout ${X:-HEAD -- .}",
+        "cd /tmp && git reset ${X:-HEAD --hard}",
+        "( git reset ${X:-HEAD --hard} )",
+        "f() { git reset ${X:-HEAD --hard}; }; f",
+        "git reset ${X:-\"HEAD\" --hard}",
+        "git reset ${X:-'HEAD' --hard}",
+        "git reset ${X:+HEAD --hard}",
+        "git push ${X:+origin main --force}",
+    ];
+    let fixed_arguments = [
+        r#"git reset "${X:-HEAD --hard}""#,
+        r#"git commit -m "${X:-reset --hard}""#,
+        r#"git commit -m "x" "reset --hard""#,
+        r#"git log ${X:-"--grep=reset --hard"}"#,
+    ];
+    let powershell = [
+        r#"git reset 'HEAD" --hard "--'"#,
+        r#"git clean 'x" -fdx "y'"#,
+        r#"git push 'origin" --force "main'"#,
+        "git reset \"HEAD`\" --hard `\"--\"",
+        r#"& git reset 'HEAD" --hard "--'"#,
+        "git reset 'HEAD\" --hard \"--'; echo \"`$(\"",
+    ];
+    let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
+    assert_all(&split, "Deny", posix, "POSIX expansion");
+    assert_all(&fixed_arguments, "Allow", posix, "fixed POSIX argument");
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        let bash = |command: &str| hook_decision(protocol, "Bash", command);
+        let ps = |command: &str| hook_decision(protocol, "PowerShell", command);
+        assert_all(&split, "deny", bash, "unquoted POSIX expansion");
+        assert_all(&fixed_arguments, "allow", bash, "fixed POSIX argument");
+        assert_all(&powershell, "deny", ps, "PowerShell native argument");
+        let nested = "bash -c 'git reset ${X:-HEAD --hard}'";
+        assert_all(&[nested], "deny", ps, "nested POSIX under PowerShell");
+        let cmd = |command: &str| hook_decision(protocol, "cmd", command);
+        assert_all(&[nested], "deny", cmd, "nested POSIX under cmd");
+    }
+}
+
+/// Text in an optional expansion is not proof that a safe flag reaches Git.
+/// Only dcg reads these strings; this test does not execute their shell source.
+#[test]
+fn optional_expansion_cannot_grant_git_clean_dry_run_exemption() {
+    let unsafe_commands = [
+        "git clean -fdx ${X:-foo --dry-run}",
+        "git clean -fdx ${X:+foo --dry-run}",
+        "git clean -fdx ${X:-foo -n}",
+        "( git clean -fdx ${X:-foo --dry-run} )",
+    ];
+    let safe_commands = [
+        "git clean -n -fdx ${X:-foo}",
+        "git clean --dry-run -fdx ${X:-foo}",
+        "git clean -n ${FILES}",
+        "git status ${X:-HEAD --hard}",
+    ];
+    let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
+    assert_all(&unsafe_commands, "Deny", posix, "optional safe flag");
+    assert_all(&safe_commands, "Allow", posix, "literal safe flag");
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        let bash = |command: &str| hook_decision(protocol, "Bash", command);
+        assert_all(&unsafe_commands, "deny", bash, "optional safe flag");
+        assert_all(&safe_commands, "allow", bash, "literal safe flag");
+    }
+}
+
+/// A quoted argument with spaces stays one argument in the POSIX reading, and
+/// in the union that adds it.
+#[test]
+fn quoted_argument_with_spaces_stays_one_word() {
+    for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+        let decide = |command: &str| format!("{:?}", decision_in(command, dialect));
+        let label = format!("{dialect:?}");
+        assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT, "Allow", decide, &label);
+        assert_all(GIT_NEXT_TO_QUOTED_TEXT, "Deny", decide, &label);
+    }
+    let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
+    assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT_POSIX, "Allow", posix, "Posix");
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        let decide = |command: &str| hook_decision(protocol, "Bash", command);
+        let label = format!("{protocol:?} Bash");
+        assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT, "allow", decide, &label);
+        // Codex on a Windows host reads a Bash label as `Unknown`.
+        if !cfg!(windows) {
+            assert_all(QUOTED_TEXT_IN_ONE_ARGUMENT_POSIX, "allow", decide, &label);
+        }
+        assert_all(GIT_NEXT_TO_QUOTED_TEXT, "deny", decide, &label);
+    }
+}
+
+/// An unquoted `${X:-word}`, `${X:=word}` or `${X:+word}` argument can give
+/// its operand's fields as argv. Only dcg reads these strings.
+#[test]
+fn parameter_operand_fields_are_possible_git_argv() {
+    let unsafe_commands = [
+        "git clean ${X:--fdx}",
+        "git clean ${X:--f -d -x}",
+        "git push ${X:+--force} origin main",
+        "git clean ${X:+-f -d -x}",
+        "git stash ${X:-clear}",
+        "git checkout ${X:--- .}",
+        "git reset ${X:-x} ${Y:-HEAD --hard}",
+    ];
+    let safe_commands = [
+        "git push ${X:+--dry-run} origin main",
+        "git checkout ${BRANCH:-main}",
+        "git log ${X:-\"--grep=reset --hard\"}",
+    ];
+    let posix = |command: &str| format!("{:?}", decision_in(command, ShellDialect::Posix));
+    assert_all(&unsafe_commands, "Deny", posix, "operand fields");
+    assert_all(&safe_commands, "Allow", posix, "harmless operand fields");
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        let bash = |command: &str| hook_decision(protocol, "Bash", command);
+        assert_all(&unsafe_commands, "deny", bash, "operand fields");
+        assert_all(&safe_commands, "allow", bash, "harmless operand fields");
     }
 }

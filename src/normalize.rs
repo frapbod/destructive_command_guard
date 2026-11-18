@@ -1654,6 +1654,15 @@ pub(crate) fn consume_posix_word_token(bytes: &[u8], i: usize, len: usize) -> us
     consume_word_token_inner(bytes, i, len, true)
 }
 
+// Keep a parameter expansion in its argv word: punctuation inside `${...}`
+// is not a shell separator. Reuse the context reader so quotes, nested
+// parameters and command substitutions have the same boundaries here.
+fn consume_word_braced_parameter(bytes: &[u8], i: usize, len: usize) -> usize {
+    std::str::from_utf8(&bytes[..len]).map_or(len, |command| {
+        crate::context::consume_braced_parameter(command, i).0
+    })
+}
+
 fn consume_word_token_inner(
     bytes: &[u8],
     mut i: usize,
@@ -1665,6 +1674,11 @@ fn consume_word_token_inner(
 
         if b.is_ascii_whitespace() {
             break;
+        }
+
+        if b == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
+            i = consume_word_braced_parameter(bytes, i, len);
+            continue;
         }
 
         if b == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
@@ -1754,6 +1768,9 @@ fn consume_word_token_inner(
                         b'\\' => {
                             i = (i + 2).min(len);
                         }
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                            i = consume_word_braced_parameter(bytes, i, len);
+                        }
                         b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
                             i = consume_shell_paren_construct(bytes, i + 2, len);
                         }
@@ -1777,6 +1794,9 @@ pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usi
 
     while i < len {
         match bytes[i] {
+            b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                i = consume_word_braced_parameter(bytes, i, len);
+            }
             b'(' => {
                 depth += 1;
                 i += 1;
@@ -1810,6 +1830,9 @@ pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usi
                         }
                         b'\\' => {
                             i = (i + 2).min(len);
+                        }
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                            i = consume_word_braced_parameter(bytes, i, len);
                         }
                         b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
                             i = consume_shell_paren_construct(bytes, i + 2, len);
@@ -5131,6 +5154,24 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn braced_parameter_is_one_word_across_shell_punctuation() {
+        for word in [
+            "${x:+)}",
+            "${x//)}",
+            "${x:-${y:+(}}",
+            "pre${x:-'a ) b'}post",
+            "\"${x:-a ) b}\"",
+            "$(echo ${x:+)})",
+        ] {
+            let line = format!("{word}; next");
+            assert_eq!(
+                super::consume_word_token(line.as_bytes(), 0, line.len()),
+                word.len(),
+                "{line}"
+            );
+        }
+    }
     use super::*;
 
     #[test]

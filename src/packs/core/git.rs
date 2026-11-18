@@ -1056,12 +1056,60 @@ fn first_literal_posix_git_token_offset(segment: &str) -> Option<usize> {
         })
 }
 
+/// The first arm body of `case WORD in [(]PATTERN) BODY`. A `case` header
+/// alone (its arms on later lines) leaves no command in this segment.
+fn command_after_posix_case_prefix<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    case_index: usize,
+) -> Option<(&'a str, usize)> {
+    let word_index = next_posix_prefix_token(segment, tokens, case_index + 1)?;
+    let in_index = next_posix_prefix_token(segment, tokens, word_index + 1)?;
+    if tokens.get(word_index)?.kind != NormalizeTokenKind::Word
+        || tokens.get(in_index)?.text(segment) != Some("in")
+    {
+        return None;
+    }
+    let Some(mut arm_index) = next_posix_prefix_token(segment, tokens, in_index + 1) else {
+        return Some((&segment[segment.len()..], segment.len()));
+    };
+    if tokens.get(arm_index)?.text(segment) == Some("(") {
+        arm_index = next_posix_prefix_token(segment, tokens, arm_index + 1)?;
+    }
+    posix_case_arm_body(segment, tokens, arm_index)
+}
+
+/// The body of a case arm `PATTERN[|PATTERN]...) BODY`. Later arms start
+/// their own segments after `;;`, and the segmenter also splits at a
+/// pattern's `|`. Outside a case this spelling is a syntax error, so reading
+/// it as an arm cannot hide a command Bash would run.
+fn posix_case_arm_body<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    mut index: usize,
+) -> Option<(&'a str, usize)> {
+    loop {
+        if tokens.get(index)?.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let next = next_posix_prefix_token(segment, tokens, index + 1)?;
+        match tokens.get(next)?.text(segment)? {
+            ")" => {
+                let body = next_posix_prefix_token(segment, tokens, next + 1)?;
+                let start = tokens.get(body)?.byte_range.start;
+                return Some((&segment[start..], start));
+            }
+            "|" => index = next_posix_prefix_token(segment, tokens, next + 1)?,
+            _ => return None,
+        }
+    }
+}
+
 fn command_after_posix_function_prefix<'a>(
     segment: &'a str,
     tokens: &[crate::normalize::NormalizeToken],
-    function_index: usize,
+    name_index: usize,
 ) -> Option<(&'a str, usize)> {
-    let name_index = next_posix_prefix_token(segment, tokens, function_index + 1)?;
     if tokens.get(name_index)?.kind != NormalizeTokenKind::Word {
         return None;
     }
@@ -1121,7 +1169,112 @@ pub(crate) fn command_after_posix_control_prefixes(
     segment: &str,
     dialect: ShellDialect,
 ) -> (&str, usize) {
-    command_after_posix_control_prefixes_bounded(segment, dialect, 0)
+    // An unknown shell may be POSIX, notably Windows Codex invoking Bash.
+    // Read the POSIX view with the same peeler used by the filesystem pack.
+    let dialect = if dialect == ShellDialect::Unknown {
+        ShellDialect::Posix
+    } else {
+        dialect
+    };
+    let (command, offset) = command_after_posix_control_prefixes_bounded(segment, dialect, 0);
+    if dialect != ShellDialect::Posix {
+        return (command, offset);
+    }
+    match end_at_unmatched_close(segment, command, offset) {
+        Some(command) => (command, offset),
+        None => (segment, 0),
+    }
+}
+
+/// End `command` at the first `)` it leaves unmatched. That `)` closes a
+/// subshell opened before the command, in this segment or in an earlier one
+/// (`(cd dir && git ...)` splits at `&&`): the words after it are not the
+/// command's argv. Bash accepts only redirections, more `)`, a separator or a
+/// closing reserved word after a subshell's `)`. When other words follow and
+/// this segment's peeled prefix opened a `(`, the line is not a POSIX
+/// subshell: `None`, so the segment stays as written. PowerShell's
+/// `if (...) { ... }` is read this way on Windows, where both dialects are
+/// judged. Otherwise the `)` closed something else, such as a substitution,
+/// and `command` is kept whole.
+fn end_at_unmatched_close<'a>(segment: &str, command: &'a str, offset: usize) -> Option<&'a str> {
+    if !command.contains(')') {
+        return Some(command);
+    }
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let paren = |token: &crate::normalize::NormalizeToken, text: &str| {
+        token.kind == NormalizeTokenKind::Separator && token.text(segment) == Some(text)
+    };
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if token.byte_range.start < offset {
+            continue;
+        }
+        if paren(token, "(") {
+            depth += 1;
+        } else if paren(token, ")") {
+            if depth == 0 {
+                if posix_compound_close_may_follow(segment, &tokens[index + 1..]) {
+                    return command.get(..token.byte_range.start - offset);
+                }
+                let prefix_opened = tokens
+                    .iter()
+                    .take_while(|token| token.byte_range.end <= offset)
+                    .any(|token| paren(token, "("));
+                return (!prefix_opened).then_some(command);
+            }
+            depth -= 1;
+        }
+    }
+    Some(command)
+}
+
+/// Whether `tokens`, after a subshell's `)`, are what Bash accepts there:
+/// redirections and further `)`, up to the end, a separator or a reserved
+/// word that closes or continues the enclosing compound command.
+fn posix_compound_close_may_follow(
+    segment: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> bool {
+    let mut target_pending = false;
+    let mut previous_end = None;
+    for token in tokens {
+        let Some(text) = token.text(segment) else {
+            return false;
+        };
+        let adjacent = previous_end == Some(token.byte_range.start);
+        previous_end = Some(token.byte_range.end);
+        if target_pending {
+            // The tokenizer splits `2>&1` into `2>`, `&` and `1`.
+            if token.kind == NormalizeTokenKind::Separator {
+                if !(text == "&" && adjacent) {
+                    return false;
+                }
+                continue;
+            }
+            target_pending = false;
+            continue;
+        }
+        if token.kind == NormalizeTokenKind::Separator {
+            match text {
+                ")" => continue,
+                "(" => return false,
+                _ => return true,
+            }
+        }
+        if matches!(
+            text,
+            "then" | "do" | "done" | "fi" | "}" | "else" | "elif" | "esac"
+        ) {
+            return true;
+        }
+        let operator = text.trim_start_matches(|ch: char| ch.is_ascii_digit());
+        let operator = operator.strip_prefix('&').unwrap_or(operator);
+        if !operator.starts_with(['<', '>']) {
+            return false;
+        }
+        target_pending = operator.trim_start_matches(['<', '>', '&', '|']).is_empty();
+    }
+    !target_pending
 }
 
 fn command_after_posix_control_prefixes_bounded(
@@ -1160,9 +1313,24 @@ fn command_after_posix_control_prefixes_bounded(
             break;
         }
     }
-    if !prefix_probe.split_whitespace().next().is_some_and(|word| {
-        crate::context::is_shell_command_prefix_reserved_word(word) || word == "function"
-    }) {
+    // `(` opens a subshell, `NAME()` declares a function and `PATTERN)` opens
+    // a case arm. Each puts syntax before a body command, like the reserved
+    // words do.
+    let mut words = prefix_probe.split_whitespace();
+    let first = words.next();
+    if !prefix_probe.starts_with('(')
+        && !first.is_some_and(|word| {
+            crate::context::is_shell_command_prefix_reserved_word(word)
+                || matches!(word, "function" | "case" | "time")
+        })
+        && !first
+            .into_iter()
+            .chain(words.next())
+            // A backslash-newline between a function name and `()` may
+            // leave more than two whitespace-separated probe words. Let
+            // the tokenizer inspect such a prefix rather than skipping it.
+            .any(|word| word.contains(['(', ')']) || word.ends_with('\\'))
+    {
         return (segment, 0);
     }
 
@@ -1173,18 +1341,33 @@ fn command_after_posix_control_prefixes_bounded(
         let Some(token) = tokens.get(index) else {
             return (segment, 0);
         };
-        if token.kind != NormalizeTokenKind::Word {
-            return (segment, 0);
-        }
         let Some(raw) = token.text(segment) else {
             return (segment, 0);
         };
+        if token.kind != NormalizeTokenKind::Word {
+            if raw == "(" {
+                stripped_reserved_word = true;
+                token_index = next_posix_prefix_token(segment, &tokens, index + 1);
+                continue;
+            }
+            return (segment, 0);
+        }
 
-        if raw == "function" {
-            let Some((body, offset)) = command_after_posix_function_prefix(segment, &tokens, index)
-            else {
-                return (segment, 0);
-            };
+        let structural_body = match raw {
+            "function" => next_posix_prefix_token(segment, &tokens, index + 1)
+                .and_then(|name| command_after_posix_function_prefix(segment, &tokens, name)),
+            "case" => command_after_posix_case_prefix(segment, &tokens, index),
+            _ => posix_case_arm_body(segment, &tokens, index).or_else(|| {
+                // `NAME () BODY`: without `function`, both parentheses are required.
+                let open = next_posix_prefix_token(segment, &tokens, index + 1)?;
+                let close = next_posix_prefix_token(segment, &tokens, open + 1)?;
+                (tokens.get(open)?.text(segment) == Some("(")
+                    && tokens.get(close)?.text(segment) == Some(")"))
+                .then(|| command_after_posix_function_prefix(segment, &tokens, index))
+                .flatten()
+            }),
+        };
+        if let Some((body, offset)) = structural_body {
             if body.is_empty() {
                 return (body, offset);
             }
@@ -1211,6 +1394,20 @@ fn command_after_posix_control_prefixes_bounded(
             return (command, offset.saturating_add(nested_offset));
         }
 
+        if raw == "time" {
+            // The `time [-p] [--]` reserved word times the pipeline after it,
+            // which may open with `(`, `{` or `!`.
+            stripped_reserved_word = true;
+            token_index = next_posix_prefix_token(segment, &tokens, index + 1);
+            for option in ["-p", "--"] {
+                if let Some(at) = token_index.filter(|&at| {
+                    tokens.get(at).and_then(|token| token.text(segment)) == Some(option)
+                }) {
+                    token_index = next_posix_prefix_token(segment, &tokens, at + 1);
+                }
+            }
+            continue;
+        }
         let command_prefix = if stripped_reserved_word {
             matches!(raw, "if" | "while" | "until" | "{" | "!")
         } else {
@@ -4956,6 +5153,37 @@ fn frontend_bail_may_execute_git(words: &[GitSemanticWord], dialect: ShellDialec
 /// quoting cannot hide existing regex-backed `core.git` rules. Callers must not
 /// synthesize source spans from the decoded string.
 pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Option<String> {
+    syntax_views_with_split_words(command, dialect, false).map(|mut views| views.swap_remove(0))
+}
+
+/// The decoded Git views that a safe pattern must all accept.
+///
+/// An unquoted expansion may give its operand's fields or an unknown value
+/// (`${X:-. -"W"}` runs `. -W` when `X` is unset). Its text proves neither
+/// that a safe flag reaches Git nor that an unsafe one does not, so a
+/// `core.git` exemption holds only if it holds under every reading of each
+/// such word: the unset or empty reading (the operand's fields after quote
+/// removal) and the set reading (one opaque value). A split word with blanks
+/// that has no such reading grants no exemption: the result is then empty.
+/// `None` means there is no decoded view; the caller reads the segment as
+/// written. The destructive patterns keep reading the fields through
+/// [`syntax_view_in_dialect`].
+pub(crate) fn safe_syntax_views_in_dialect(
+    command: &str,
+    dialect: ShellDialect,
+) -> Option<Vec<String>> {
+    syntax_views_with_split_words(command, dialect, true)
+}
+
+/// Readings of one decoded word: `[unset or empty, set]`, each a list of regex
+/// words. `None` means the word has no reading that may grant an exemption.
+type WordReadings = [Vec<String>; 2];
+
+fn syntax_views_with_split_words(
+    command: &str,
+    dialect: ShellDialect,
+    safe_readings: bool,
+) -> Option<Vec<String>> {
     let resolved_substitutions = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         .then(|| resolve_literal_printf_substitutions(command))
         .transpose()
@@ -4970,7 +5198,7 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
     };
 
     if dialect == ShellDialect::Unknown {
-        return Some(command.to_string());
+        return Some(vec![command.to_string()]);
     }
 
     let command = command.trim();
@@ -4982,7 +5210,9 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
             PowerShellCallTarget::GitBranch => format!("git branch {tail}"),
             PowerShellCallTarget::Git | PowerShellCallTarget::Dynamic => format!("git {tail}"),
         };
-        return Some(crate::normalize::normalize_command(&synthetic).into_owned());
+        return Some(vec![
+            crate::normalize::normalize_command(&synthetic).into_owned(),
+        ]);
     }
     let command = command
         .strip_prefix('&')
@@ -5002,15 +5232,51 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         return None;
     }
 
+    // Fixed decoded argv elements must remain one regex word. Expansions that
+    // can undergo field splitting are not fixed argv: keep their whitespace
+    // visible to the destructive patterns. Windows PowerShell 5.1 may also
+    // reparse an embedded double quote when it invokes a native program.
+    // Keeping whitespace visible for a whole uncertain word is deliberately
+    // conservative, including any literal quoted whitespace in that word.
+    let preserve_word = |word: &str| {
+        word.chars()
+            .map(|ch| if ch.is_whitespace() { '\u{1f}' } else { ch })
+            .collect::<String>()
+    };
+    let regex_word = |decoded: &str, may_split: bool| {
+        if may_split || (dialect == ShellDialect::PowerShell && decoded.contains('"')) {
+            decoded.to_string()
+        } else {
+            preserve_word(decoded)
+        }
+    };
+    let word_readings = |decoded: &str, may_split: bool| -> Option<WordReadings> {
+        if !(safe_readings && may_split) {
+            let word = regex_word(decoded, may_split);
+            return Some([vec![word.clone()], vec![word]]);
+        }
+        if dialect == ShellDialect::Posix
+            && let Some(readings) = posix_parameter_readings(decoded)
+        {
+            return Some(readings.map(|fields| fields.iter().map(|f| preserve_word(f)).collect()));
+        }
+        if decoded.contains(char::is_whitespace) {
+            return None;
+        }
+        Some([vec![decoded.to_string()], vec![decoded.to_string()]])
+    };
     let mut decoder = ShellTokenDecoder::new(dialect);
     let mut words = Vec::with_capacity(tokens.len());
+    let mut readings = Vec::with_capacity(tokens.len());
     for token in tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
     {
         let raw = token.text(command)?;
         if let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) {
-            words.push(decoded.into_owned());
+            let may_split = git_token_expansion_may_split(raw, dialect);
+            words.push(regex_word(&decoded, may_split));
+            readings.push(word_readings(&decoded, may_split));
         }
     }
     if words.is_empty() {
@@ -5020,7 +5286,7 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         // Command-substitution output is argv data; it is not parsed again as
         // shell source. Do not let an `echo "$(printf 'git reset --hard')"`
         // data argument become a synthetic Git invocation in the regex view.
-        return Some("__dcg_non_git_command__".to_string());
+        return Some(vec!["__dcg_non_git_command__".to_string()]);
     }
 
     if let Some(semantic) = decode_git_semantic_words(command, dialect)
@@ -5028,17 +5294,92 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
         && let Some(executable_index) = semantic_git_executable_index(&semantic.words, dialect)
         && semantic.words[executable_index].dynamic
     {
-        let mut words: Vec<_> = semantic
+        readings = semantic
             .words
             .iter()
-            .map(|word| word.decoded.clone())
+            .map(|word| word_readings(&word.decoded, word.may_split))
             .collect();
-        words[executable_index] = "git".to_string();
-        return Some(crate::normalize::normalize_command(&words.join(" ")).into_owned());
+        readings[executable_index] = Some([vec!["git".to_string()], vec!["git".to_string()]]);
     }
 
-    let decoded = words.join(" ");
-    Some(crate::normalize::normalize_command(&decoded).into_owned())
+    // Every word fixed: one view. Otherwise the all-unset and the all-set
+    // readings. Mixed readings are not tried.
+    let Some(readings) = readings.into_iter().collect::<Option<Vec<_>>>() else {
+        return Some(Vec::new());
+    };
+    let mut views = Vec::with_capacity(2);
+    for choice in 0..2 {
+        let view = readings
+            .iter()
+            .flat_map(|reading| reading[choice].iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let view = crate::normalize::normalize_command(&view).into_owned();
+        if !views.contains(&view) {
+            views.push(view);
+        }
+    }
+    Some(views)
+}
+
+/// An unknown parameter value in a reconstructed Git argv: one word that no
+/// rule reads as an option.
+const PARAMETER_VALUE: &str = "__dcg_parameter_value__";
+
+/// Possible argv fields of an unquoted `${NAME...}` argument, as two readings:
+/// `[unset or empty, set]`. A set parameter's value is unknown, so it reads as
+/// one opaque word. Returns `None` for any other dynamic word, and for operands
+/// that hold further expansions; those keep the conservative raw view.
+fn posix_parameter_argument_readings(word: &GitSemanticWord) -> Option<[Vec<String>; 2]> {
+    if !(word.dynamic && word.may_split) {
+        return None;
+    }
+    posix_parameter_readings(&word.decoded)
+}
+
+/// [`posix_parameter_argument_readings`] for one decoded unquoted word.
+fn posix_parameter_readings(decoded: &str) -> Option<[Vec<String>; 2]> {
+    if !git_dynamic_fragments(decoded, ShellDialect::Posix)
+        .iter()
+        .all(String::is_empty)
+    {
+        return None;
+    }
+    let inner = decoded.strip_prefix("${")?.strip_suffix('}')?;
+    let name_len = inner
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    if name_len == 0 || !inner.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let operator = &inner[name_len..];
+    let value = vec![PARAMETER_VALUE.to_string()];
+    // A bare parameter and pattern substitution or removal yield nothing or
+    // an unknown value.
+    if operator.is_empty() || operator.starts_with(['/', '%', '#']) {
+        return Some([Vec::new(), value]);
+    }
+    let (alternate, operand) = if let Some(operand) = operator
+        .strip_prefix(":+")
+        .or_else(|| operator.strip_prefix('+'))
+    {
+        (true, operand)
+    } else {
+        let operand = [":-", ":=", "-", "="]
+            .iter()
+            .find_map(|prefix| operator.strip_prefix(prefix))?;
+        (false, operand)
+    };
+    if operand.contains(['$', '`']) {
+        return None;
+    }
+    let fields = shell_words::split(operand).ok()?;
+    Some(if alternate {
+        [Vec::new(), fields]
+    } else {
+        [fields, value]
+    })
 }
 
 /// Build the decoded Git regex view without reintroducing inert argv data.
@@ -5092,6 +5433,45 @@ pub(crate) fn syntax_view_for_pattern_matching(
         .skip(executable_index + 1)
         .any(|word| word.dynamic)
     {
+        // An unquoted parameter-only argument is a choice of argv: it can
+        // vanish, give its operand's fields (`${X:-HEAD --hard}`,
+        // `${X:+--force}`) or give an unknown value. The raw regex view cannot
+        // walk punctuation inside `${...}` and would let operand text such as
+        // `--dry-run` act as a safe flag. Try each reading, deny-only: a
+        // reading is presented only when this pack denies it, never as a safe
+        // exemption. Keep all other dynamic words on the existing
+        // conservative path.
+        let args = &decoded.words[executable_index + 1..];
+        let readings: Option<Vec<[Vec<String>; 2]>> = args
+            .iter()
+            .filter(|word| word.dynamic)
+            .map(posix_parameter_argument_readings)
+            .collect();
+        if dialect == ShellDialect::Posix
+            && let Some(readings) = readings
+        {
+            for choice in 0..2 {
+                let mut candidate = String::from("git");
+                let mut dynamic = readings.iter();
+                for word in args {
+                    let fields = if word.dynamic {
+                        dynamic
+                            .next()
+                            .map_or(&[][..], |reading| &reading[choice][..])
+                    } else {
+                        std::slice::from_ref(&word.decoded)
+                    };
+                    for field in fields {
+                        candidate.push(' ');
+                        candidate.push_str(&shell_words::quote(field));
+                    }
+                }
+                let sanitized = crate::context::sanitize_for_pattern_matching(&candidate);
+                if AMBIGUITY_ARBITER.check(sanitized.as_ref()).is_some() {
+                    return syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix);
+                }
+            }
+        }
         return sanitized_view;
     }
 
@@ -5136,6 +5516,16 @@ pub(crate) fn syntax_view_for_pattern_matching(
     let executable_unbounded = git_semantic_executable_is_unbounded(executable, dialect);
     let mut args = String::new();
     for word in decoded.words.iter().skip(executable_index + 1) {
+        // Windows PowerShell 5.1 does not escape a `"` inside an argument when
+        // it builds a native command line, so the program splits that argument
+        // again at its blanks. Keep those blanks as argv boundaries.
+        if dialect == ShellDialect::PowerShell && word.decoded.contains('"') {
+            for field in word.decoded.split_whitespace() {
+                args.push(' ');
+                args.push_str(&shell_words::quote(field));
+            }
+            continue;
+        }
         args.push(' ');
         args.push_str(&shell_words::quote(&word.decoded));
     }
@@ -7671,6 +8061,59 @@ mod tests {
     }
 
     #[test]
+    fn posix_function_prefix_with_line_continuations_exposes_body() {
+        for segment in [
+            "echo \\\n () \\\n { eval \"$*\"",
+            "echo\\\n() { eval \"$*\"",
+            "echo \\\n \\\n () { eval \"$*\"",
+        ] {
+            let (body, offset) = command_after_posix_control_prefixes(segment, ShellDialect::Posix);
+            assert_eq!(body, "eval \"$*\"", "{segment:?}");
+            assert_eq!(&segment[offset..], body, "{segment:?}");
+        }
+    }
+
+    #[test]
+    fn posix_command_ends_at_the_close_of_an_earlier_subshell() {
+        for (segment, command) in [
+            ("\"git\" reset --hard )", "\"git\" reset --hard "),
+            (
+                "\"git\" reset --hard)>/dev/null 2>&1",
+                "\"git\" reset --hard",
+            ),
+            (
+                "\"git\" reset --hard ) 2>&1 >&2 fi",
+                "\"git\" reset --hard ",
+            ),
+            ("( \"git\" reset --hard ) then :", "\"git\" reset --hard "),
+            ("{ ( \"git\" reset --hard ) }", "\"git\" reset --hard "),
+            ("do ( \"git\" reset --hard ) done", "\"git\" reset --hard "),
+            (
+                "case a in a) ( \"git\" reset --hard ) ",
+                "\"git\" reset --hard ",
+            ),
+            ("time ( \"git\" reset --hard )", "\"git\" reset --hard "),
+            (
+                "time -p -- ( \"git\" reset --hard )",
+                "\"git\" reset --hard ",
+            ),
+            ("! time ( \"git\" reset --hard )", "\"git\" reset --hard "),
+            ("time ! ( \"git\" reset --hard )", "\"git\" reset --hard "),
+            ("{ time ( \"git\" reset --hard )", "\"git\" reset --hard "),
+            ("git log --format='(%h)'", "git log --format='(%h)'"),
+            ("echo $(git status) foo", "echo $(git status) foo"),
+            ("\"git\" status) foo", "\"git\" status) foo"),
+            ("if ($n -gt 1) { 'x' }", "if ($n -gt 1) { 'x' }"),
+        ] {
+            assert_eq!(
+                command_after_posix_control_prefixes(segment, ShellDialect::Posix).0,
+                command,
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
     fn posix_control_prefixes_expose_only_the_introduced_command() {
         for command in [
             "if git reset --hard",
@@ -7693,6 +8136,15 @@ mod tests {
             "function f() { git reset --hard",
             "function f if git reset --hard",
             "then function f { git reset --hard",
+            "( git reset --hard",
+            "(\"git\" reset --hard",
+            "{ ( git reset --hard",
+            "f() { git reset --hard",
+            "f () ( git reset --hard",
+            "case a in a) git reset --hard",
+            "case a in (a) git reset --hard",
+            "a) git reset --hard",
+            "b|a) git reset --hard",
         ] {
             assert!(
                 command_executes_git_in_dialect(command, ShellDialect::Posix),
@@ -7717,6 +8169,8 @@ mod tests {
             "sudo coproc git reset --hard",
             "/usr/bin/coproc git reset --hard",
             "'coproc' git reset --hard",
+            "case a in a) echo git reset --hard",
+            "a) echo git reset --hard",
         ] {
             assert!(
                 !command_executes_git_in_dialect(command, ShellDialect::Posix),
