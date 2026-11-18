@@ -796,8 +796,9 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
 
 /// Bash and zsh read `((…))` as arithmetic and keep blanks in a `=~` regex
 /// group, where `#` starts no comment, so the git command after it runs;
-/// dash reads nested subshells and has no `[[`, so there it does. Every blocked command below runs its git command in Bash 5.2 or
-/// dash 0.5.12 (measured with a `git` that only prints its arguments).
+/// dash reads nested subshells and has no `[[`, so there it does. Every
+/// blocked command below runs its git command in Bash 5.2 or dash 0.5.12
+/// (measured with a `git` that only prints its arguments).
 #[test]
 fn bash_data_hash_hides_no_later_git_command() {
     let payload = |command: &str, codex: bool| {
@@ -852,10 +853,24 @@ fn bash_data_hash_hides_no_later_git_command() {
         "[[ x =~ |( #) ]]; git reset --hard",
         "[[ x =~ a||( #) ]]; git reset --hard",
         "[[ x =~ (a)|b|( #) ]] || git reset --hard",
+        "[[ x =~|( #) ]]; git reset --hard",
+        "case x in x)[[ x =~ ( #) ]];;esac;git reset --hard",
+        "f()[[ x =~ ( #) ]];git reset --hard",
         // dash's reading: the comment ends at the line end and the quote in
         // it opens nothing; Bash reads one arithmetic command to the end.
         "(( 1 #'\ngit reset --hard))\n'))",
-    ] {
+    ]
+    .map(String::from)
+    .into_iter()
+    // Many short subshells before the arithmetic hide nothing.
+    .chain([(21, 1_000), (17, 8_000)].map(|(count, filler)| {
+        format!(
+            "{} echo $((1)); (( 1 #)); git reset --hard; : {}",
+            "((true) );".repeat(count),
+            "x".repeat(filler)
+        )
+    })) {
+        let command = command.as_str();
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
         let claude = run_hook_raw(&payload(command, false), &[]);

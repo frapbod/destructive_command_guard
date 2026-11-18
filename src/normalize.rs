@@ -5438,16 +5438,25 @@ pub(crate) fn powershell_line_breaks_as_line_feeds(command: &str) -> Option<Stri
 /// syntax error), and in `$((…))` too, where it reports an error that ends
 /// the line before anything after it runs; those are left alone.
 ///
-/// A `[[` conditional and an `=~` start where a word does (after a blank,
-/// `;`, `&`, `|`, `(` or a backquote). A `((` needs no word start: `(` is a
-/// metacharacter, so `for((`, `if((`, `!((`, `{((` and `case x in x)((` open
-/// an arithmetic command too; any `((` not right after `$` counts (a
-/// `\`LF pair between the two `(` is skipped). An arithmetic command ends
-/// where Bash ends it (see [`crate::context::arithmetic_end`]); a regex word
-/// ends at a blank, `;` or `&` outside its parentheses (`|` stays in it). Quoted text and comments outside them are passed over.
-/// Inside them, only a `#` outside quotes that follows a blank or an
-/// operator byte is spelled: one after a word byte (`2#101`, `$#`, `${#x}`)
-/// starts no comment to any reader.
+/// An `=~` starts where a word does (after a blank, `;`, `&`, `|`, `(` or a
+/// backquote) and ends at a blank, `(` or `|`, where its regex word starts.
+/// A `[[` conditional starts there too, and after `)`, a metacharacter, so
+/// `f()[[` and `case x in x)[[` open one. A `((` needs no word start, as
+/// `(` is a metacharacter: `for((`, `if((`, `!((`, `{((` and
+/// `case x in x)((` open an arithmetic command too; any `((` not right
+/// after `$` counts (a `\`LF pair between the two `(` is skipped). An
+/// arithmetic command ends where Bash ends it (see
+/// [`crate::context::arithmetic_scan`]); a regex word ends at a blank, `;`
+/// or `&` outside its parentheses (`|` stays in it). Quoted text and
+/// comments outside them are passed over. Inside them, only a `#` outside
+/// quotes that follows a blank or an operator byte is spelled: one after a
+/// word byte (`2#101`, `$#`, `${#x}`) starts no comment to any reader.
+///
+/// Each `((` costs a lookup that reads up to the `)` closing its level, and
+/// a run of unclosed `((` would read to the end once per `(`. So the
+/// lookups may read 16 times the input (plus 4 KiB) in all; past that,
+/// every `#` from there to the end that follows a blank or an operator
+/// byte is spelled, quoted or not, which can only add denies.
 ///
 /// Length preserving (one ASCII byte for another), so every range in the
 /// view is the same range in `command`.
@@ -5472,19 +5481,16 @@ pub(crate) fn bash_hashes_as_data(command: &str) -> Option<String> {
             .get(i)
             .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\n'))
     };
-    // Bytes the `arithmetic_end` lookups may scan in all: every one that
-    // succeeds covers text the loop then skips, but a run of unclosed `((`
-    // would rescan to the end each time. Past the budget the rest of the
-    // input is spelled as arithmetic (more denies, never fewer).
+    // The bytes the arithmetic lookups may read in all (see the doc).
     let budget = 16 * len + 4096;
     let mut spent = 0usize;
-    let mut arith_end = |start: usize| -> Option<(usize, usize)> {
+    let mut arithmetic = |start: usize| {
         if spent > budget {
-            return Some((len, len));
+            return Lookup::Spent;
         }
-        let end = crate::context::arithmetic_end(bytes, start);
-        spent += end.unwrap_or(len).saturating_sub(start) + 1;
-        end.map(|end| (end, end - 2))
+        let scan = crate::context::arithmetic_scan(bytes, start);
+        spent += scan.unwrap_or_else(|stop| stop).min(len) - start.min(len) + 1;
+        scan.map_or(Lookup::NotArithmetic, Lookup::End)
     };
     let mut spelled: Option<Vec<u8>> = None;
     // Each open double-quoted string (`(true, _)`) or substitution body
@@ -5507,13 +5513,21 @@ pub(crate) fn bash_hashes_as_data(command: &str) -> Option<String> {
                 i + 1
             }
             b'$' if bytes.get(i + 1) == Some(&b'(') => {
-                if bytes.get(i + 2) == Some(&b'(')
-                    && let Some((end, _)) = arith_end(i + 3)
-                {
-                    end
+                let lookup = if bytes.get(i + 2) == Some(&b'(') {
+                    arithmetic(i + 3)
                 } else {
-                    frames.push((false, 0));
-                    i + 2
+                    Lookup::NotArithmetic
+                };
+                match lookup {
+                    Lookup::End(end) => end,
+                    Lookup::NotArithmetic => {
+                        frames.push((false, 0));
+                        i + 2
+                    }
+                    Lookup::Spent => {
+                        spell_every_comment_hash(bytes, i, len, &mut spelled);
+                        break;
+                    }
                 }
             }
             _ if in_double => i + 1,
@@ -5529,14 +5543,27 @@ pub(crate) fn bash_hashes_as_data(command: &str) -> Option<String> {
                 memchr::memchr(b'\n', &bytes[i..]).map_or(len, |at| i + at)
             }
             b'(' if (i == 0 || bytes[i - 1] != b'$')
-                && let Some(second) = second_open_paren(bytes, i)
-                && let Some((end, body_end)) = arith_end(second + 1) =>
+                && let Some(second) = second_open_paren(bytes, i) =>
             {
-                spell_comment_hashes(bytes, second + 1, body_end, &mut spelled);
-                end
+                match arithmetic(second + 1) {
+                    Lookup::End(end) => {
+                        spell_comment_hashes(bytes, second + 1, end - 2, &mut spelled);
+                        end
+                    }
+                    Lookup::NotArithmetic => {
+                        if let Some(frame) = frames.last_mut() {
+                            frame.1 += 1;
+                        }
+                        i + 1
+                    }
+                    Lookup::Spent => {
+                        spell_every_comment_hash(bytes, i, len, &mut spelled);
+                        break;
+                    }
+                }
             }
             b'[' if bytes.get(i + 1) == Some(&b'[')
-                && word_starts_after(i)
+                && (word_starts_after(i) || bytes[i - 1] == b')')
                 && blank_or_end(i + 2) =>
             {
                 in_conditional = true;
@@ -5549,7 +5576,7 @@ pub(crate) fn bash_hashes_as_data(command: &str) -> Option<String> {
             b'=' if in_conditional
                 && bytes.get(i + 1) == Some(&b'~')
                 && word_starts_after(i)
-                && (blank_or_end(i + 2) || bytes.get(i + 2) == Some(&b'(')) =>
+                && (blank_or_end(i + 2) || matches!(bytes.get(i + 2), Some(b'(' | b'|'))) =>
             {
                 let start = i
                     + 2
@@ -5582,6 +5609,15 @@ pub(crate) fn bash_hashes_as_data(command: &str) -> Option<String> {
     }
     // Only an ASCII byte changed into another ASCII byte.
     spelled.and_then(|spelled| String::from_utf8(spelled).ok())
+}
+
+/// What an arithmetic lookup of [`bash_hashes_as_data`] found.
+enum Lookup {
+    /// Arithmetic, which ends before this index.
+    End(usize),
+    NotArithmetic,
+    /// The lookups have read all the bytes they may.
+    Spent,
 }
 
 /// Index of the `(` that follows the `(` at `open` once `\`LF pairs (line
@@ -5631,8 +5667,8 @@ fn skip_double_quoted_text(bytes: &[u8], start: usize, end: usize) -> usize {
 }
 
 /// Spell `_` each `#` in `start..end` of `bytes` that is outside quotes and
-/// follows a blank or an operator byte, quoting read as
-/// [`crate::context::arithmetic_end`] reads it.
+/// may start a comment, quoting read as [`crate::context::arithmetic_scan`]
+/// reads it.
 fn spell_comment_hashes(bytes: &[u8], start: usize, end: usize, spelled: &mut Option<Vec<u8>>) {
     let mut i = start;
     while i < end {
@@ -5640,19 +5676,34 @@ fn spell_comment_hashes(bytes: &[u8], start: usize, end: usize, spelled: &mut Op
             b'\\' => i + 2,
             b'\'' => memchr::memchr(b'\'', &bytes[i + 1..end]).map_or(end, |at| i + at + 2),
             b'"' => skip_double_quoted_text(bytes, i + 1, end),
-            b'#' if i > 0
-                && (bytes[i - 1].is_ascii_whitespace()
-                    || matches!(
-                        bytes[i - 1],
-                        b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'`'
-                    )) =>
-            {
+            b'#' if hash_may_start_comment(bytes, i) => {
                 spelled.get_or_insert_with(|| bytes.to_vec())[i] = b'_';
                 i + 1
             }
             _ => i + 1,
         };
     }
+}
+
+/// Spell `_` each `#` in `start..end` of `bytes` that may start a comment,
+/// quoted or not.
+fn spell_every_comment_hash(bytes: &[u8], start: usize, end: usize, spelled: &mut Option<Vec<u8>>) {
+    for at in memchr::memchr_iter(b'#', &bytes[start..end]) {
+        if hash_may_start_comment(bytes, start + at) {
+            spelled.get_or_insert_with(|| bytes.to_vec())[start + at] = b'_';
+        }
+    }
+}
+
+/// Whether the `#` at `at` follows a blank or an operator byte; one after a
+/// word byte starts no comment to any reader.
+fn hash_may_start_comment(bytes: &[u8], at: usize) -> bool {
+    at > 0
+        && (bytes[at - 1].is_ascii_whitespace()
+            || matches!(
+                bytes[at - 1],
+                b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'`'
+            ))
 }
 
 /// `command` with every program name it spells in a case other than lower
@@ -6115,6 +6166,19 @@ mod tests {
                 "[[ x =~ a|( #) ]]; git reset --hard",
                 "[[ x =~ a|( _) ]]; git reset --hard",
             ),
+            (
+                "[[ x =~|( #) ]]; git reset --hard",
+                "[[ x =~|( _) ]]; git reset --hard",
+            ),
+            // `)` is a metacharacter, so a `[[` after it opens a conditional.
+            (
+                "case x in x)[[ x =~ ( #) ]];;esac;git reset --hard",
+                "case x in x)[[ x =~ ( _) ]];;esac;git reset --hard",
+            ),
+            (
+                "f()[[ x =~ ( #) ]];git reset --hard",
+                "f()[[ x =~ ( _) ]];git reset --hard",
+            ),
             // A group in a `=~` regex keeps its blanks in the word.
             (
                 "[[ x =~ ( #) ]]; git reset --hard",
@@ -6175,6 +6239,31 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn bash_hashes_as_data_spells_to_the_end_past_its_budget() {
+        let tail = " (( 1 #)); git reset --hard";
+        // Unclosed runs spend the budget in the `((` and the `$((` arm.
+        for head in ["(".repeat(2_000), "$((".repeat(200)] {
+            let command = format!("{head} echo $((1));{tail}");
+            let spelled = bash_hashes_as_data(&command).expect("spelled");
+            assert!(
+                spelled.ends_with(" (( 1 _)); git reset --hard"),
+                "{head:.9}"
+            );
+        }
+        // Lookups are charged the bytes they read, so many short subshells
+        // spend nothing that hides a later arithmetic `#`.
+        for (count, filler) in [(21, 1_000), (17, 8_000), (2_000, 0)] {
+            let command = format!(
+                "{} echo $((1));{tail}; : {}",
+                "((true) );".repeat(count),
+                "x".repeat(filler)
+            );
+            let spelled = bash_hashes_as_data(&command).expect("spelled");
+            assert!(spelled.contains(" (( 1 _)); git reset --hard"), "{count}");
+        }
     }
 
     #[test]
