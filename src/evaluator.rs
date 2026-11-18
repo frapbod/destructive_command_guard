@@ -14425,7 +14425,7 @@ fn powershell_redirection_element_end(
     range: std::ops::Range<usize>,
 ) -> Option<usize> {
     let (start, target_follows) =
-        powershell_unescaped_redirect_suffix(segment.get(range.clone())?)?;
+        powershell_unescaped_redirect_suffix(segment.get(range.clone())?, false)?;
     if start != 0 {
         return None;
     }
@@ -14460,7 +14460,12 @@ fn powershell_redirection_element_end(
     Some(powershell_cmdlet_element_end(segment, operator_end, target).max(range.end))
 }
 
-fn powershell_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
+/// Where the PowerShell redirection glued into `word` starts, and whether its
+/// target is the next word. With `glued_text`, a `<` or `>` glued to a
+/// bareword or a variable is text, as PowerShell reads it inside a command
+/// argument (`a>x`, `a<#`); without it, every such operator counts, the wider
+/// reading the deny-wins argv view takes (`git>$null reset`).
+fn powershell_unescaped_redirect_suffix(word: &str, glued_text: bool) -> Option<(usize, bool)> {
     let bytes = word.as_bytes();
     let mut index = 0usize;
     let mut single = false;
@@ -14492,7 +14497,8 @@ fn powershell_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
                 };
                 // Glued to a bareword or a variable, `<` and `>` are text
                 // (`a>x`, `a<#`), as a glued `#` would be.
-                if operator_start > 0
+                if glued_text
+                    && operator_start > 0
                     && !crate::normalize::powershell_argument_text_ends_at(word, index)
                 {
                     index += 1;
@@ -14562,7 +14568,8 @@ fn mask_powershell_output_argument_data<'a>(
                 next_is_redirect_target = false;
                 continue;
             }
-            if let Some((redirect_start, needs_target)) = powershell_unescaped_redirect_suffix(raw)
+            if let Some((redirect_start, needs_target)) =
+                powershell_unescaped_redirect_suffix(raw, true)
             {
                 next_is_redirect_target = needs_target;
                 if redirect_start > 0 && !powershell_alias_word_is_dynamic(raw) {
@@ -14743,7 +14750,7 @@ fn cmd_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
 fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option<String> {
     let redirect_suffix: fn(&str) -> Option<(usize, bool)> = match dialect {
         ShellDialect::Cmd => cmd_unescaped_redirect_suffix,
-        ShellDialect::PowerShell => powershell_unescaped_redirect_suffix,
+        ShellDialect::PowerShell => |word| powershell_unescaped_redirect_suffix(word, false),
         ShellDialect::Posix | ShellDialect::Unknown => return None,
     };
     memchr::memchr2(b'<', b'>', command.as_bytes())?;
