@@ -45,6 +45,23 @@ const RUNS_IT: &[&str] = &[
     "powershell -ec ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=",
     "powershell -Config x -c \"git reset --hard\"",
     "powershell -sta -noni \"git reset --hard\"",
+    // Switches 5.1 reads but dcg does not model are never the command, for
+    // any prefix: 5.1 keeps parsing after `/imp`, and the later -c runs.
+    "powershell /imp -c \"git reset --hard\"",
+    "powershell /ImportSystemModules -c \"git reset --hard\"",
+    "powershell /-imp -c \"git reset --hard\"",
+    "powershell /ea AAAA -c \"git reset --hard\"",
+    "powershell /encodedarguments AAAA -c \"git reset --hard\"",
+    "powershell /s -c \"git reset --hard\"",
+    "powershell /so -c \"git reset --hard\"",
+    "powershell /nam -c \"git reset --hard\"",
+    "powershell /PSConsoleFile x.psc1 -c \"git reset --hard\"",
+    "powershell -NoProfile /imp -Command \"git reset --hard\"",
+    "powershell -imp -c \"git reset --hard\"",
+    "powershell --imp -c \"git reset --hard\"",
+    // ... and never prove that the host leaves piped input alone.
+    "echo \"git reset --hard\" | powershell /imp -c -",
+    "echo \"git reset --hard\" | powershell /imp",
     // pwsh knows -WorkingDirectory; its command is still judged.
     "pwsh -WorkingDirectory C:\\ -c \"git reset --hard\"",
 ];
@@ -63,6 +80,7 @@ const HARMLESS: &[&str] = &[
     "powershell -Config Microsoft.PowerShell -c \"Get-Date\"",
     "powershell -v 2 -c \"Get-Date\"",
     "powershell /?",
+    "powershell /nop /c \"Get-Date\"",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
@@ -228,6 +246,10 @@ fn posix_dialect_reads_windows_powershell_switches() {
         "powershell -WorkingDirectory \"x; git reset --hard\"",
         "powershell -SettingsFile \"x; git reset --hard\"",
         "powershell.exe -Work 'x; git reset --hard'",
+        "powershell /imp -c 'git reset --hard'",
+        "powershell /PSConsoleFile x.psc1 -c 'git reset --hard'",
+        "echo 'git reset --hard' | powershell /imp -c -",
+        "echo 'git reset --hard' | powershell /imp",
     ] {
         assert_eq!(
             decision_in(command, ShellDialect::Posix),

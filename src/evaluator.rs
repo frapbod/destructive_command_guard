@@ -4473,6 +4473,12 @@ enum PowerShellHostOption {
     /// `-Version`): takes the next argument as its value when there is one;
     /// as the last argument it starts nothing.
     OptionalValue,
+    /// A switch the host reads, but whose effect dcg does not model (the
+    /// Windows PowerShell 5.1 server modes, for example). It is never the
+    /// start of the command and never proves the host leaves stdin alone:
+    /// callers fail closed on it for every prefix, `/` included.
+    Unmodeled,
+    /// Not a switch dcg knows for this host.
     Unknown,
 }
 
@@ -4568,6 +4574,13 @@ fn powershell_switch_prefix(decoded: &str) -> Option<(char, &str)> {
     (is_powershell_dash(prefix) || prefix == '/').then_some((prefix, chars.as_str()))
 }
 
+/// Whether a decoded argument carries a dash switch prefix (any of the four
+/// dashes, after trimming). An unknown dashed argument is never a command or
+/// script path, so callers fail closed on it; an unknown `/name` is one.
+fn powershell_argument_is_dashed(decoded: &str) -> bool {
+    powershell_switch_prefix(decoded).is_some_and(|(prefix, _)| prefix != '/')
+}
+
 /// Reads a lower-case switch name (prefix and extra dash removed) the way
 /// Windows PowerShell 5.1 does.
 ///
@@ -4588,24 +4601,29 @@ fn powershell_switch_prefix(decoded: &str) -> Option<(char, &str)> {
 ///
 /// `-Version` is read by the native powershell.exe launcher before the
 /// managed parser; it is kept as a value option for any prefix
-/// (`powershell -v 2 -c ...` is a known spelling). Undocumented switches
-/// (ImportSystemModules, the server modes, EncodedArguments) keep their
-/// place so they still shadow later entries, but stay `Unknown`; so does the
-/// launcher's `-PSConsoleFile`. Real 5.1 is unmeasured (no sandboxed route).
+/// (`powershell -v 2 -c ...` is a known spelling). The launcher's
+/// `-PSConsoleFile` and the undocumented managed switches
+/// (ImportSystemModules, the server modes, EncodedArguments) are switches
+/// 5.1 reads, so they are `Unmodeled`, never the start of the command: 5.1
+/// keeps parsing after `/imp`, and a later `-c` runs. The launcher's own
+/// abbreviation rule for `-PSConsoleFile` is unknown, so every prefix of it
+/// is `Unmodeled` (no 5.1 switch starts with `p`). Real 5.1 is unmeasured (no
+/// sandboxed route).
 fn windows_powershell_switch(name: &str) -> PowerShellHostOption {
-    use PowerShellHostOption::{Command, EncodedCommand, File, NoValue, Unknown, Value};
+    use PowerShellHostOption::{Command, EncodedCommand, File, NoValue, Unknown, Unmodeled, Value};
     const SWITCHES: &[(&str, usize, PowerShellHostOption)] = &[
+        ("psconsolefile", 1, Unmodeled),
         ("version", 1, Value),
         ("help", 1, NoValue),
         ("?", 1, NoValue),
         ("noexit", 3, NoValue),
-        ("importsystemmodules", 3, Unknown),
+        ("importsystemmodules", 3, Unmodeled),
         ("noprofile", 3, NoValue),
         ("nologo", 3, NoValue),
         ("noninteractive", 4, NoValue),
-        ("socketservermode", 2, Unknown),
-        ("servermode", 1, Unknown),
-        ("namedpipeservermode", 3, Unknown),
+        ("socketservermode", 2, Unmodeled),
+        ("servermode", 1, Unmodeled),
+        ("namedpipeservermode", 3, Unmodeled),
         ("configurationname", 6, Value),
         ("command", 1, Command),
         ("windowstyle", 1, Value),
@@ -4618,8 +4636,8 @@ fn windows_powershell_switch(name: &str) -> PowerShellHostOption {
         ("ep", 2, Value),
         ("encodedcommand", 1, EncodedCommand),
         ("ec", 1, EncodedCommand),
-        ("encodedarguments", 8, Unknown),
-        ("ea", 2, Unknown),
+        ("encodedarguments", 8, Unmodeled),
+        ("ea", 2, Unmodeled),
         ("sta", 1, NoValue),
         ("mta", 3, NoValue),
     ];
@@ -5230,12 +5248,16 @@ fn parse_powershell_launcher(
                 }
                 index += 2;
             }
+            PowerShellHostOption::Unmodeled => {
+                return WindowsLauncherParse::Unverified(format!(
+                    "PowerShell host option {raw:?} is not modeled"
+                ));
+            }
             PowerShellHostOption::Unknown => {
-                let prefix = powershell_host_option_value(raw, outer_dialect)
+                let dashed = powershell_host_option_value(raw, outer_dialect)
                     .as_deref()
-                    .and_then(powershell_switch_prefix)
-                    .map(|(prefix, _)| prefix);
-                if prefix.is_some_and(|prefix| prefix != '/') || raw.trim_start().starts_with('-') {
+                    .is_some_and(powershell_argument_is_dashed);
+                if dashed || raw.trim_start().starts_with('-') {
                     return WindowsLauncherParse::Unverified(format!(
                         "PowerShell host option {raw:?} is unknown or ambiguous"
                     ));
@@ -8396,8 +8418,11 @@ fn appended_code_input_mode(
                     }
                     index += 2;
                 }
+                PowerShellHostOption::Unmodeled => {
+                    return PipelineShellInputMode::Unverified;
+                }
                 PowerShellHostOption::Unknown => {
-                    if argument.starts_with('-') {
+                    if powershell_argument_is_dashed(argument) {
                         return PipelineShellInputMode::Unverified;
                     }
                     let kind = if join_windows_argv {
@@ -9326,8 +9351,9 @@ fn powershell_pipeline_input_mode(args: &[String], host: PowerShellHost) -> Pipe
                 }
                 index += 2;
             }
+            PowerShellHostOption::Unmodeled => return PipelineShellInputMode::Unverified,
             PowerShellHostOption::Unknown => {
-                if argument.starts_with('-') {
+                if powershell_argument_is_dashed(argument) {
                     return PipelineShellInputMode::Unverified;
                 }
                 return PipelineShellInputMode::DoesNotReadStdin;
@@ -59159,7 +59185,7 @@ mod tests {
             ),
             (
                 "-s",
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Unmodeled,
                 PowerShellHostOption::Unknown,
             ),
             (
@@ -59189,7 +59215,7 @@ mod tests {
             ),
             (
                 "-ea",
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Unmodeled,
                 PowerShellHostOption::Unknown,
             ),
             (
@@ -59204,6 +59230,21 @@ mod tests {
             ),
             (
                 "-PSConsoleFile",
+                PowerShellHostOption::Unmodeled,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "/imp",
+                PowerShellHostOption::Unmodeled,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "/-nam",
+                PowerShellHostOption::Unmodeled,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "/Foo",
                 PowerShellHostOption::Unknown,
                 PowerShellHostOption::Unknown,
             ),
