@@ -212,6 +212,13 @@ const RUNS_IT: &[&str] = &[
     "$h = @{a = 1 | ForEach-Object { Remove-Item -Recurse -Force C:\\Users }}",
 ];
 
+/// pwsh 7.5 hands `cmd` a value it reads at run time (`%X%`), as the bare
+/// `cmd /c "echo %X%"` does. dcg denies the bare call on the base commit
+/// (a launcher that fails closed on a runtime value), so the assignment
+/// must get that verdict too (card t_3bdbf4bf's rows).
+const FAILS_CLOSED_LIKE_THE_BARE_COMMAND: &[&str] =
+    &["$r = cmd /c \"echo %X%\"", "$r=cmd /c \"echo %X%\""];
+
 /// pwsh 7.5 runs these too (a real directory is deleted). The Unknown
 /// dialect allows the bare .NET call on the base commit (card t_02cc8a24),
 /// so only the PowerShell dialect is held to them here.
@@ -227,6 +234,7 @@ const HARMLESS: &[&str] = &[
     // The same shapes with a harmless value or data.
     "$c=iex 'git status'",
     "$c=iex 'git log -1'",
+    "$r = cmd /c \"echo hi\"",
     "Get-Date & $c=git status",
     "return $c=git status",
     "$c\u{e9}=git status",
@@ -434,7 +442,11 @@ fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
 #[test]
 fn powershell_tool_judges_the_value_of_a_statement_leading_assignment() {
     for protocol in [Protocol::Claude, Protocol::Codex] {
-        for command in RUNS_IT.iter().chain(RUNS_IT_IN_POWERSHELL) {
+        for command in RUNS_IT
+            .iter()
+            .chain(RUNS_IT_IN_POWERSHELL)
+            .chain(FAILS_CLOSED_LIKE_THE_BARE_COMMAND)
+        {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "deny",
@@ -454,7 +466,7 @@ fn powershell_tool_judges_the_value_of_a_statement_leading_assignment() {
 #[test]
 fn powershell_and_unknown_dialects_judge_the_value_of_a_statement_leading_assignment() {
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
-        for command in RUNS_IT {
+        for command in RUNS_IT.iter().chain(FAILS_CLOSED_LIKE_THE_BARE_COMMAND) {
             assert_eq!(
                 decision_in(command, dialect),
                 EvaluationDecision::Deny,
