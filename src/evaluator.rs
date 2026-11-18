@@ -2179,7 +2179,7 @@ fn split_top_level_powershell_statements(command: &str) -> Result<Vec<&str>, ()>
                     index += 1;
                 }
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 let end = skip_powershell_block_comment(command, index);
                 if end == bytes.len() && !command[index..].ends_with("#>") {
                     return Err(());
@@ -4900,7 +4900,7 @@ fn find_powershell_script_block_close(command: &str, start: usize) -> Option<usi
                     .find('\n')
                     .map_or(bytes.len(), |newline| index + newline + 1);
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 index = skip_powershell_block_comment(command, index);
             }
             b'\'' => index = skip_powershell_single_quote(command, index),
@@ -8001,7 +8001,7 @@ fn find_powershell_subexpression_close(command: &str, body_start: usize) -> Resu
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Ambiguous => {
                 return Err(());
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 index = skip_powershell_block_comment(command, index);
             }
             b'\'' => index = skip_powershell_single_quote(command, index),
@@ -8105,7 +8105,7 @@ fn collect_powershell_substitution_bodies(command: &str) -> Result<Vec<String>, 
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Ambiguous => {
                 return Err(());
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 index = skip_powershell_block_comment(command, index);
             }
             b'\'' => index = skip_powershell_single_quote(command, index),
@@ -8184,7 +8184,7 @@ fn collect_powershell_verbatim_here_string_substitution_bodies(
             b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Ambiguous => {
                 return Err(());
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 index = skip_powershell_block_comment(command, index);
             }
             b'\'' => index = skip_powershell_single_quote(command, index),
@@ -8253,7 +8253,7 @@ fn mask_powershell_block_comments(command: &str) -> Cow<'_, str> {
                 index =
                     powershell_here_string_end(command, index).map_or(index + 1, |(_, _, end)| end);
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 let end = skip_powershell_block_comment(command, index);
                 masked.get_or_insert_with(|| bytes.to_vec())[index..end].fill(b' ');
                 index = end;
@@ -12480,7 +12480,7 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
                     .find('\n')
                     .map_or(bytes.len(), |newline| index + newline + 1);
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 index = skip_powershell_block_comment(command, index);
             }
             b'\'' => index = skip_powershell_single_quote(command, index),
@@ -15478,7 +15478,7 @@ fn restore_powershell_here_string_substitution_text<'a>(
                     .find('\n')
                     .map_or(bytes.len(), |newline| index + newline + 1);
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 index = skip_powershell_block_comment(original_command, index);
             }
             b'\'' => index = skip_powershell_single_quote(original_command, index),
