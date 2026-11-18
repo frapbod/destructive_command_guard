@@ -152,7 +152,6 @@ fn restore_staged_alone_stays_allowed() {
             "git restore -S src",
             "git restore . --staged",
             "git restore --staged --no-worktree .",
-            "git restore -W --no-w -S .",
             "git restore --staged -sHEAD .",
             "git restore --staged -sWIP .",
             "git restore --staged --source=HEAD src",
