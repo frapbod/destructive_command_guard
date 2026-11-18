@@ -658,7 +658,13 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
     })
 }
 
-fn find_posix_substitution_close(command: &str, start: usize, delimiter: u8) -> Result<usize, ()> {
+/// The byte index of the delimiter that closes a command substitution whose
+/// body starts at `start` (`)` for `$(`, `` ` `` for a backquote).
+pub(crate) fn find_posix_substitution_close(
+    command: &str,
+    start: usize,
+    delimiter: u8,
+) -> Result<usize, ()> {
     let bytes = command.as_bytes();
     let mut index = start;
     let mut depth = usize::from(delimiter == b')');
@@ -5335,7 +5341,8 @@ fn syntax_views_with_split_words(
         }
         if dialect == ShellDialect::Posix {
             // An unquoted command substitution may give any fields, flags
-            // included (`$(echo${IFS}-W)`), so it proves no exemption.
+            // included (`$(echo${IFS}-W)`), so it has no reading and proves
+            // no exemption. A quoted one is one opaque field, like `"$X"`.
             return posix_parameter_readings(decoded).map(|readings| {
                 readings.map(|fields| fields.iter().map(|f| preserve_word(f)).collect())
             });
@@ -5383,16 +5390,22 @@ fn syntax_views_with_split_words(
         readings[executable_index] = Some([vec!["git".to_string()], vec!["git".to_string()]]);
     }
 
-    // Every word fixed: one view. Otherwise the all-unset and the all-set
-    // readings. Mixed readings are not tried.
+    // Every word fixed: one view. Otherwise every mix of the words' unset and
+    // set readings; an exemption must hold on each. Too many dynamic words
+    // to mix prove no exemption.
     let Some(readings) = readings.into_iter().collect::<Option<Vec<_>>>() else {
         return Some(Vec::new());
     };
-    let mut views = Vec::with_capacity(2);
-    for choice in 0..2 {
+    let (choices, complete) = crate::normalize::posix_reading_choices(&readings);
+    if !complete {
+        return Some(Vec::new());
+    }
+    let mut views = Vec::with_capacity(choices.len());
+    for choice in choices {
         let view = readings
             .iter()
-            .flat_map(|reading| reading[choice].iter().map(String::as_str))
+            .zip(&choice)
+            .flat_map(|(reading, &pick)| reading[pick].iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
         let view = crate::normalize::normalize_command(&view).into_owned();
@@ -5481,9 +5494,11 @@ pub(crate) fn syntax_view_for_pattern_matching(
         // or give an unknown value. The raw regex view cannot walk
         // punctuation inside `${...}` and would let operand text such as
         // `--dry-run` act as a safe flag. Try the all-unset and the all-set
-        // readings, deny-only: a reading is presented only when this pack
-        // denies it, never as a safe exemption. A word with no reading (a
-        // command substitution) stays one opaque word in each reading.
+        // readings, then each mix across words (`${X:---} $F` runs
+        // `git checkout -- <F>` only with X unset and F set), deny-only: a
+        // reading is presented only when this pack denies it, never as a
+        // safe exemption. A word with no reading (an unquoted command
+        // substitution) stays one opaque word in each reading.
         if dialect == ShellDialect::Posix {
             let args = &decoded.words[executable_index + 1..];
             let readings: Vec<[Vec<String>; 2]> = args
@@ -5493,9 +5508,13 @@ pub(crate) fn syntax_view_for_pattern_matching(
                         .unwrap_or_else(|| [vec![word.decoded.clone()], vec![word.decoded.clone()]])
                 })
                 .collect();
-            for choice in 0..2 {
+            for choice in crate::normalize::posix_reading_choices(&readings).0 {
                 let mut candidate = String::from("git");
-                for field in readings.iter().flat_map(|reading| &reading[choice]) {
+                for field in readings
+                    .iter()
+                    .zip(&choice)
+                    .flat_map(|(reading, &pick)| &reading[pick])
+                {
                     candidate.push(' ');
                     candidate.push_str(&shell_words::quote(field));
                 }

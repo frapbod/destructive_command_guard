@@ -167,6 +167,35 @@ fn expansion_operands_supply_judged_argv() {
     );
 }
 
+/// One parameter may be set while another is unset; neither uniform reading
+/// shows these (shell-truth: `rm -rf /x`, `rm -r -f /x`, `git checkout -- a`
+/// for `DIR=/x` and `F=a` in linux-bash and linux-dash).
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn mixed_readings_across_words_supply_judged_argv() {
+    assert_tools(
+        "deny",
+        &[
+            r"rm ${X:--rf} $DIR",
+            r"rm ${X:--rf} $HOME",
+            r"rm ${X:--rf} ${DIR}",
+            r"rm ${X:--rf} $1",
+            r"rm ${RM_OPTS:--rf} $BUILD_DIR",
+            r"rm -r${X}f $DIR",
+            r"rm ${X:--r} -f $DIR",
+            r"git checkout ${X:---} $F",
+        ],
+    );
+    assert_tools(
+        "allow",
+        &[
+            r"rm -f $A $B $C",
+            r"git diff $A $B",
+            r"rm -- ${X:--rf} ~/zz",
+        ],
+    );
+}
+
 #[test]
 fn command_substitution_output_is_judged_argv() {
     assert_tools(
@@ -182,6 +211,8 @@ fn command_substitution_output_is_judged_argv() {
             r"git restore --staged . `echo${IFS}-W`",
             r"rm $(echo -rf ~/zz)",
             r"rm $(echo -rf /etc)",
+            // Unquoted output may be any fields, flags included.
+            r"git clean -fdn $(pwd)",
         ],
     );
     assert_tools(
@@ -192,6 +223,13 @@ fn command_substitution_output_is_judged_argv() {
             r"git log $(echo HEAD~1)",
             r"echo $(echo --hard)",
             r#"git commit -m "$(echo --hard)""#,
+            // A quoted substitution is one field, like `"$X"`, so the dry
+            // run still holds.
+            r#"git clean -fdn "$(pwd)""#,
+            r#"git clean -fdn "`pwd`""#,
+            r#"git clean -f -n "$(pwd)/target""#,
+            r#"git clean -fd --dry-run -- "$(git rev-parse --show-toplevel)/build""#,
+            r#"git clean -fdn "${ROOT:-$(pwd)}""#,
             r"git restore --staged $(git diff --name-only --cached)",
             r"git diff $(git merge-base HEAD main)",
             r#"rm "$(echo ~/x)""#,

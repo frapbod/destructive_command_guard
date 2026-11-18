@@ -33323,15 +33323,17 @@ fn rm_segment_denied_after_literal_substitution(
     }
 }
 
-/// The rm decision for a segment read with every parameter unset, then with
-/// every parameter set, when that is a DENY the segment's own text did not
-/// produce.
+/// The rm decision for a segment read with each dynamic word unset or set
+/// ([`crate::normalize::posix_reading_choices`]), when that is a DENY the
+/// segment's own text did not produce.
 ///
 /// An expansion's text becomes rm's argv: `rm ${X:--rf /tmp/zz}` runs
-/// `rm -rf /tmp/zz` when `X` is unset, and `rm -r${X}f ~/zz` runs
-/// `rm -rf ~/zz`. The readings are the ones core.git uses
+/// `rm -rf /tmp/zz` when `X` is unset, `rm -r${X}f ~/zz` runs `rm -rf ~/zz`,
+/// and `rm ${X:--rf} $DIR` runs `rm -rf <DIR>` when only `DIR` is set. The
+/// readings are the ones core.git uses
 /// ([`crate::normalize::posix_parameter_word_readings`]); a word with no
-/// reading (a command substitution) and an assignment word stay as written.
+/// reading (an unquoted command substitution) and an assignment word stay as
+/// written.
 /// Deny-only, so a reading never makes a command more permitted than its
 /// text.
 fn rm_segment_denied_under_parameter_readings(
@@ -33342,7 +33344,9 @@ fn rm_segment_denied_under_parameter_readings(
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) || !segment.contains('$') {
         return None;
     }
-    let mut readings = [String::new(), String::new()];
+    // The text before each dynamic word, and that word's two readings.
+    let mut before = Vec::new();
+    let mut words: Vec<[Vec<String>; 2]> = Vec::new();
     let mut copied = 0usize;
     for token in &tokenize_for_shell_dialect(segment, ShellDialect::Posix) {
         if token.kind != NormalizeTokenKind::Word {
@@ -33362,35 +33366,41 @@ fn rm_segment_denied_under_parameter_readings(
         let Some(fields) = crate::normalize::posix_parameter_word_readings(raw) else {
             continue;
         };
-        for (reading, fields) in readings.iter_mut().zip(&fields) {
-            reading.push_str(&segment[copied..token.byte_range.start]);
-            let quoted: Vec<_> = fields
-                .iter()
-                .map(|field| shell_words::quote(field))
-                .collect();
-            reading.push_str(&quoted.join(" "));
-        }
+        before.push(&segment[copied..token.byte_range.start]);
+        words.push(fields);
         copied = token.byte_range.end;
     }
-    if copied == 0 {
+    if words.is_empty() {
         return None;
     }
     // The readings are POSIX argv, so only the POSIX rm grammar judges them;
     // under `Unknown` that is one reading of the union.
-    readings.iter().find_map(|reading| {
-        let reading = format!("{reading}{}", &segment[copied..]);
-        match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
-            &reading,
-            automated_stdin,
-            ShellDialect::Posix,
-        ) {
-            crate::packs::core::filesystem::RmParseDecision::Deny(mut hit) => {
-                hit.span = Some(0..segment.len());
-                Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit))
+    crate::normalize::posix_reading_choices(&words)
+        .0
+        .into_iter()
+        .find_map(|choice| {
+            let mut reading = String::new();
+            for ((text, fields), pick) in before.iter().zip(&words).zip(choice) {
+                reading.push_str(text);
+                let quoted: Vec<_> = fields[pick]
+                    .iter()
+                    .map(|field| shell_words::quote(field))
+                    .collect();
+                reading.push_str(&quoted.join(" "));
             }
-            _ => None,
-        }
-    })
+            reading.push_str(&segment[copied..]);
+            match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+                &reading,
+                automated_stdin,
+                ShellDialect::Posix,
+            ) {
+                crate::packs::core::filesystem::RmParseDecision::Deny(mut hit) => {
+                    hit.span = Some(0..segment.len());
+                    Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit))
+                }
+                _ => None,
+            }
+        })
 }
 
 /// `segment` with its relative operands anchored to the directory a literal

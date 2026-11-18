@@ -2189,7 +2189,9 @@ const MAX_PARAMETER_READING_BYTES: usize = 16 * 1024;
 /// `${X:+--force}` gives `--force` when `X` is set. The text as written proves
 /// neither that a flag is present nor that it is absent, so callers read both:
 /// a destructive rule may deny on either reading, and an exemption must hold
-/// on both. Mixed readings (one parameter set, another unset) are not tried.
+/// on both. Across words, callers also mix them ([`posix_reading_choices`]).
+/// Within one word, mixed readings (one parameter set, another unset) are not
+/// tried.
 ///
 /// A set parameter reads as the one opaque word [`POSIX_PARAMETER_VALUE`];
 /// `$#`, `$?`, `$$`, `$!` and `$-` are always set. Quote removal and Bash
@@ -2197,8 +2199,13 @@ const MAX_PARAMETER_READING_BYTES: usize = 16 * 1024;
 /// latter only to unquoted expansion results; pathname, brace and tilde
 /// expansion are not, so those characters stay literal.
 ///
-/// `None` means the fields depend on a command or process substitution or an
-/// arithmetic expansion, or the quoting is malformed or too deep.
+/// A command substitution or arithmetic expansion inside double quotes is one
+/// field of unknown text, so it reads as [`POSIX_PARAMETER_VALUE`] in both
+/// readings, like `$?`.
+///
+/// `None` means the fields depend on an unquoted command or process
+/// substitution or arithmetic expansion, or the quoting is malformed or too
+/// deep.
 pub(crate) fn posix_parameter_word_readings(raw: &str) -> Option<[Vec<String>; 2]> {
     if raw.len() > MAX_PARAMETER_READING_BYTES {
         return None;
@@ -2210,6 +2217,43 @@ pub(crate) fn posix_parameter_word_readings(raw: &str) -> Option<[Vec<String>; 2
         Some(reading.finish())
     };
     Some([read(false)?, read(true)?])
+}
+
+/// At most this many words whose two readings differ are mixed; 2^6 = 64
+/// argv choices.
+const MAX_MIXED_READING_WORDS: usize = 6;
+
+/// Argv choices for a command whose words each have an unset (`[0]`) and a
+/// set (`[1]`) reading ([`posix_parameter_word_readings`]): one reading index
+/// per word. One parameter may be set while another is unset, so
+/// `rm ${X:--rf} $DIR` runs `rm -rf <DIR>` though neither uniform reading
+/// shows it. The every-unset and every-set choices come first, then each mix.
+///
+/// The flag is `false` when more than [`MAX_MIXED_READING_WORDS`] words
+/// differ: then only the two uniform choices are given, which may judge a
+/// denial but cannot prove an exemption.
+pub(crate) fn posix_reading_choices<T: PartialEq>(words: &[[T; 2]]) -> (Vec<Vec<usize>>, bool) {
+    let varying: Vec<usize> = words
+        .iter()
+        .enumerate()
+        .filter(|(_, [unset, set])| unset != set)
+        .map(|(index, _)| index)
+        .collect();
+    let complete = varying.len() <= MAX_MIXED_READING_WORDS;
+    let mut choices = vec![vec![0; words.len()]];
+    if !varying.is_empty() {
+        choices.push(vec![1; words.len()]);
+    }
+    if complete {
+        for mask in 1..(1usize << varying.len()).saturating_sub(1) {
+            let mut choice = vec![0; words.len()];
+            for (bit, &word) in varying.iter().enumerate() {
+                choice[word] = (mask >> bit) & 1;
+            }
+            choices.push(choice);
+        }
+    }
+    (choices, complete)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2305,6 +2349,17 @@ impl PosixWordReading {
                     double = !double;
                     self.present = true;
                 }
+                // Quoted, a command substitution's output is one field
+                // whose text is unknown, read like a set parameter; unquoted,
+                // it may give any fields.
+                '`' if double => {
+                    let rest: String = chars[index..].iter().collect();
+                    let close =
+                        crate::packs::core::git::find_posix_substitution_close(&rest, 0, b'`')
+                            .ok()?;
+                    index += rest[..close].chars().count() + 1;
+                    self.parameter_value(true)?;
+                }
                 '`' => return None,
                 '<' | '>' if !double && chars.get(index) == Some(&'(') => return None,
                 '$' => {
@@ -2335,6 +2390,13 @@ impl PosixWordReading {
                 let close = posix_parameter_brace_close(chars, index + 1)?;
                 self.braced(&chars[index + 1..close], set, context, depth)?;
                 Some(close + 1)
+            }
+            Some('(') if context.double => {
+                let rest: String = chars[index..].iter().collect();
+                let close =
+                    crate::packs::core::git::find_posix_substitution_close(&rest, 1, b')').ok()?;
+                self.parameter_value(true)?;
+                Some(index + rest[..close].chars().count() + 1)
             }
             Some('(') => None,
             Some('\'') if !context.double => {
@@ -6020,13 +6082,54 @@ mod tests {
         assert_eq!(read("${#X}"), Some([fields(&[V]), fields(&[V])]));
         // A failing `${X:?}` runs nothing when X is unset.
         assert_eq!(read("${X:?}"), Some([fields(&[]), fields(&[V])]));
-        // No reading for command substitution, arithmetic or bad quoting.
+        // A quoted command substitution is one field of unknown text.
+        assert_eq!(read("\"$(pwd)\""), Some([fields(&[V]), fields(&[V])]));
+        assert_eq!(
+            read("\"$(git rev-parse \"x)\")/build\""),
+            Some([
+                fields(&[&format!("{V}/build")]),
+                fields(&[&format!("{V}/build")])
+            ])
+        );
+        assert_eq!(read("\"`pwd`\""), Some([fields(&[V]), fields(&[V])]));
+        assert_eq!(
+            read("\"${ROOT:-$(pwd)}\""),
+            Some([fields(&[V]), fields(&[V])])
+        );
+        // No reading for unquoted command substitution, arithmetic or bad
+        // quoting.
         assert_eq!(read("$(echo -W)"), None);
         assert_eq!(read("${X:-$(echo -W)}"), None);
         assert_eq!(read("`echo -W`"), None);
         assert_eq!(read("$((1+2))"), None);
         assert_eq!(read("${X:-'a}"), None);
         assert_eq!(read("${}"), None);
+    }
+
+    #[test]
+    fn posix_reading_choices_mix_words_up_to_the_bound() {
+        let word = |unset: &str, set: &str| [unset.to_string(), set.to_string()];
+        let fixed = word("rm", "rm");
+        let (choices, complete) =
+            posix_reading_choices(&[fixed.clone(), word("-rf", "V"), word("", "V")]);
+        assert!(complete);
+        assert_eq!(
+            choices,
+            vec![vec![0, 0, 0], vec![1, 1, 1], vec![0, 1, 0], vec![0, 0, 1]]
+        );
+        assert_eq!(
+            posix_reading_choices(std::slice::from_ref(&fixed)).0,
+            vec![vec![0]]
+        );
+        let many = vec![word("", "V"); MAX_MIXED_READING_WORDS];
+        assert_eq!(
+            posix_reading_choices(&many).0.len(),
+            1 << MAX_MIXED_READING_WORDS
+        );
+        let too_many = vec![word("", "V"); MAX_MIXED_READING_WORDS + 1];
+        let (choices, complete) = posix_reading_choices(&too_many);
+        assert!(!complete);
+        assert_eq!(choices.len(), 2);
     }
 
     #[test]
