@@ -6428,7 +6428,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // walk stops at a quote or a redirection glyph.
         safe_pattern!(
             "lfs-prune-dry-run",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--dry-run(?:\s|$)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--dry-run(?:\s|$)(?!(?:[^;&|<>()\n]*\s)?(?:--dry-run=|-[A-Za-z]*d=))"
         ),
     ]
 }
@@ -6509,7 +6509,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // checkout -- discards uncommitted changes
         destructive_pattern!(
             "checkout-discard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+--\s+",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?:--\s+|(?:[^;&|\n<>()]*?\s)?--pathspec-fr(?:o(?:m(?:-(?:f(?:i(?:le?)?)?)?)?)?)?[=\s])",
             "git checkout -- discards uncommitted changes permanently. Use 'git stash' first.",
             High,
             "git checkout -- <path> discards all uncommitted changes to the specified files \
@@ -6540,7 +6540,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "checkout-ref-discard",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
+            r"(?:(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout(?:[^\S\n]+(?!-b\b)(?!--orphan\b)[^\s;&|<>()]+)+[^\S\n]+--\s+|(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout(?:[^\S\n]+(?:-[0-9AC-TV-Zac-z]+|--(?:[a-z][a-z-]*=[^\s;&|<>()]*|(?!c|or|u|in|pathspec-fr)[a-z][a-z-]*)))*[^\S\n]+(?![-#\\])(?!\.(?:/[^\s;&|<>()]*)?(?:\s|$|[;&|<>)]))[^\s;&|<>()]+(?:[^\S\n]+(?:-[0-9AC-TV-Zac-z]+|--(?:[a-z][a-z-]*=[^\s;&|<>()]*|(?!c|or|u|in|pathspec-fr)[a-z][a-z-]*)))*[^\S\n]+(?![-#\\])(?!\.(?:/[^\s;&|<>()]*)?(?:\s|$|[;&|<>)]))[^\s;&|<>()]+(?=\s|$|[;&|)]))",
             "git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first.",
             High,
             "git checkout <ref> -- <path> replaces your working tree files with versions from \
@@ -6728,13 +6728,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // content and uncommitted changes to it are lost (#373). Deny only the
         // same-path shape (a backreference pins redirect target == shown
         // path), so `git show HEAD:f > f.from-ref` and every other capture to
-        // a new file stays allowed. Covers `>`, `>>`, and `>|`; the piped
+        // a new file stays allowed. Covers `>`, `>>`, `>|`, `1>` and `&>`,
+        // after any other-descriptor redirects (`2>/dev/null`, `2>&1`): the
+        // shell opens (and truncates) every redirect target before git runs,
+        // whatever their order. The piped
         // `| tee <path>` spelling cannot be a core.git pattern (this pack is
         // matched per pipeline segment by design), so the prose warns about
         // it instead.
         destructive_pattern!(
             "show-redirect-overwrite-source",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+(?:[^\s;&|<>()]+\s+)*?[^\s:]+:(\S+)(?:\s+[0-9]*>&?\s*[^\s;&|<>()]+)*(?:\s*&|\s+1)?\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
             "git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'.",
             High,
             "Redirecting `git show <ref>:<path>` back onto `<path>` replaces the working-tree \
@@ -9074,6 +9077,23 @@ git x",
             "git show origin/main:README.md >| README.md",
             "git show HEAD:a.txt > ./a.txt",
             "git show HEAD:a.txt > a.txt && cargo build",
+            // Options before `<ref>:<path>`. Git 2.39.5 wrote the other
+            // version over the edit for `--quiet` and `-m`.
+            "git show --quiet other:f > f",
+            "git show -m other:f > f",
+            "git show -q --no-patch other:f > f",
+            "git show --format=%s other:f > f",
+            "git --git-dir=.git show -m other:f > f",
+            // Other-descriptor redirects first, and `1>` / `&>` as the
+            // stdout redirect: the shell truncates `f` before git runs.
+            "git show other:f 2>/dev/null > f",
+            "git show other:f 2>&1 > f",
+            "git show HEAD:src/a.rs 2>/dev/null > src/a.rs",
+            "git show HEAD:src/a.rs 2> /dev/null >> src/a.rs",
+            "git show other:f 1> f",
+            "git show other:f &> f",
+            "git show other:f &>> f",
+            "git show other:f >/dev/null 2>&1 > f",
         ] {
             assert_blocks_with_pattern(&pack, cmd, "show-redirect-overwrite-source");
             assert_blocks_with_severity(&pack, cmd, Severity::High);
@@ -9088,6 +9108,13 @@ git x",
             "git show HEAD:a.txt > b.txt",
             "git show HEAD:a.txt | less",
             "git show HEAD:a.txt | grep TODO",
+            "git show other:f > g",
+            "git show -m HEAD",
+            "git show -m other:f > g",
+            "git show --quiet other:f | less",
+            "git show HEAD:src/a.rs 2>/dev/null > src/b.rs",
+            "git show other:f 2>f.err > g",
+            "git show other:f1> f",
         ] {
             assert!(
                 pack.check(cmd)
@@ -9851,6 +9878,111 @@ git x",
                 "{command} must stay allowed, matched {:?}",
                 pack.check(command).and_then(|matched| matched.name)
             );
+        }
+    }
+
+    /// `git checkout` restores paths, from the index or a tree-ish, whenever
+    /// paths follow `--`, two operands are given, or `--pathspec-from-file`
+    /// names them; options may come first. Git 2.39.5 overwrote an
+    /// uncommitted edit for every deny case below (throwaway repository,
+    /// argv only); with one word between `checkout` and `--`, or `--` right
+    /// after `checkout`, the rules saw only the first of these spellings.
+    #[test]
+    fn checkout_path_mode_after_options_blocks() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git checkout -q other -- f", "checkout-ref-discard"),
+            ("git checkout --quiet other -- f", "checkout-ref-discard"),
+            (
+                "git checkout --no-overlay other -- f",
+                "checkout-ref-discard",
+            ),
+            (
+                "git checkout --recurse-submodules other -- f",
+                "checkout-ref-discard",
+            ),
+            (
+                "git checkout --conflict merge other -- f",
+                "checkout-ref-discard",
+            ),
+            ("git checkout -q -q -- f", "checkout-ref-discard"),
+            ("git -C repo checkout -q other -- f", "checkout-ref-discard"),
+            ("git-checkout -q other -- f", "checkout-ref-discard"),
+            ("git checkout other f", "checkout-ref-discard"),
+            ("git checkout -q other f", "checkout-ref-discard"),
+            (
+                "git checkout --conflict=merge other f",
+                "checkout-ref-discard",
+            ),
+            ("git --no-pager checkout main a b", "checkout-ref-discard"),
+            (
+                "git checkout other --pathspec-from-file=list",
+                "checkout-discard",
+            ),
+            ("git checkout --pathspec-from-file=list", "checkout-discard"),
+            (
+                "git checkout -q other --pathspec-from-file list",
+                "checkout-discard",
+            ),
+            ("git checkout --pathspec-fr=list", "checkout-discard"),
+            // Already denied; kept as controls.
+            ("git checkout other -- f", "checkout-ref-discard"),
+            ("git checkout -- f", "checkout-discard"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // Branch switches, branch creation (Git refuses paths with it), a
+        // value-taking option before one operand, a redirect, a trailing
+        // `--`, and another command on the next line stay allowed.
+        for command in [
+            "git checkout -q main",
+            "git checkout -b x origin/main",
+            "git checkout -q -b x origin/main",
+            "git checkout -B x origin/x",
+            "git checkout --orphan new main",
+            "git checkout --detach HEAD~1",
+            "git checkout --track origin/feature",
+            "git checkout --conflict merge main",
+            "git checkout -U3 main",
+            "git checkout -q main --",
+            "git checkout main 2>/dev/null",
+            "git checkout main # back to main",
+            "git checkout --no-pathspec-from-file main",
+            "git checkout main\ngit diff a b",
+            "git checkout main\ngit diff -- f",
+            "git lfs checkout a.bin b.bin",
+            "git mv checkout src/checkout",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+    }
+
+    /// git-lfs parses flags with Go pflag, where the last value wins: git-lfs
+    /// 3.8.1 deleted the old object for `git lfs prune --dry-run
+    /// --dry-run=false` and `--dry-run -d=false`, so a later explicit value
+    /// withdraws the dry-run exemption.
+    #[test]
+    fn lfs_prune_dry_run_overridden_by_a_later_value_is_not_safe() {
+        let pack = create_pack();
+        for command in [
+            "git lfs prune --dry-run --dry-run=false",
+            "git lfs prune --dry-run -d=false",
+            "git lfs prune --dry-run -vd=0",
+        ] {
+            assert!(!pack.matches_safe(command), "{command} must not be safe");
+            assert_blocks_with_pattern(&pack, command, "lfs-prune");
+        }
+        for command in [
+            "git lfs prune --dry-run",
+            "git lfs prune --dry-run --verbose",
+            "git lfs prune --dry-run=false --dry-run",
+        ] {
+            assert!(pack.matches_safe(command), "{command} must stay safe");
         }
     }
 
