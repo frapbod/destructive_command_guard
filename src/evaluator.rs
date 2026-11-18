@@ -12932,6 +12932,36 @@ fn powershell_parameter_word(word: &str) -> bool {
             .is_some_and(|next| !(next.is_ascii_digit() || next == '.' || next.is_whitespace()))
 }
 
+/// How PowerShell reads one argument-mode word of a cmdlet statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellWordRole {
+    Argument,
+    Parameter,
+    /// A word whose binding dcg does not read.
+    Unplaced,
+}
+
+/// A parameter comes only from a bare dash token: a dash, then a name up to
+/// `:` or the word's end. A word that starts with a quote or an escaped
+/// dash, or whose name holds a quote, is an argument (`'-MemberName'`,
+/// `` `-MemberName ``, `-Member'Name'`). A backtick, `$` or `@` in the name
+/// binds in ways dcg does not read (`` -Member`Name `` is a parameter before
+/// the member name and an argument after it), so the word is unplaced.
+fn powershell_cmdlet_word_role(raw: &str) -> PowerShellWordRole {
+    if !powershell_parameter_word(raw) {
+        return PowerShellWordRole::Argument;
+    }
+    for character in raw.chars().skip(1) {
+        match character {
+            ':' => break,
+            '\'' | '"' | '\u{2018}'..='\u{201e}' => return PowerShellWordRole::Argument,
+            '`' | '$' | '@' => return PowerShellWordRole::Unplaced,
+            _ => {}
+        }
+    }
+    PowerShellWordRole::Parameter
+}
+
 /// How `parameter` (with its dash, without an attached value) binds among
 /// `parameters` and the common parameters. PowerShell takes an exact name or
 /// alias, or else a prefix of one. `None` is a name that matches none, or
@@ -13207,9 +13237,26 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             }
         }
         let segment = &command[command_token.byte_range.start..segment_end];
-        let Some(words) = decoded_powershell_segment_words(segment) else {
-            continue;
-        };
+        // `--%`, bare or quoted, stops PowerShell's parsing. The decoder
+        // drops it, so it is kept here as the word `--%`, which is not
+        // placed; each word is decoded on its own.
+        let words: Vec<(String, bool, std::ops::Range<usize>)> =
+            tokenize_for_shell_dialect(segment, ShellDialect::PowerShell)
+                .iter()
+                .filter(|token| token.kind == NormalizeTokenKind::Word)
+                .take(MAX_POWERSHELL_VISIBLE_ALIAS_WORDS + 1)
+                .filter_map(|token| {
+                    let raw = token.text(segment)?;
+                    let value = ShellTokenDecoder::new(ShellDialect::PowerShell)
+                        .decode(raw, ShellTokenRole::Syntax)
+                        .map_or_else(|| "--%".to_string(), std::borrow::Cow::into_owned);
+                    Some((
+                        value,
+                        powershell_alias_word_is_dynamic(raw),
+                        token.byte_range.clone(),
+                    ))
+                })
+                .collect();
         let parameters = match cmdlet {
             PowerShellMemberCmdlet::ForEachObject => POWERSHELL_FOREACH_OBJECT_PARAMETERS,
             PowerShellMemberCmdlet::NewObject => POWERSHELL_NEW_OBJECT_PARAMETERS,
@@ -13251,7 +13298,16 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                 continue;
             }
             let previous_end = words[index - 2].2.end.max(value_end);
-            if *dynamic || !powershell_parameter_word(value) {
+            let word_role = if value == "--%" {
+                PowerShellWordRole::Unplaced
+            } else {
+                powershell_cmdlet_word_role(raw)
+            };
+            if word_role == PowerShellWordRole::Unplaced {
+                unplaced = true;
+                break;
+            }
+            if word_role == PowerShellWordRole::Argument {
                 if name.is_none() {
                     // `% { … }` is the script-block form.
                     if cmdlet == PowerShellMemberCmdlet::ForEachObject && value.starts_with('{') {
@@ -13370,10 +13426,13 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             }
         }
         // The word list stops at its bound; a name or argument list after it
-        // is not read.
+        // is not read, and a named name after it would make a positional
+        // name the first argument.
         if words.len() > MAX_POWERSHELL_VISIBLE_ALIAS_WORDS
             && index >= words.len()
-            && (name.is_none() || (named_arguments.is_none() && positional.len() < 2))
+            && (name.is_none()
+                || positional_name
+                || (named_arguments.is_none() && positional.len() < 2))
         {
             sinks.push(ExecutableTextSink::Unverified {
                 rule: SINK_ANALYSIS_BOUNDS_RULE,
@@ -67379,14 +67438,55 @@ mod tests {
                 "% 'a', 'b' 'y' -MemberName InvokeScript",
                 vec![POWERSHELL_ENGINE_SCRIPT_RULE],
             ),
+            // Only a bare dash word is a parameter: a quoted or escaped dash,
+            // or a quote in the name, makes an argument.
+            ("% InvokeScript 'a' '-MemberName' 'x'", vec!["a"]),
+            ("% InvokeScript 'a' \"-MemberName\" 'x'", vec!["a"]),
+            ("% InvokeScript 'a' `-MemberName 'x'", vec!["a"]),
+            ("% InvokeScript 'a' -Member'Name' 'x'", vec!["a"]),
+            ("% InvokeScript 'a' -\"MemberName\" x", vec!["a"]),
+            (
+                "% InvokeScript 'a' -\u{2018}MemberName\u{2019} x",
+                vec!["a"],
+            ),
+            ("% InvokeScript 'a' '-Mem' Trim", vec!["a"]),
+            ("% Replace '-old' '-new'", vec![]),
+            ("% TrimStart '--'", vec![]),
+            ("New-Object a.Regex '-\\d+'", vec![]),
+            ("% -MemberName:'InvokeScript' 'a'", vec!["a"]),
+            ("% -ErrorAction:$e InvokeScript 'a'", vec!["a"]),
+            // A backtick, `$` or `@` in a parameter name, and `--%`, bare or
+            // quoted, are not placed.
+            (
+                "% InvokeScript 'a' -Member`Name x",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% InvokeScript 'a' -Member$x x",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% InvokeScript 'a' '--%'",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% InvokeScript 'a' --% x",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            // In an array value, `'--%'` is a string.
+            ("New-Object a.Command 'a', \"--%\"", vec!["a"]),
+            ("% { cmd /c --% echo a }", vec![]),
         ] {
             assert_eq!(sources(command), expected, "{command:?}");
         }
-        // Words past the reader's bound leave the name unread.
+        // Words past the reader's bound leave the name unread, or a named
+        // name that would make the positional name the first argument.
         let long = format!(
             "% -OutBuffer ({}) InvokeScript 'a'",
             vec!["0"; 300].join(" + ")
         );
+        assert_eq!(sources(&long), vec![SINK_ANALYSIS_BOUNDS_RULE]);
+        let long = format!("% 'a'{} -MemberName InvokeScript", " 'x'".repeat(300));
         assert_eq!(sources(&long), vec![SINK_ANALYSIS_BOUNDS_RULE]);
         let started = std::time::Instant::now();
         for command in [

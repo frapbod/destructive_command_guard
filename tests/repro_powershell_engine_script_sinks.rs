@@ -288,6 +288,29 @@ const RUNS_IT: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % 2>(Join-Path $HOME 'e.txt') InvokeScript 'git reset --hard'",
     "$ExecutionContext.InvokeCommand | % 2> <# c #> ('x' + 'y') InvokeScript 'git reset --hard'",
     "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 'git reset --hard' 'x' 'y'",
+    // Review round 8 (runner rv9/truth*.out, r8/truth.out): only a bare
+    // dash word is a parameter, and `--%` is not skipped.
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' '-MemberName' 'x'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' \"-MemberName\" 'x'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' `-MemberName 'x'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' -Member'Name' 'x'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' '-Mem' Trim",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' '--%'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' \"--%\"",
+    "$c = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', '--%'; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList 'git reset --hard', '--%'; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' -Member`Name x",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' -\"MemberName\" x",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' --% x",
+    "$e = 'Stop'; $ExecutionContext.InvokeCommand | % -ErrorAction:$e InvokeScript 'git reset --hard'",
+    "$o = 'o'; $ExecutionContext.InvokeCommand | % -OutVariable:$o InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' -‘MemberName’ x",
+    "$x = 'Name'; $ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' -Member$x x",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' -Member\"Name\":x",
+    "$e = 'Stop'; $c = New-Object -ErrorAction:$e System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % -MemberName:'InvokeScript' 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' '-ArgumentList' 'x'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 'git reset --hard' --% x",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -376,6 +399,20 @@ const HARMLESS: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % 2>&1 InvokeScript 'git status' 'x'",
     "Get-ChildItem | % -MemberName 2> ('x' + 'y') Name",
     "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command 2> ('x' + 'y') -ArgumentList 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // Their harmless twins, and dash strings passed to ordinary methods
+    // (review round 8).
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' '-MemberName' 'x'",
+    "'a-old' | % Replace '-old' '-new'",
+    "'a--b' | ForEach-Object Replace '--' '-'",
+    "'x-y' | % -MemberName Split -ArgumentList '-y'",
+    "'a-old' | % Replace '-old', '-new'",
+    "'--x' | % TrimStart '--'",
+    "$e = 'Stop'; $ExecutionContext.InvokeCommand | % -ErrorAction:$e InvokeScript 'git status'",
+    "'a-old' | % -MemberName Replace -ArgumentList '-old', '-new'",
+    "'a-b' | % Split \"-\"",
+    "$ExecutionContext.InvokeCommand | % -MemberName:'InvokeScript' 'git status'",
+    "'a.b' | % Split '.' -ErrorAction:$ErrorActionPreference",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' -‘MemberName’ x",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -421,6 +458,11 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$c = New-Object System.Management.Automation.Runspaces.Command 2>$null 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
     "Get-ChildItem | % 2>$null Name",
     "$ExecutionContext.InvokeCommand | % -MemberName 2>$null InvokeScript 'git status'",
+    // An escaped dash word, a quoted dash string and `--%` inside a script
+    // block (review round 8): Unknown denies these on base 5b316f61 too.
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' `-MemberName 'x'",
+    "$r = New-Object System.Text.RegularExpressions.Regex '-\\d+'; $r.Match('a-12').Value",
+    "Get-ChildItem | % { cmd /c --% echo hi }",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
