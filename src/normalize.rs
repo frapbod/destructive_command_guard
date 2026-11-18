@@ -3791,6 +3791,10 @@ pub(crate) fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHash
 
 /// Classify the byte before a possible line or block comment.
 fn powershell_comment_predecessor_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
+    if powershell_braced_variable_ends_at(bytes, index) {
+        // `${c}` ends a name, not a group: `${c}#x` is text like `$c#x`.
+        return PowerShellHashRole::Literal;
+    }
     if index == 0
         || bytes[index - 1].is_ascii_whitespace()
         || powershell_horizontal_space_ends_at(bytes, index)
@@ -3805,6 +3809,26 @@ fn powershell_comment_predecessor_role(bytes: &[u8], index: usize) -> PowerShell
         return PowerShellHashRole::Literal;
     }
     PowerShellHashRole::Ambiguous
+}
+
+/// Whether `bytes[..index]` ends with a braced variable, `${…}`.
+fn powershell_braced_variable_ends_at(bytes: &[u8], index: usize) -> bool {
+    index >= 3
+        && bytes[index - 1] == b'}'
+        && bytes[..index - 1]
+            .iter()
+            .rposition(|&byte| matches!(byte, b'{' | b'}'))
+            .is_some_and(|open| open > 0 && bytes[open] == b'{' && bytes[open - 1] == b'$')
+}
+
+/// Whether a `<#` at `index` opens a block comment, for a reader that does
+/// not track PowerShell's parse mode. Glued to a word (`a<#`, `$c<#`,
+/// `${c}<#`) it is text in argument mode. Where expression mode makes it a
+/// comment (`$c<#x#>=1`), the deny-only view of [`mask_powershell_comments`]
+/// reads it so.
+pub(crate) fn powershell_block_comment_opens_at(bytes: &[u8], index: usize) -> bool {
+    bytes.get(index..index + 2) == Some(b"<#")
+        && powershell_comment_predecessor_role(bytes, index) != PowerShellHashRole::Literal
 }
 
 fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
@@ -4974,29 +4998,20 @@ impl PowerShellParseState {
 
     /// Whether a `#` or `<#` at `i` starts a comment. `arg_start` is where
     /// the current argument began; `quoted_end` is where a string that began
-    /// it closed; `braced_end` is where the last `${…}` variable closed.
+    /// it closed.
     fn comment_starts(
         &self,
         bytes: &[u8],
         i: usize,
         arg_start: usize,
         quoted_end: Option<usize>,
-        braced_end: Option<usize>,
     ) -> bool {
         let block = bytes.get(i..i + 2) == Some(b"<#");
         if bytes[i] != b'#' && !block {
             return false;
         }
-        if self.mode != PowerShellParseMode::Command {
-            return true;
-        }
-        // The `}` of a `${…}` variable ends a name, not a group: `${c}#x` is
-        // text in argument mode, like `$c#x`.
-        let role = match powershell_comment_predecessor_role(bytes, i) {
-            PowerShellHashRole::Comment if braced_end == Some(i) => PowerShellHashRole::Literal,
-            role => role,
-        };
-        if role == PowerShellHashRole::Comment {
+        let role = powershell_comment_predecessor_role(bytes, i);
+        if role == PowerShellHashRole::Comment || self.mode != PowerShellParseMode::Command {
             return true;
         }
         // In argument mode a word absorbs `#` (`a#x`, `$c#x`, `a'b'#x`), but
@@ -5085,7 +5100,6 @@ fn consume_powershell_word(
     let mut arg_start = i;
     let mut quoted_end = None;
     let mut quote_began_argument = false;
-    let mut braced_end = None;
 
     while i < len {
         let byte = bytes[i];
@@ -5094,9 +5108,9 @@ fn consume_powershell_word(
                 if matches!(byte, b'\r' | b'\n')
                     || powershell_horizontal_space_len(bytes, i).is_some()
                     || powershell_separator_end(bytes, i, len).is_some()
-                    || parse.as_deref().is_some_and(|parse| {
-                        parse.comment_starts(bytes, i, arg_start, quoted_end, braced_end)
-                    })
+                    || parse
+                        .as_deref()
+                        .is_some_and(|parse| parse.comment_starts(bytes, i, arg_start, quoted_end))
                 {
                     break;
                 }
@@ -5122,7 +5136,6 @@ fn consume_powershell_word(
                             };
                         }
                         i = (i + 1).min(len);
-                        braced_end = Some(i);
                     }
                     b'@' => {
                         i = consume_powershell_here_string(bytes, i, len).unwrap_or(i + 1);
