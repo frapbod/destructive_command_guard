@@ -3571,3 +3571,149 @@ fn heredoc_safe_python_codex_allows() {
         "safe python one-liner should be allowed\n{o}"
     );
 }
+
+/// Payloads whose command holds real line breaks (the shared builders escape
+/// only quotes and backslashes).
+fn multiline_payload(command: &str, codex: bool) -> Vec<u8> {
+    let mut payload = serde_json::json!({
+        "session_id": "sess-posix-comment",
+        "cwd": "/tmp/test-workdir",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_use_id": "call_comment",
+    });
+    if codex {
+        payload["turn_id"] = serde_json::json!("turn-test-comment");
+    }
+    payload.to_string().into_bytes()
+}
+
+/// A POSIX `#` comment that starts the command ends at the newline: a quote in
+/// it opens no string, so the next line's destructive git command is seen.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
+    for command in [
+        "# it's here\ngit reset --hard",
+        "# say \"hi\ngit reset --hard",
+        "#it's\ngit push --force origin main",
+        "  # it's\ngit reset --hard",
+        "# it's\r\ngit reset --hard",
+        // `#` inside a word is data, not a comment: bash runs the git command.
+        "echo $((1))#; git reset --hard",
+        "echo $((1))#; git push --force origin main",
+        "echo $((1))#; git clean -fdx",
+        "echo $((1))#&& git reset --hard",
+        "echo $((1))#| git reset --hard",
+        "x=$((1))#; git reset --hard",
+        "echo $((1+2))#x; git reset --hard",
+        "$(true)#; git reset --hard",
+        "echo a\\ #; git reset --hard",
+        // CR, FF and VT do not end a POSIX word; continuations remove no word.
+        "echo x\r\\\n#; git reset --hard",
+        "echo x\x0c\\\n#; git reset --hard",
+        "echo x\x0b\\\n#; git reset --hard",
+        "echo x\r\\\n\\\n#; git reset --hard",
+        "echo x\r\\\n#&& git reset --hard",
+        "echo x\r\\\n#| git reset --hard",
+        "echo x\r\\\n#; git clean -fdx",
+        // A line continuation keeps the comment at a word start.
+        "echo a \\\n#it's\ngit reset --hard",
+        "\\\n#it's\ngit reset --hard",
+        // A comment that starts a command substitution body.
+        "echo $(#it's\ngit reset --hard)",
+        // A blank in `${…}` is no word break, so the `#` after it is data.
+        "x=${y:- #}; git reset --hard",
+        ": ${y:= #}; git reset --hard",
+        "export X=${y:- #}; git reset --hard",
+        "x=${y:- #} && git push --force origin main",
+        "x=${y:- #}|git reset --hard",
+        "x=${y:-\t#}; git reset --hard",
+        "x=${y/ #/}; git reset --hard",
+        "x=${y:- #}; git branch -D main",
+        "x=${y:- #}; git stash clear",
+        "x=${y:- #}; git checkout -- .",
+        "x=${y:- #}; ls; git reset --hard",
+        "x=${y:+ #}; git push origin +main",
+        "for f in ${x:- #}; do git reset --hard; done",
+        "[ -z ${y:- #} ] ; git reset --hard",
+        "echo ${y:- #}; git reset --hard",
+        // A blank in `${…}` in an assignment prefix of the command itself.
+        "x=${y:- a} git reset --hard",
+        "x=${y:- } git reset --hard",
+        "x=${y:- a} git push --force origin main",
+        "y=1 x=${y:- #} git reset --hard",
+        // Quotes and nested expansions inside `${…}`.
+        "x=${y:-\"a #\"}; git reset --hard",
+        "x=${y:-'a #'}; git reset --hard",
+        "x=${y:-${z:- #}}; git reset --hard",
+        "x=${y:-${z:- #} #}; git reset --hard",
+        "x=${y:-$(echo a #\n)}; git reset --hard",
+        "x=${y:-$( #it's\ntrue)}; git reset --hard",
+        "x=${y:- #$(git reset --hard)}",
+        "x=${y:- $(git reset --hard) #}",
+        "echo \"${y:-\" #\"}\"; git reset --hard",
+        "echo \"${y:- #}\"; git reset --hard",
+        // dash reads `'` in `\"${…}\"` as a plain character.
+        "echo \"${y:-it's}\"; git reset --hard",
+    ] {
+        let codex = run_hook_raw(&multiline_payload(command, true), &[]);
+        assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&multiline_payload(command, false), &[]);
+        assert!(
+            claude.is_claude_block_shape(),
+            "claude {command:?}\n{claude}"
+        );
+    }
+    for command in [
+        "# it's here\ngit status",
+        "# git reset --hard",
+        "echo \"it's #1\"",
+        "echo a \\\n#it's\ngit status",
+        // A continuation after an actual blank leaves # at a comment boundary.
+        "echo x \\\n#; git reset --hard",
+        "echo x\t\\\n#; git reset --hard",
+        "echo a #$(git reset --hard)",
+        // `#` after the closing `}` starts a comment again.
+        "x=${y:- #}; git status",
+        "x=${y:- a} git status",
+        "x=${y:- } git status",
+        "echo ${y:- a} #; git reset --hard",
+        "x=${y:-\"a #\"} #it's\ngit status",
+        "echo \"${y:-\" #\"}\" #it's\ngit status",
+    ] {
+        let codex = run_hook_raw(&multiline_payload(command, true), &[]);
+        assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&multiline_payload(command, false), &[]);
+        assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+}
+
+/// Unclosed `${` used to be looked up again at each one, quadratic in them,
+/// so a large file write ran out of the evaluation budget and asked instead
+/// of denying (review round 3: 60 KB took 1.5 s). A run of them is linear.
+#[test]
+fn unclosed_braced_parameters_keep_the_hook_within_budget() {
+    let body = "${".repeat(30_000);
+    let deny = format!("cat <<'EOF' > notes.txt\n{body}\nEOF\ngit reset --hard");
+    // 32 KB: the base also asks for a 60 KB heredoc, whatever its text.
+    let allow = format!(
+        "cat <<'EOF' > notes.txt\n{}\nEOF\ngit status",
+        "${".repeat(16_000)
+    );
+    let quoted = format!("echo \"{body}\"; git reset --hard");
+    for codex in [true, false] {
+        for command in [&deny, &quoted] {
+            let outcome = run_hook_raw(&multiline_payload(command, codex), &[]);
+            // A deny, not an ask after the budget ran out.
+            assert_eq!(
+                outcome.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+                "codex={codex}\n{outcome}"
+            );
+        }
+        let outcome = run_hook_raw(&multiline_payload(&allow, codex), &[]);
+        assert!(outcome.is_allow_shape(), "codex={codex}\n{outcome}");
+    }
+}
