@@ -21923,7 +21923,11 @@ fn posix_deferred_command_views(command: &str) -> Vec<String> {
         if !trap && !variables {
             continue;
         }
-        let Ok(words) = shell_words::split(segment.trim()) else {
+        // A redirection is not a word of the command, wherever it stands
+        // (`2>/dev/null trap … EXIT`, `trap 2>&1 … EXIT`): read the words in
+        // the length-preserving view without redirections.
+        let words_view = crate::heredoc::redirection_free_view(segment);
+        let Ok(words) = shell_words::split(words_view.as_deref().unwrap_or(segment).trim()) else {
             continue;
         };
         let mut index = 0usize;

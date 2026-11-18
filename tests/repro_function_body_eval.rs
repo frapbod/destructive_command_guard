@@ -185,3 +185,26 @@ fn harmless_function_bodies_and_output_stay_allowed() {
         ],
     );
 }
+
+/// The trap reader read the segment's words with redirections in them, so a
+/// redirection before `trap` or before its handler hid the handler. Every
+/// shell sets the trap and runs the handler on exit.
+#[test]
+fn a_redirection_does_not_hide_a_trap_handler() {
+    assert_both(
+        "deny",
+        &[
+            "2>/dev/null trap 'git reset --hard' EXIT",
+            "trap 2>/dev/null 'git reset --hard' EXIT",
+            "f() { 2>/dev/null trap 'git reset --hard' EXIT; }; f",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            "2>/dev/null trap 'echo bye' EXIT",
+            "trap 'echo bye' EXIT 2>/dev/null",
+            "echo 2>/dev/null trap 'git reset --hard' EXIT",
+        ],
+    );
+}
