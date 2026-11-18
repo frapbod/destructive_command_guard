@@ -5968,57 +5968,58 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn posix_parameter_word_readings_give_unset_and_set_argv() {
         const V: &str = POSIX_PARAMETER_VALUE;
-        let read = |raw: &str| posix_parameter_word_readings(raw).map(|[unset, set]| (unset, set));
+        let read = posix_parameter_word_readings;
         let fields = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
         // Default operands split on blanks; quotes inside them hold.
         assert_eq!(
             read("${X:--rf /tmp/zz}"),
-            Some((fields(&["-rf", "/tmp/zz"]), fields(&[V])))
+            Some([fields(&["-rf", "/tmp/zz"]), fields(&[V])])
         );
         assert_eq!(
             read("${X:-. -\"W\"$Z}"),
-            Some((fields(&[".", "-W"]), fields(&[V])))
+            Some([fields(&[".", "-W"]), fields(&[V])])
         );
         assert_eq!(
             read("${X:-. \"a\nb\" -W}"),
-            Some((fields(&[".", "a\nb", "-W"]), fields(&[V])))
+            Some([fields(&[".", "a\nb", "-W"]), fields(&[V])])
         );
         // Partial words.
         assert_eq!(
             read("-${Y}W"),
-            Some((fields(&["-W"]), fields(&[&format!("-{V}W")])))
+            Some([fields(&["-W"]), fields(&[&format!("-{V}W")])])
         );
         assert_eq!(
             read("${Y:--}W"),
-            Some((fields(&["-W"]), fields(&[&format!("{V}W")])))
+            Some([fields(&["-W"]), fields(&[&format!("{V}W")])])
         );
-        assert_eq!(read("\"\"${Y:--W}"), Some((fields(&["-W"]), fields(&[V]))));
+        assert_eq!(read("\"\"${Y:--W}"), Some([fields(&["-W"]), fields(&[V])]));
         assert_eq!(
             read("${X:+.}${Y:--W}"),
-            Some((fields(&["-W"]), fields(&[&format!(".{V}")])))
+            Some([fields(&["-W"]), fields(&[&format!(".{V}")])])
         );
         // Alternate values appear only when set; quoted words do not split.
         assert_eq!(
             read("${X:+--force}"),
-            Some((fields(&[]), fields(&["--force"])))
+            Some([fields(&[]), fields(&["--force"])])
         );
         assert_eq!(
             read("\"${X:---hard}\""),
-            Some((fields(&["--hard"]), fields(&[V])))
+            Some([fields(&["--hard"]), fields(&[V])])
         );
         assert_eq!(
             read("\"${X:-a b}\""),
-            Some((fields(&["a b"]), fields(&[V])))
+            Some([fields(&["a b"]), fields(&[V])])
         );
-        assert_eq!(read("\"$X\""), Some((fields(&[""]), fields(&[V]))));
-        assert_eq!(read("$FILES"), Some((fields(&[]), fields(&[V]))));
+        assert_eq!(read("\"$X\""), Some([fields(&[""]), fields(&[V])]));
+        assert_eq!(read("$FILES"), Some([fields(&[]), fields(&[V])]));
         // Always-set special parameters and lengths are one unknown value.
-        assert_eq!(read("$?"), Some((fields(&[V]), fields(&[V]))));
-        assert_eq!(read("${#X}"), Some((fields(&[V]), fields(&[V]))));
+        assert_eq!(read("$?"), Some([fields(&[V]), fields(&[V])]));
+        assert_eq!(read("${#X}"), Some([fields(&[V]), fields(&[V])]));
         // A failing `${X:?}` runs nothing when X is unset.
-        assert_eq!(read("${X:?}"), Some((fields(&[]), fields(&[V]))));
+        assert_eq!(read("${X:?}"), Some([fields(&[]), fields(&[V])]));
         // No reading for command substitution, arithmetic or bad quoting.
         assert_eq!(read("$(echo -W)"), None);
         assert_eq!(read("${X:-$(echo -W)}"), None);

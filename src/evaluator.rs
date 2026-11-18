@@ -33344,7 +33344,7 @@ fn rm_segment_denied_under_parameter_readings(
     }
     let mut readings = [String::new(), String::new()];
     let mut copied = 0usize;
-    for token in tokenize_for_shell_dialect(segment, ShellDialect::Posix).iter() {
+    for token in &tokenize_for_shell_dialect(segment, ShellDialect::Posix) {
         if token.kind != NormalizeTokenKind::Word {
             continue;
         }
