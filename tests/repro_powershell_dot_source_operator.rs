@@ -6,7 +6,9 @@
 //! `& { . git reset --hard }`, and `. Remove-Item -Recurse -Force victim`
 //! deleted `victim`. dcg judged the `&` forms and let the dot forms pass.
 //! The operator also runs a command on the right of every assignment form,
-//! after `return`, `throw` and `exit` (shell-truth pwsh, Nov 18 2026).
+//! after `return`, `throw` and `exit`, and glued to a quoted name
+//! (`.'git'`); the call operator with a quoted name after an assignment
+//! (`$r = & 'git' reset --hard`) passed too (shell-truth pwsh, Nov 18 2026).
 //! Dot-sourcing a script (`. ./x.ps1`, `. $profile`) and a `.` inside
 //! arguments stay allowed.
 
@@ -74,6 +76,31 @@ const POWERSHELL_RUNS_IT: &[&str] = &[
     ". rm -Recurse -Force C:\\Users\\kaita",
     "powershell -NoProfile -Command \". 'git' reset --hard\"",
     "powershell -NoProfile -Command \". Remove-Item -Recurse -Force C:\\Users\\kaita\"",
+    // A dot glued to a quoted command name is the operator too
+    // (shell-truth pwsh, Nov 18 2026: each ran `git reset --hard`).
+    ".'git' reset --hard",
+    ".\"git\" reset --hard",
+    ".\"g`it\" reset --hard",
+    "$r = .'git' reset --hard",
+    "$a, $b = .'git' reset --hard",
+    "echo a; .'git' reset --hard",
+    "if ($true) {.'git' reset --hard}",
+    "return .'git' reset --hard",
+    ".'iex' 'git reset --hard'",
+    ".'Invoke-Expression' 'git reset --hard'",
+    "$r=.'git' reset --hard",
+    "$r =.'git' reset --hard",
+    "$r = . 'git' reset --hard",
+    "return . 'git' reset --hard",
+    // The call operator with a quoted name after an assignment, `return` or
+    // `exit` (shell-truth pwsh, Nov 18 2026: each ran `git reset --hard`;
+    // base/v0.16.0 8bf24148 allowed each in the PowerShell dialect).
+    "$r=&'git' reset --hard",
+    "$r = & 'git' reset --hard",
+    "$r = &\"git\" reset --hard",
+    "$a, $b = &'git' reset --hard",
+    "return & 'git' reset --hard",
+    "exit & 'git' reset --hard",
     "& git reset --hard",
 ];
 
@@ -94,17 +121,29 @@ const HARMLESS: &[&str] = &[
     ". git reset --soft HEAD~1",
     ". 'git' status",
     "$c = 'git'; . $c status",
+    "$r = & 'git' status",
+    "$r = .'git' status",
     "echo . git reset --hard",
     "git add .",
     "git log -- .",
     "Write-Output \"x . git reset --hard\"",
     "git commit -m 'fix. git reset --hard is bad'",
     // PowerShell 7.5 ran no Git for these (shell-truth pwsh, Nov 18 2026):
-    // an argument, a word joined to the dot, and a parse error.
-    "Write-Output . git reset --hard",
+    // an argument, a word joined to the dot, member access, and a parse error.
+    "Write-Output .'git' reset --hard",
+    "'x'.'git'",
+    "$r.'git'",
     "return. git reset --hard",
     "$r=.git reset --hard",
     "$r -eq . git reset --hard",
+];
+
+/// Harmless in PowerShell, which ran no Git for it (shell-truth pwsh, Nov 18
+/// 2026). The Unknown union denies it on base/v0.16.0 too (8bf24148), so only
+/// the PowerShell dialect is asserted.
+const HARMLESS_IN_POWERSHELL: &[&str] = &[
+    "Write-Output . git reset --hard",
+    "$x = & 'Write-Output' git reset --hard",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
@@ -233,7 +272,7 @@ fn powershell_tool_judges_the_dot_source_operator_both_protocols() {
                 "{protocol:?}: {command:?}"
             );
         }
-        for command in HARMLESS {
+        for command in HARMLESS.iter().chain(HARMLESS_IN_POWERSHELL) {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "allow",
@@ -262,6 +301,13 @@ fn powershell_and_unknown_dialects_judge_the_dot_source_operator() {
                 "{dialect:?}: {command:?}"
             );
         }
+    }
+    for command in HARMLESS_IN_POWERSHELL {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Allow,
+            "{command:?}"
+        );
     }
 }
 

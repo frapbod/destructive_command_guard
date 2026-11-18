@@ -3201,36 +3201,68 @@ fn decode_powershell_pattern_view(command: &str) -> Cow<'_, str> {
     Cow::Owned(output)
 }
 
-/// Read each PowerShell dot-source operator in command position as the call
-/// operator.
+/// Read each PowerShell invocation operator in command position as a call
+/// operator at the start of its statement.
 ///
 /// `. git reset --hard` runs Git exactly as `& git reset --hard` does: the dot
 /// only changes the scope a script runs in. Every reader that understands the
-/// call operator can judge the dot form once the `.` byte becomes `&`. The
-/// view has the same length as `command`, so spans still address it.
+/// call operator can judge the dot form once the `.` byte becomes `&`.
 ///
 /// A command position is the start of a statement, the right side of an
 /// assignment (see [`powershell_assignment_rhs`]) and the operand of
-/// `return`, `throw` or `exit`. Only a static command word is rewritten.
+/// `return`, `throw` or `exit`. The readers know a call operator best at the
+/// start of a statement (`$r = & 'git' reset --hard` passed them), so the
+/// text before an operator in any other command position is blanked:
+/// `$r = . 'git' x` reads as `      & 'git' x`. The original line is judged
+/// too, so the blanked prefix loses nothing. The view has the same length as
+/// `command`, so spans still address it.
+///
+/// A quote ends the dot operator, so `.'git'` and `$r=.'git'` hold the
+/// operator and its operand in one word. Only a static command word is read.
 /// Dot-sourcing a variable or an expandable string (`. $profile`,
 /// `. "$PSScriptRoot\x.ps1"`) loads a script whose name is not known here,
-/// and keeps the reading it had. A `.` in an argument (`git add .`) is data.
-/// Returns `None` when nothing changes.
+/// and keeps the reading it had; so do `& $x` and `& (…)` after an
+/// assignment. A `.` in an argument (`git add .`) is data. Returns `None`
+/// when nothing changes.
 #[must_use]
-pub(crate) fn powershell_dot_source_call_view(command: &str) -> Option<String> {
-    if !command.contains('.') {
+pub(crate) fn powershell_invocation_operator_view(command: &str) -> Option<String> {
+    if !command.contains(['.', '&']) {
         return None;
     }
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
-    let mut dots = Vec::new();
+    // (statement start, operator byte) for each operator read.
+    let mut operators = Vec::new();
     // Where the current statement starts; `None` after a closing parenthesis,
     // which completes an expression that no command follows.
     let mut statement_start = Some(0);
     let mut iter = tokens.iter().peekable();
+    // Whether the next token is a static command word for the operator that
+    // ends at `end`. Only `&` may touch its operand unquoted: `.git` is one
+    // command name.
+    let static_operand = |next: Option<&&NormalizeToken>, end: usize, call: bool| {
+        next.is_some_and(|next| {
+            next.kind == NormalizeTokenKind::Word
+                && next.text(command).is_some_and(|word| {
+                    (call || next.byte_range.start > end || word.starts_with(['\'', '"']))
+                        && !word.contains('$')
+                        && !word.starts_with(['@', '{'])
+                })
+        })
+    };
     while let Some(token) = iter.next() {
         let raw = token.text(command)?;
         let range = &token.byte_range;
         if token.kind == NormalizeTokenKind::Separator {
+            // A call operator after an assignment, `return`, `throw` or
+            // `exit`. At a statement start the readers already know it.
+            if raw.trim() == "&"
+                && let Some(start) = statement_start
+                && !command[start..range.start].trim().is_empty()
+                && static_operand(iter.peek(), range.end, true)
+                && powershell_command_position(&command[start..range.start])
+            {
+                operators.push((start, range.start + raw.find('&')?));
+            }
             statement_start = (raw != ")").then_some(range.end);
             continue;
         }
@@ -3243,33 +3275,33 @@ pub(crate) fn powershell_dot_source_call_view(command: &str) -> Option<String> {
             continue;
         };
         // `$r=.` and `=.` glue the operator onto the assignment.
+        let quoted = raw
+            .find(".'")
+            .or_else(|| raw.find(".\""))
+            .filter(|&dot| (dot == 0 || raw[..dot].ends_with('=')) && !raw[dot..].contains('$'));
         let operator = if raw == "." {
             Some(range.start)
         } else if raw.ends_with("=.") {
             Some(range.end - 1)
         } else {
-            None
+            quoted.map(|dot| range.start + dot)
         };
         let Some(operator) = operator else {
             continue;
         };
-        let static_operand = iter.peek().is_some_and(|next| {
-            next.kind == NormalizeTokenKind::Word
-                && next.byte_range.start > range.end
-                && next
-                    .text(command)
-                    .is_some_and(|word| !word.contains('$') && !word.starts_with(['@', '{']))
-        });
-        if static_operand && powershell_command_position(&command[start..operator]) {
-            dots.push(operator);
+        if (quoted.is_some() || static_operand(iter.peek(), range.end, false))
+            && powershell_command_position(&command[start..operator])
+        {
+            operators.push((start, operator));
         }
     }
-    if dots.is_empty() {
+    if operators.is_empty() {
         return None;
     }
     let mut view = command.as_bytes().to_vec();
-    for dot in dots {
-        view[dot] = b'&';
+    for (start, operator) in operators {
+        view[start..operator].fill(b' ');
+        view[operator] = b'&';
     }
     String::from_utf8(view).ok()
 }
@@ -8442,7 +8474,7 @@ mod tests {
     }
 
     #[test]
-    fn powershell_dot_source_call_view_reads_statement_leading_dots() {
+    fn powershell_invocation_operator_view_reads_operators_in_command_position() {
         for (command, expected) in [
             (". git reset --hard", "& git reset --hard"),
             (". 'git' reset --hard", "& 'git' reset --hard"),
@@ -8450,24 +8482,39 @@ mod tests {
             ("a | . git x", "a | & git x"),
             ("a\n. git x", "a\n& git x"),
             ("if ($true) { . git x }", "if ($true) { & git x }"),
-            ("$r = . git x", "$r = & git x"),
-            ("$r=. git x", "$r=& git x"),
-            ("$r += . git x", "$r += & git x"),
-            ("$r ??= . git x", "$r ??= & git x"),
-            ("$r =. git x", "$r =& git x"),
-            ("[string]$r = . git x", "[string]$r = & git x"),
-            ("[int] [string]$r = . git x", "[int] [string]$r = & git x"),
-            ("$a, $b = . git x", "$a, $b = & git x"),
-            ("$a = $b = . git x", "$a = $b = & git x"),
-            ("$x[1,2] = . git x", "$x[1,2] = & git x"),
-            ("return . git x", "return & git x"),
-            ("THROW . git x", "THROW & git x"),
-            ("exit . git x", "exit & git x"),
+            ("$r = . git x", "     & git x"),
+            ("$r=. git x", "   & git x"),
+            ("$r += . git x", "      & git x"),
+            ("$r ??= . git x", "       & git x"),
+            ("$r =. git x", "    & git x"),
+            ("[string]$r = . git x", "             & git x"),
+            ("[int] [string]$r = . git x", "                   & git x"),
+            ("$a, $b = . git x", "         & git x"),
+            ("$a = $b = . git x", "          & git x"),
+            ("$x[1,2] = . git x", "          & git x"),
+            ("return . git x", "       & git x"),
+            ("THROW . git x", "      & git x"),
+            ("exit . git x", "     & git x"),
+            ("echo a; $r = . git x", "echo a;      & git x"),
             (".\u{a0}git x", "&\u{a0}git x"),
+            ("$r=.\u{a0}git x", "   &\u{a0}git x"),
+            (".'git' x", "&'git' x"),
+            (".\"git\" x", "&\"git\" x"),
+            ("$r=.'git' x", "   &'git' x"),
+            ("$r =.'git' x", "    &'git' x"),
+            ("$a, $b = .'git' x", "         &'git' x"),
+            ("echo a; .'git' x", "echo a; &'git' x"),
+            (".'iex' 'git x'", "&'iex' 'git x'"),
             (". ./x.ps1", "& ./x.ps1"),
+            // The call operator itself, outside a statement start.
+            ("$r = & 'git' x", "     & 'git' x"),
+            ("$r=&'git' x", "   &'git' x"),
+            ("$a, $b = &\"git\" x", "         &\"git\" x"),
+            ("return & 'git' x", "       & 'git' x"),
+            ("exit & git x", "     & git x"),
         ] {
             assert_eq!(
-                powershell_dot_source_call_view(command).as_deref(),
+                powershell_invocation_operator_view(command).as_deref(),
                 Some(expected),
                 "{command:?}"
             );
@@ -8477,6 +8524,7 @@ mod tests {
             ". \"$PSScriptRoot\\x.ps1\"",
             ". { Get-Date }",
             ". @('git')",
+            ". ('git') x",
             "git add .",
             "echo . git x",
             ".git x",
@@ -8487,11 +8535,25 @@ mod tests {
             "return. git x",
             "$r=.git x",
             "$r -eq . git x",
+            "Write-Output .'git' x",
+            "'x'.'git'",
+            "$r.'git'",
+            ".\"$PSScriptRoot\\x.ps1\"",
+            "git config a=.'x'",
+            "a=.'git' x",
             "$r = 1 + . git x",
             "git config a= . git x",
+            // A call operator at a statement start, or with a dynamic operand.
+            "& git x",
+            "echo a; & 'git' x",
+            "$r = & $x",
+            "$r = & (Join-Path $PSScriptRoot 'x.ps1')",
+            "$r = & { git x }",
+            "git status & 'git' x",
+            "x=1 & git x",
         ] {
             assert_eq!(
-                powershell_dot_source_call_view(command),
+                powershell_invocation_operator_view(command),
                 None,
                 "{command:?}"
             );

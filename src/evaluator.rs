@@ -16037,9 +16037,10 @@ fn evaluate_command_in_dialect_union(
     };
 
     // PowerShell's dot-source operator runs a command like the call operator:
-    // `. git reset --hard` runs Git. Judge the line with each statement-leading
-    // dot read as `&`, deny wins. The view has the same length, so a denial's
-    // span still addresses the command. What the user allowed as written stays
+    // `. git reset --hard` runs Git. Judge the line with each dot in command
+    // position read as `&`, and each call operator after an assignment or
+    // `return` moved to its statement start, deny wins. The view has the same
+    // length, so a denial's span still addresses the command. What the user allowed as written stays
     // allowed. The view is not a request the user made, so it may spend no
     // allow-once grant: one for the `&` spelling belongs to that request
     // (GH#537). A grant for the dot spelling itself is found at the outer
@@ -16049,7 +16050,7 @@ fn evaluate_command_in_dialect_union(
         ShellDialect::PowerShell | ShellDialect::Unknown
     ) && primary.decision == EvaluationDecision::Allow
         && primary.allowlist_override.is_none()
-        && let Some(view) = crate::normalize::powershell_dot_source_call_view(command)
+        && let Some(view) = crate::normalize::powershell_invocation_operator_view(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
         let alternate = if deadline_exceeded(deadline) {
