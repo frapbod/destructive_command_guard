@@ -15712,6 +15712,89 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             }
         }
     }
+    // Bash and zsh read a `#` after a blank as data inside an arithmetic
+    // command, a `=~` regex group and a pattern group:
+    // `(( x = 1 #)); git reset --hard` and `[[ x =~ ( #) ]]; git reset --hard`
+    // run `git reset --hard`. dash reads nested subshells and has no `[[`, so
+    // there it starts a comment, as it does for the shared readers. When such
+    // a `#` may start a comment, read the command again with it spelled as
+    // data (see `bash_hashes_as_data`), through this whole function, as the
+    // lone-CR spelling above is read; that spelling has no such `#` left.
+    // Deny wins. A `!(…)` is such a group only once `extglob` is on, and a
+    // negated subshell otherwise, so a command with a `!` is read both ways.
+    // A command too costly to read that way fails closed. What the user
+    // authorized as written stays authorized, and the spelling spends no
+    // allow-once grant.
+    let mut bash_spelling: Option<String> = None;
+    for extglob in [false, true] {
+        if result.decision != EvaluationDecision::Allow
+            || result.bypass_method == Some(BypassMethod::AllowOnce)
+            || !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            || (extglob && memchr::memchr(b'!', command.as_bytes()).is_none())
+        {
+            break;
+        }
+        let Some(reading) = crate::normalize::bash_hashes_as_data(command, extglob) else {
+            continue;
+        };
+        if let crate::normalize::BashHashReading::Spelled(spelled) = &reading
+            && bash_spelling.as_ref() == Some(spelled)
+        {
+            continue;
+        }
+        if explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path) {
+            break;
+        }
+        // The copy's incomplete analyses count only if its result is used.
+        let alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+        let alternate = if let crate::normalize::BashHashReading::Spelled(spelled) = &reading
+            && !deadline_exceeded(deadline)
+        {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                spelled,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        } else {
+            EvaluationResult::indeterminate_due_to_budget()
+        };
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            drop(alternate_scope);
+            result = alternate;
+            // The spelling is length preserving: show the command's own text.
+            if let Some(info) = result.pattern_info.as_mut()
+                && let Some(span) = info.matched_span.as_ref()
+                && span.end <= command.len()
+                && command.is_char_boundary(span.start)
+                && command.is_char_boundary(span.end)
+            {
+                info.matched_text_preview = Some(extract_match_preview(command, span));
+            }
+        } else {
+            alternate_scope.discard();
+        }
+        if let crate::normalize::BashHashReading::Spelled(spelled) = reading {
+            bash_spelling = Some(spelled);
+        }
+    }
+
     // A program name in another case runs the same program on a
     // case-insensitive filesystem (`RM -rf ~` runs `rm`), while the packs and
     // the shell analysis compare lower-case names. Read the command again with
@@ -38666,7 +38749,17 @@ fn evaluate_heredoc(
                     line_number: 1,
                 }]
             };
-            if destination_source_context {
+            // The command splitter reads a `#` that Bash reads as data (in
+            // `((…))` or a `=~` regex group) as a comment, as dash does, and
+            // so hands on no command after it: `bash -c '(( x = 1 #)); git
+            // reset --hard'`. The whole body, read by the evaluator, gets its
+            // Bash reading too (see `bash_hashes_as_data`).
+            let bash_data_hash = per_command_pass
+                && !destination_source_context
+                && [false, true].into_iter().any(|extglob| {
+                    crate::normalize::bash_hashes_as_data(&content.content, extglob).is_some()
+                });
+            if destination_source_context || bash_data_hash {
                 // `f=/etc/sudoers; tee "$f"` requires both statements. Keep
                 // the existing per-command checks as well: they reach bodies
                 // of functions and other constructs the outer walk may not

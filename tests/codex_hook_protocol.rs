@@ -794,6 +794,194 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
     }
 }
 
+/// Bash and zsh read `((…))` as arithmetic and keep blanks in a `=~` regex
+/// group and in a pattern group, where `#` starts no comment, so the git
+/// command after it runs; dash reads nested subshells and has no `[[`, so
+/// there it does. Every blocked command below runs its git command in Bash
+/// 3.2, 5.2 or 5.3 (also with `-O extglob`), zsh 5.9 or dash 0.5.12 (measured
+/// with a `git` that only records its arguments).
+#[test]
+fn bash_data_hash_hides_no_later_git_command() {
+    let payload = |command: &str, codex: bool| {
+        let mut payload = serde_json::json!({
+            "session_id": "sess-arithmetic-hash",
+            "cwd": "/tmp/test-workdir",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_use_id": "call_arithmetic_hash",
+        });
+        if codex {
+            payload["turn_id"] = serde_json::json!("turn-arithmetic-hash");
+        }
+        payload.to_string().into_bytes()
+    };
+    for command in [
+        "(( x = 1 #)); git reset --hard",
+        "(( x = 1 # )); git reset --hard",
+        "((x=1 #)); git push --force origin main",
+        "((x=1 #)) && git clean -fdx",
+        "(( 1 \n #)); git reset --hard",
+        "for (( i=0 #; i<1; i++ )); do :; done; git reset --hard",
+        "for ((i=0;i<1;i++ #)); do :; done; git reset --hard",
+        "if (( 1 #)); then :; fi; git reset --hard",
+        "x=1; (( x #)) || git reset --hard",
+        "echo $( (( 1 #)) ; git reset --hard )",
+        "echo `(( 1 #)); git reset --hard`",
+        "bash -c '(( x = 1 #)); git reset --hard'",
+        "bash -c \"for ((i=0;i<1;i++ #)); do :; done; git reset --hard\"",
+        "bash <<'EOF'\n(( x = 1 #)); git reset --hard\nEOF",
+        "(( 1 #'x' )); git reset --hard",
+        "(( 1 #'x\n' )); git reset --hard",
+        "[[ x =~ ( #) ]]; git reset --hard",
+        "[[ x =~ ((a) #) ]]; git reset --hard",
+        "for((i=0;i<1;i++ #));do :;done;git reset --hard",
+        "if((1 #));then :;fi;git reset --hard",
+        "while((0 #));do :;done;git reset --hard",
+        "if true;then((1 #));fi;git reset --hard",
+        "for x in 1;do((1 #));done;git reset --hard",
+        "if false;then :;else((1 #));fi;git reset --hard",
+        "if false;then :;elif((1 #));then :;fi;git reset --hard",
+        "!((1 #));git reset --hard",
+        "time((1 #));git reset --hard",
+        "case x in x)((1 #));;esac;git reset --hard",
+        "case x in (x)((1 #));;esac;git reset --hard",
+        "{((1 #));};git reset --hard",
+        "f(){((1 #));};f;git reset --hard",
+        "bash -c 'for((i=0;i<1;i++ #));do :;done;git reset --hard'",
+        "(\\\n( 1 #)); git reset --hard",
+        "[[ x =~ a|( #) ]]; git reset --hard",
+        "[[ x =~ |( #) ]]; git reset --hard",
+        "[[ x =~ a||( #) ]]; git reset --hard",
+        "[[ x =~ (a)|b|( #) ]] || git reset --hard",
+        "[[ x =~|( #) ]]; git reset --hard",
+        "case x in x)[[ x =~ ( #) ]];;esac;git reset --hard",
+        "f()[[ x =~ ( #) ]];git reset --hard",
+        // Line continuations, which Bash removes before it reads tokens.
+        "[[ x =~ \\\n ( #) ]]; git reset --hard",
+        "[[ x =~\\\n( #) ]]; git reset --hard",
+        "[\\\n[ x =~ ( #) ]]; git reset --hard",
+        "[[\\\n x =~ ( #) ]]; git reset --hard",
+        "[[ x =\\\n~ ( #) ]]; git reset --hard",
+        ": x\\\n# ; (( 1 #)); git reset --hard",
+        "for\\\n((i=0;i<1;i++ #));do :;done;git reset --hard",
+        "if [[ x =~ \\\n( #) ]]; then :; fi; git reset --hard",
+        // Pattern groups in `[[` operands, and `extglob` groups.
+        "[[ x == @( #) ]]; git reset --hard",
+        "[[ x == +( #) ]]; git reset --hard",
+        "[[ x = x@( #) ]]; git reset --hard",
+        "[[ x == *( #) ]] || git reset --hard",
+        "[[ x == ?( #) ]]; git reset --hard",
+        "[[ x != !( #) ]] || git reset --hard",
+        "[[ x == ( #) ]]; git reset --hard",
+        "[[ x == (a| #) ]]; git reset --hard",
+        "shopt -s extglob\n: @( #); git reset --hard",
+        ": @( #); git reset --hard",
+        "echo x*( #); git reset --hard",
+        "case x in @( #)) :;; esac; git reset --hard",
+        // With `extglob` on, `!(…)` is a group too.
+        ": !( #); git reset --hard",
+        "bash -O extglob -c ': !( #); git reset --hard'",
+        "x\\\n#; git reset --hard",
+        "echo $\\\n( (( 1 #)); git reset --hard )",
+        // A comment in a command substitution inside a `[[` operand or an
+        // arithmetic command: its quote and `)` are comment text to Bash.
+        "[[ x == $( : # \"\n) ]]; (( 1 #)); git reset --hard\n# \" ) ]]",
+        "[[ x == $( : # '\n) ]]; (( 1 #)); git reset --hard\n# ' ) ]]",
+        "[[ x != $( : # \"\n) ]] || (( 1 #)); git reset --hard\n# \" ) ]]",
+        "[[ x =~ $( : # \"\n) ]]; (( 1 #)); git reset --hard\n# \" ) ]]",
+        "for (( i=$( : # \"\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# \" ) ; i<1; i++ )); do :; done",
+        "for (( i=$( : # '\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# ' ) ; i<1; i++ )); do :; done",
+        "(( i=$( : # ) )\n) + 1 #)); git reset --hard",
+        // Comments after a `$((…))` or `$'…'` in a command substitution.
+        "(( i = $( echo $(( 1 )) # \"\n) + 1 )); (( 1 #)); git reset --hard\n# \" ) + 1 ))",
+        "for (( i=$( echo $(( 1 )) # \"\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# \"",
+        "for (( i=$( echo $(( 1 )) # '\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# '",
+        "for (( i=$( : $((1)) # \"\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# \"",
+        "[[ x == $( : $'\\'' # \"\n) ]]; (( 1 #)); git reset --hard\n# \"",
+        // `$'…'` and backquotes are quoted text in every span.
+        "[[ x =~ $'\\'' ]]; (( 1 #)); git reset --hard",
+        "(( 1 $'\\'' #)); git reset --hard",
+        "(( `echo )` + 1 #)); git reset --hard",
+        "[[ x == @( `echo )` #) ]]; git reset --hard",
+        "(( \"$(echo \")\")\" + 1 #)); git reset --hard",
+        // A backquoted command ends at the first unescaped backquote.
+        "(( `: '` + 1 #)); git reset --hard\n: '`'",
+        "[[ x =~ ( `: '` #) ]]; git reset --hard\n: '`'",
+        // A Bash 5.3 `${ …; }` hides nothing after its first `}`.
+        "echo \"${ (echo) }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ { :; } }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ if :; then :; fi }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ for x in 1; do :; done }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ case x in x) ;; esac }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ [[ x ]] }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ (( 1 )) }; : # \"; (( 1 #)); git reset --hard",
+        // A `${` ends at its first `}`: only a nested `${` nests.
+        "echo ${x:-{}; (( 1 #)); git reset --hard",
+        "echo ${x:-${y:-{}}; (( 1 #)); git reset --hard",
+        // A quote in a heredoc body opens nothing.
+        "cat <<'EOF'\ndon't\nEOF\n(( 1 #)); git reset --hard",
+        "cat <<'EOF'\na\\\ndon't\nEOF\n(( 1 #)); git reset --hard",
+        "cat <<EOF\nsay \"hi\nEOF\n(( 1 #)); git reset --hard",
+        // dash's reading: the comment ends at the line end and the quote in
+        // it opens nothing; Bash reads one arithmetic command to the end.
+        "(( 1 #'\ngit reset --hard))\n'))",
+    ]
+    .map(String::from)
+    .into_iter()
+    // Many short subshells before the arithmetic hide nothing.
+    .chain([(21, 1_000), (17, 8_000)].map(|(count, filler)| {
+        format!(
+            "{} echo $((1)); (( 1 #)); git reset --hard; : {}",
+            "((true) );".repeat(count),
+            "x".repeat(filler)
+        )
+    }))
+    // Deeply nested subshells before it hide nothing, and a comment after
+    // them stays a comment, so its quote opens nothing.
+    .chain([100, 140].map(|levels| {
+        format!(
+            "{}true{};: # \"\n(( 1 #)); git reset --hard\n# \"",
+            "(".repeat(levels),
+            ") ".repeat(levels)
+        )
+    })) {
+        let command = command.as_str();
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(
+            claude.is_claude_block_shape(),
+            "claude {command:?}\n{claude}"
+        );
+    }
+    for command in [
+        "(( x = 1 )); git status",
+        "(( x = 1 )) # git reset --hard",
+        "(( x = 1 #)); git status",
+        "echo $(( 2#101 ))",
+        "[[ x =~ ( a ) ]] # git reset --hard",
+        "if((x>1));then :;fi; git status",
+        "for((i=0;i<3;i++));do :;done # git reset --hard",
+        "[[ x =~ ^(a|b)$ ]] && echo ok # git reset --hard",
+        "[[ x == @(a|b) ]] && echo ok # git reset --hard",
+        ": # it's \\\n# (( 1 #)); git reset --hard",
+        "if !(true); then :; fi # git reset --hard",
+        "[[ x == $(echo x) ]] && echo ok # git reset --hard",
+        "(( $(echo 1) > 0 )) && echo ok # git reset --hard",
+        "cat <<'EOF'\ndon't\nEOF\n(( 1 #)); git status",
+        "[[ x == $'\\'' ]] && echo ok # git reset --hard",
+        "[[ x =~ ( $'a' ) ]] && echo ok # git reset --hard",
+        "(( `echo 1` > 0 )) && echo ok # git reset --hard",
+        "[[ x == $( echo $(( 1 )) ) ]] && echo ok # git reset --hard",
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+}
+
 #[test]
 fn vscode_copilot_terminal_tool_variants_block_destructive_commands() {
     for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {

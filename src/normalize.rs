@@ -6143,6 +6143,678 @@ pub(crate) fn powershell_line_breaks_as_line_feeds(command: &str) -> Option<Stri
     String::from_utf8(spelled).ok()
 }
 
+/// The Bash reading [`bash_hashes_as_data`] gives a command.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BashHashReading {
+    /// The command with each `#` that is data to Bash, but may start a
+    /// comment to dcg's readers, spelled `_`.
+    Spelled(String),
+    /// The command has no reading here: the paren lookups read all the bytes
+    /// they may before its end, or a span this reading spells holds a comment
+    /// in a command substitution. The caller fails closed.
+    Unread,
+}
+
+/// The Bash reading of `command` in which dcg's readers see each `#` that is
+/// data to Bash as data; `None` when there is no such `#`.
+///
+/// Bash reads a `#` after a blank as data, not as a comment, in:
+///
+/// - an arithmetic command `((…))` (also a `for ((…))` header):
+///   `(( x = 1 #)); git reset --hard` runs `git reset --hard` after the
+///   arithmetic fails;
+/// - a parenthesized group in the regex after `=~` in `[[ … ]]`, where
+///   blanks are part of the word: `[[ x =~ ( #) ]]; git reset --hard` runs
+///   it too;
+/// - a pattern group: an operand of `==`, `=` or `!=` in `[[ … ]]` (Bash 4.1
+///   and later read `@(…)`, `*(…)`, `?(…)`, `+(…)` and `!(…)` there, zsh
+///   any `(…)`), and `@(…)`, `*(…)`, `?(…)` or `+(…)` anywhere once
+///   `extglob` is on. With it off, such a group is a syntax error, and
+///   nothing after it runs. A `!(…)` elsewhere is a group only with
+///   `extglob` on; with it off, it is a negated subshell, in which `#` does
+///   start a comment. So it is read as a group only when `extglob` is true:
+///   the caller reads both.
+///
+/// dash reads the first as two subshells and has none of the others, so
+/// there a `#` after a blank does start a comment: `(( 1 #'` LF
+/// `git reset --hard))` LF `'))` runs `git reset --hard` in dash and nothing
+/// in Bash. dcg's shared readers (the quote and span classifier, the
+/// sanitizer, the segment splitter, the tokenizers) read the dash way, so the
+/// evaluator also reads this spelling, in which they see the Bash reading,
+/// and deny wins. Measured with bash 3.2, 5.2 and 5.3, zsh 5.9 and dash
+/// 0.5.12.
+///
+/// Elsewhere Bash does read a comment (`[[ a == a #]]` is a syntax error;
+/// `$((…))` reports an error that ends the line before anything after it
+/// runs), and those are left alone: text spelled as data where Bash reads a
+/// comment could hide a command, as a quote in the comment would then open.
+///
+/// Bash removes each `\`LF pair (a line continuation) outside single quotes
+/// and comments before it reads tokens, so every test of what comes before
+/// or after a byte reads past such pairs: `[\`LF`[`, `=\`LF`~` and
+/// `for\`LF`((` open what they spell without the pair, and in `x\`LF`#` the
+/// `#` is part of the word `x#`, so data, and spelled. A `#` starts a comment
+/// at the start of a token (after a blank, `;`, `&`, `|`, `(`, `)`, `<`,
+/// `>` or a backquote); a `[[`, `]]` or a `[[` operator is a token there too.
+/// A `((` needs no token start, as `(` is a metacharacter (`for((`, `if((`,
+/// `!((`, `case x in x)((`); any `((` not right after `$` counts. An
+/// arithmetic command ends where Bash ends it (see
+/// [`SpanReader::arithmetic`]); a `[[` operand word ends at a
+/// blank, `;`, `&` or `)` outside its parentheses (`|` stays in it), and an
+/// `extglob` group at its own `)`. Quoted text and comments outside them are
+/// passed over, and so is a `${…}` outside the `$(…)` in it, which ends at
+/// its first `}` (also a Bash 5.3 `${ …; }`, which the shared readers read
+/// the same way). Inside them, only a `#` outside quotes that follows a
+/// blank or an operator byte is spelled: one after a word byte (`2#101`,
+/// `$#`, `${#x}`) starts no comment to any reader.
+///
+/// A heredoc body is raw text, and passed over: a quote in it (`don't`)
+/// opens nothing. Only text that every shell reads as a body is (see
+/// [`crate::context::undisputed_heredoc_body_ranges`]).
+///
+/// Every reader of those spans passes over quoted text with one reader,
+/// [`SpanReader::quoted_end`], which reads `\`, `'…'`, `$'…'`, `"…"`,
+/// backquotes, `$(…)`, `$((…))` and `${…}` as this function does. A command
+/// substitution there holds command text, where Bash reads a comment whose
+/// quotes open nothing and whose `)` closes nothing (`[[ x == $( : # "` LF
+/// `) ]]`). That reader does not read comments, so such a span is
+/// [`BashHashReading::Unread`]. Known limit, shared with dcg's other
+/// readers: the `)` that ends a `case` pattern in such a substitution ends
+/// the substitution there.
+///
+/// Each `((`, `$((` and `extglob` group costs a lookup of the `)` that
+/// closes it, which a run of nested or unclosed `(` shares (see
+/// [`SpanReader`]). A command whose lookups would read more than 16 times its
+/// length (plus 4 KiB) is [`BashHashReading::Unread`].
+///
+/// Length preserving (one ASCII byte for another), so every range in the
+/// view is the same range in `command`.
+#[must_use]
+pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHashReading> {
+    bash_hashes_as_data_within(command, extglob, 16 * command.len() + 4096)
+}
+
+/// [`bash_hashes_as_data`] with lookups that may read `budget` bytes.
+fn bash_hashes_as_data_within(
+    command: &str,
+    extglob: bool,
+    budget: usize,
+) -> Option<BashHashReading> {
+    let bytes = command.as_bytes();
+    if memchr::memchr(b'#', bytes).is_none()
+        || (memchr::memchr(b'(', bytes).is_none()
+            && memchr::memmem::find(bytes, b"=~").is_none()
+            && memchr::memmem::find(bytes, b"\\\n").is_none())
+    {
+        return None;
+    }
+    match spell_bash_data_hashes(command, extglob, budget) {
+        Ok(spelled) => spelled
+            // Only an ASCII byte changed into another ASCII byte.
+            .and_then(|spelled| String::from_utf8(spelled).ok())
+            .map(BashHashReading::Spelled),
+        Err(NoReading) => Some(BashHashReading::Unread),
+    }
+}
+
+fn spell_bash_data_hashes(
+    command: &str,
+    extglob: bool,
+    budget: usize,
+) -> Result<Option<Vec<u8>>, NoReading> {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let next = |at: usize| past_line_continuations(bytes, at);
+    let mut spans = SpanReader::new(bytes, budget);
+    let mut spelled: Option<Vec<u8>> = None;
+    let mut frames: Vec<Frame> = Vec::new();
+    // Inside `[[ … ]]`, where operators take a pattern or regex word.
+    let mut in_conditional = false;
+    // Where the last comment ended: the `\`LF pair that ends a comment is no
+    // line continuation.
+    let mut floor = 0usize;
+    // Heredoc bodies are raw text: a quote in one opens nothing.
+    let mut bodies = crate::context::undisputed_heredoc_body_ranges(command)
+        .into_iter()
+        .peekable();
+    let mut i = 0;
+    while i < len {
+        if let Some(body) = bodies.peek() {
+            if i >= body.end {
+                bodies.next();
+                continue;
+            }
+            if i >= body.start {
+                i = body.end;
+                continue;
+            }
+        }
+        let top = frames.last().copied();
+        let in_double = top == Some(Frame::Double);
+        let in_braces = matches!(top, Some(Frame::Braces { .. }));
+        let byte = bytes[i];
+        i = match byte {
+            b'\\' => i + 2,
+            b'"' if in_double => {
+                frames.pop();
+                i + 1
+            }
+            b'"' => {
+                frames.push(Frame::Double);
+                i + 1
+            }
+            // `$$` is one parameter: a `{` or `(` after it opens nothing.
+            b'$' if bytes.get(next(i + 1)) == Some(&b'$') => next(i + 1) + 1,
+            b'$' if bytes.get(next(i + 1)) == Some(&b'{') => {
+                let quoted = in_double || top == Some(Frame::Braces { quoted: true });
+                frames.push(Frame::Braces { quoted });
+                next(i + 1) + 1
+            }
+            b'$' if bytes.get(next(i + 1)) == Some(&b'(') => {
+                let open = next(i + 1);
+                let second = next(open + 1);
+                let lookup = if bytes.get(second) == Some(&b'(') {
+                    spans.arithmetic(second)?
+                } else {
+                    None
+                };
+                if let Some(end) = lookup {
+                    end
+                } else {
+                    frames.push(Frame::Substitution(0));
+                    open + 1
+                }
+            }
+            _ if in_double => i + 1,
+            // Bash ends a `${` at the first `}` outside quotes; only a nested
+            // `${` nests (`${x:-{}` ends at its `}`).
+            b'}' if in_braces => {
+                frames.pop();
+                i + 1
+            }
+            b'\'' if top == Some(Frame::Braces { quoted: true }) => i + 1,
+            b'$' if crate::context::ansi_c_quote_starts_at(bytes, i) => {
+                crate::context::skip_ansi_c_quoted(bytes, i + 2)
+            }
+            b'\'' => memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + at + 2),
+            b'<' | b'>' if bytes.get(next(i + 1)) == Some(&b'(') => {
+                frames.push(Frame::Substitution(0));
+                next(i + 1) + 1
+            }
+            _ if in_braces => i + 1,
+            b'#' if token_starts_at(bytes, i, floor) => {
+                let end = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |at| i + at);
+                floor = end + 1;
+                end
+            }
+            b'#' => {
+                // Joined to the word before it by a line continuation (any
+                // other `#` here follows a word byte).
+                if hash_may_start_comment(bytes, i) {
+                    spelled.get_or_insert_with(|| bytes.to_vec())[i] = b'_';
+                }
+                i + 1
+            }
+            b'(' if byte_before(bytes, i, floor) != Some(b'$')
+                && let Some(second) = second_open_paren(bytes, i) =>
+            {
+                if let Some(end) = spans.arithmetic(second)? {
+                    spans.spell_hashes(second + 1, end - 2, false, &mut spelled)?;
+                    end
+                } else {
+                    if let Some(Frame::Substitution(open)) = frames.last_mut() {
+                        *open += 1;
+                    }
+                    i + 1
+                }
+            }
+            b'@' | b'*' | b'?' | b'+' | b'!'
+                if (byte != b'!' || extglob) && bytes.get(next(i + 1)) == Some(&b'(') =>
+            {
+                let open = next(i + 1);
+                if let Some(end) = spans.close(open)? {
+                    spans.spell_hashes(open, end, true, &mut spelled)?;
+                    end
+                } else {
+                    // Unclosed, a syntax error: nothing after it runs.
+                    i + 1
+                }
+            }
+            b'[' if bytes.get(next(i + 1)) == Some(&b'[')
+                && token_starts_at(bytes, i, floor)
+                && matches!(
+                    bytes.get(next(next(i + 1) + 1)),
+                    None | Some(b' ' | b'\t' | b'\n' | b'(')
+                ) =>
+            {
+                in_conditional = true;
+                next(i + 1) + 1
+            }
+            b']' if in_conditional
+                && bytes.get(next(i + 1)) == Some(&b']')
+                && token_starts_at(bytes, i, floor) =>
+            {
+                in_conditional = false;
+                next(i + 1) + 1
+            }
+            b'=' | b'!'
+                if in_conditional
+                    && token_starts_at(bytes, i, floor)
+                    && let Some((regex, after)) = conditional_operator(bytes, i) =>
+            {
+                let mut start = after;
+                loop {
+                    let skipped = next(start);
+                    start = skipped
+                        + bytes[skipped..]
+                            .iter()
+                            .take_while(|b| matches!(b, b' ' | b'\t' | b'\n'))
+                            .count();
+                    if start == skipped {
+                        break;
+                    }
+                }
+                let end = spans.operand_word_end(start)?;
+                // A regex spells every `#` in it, a pattern only those in
+                // its groups.
+                spans.spell_hashes(start, end, !regex, &mut spelled)?;
+                end
+            }
+            b'(' => {
+                if let Some(Frame::Substitution(open)) = frames.last_mut() {
+                    *open += 1;
+                }
+                i + 1
+            }
+            b')' => {
+                match frames.last_mut() {
+                    Some(Frame::Substitution(0)) => {
+                        frames.pop();
+                    }
+                    Some(Frame::Substitution(open)) => *open -= 1,
+                    _ => {}
+                }
+                i + 1
+            }
+            _ => i + 1,
+        };
+    }
+    Ok(spelled)
+}
+
+/// A span of [`bash_hashes_as_data`] has no reading: the lookups have read
+/// all the bytes they may, or the span holds a comment in a command
+/// substitution (see [`SpanReader::quoted_end`]).
+struct NoReading;
+
+/// The span readers of [`bash_hashes_as_data`]: where the parentheses of an
+/// arithmetic command or a pattern group close, where a `[[` operand word
+/// ends, and which `#` in such a span to spell. All of them pass over quoted
+/// text with one reader, [`Self::quoted_end`].
+///
+/// A scan from a `(` to its `)` also matches every `(` it passes outside
+/// quotes, and a scan from one of those reads the same bytes the same way,
+/// so the matches are kept and such a lookup reads nothing again. A run of
+/// nested or unclosed `(` costs one scan, not one per `(`. The end of every
+/// quoted text read is kept too (its reading does not depend on where it
+/// is), so a later scan passes it at once. Lookups the kept matches do not
+/// answer scan afresh; all the scans may read `budget` bytes.
+struct SpanReader<'a> {
+    bytes: &'a [u8],
+    budget: usize,
+    spent: usize,
+    /// Each `(` the last scan passed, with the index past its `)`, or `None`
+    /// when no `)` closes it.
+    closes: std::collections::HashMap<usize, Option<usize>>,
+    /// The index past each quoted text read (other than a `${…}`, whose
+    /// reading depends on quotes around it), by where it starts.
+    quoted: std::collections::HashMap<usize, usize>,
+}
+
+/// Quoted text [`SpanReader::quoted_end`] is inside of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quoted {
+    /// A double-quoted string.
+    Double,
+    /// A backquoted command.
+    Backquote,
+    /// A `$(…)` or `$((…))` body, with the parentheses open in it (the
+    /// second `(` of a `$((` is one).
+    Parens(usize),
+    /// A `${…}`, and whether it is in double quotes, where a `'` in it is a
+    /// literal.
+    Braces { quoted: bool },
+}
+
+impl<'a> SpanReader<'a> {
+    fn new(bytes: &'a [u8], budget: usize) -> Self {
+        Self {
+            bytes,
+            budget,
+            spent: 0,
+            closes: std::collections::HashMap::new(),
+            quoted: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Index past the quoted text that starts at `at`, or `end` when it does
+    /// not close before `end`; `None` when no quoted text starts there.
+    ///
+    /// Quoted text is read as [`bash_hashes_as_data`] reads it: `\` escapes
+    /// the byte after it; `'…'`; `$'…'`, in which `\` escapes; `"…"`, in which
+    /// `$(…)`, `${…}` and backquotes nest; a backquoted command, which ends at
+    /// the first unescaped backquote (a quote in it opens nothing, in Bash and
+    /// zsh); `$(…)` and `$((…))`, whose bodies count both parentheses of a
+    /// `$((`; `${…}`,
+    /// which ends at its first `}` outside quotes and in double quotes reads
+    /// `'` as a literal; and `$$`, after which a `(` or `{` opens nothing.
+    /// [`NoReading`] when a command substitution in it holds a `#` that may
+    /// start a comment: Bash reads that comment to the end of its line, so
+    /// its quotes open nothing and its `)` closes nothing.
+    fn quoted_end(&mut self, at: usize, end: usize) -> Result<Option<usize>, NoReading> {
+        let bytes = self.bytes;
+        let mut frames: Vec<(Quoted, usize)> = Vec::new();
+        let mut i = at;
+        while i < end {
+            self.spent += 1;
+            let top = frames.last().map(|frame| frame.0);
+            match quote_opens(bytes, i, top) {
+                Some(QuoteOpen::Skip(past)) => i = past,
+                Some(QuoteOpen::Push(quoted, body)) => {
+                    if let Some(&past) = self.quoted.get(&i) {
+                        i = past;
+                    } else {
+                        frames.push((quoted, i));
+                        i = body;
+                    }
+                }
+                None => {
+                    let closed = match (frames.last_mut(), bytes[i]) {
+                        (None, _) => return Ok(None),
+                        (Some((Quoted::Double, _)), b'"')
+                        | (Some((Quoted::Backquote, _)), b'`')
+                        | (Some((Quoted::Braces { .. }, _)), b'}')
+                        | (Some((Quoted::Parens(0), _)), b')') => true,
+                        (Some((Quoted::Parens(open), _)), b'(') => {
+                            *open += 1;
+                            false
+                        }
+                        (Some((Quoted::Parens(open), _)), b')') => {
+                            *open -= 1;
+                            false
+                        }
+                        (Some((Quoted::Parens(_) | Quoted::Backquote, _)), b'#')
+                            if hash_may_start_comment(bytes, i) =>
+                        {
+                            return Err(NoReading);
+                        }
+                        _ => false,
+                    };
+                    i += 1;
+                    if closed && let Some((quoted, start)) = frames.pop() {
+                        self.remember(quoted, start, i);
+                    }
+                }
+            }
+            if frames.is_empty() {
+                return Ok(Some(i));
+            }
+        }
+        if frames.is_empty() {
+            return Ok(None);
+        }
+        // Unclosed: quoted to the end of the span, and of the input when the
+        // span ends there.
+        if end == bytes.len() {
+            for (quoted, start) in frames {
+                self.remember(quoted, start, end);
+            }
+        }
+        Ok(Some(end))
+    }
+
+    fn remember(&mut self, quoted: Quoted, start: usize, past: usize) {
+        if !matches!(quoted, Quoted::Braces { .. }) {
+            self.quoted.insert(start, past);
+        }
+    }
+
+    /// Index past the `)` that closes the `(` at `open`; `None` when none
+    /// does. Quoted text counts no parenthesis.
+    fn close(&mut self, open: usize) -> Result<Option<usize>, NoReading> {
+        if let Some(close) = self.closes.get(&open) {
+            return Ok(*close);
+        }
+        if self.spent > self.budget {
+            return Err(NoReading);
+        }
+        let bytes = self.bytes;
+        self.closes.clear();
+        let mut opens: Vec<usize> = Vec::new();
+        let mut i = open;
+        while i < bytes.len() {
+            if let Some(past) = self.quoted_end(i, bytes.len())? {
+                i = past;
+                continue;
+            }
+            self.spent += 1;
+            match bytes[i] {
+                b'(' => opens.push(i),
+                b')' => {
+                    if let Some(at) = opens.pop() {
+                        self.closes.insert(at, Some(i + 1));
+                    }
+                    if opens.is_empty() {
+                        return Ok(Some(i + 1));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        self.closes.extend(opens.into_iter().map(|at| (at, None)));
+        Ok(None)
+    }
+
+    /// Where the arithmetic that the `((` (or `$((`) whose second `(` is at
+    /// `second` opens ends; `None` when it opens none. Bash (and
+    /// `context::arithmetic_end`) reads arithmetic when the `)` closing
+    /// `second` is followed at once by another `)`; otherwise (`((cd x) &&
+    /// ls)`) the parentheses open nested subshells.
+    fn arithmetic(&mut self, second: usize) -> Result<Option<usize>, NoReading> {
+        Ok(self
+            .close(second)?
+            .filter(|close| self.bytes.get(*close) == Some(&b')'))
+            .map(|close| close + 1))
+    }
+
+    /// End of the `[[` operand word that starts at `start`: the first blank,
+    /// `;`, `&` or `)` outside quoted text and its parentheses, where Bash
+    /// keeps blanks in the word.
+    fn operand_word_end(&mut self, start: usize) -> Result<usize, NoReading> {
+        let bytes = self.bytes;
+        let mut depth = 0usize;
+        let mut i = start;
+        while i < bytes.len() {
+            if let Some(past) = self.quoted_end(i, bytes.len())? {
+                i = past;
+                continue;
+            }
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' if depth > 0 => depth -= 1,
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b')' if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        Ok(i.min(bytes.len()))
+    }
+
+    /// Spell `_` each `#` in `start..end` outside quoted text that may start
+    /// a comment; with `in_groups_only`, only those inside parentheses (the
+    /// groups of a pattern word).
+    fn spell_hashes(
+        &mut self,
+        start: usize,
+        end: usize,
+        in_groups_only: bool,
+        spelled: &mut Option<Vec<u8>>,
+    ) -> Result<(), NoReading> {
+        let bytes = self.bytes;
+        let mut depth = 0usize;
+        let mut i = start;
+        while i < end {
+            if let Some(past) = self.quoted_end(i, end)? {
+                i = past;
+                continue;
+            }
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b'#' if (depth > 0 || !in_groups_only) && hash_may_start_comment(bytes, i) => {
+                    spelled.get_or_insert_with(|| bytes.to_vec())[i] = b'_';
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+}
+
+/// What starts at a byte for [`SpanReader::quoted_end`].
+enum QuoteOpen {
+    /// Quoted text read whole, which ends before this index.
+    Skip(usize),
+    /// Quoted text that may nest more, and where its body starts.
+    Push(Quoted, usize),
+}
+
+/// The quoted text that starts at `i` inside `context` (`None`: unquoted
+/// text), if any.
+fn quote_opens(bytes: &[u8], i: usize, context: Option<Quoted>) -> Option<QuoteOpen> {
+    let next = |at: usize| past_line_continuations(bytes, at);
+    let double = context == Some(Quoted::Double);
+    let quoted_braces = context == Some(Quoted::Braces { quoted: true });
+    // Bash and zsh end a backquoted command at the first unescaped
+    // backquote: nothing nests in it, not even a quote.
+    if context == Some(Quoted::Backquote) {
+        return (bytes[i] == b'\\').then_some(QuoteOpen::Skip(i + 2));
+    }
+    match bytes[i] {
+        b'\\' => Some(QuoteOpen::Skip(i + 2)),
+        b'$' if bytes.get(next(i + 1)) == Some(&b'$') => Some(QuoteOpen::Skip(next(i + 1) + 1)),
+        b'$' if bytes.get(next(i + 1)) == Some(&b'(') => {
+            Some(QuoteOpen::Push(Quoted::Parens(0), next(i + 1) + 1))
+        }
+        b'$' if bytes.get(next(i + 1)) == Some(&b'{') => Some(QuoteOpen::Push(
+            Quoted::Braces {
+                quoted: double || quoted_braces,
+            },
+            next(i + 1) + 1,
+        )),
+        b'`' => Some(QuoteOpen::Push(Quoted::Backquote, i + 1)),
+        b'"' if !double => Some(QuoteOpen::Push(Quoted::Double, i + 1)),
+        b'$' if !double && crate::context::ansi_c_quote_starts_at(bytes, i) => Some(
+            QuoteOpen::Skip(crate::context::skip_ansi_c_quoted(bytes, i + 2)),
+        ),
+        b'\'' if !double && !quoted_braces => Some(QuoteOpen::Skip(
+            memchr::memchr(b'\'', &bytes[i + 1..]).map_or(bytes.len(), |at| i + at + 2),
+        )),
+        _ => None,
+    }
+}
+
+/// What [`bash_hashes_as_data`] is inside of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    /// A double-quoted string.
+    Double,
+    /// A `$(…)`, `<(…)` or `>(…)` body, with the parentheses open in it.
+    Substitution(usize),
+    /// A `${…}`, and whether it is in double quotes, where a `'` in it is a
+    /// literal.
+    Braces { quoted: bool },
+}
+
+/// Index of the first byte at or after `at` that does not start a `\`LF pair
+/// (a line continuation, which Bash removes before it reads tokens).
+fn past_line_continuations(bytes: &[u8], mut at: usize) -> usize {
+    while bytes.get(at) == Some(&b'\\') && bytes.get(at + 1) == Some(&b'\n') {
+        at += 2;
+    }
+    at
+}
+
+/// The byte Bash reads right before index `at` once line continuations are
+/// removed; `None` at the start. A `\`LF pair is one only when its `\` is not
+/// escaped and it starts at or after `floor` (an earlier one ends a comment).
+fn byte_before(bytes: &[u8], mut at: usize, floor: usize) -> Option<u8> {
+    while at >= floor + 2
+        && bytes[at - 1] == b'\n'
+        && bytes[at - 2] == b'\\'
+        && bytes[..at - 2]
+            .iter()
+            .rev()
+            .take_while(|b| **b == b'\\')
+            .count()
+            % 2
+            == 0
+    {
+        at -= 2;
+    }
+    at.checked_sub(1).map(|before| bytes[before])
+}
+
+/// Whether Bash starts a token at index `at`: after a blank, a newline, an
+/// operator byte or a backquote, once line continuations are removed.
+fn token_starts_at(bytes: &[u8], at: usize, floor: usize) -> bool {
+    byte_before(bytes, at, floor).is_none_or(|before| {
+        matches!(
+            before,
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'`'
+        )
+    })
+}
+
+/// Index of the `(` that follows the `(` at `open` once line continuations
+/// are skipped.
+fn second_open_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let at = past_line_continuations(bytes, open + 1);
+    (bytes.get(at) == Some(&b'(')).then_some(at)
+}
+
+/// The `[[` operator at `at` that takes a pattern (`==`, `=`, `!=`) or a
+/// regex (`=~`, the `true`) word, with the index after it; `None` when there
+/// is none. A blank follows it; a regex operator may also be followed by a
+/// `(` or `|`, where its word starts.
+fn conditional_operator(bytes: &[u8], at: usize) -> Option<(bool, usize)> {
+    let second = past_line_continuations(bytes, at + 1);
+    let (regex, after) = match (bytes[at], bytes.get(second)) {
+        (b'=', Some(b'~')) => (true, past_line_continuations(bytes, second + 1)),
+        (b'=' | b'!', Some(b'=')) => (false, past_line_continuations(bytes, second + 1)),
+        (b'=', _) => (false, second),
+        _ => return None,
+    };
+    match bytes.get(after) {
+        None | Some(b' ' | b'\t' | b'\n') => Some((regex, after)),
+        Some(b'(' | b'|') if regex => Some((regex, after)),
+        _ => None,
+    }
+}
+
+/// Whether the `#` at `at` follows a blank or an operator byte; one after a
+/// word byte starts no comment to any reader.
+fn hash_may_start_comment(bytes: &[u8], at: usize) -> bool {
+    at > 0
+        && (bytes[at - 1].is_ascii_whitespace()
+            || matches!(
+                bytes[at - 1],
+                b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'`'
+            ))
+}
+
 /// `command` with every program name it spells in a case other than lower
 /// case folded to lower case, or `None` when it spells none.
 ///
@@ -6542,6 +7214,469 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    /// Bash reads `#` inside an arithmetic command as data, where the shared
+    /// readers may take it for a comment; only those bytes are spelled.
+    #[test]
+    fn bash_data_hashes_are_spelled_as_data() {
+        for (command, spelled) in [
+            (
+                "(( x = 1 #)); git reset --hard",
+                "(( x = 1 _)); git reset --hard",
+            ),
+            ("((x=1 #))&& git clean -fdx", "((x=1 _))&& git clean -fdx"),
+            (
+                "(( 1 \n #)); git reset --hard",
+                "(( 1 \n _)); git reset --hard",
+            ),
+            (
+                "for ((i=0;i<1;i++ #)); do :; done; git reset --hard",
+                "for ((i=0;i<1;i++ _)); do :; done; git reset --hard",
+            ),
+            (
+                "if (( 1 #)); then :; fi; git reset --hard",
+                "if (( 1 _)); then :; fi; git reset --hard",
+            ),
+            ("x; (( 1 #(2) ))", "x; (( 1 _(2) ))"),
+            (
+                "echo $( (( 1 #)); git reset --hard )",
+                "echo $( (( 1 _)); git reset --hard )",
+            ),
+            (
+                "echo \"$( (( 1 #)); git reset --hard )\"",
+                "echo \"$( (( 1 _)); git reset --hard )\"",
+            ),
+            (
+                "echo `(( 1 #)); git reset --hard`",
+                "echo `(( 1 _)); git reset --hard`",
+            ),
+            (
+                "echo $(((1 #)); git reset --hard)",
+                "echo $(((1 _)); git reset --hard)",
+            ),
+            // A quote in the arithmetic is read as Bash reads it.
+            (
+                "(( 1 #'x' )); git reset --hard",
+                "(( 1 _'x' )); git reset --hard",
+            ),
+            ("(( 1 #'#' ))", "(( 1 _'#' ))"),
+            // `((` needs no word start; `|` stays in a `=~` word; `\`LF is skipped.
+            (
+                "for((i=0;i<1;i++ #));do :;done;git reset --hard",
+                "for((i=0;i<1;i++ _));do :;done;git reset --hard",
+            ),
+            ("case x in x)((1 #));;esac", "case x in x)((1 _));;esac"),
+            (
+                "(\\\n( 1 #)); git reset --hard",
+                "(\\\n( 1 _)); git reset --hard",
+            ),
+            (
+                "[[ x =~ a|( #) ]]; git reset --hard",
+                "[[ x =~ a|( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x =~|( #) ]]; git reset --hard",
+                "[[ x =~|( _) ]]; git reset --hard",
+            ),
+            // `)` is a metacharacter, so a `[[` after it opens a conditional.
+            (
+                "case x in x)[[ x =~ ( #) ]];;esac;git reset --hard",
+                "case x in x)[[ x =~ ( _) ]];;esac;git reset --hard",
+            ),
+            (
+                "f()[[ x =~ ( #) ]];git reset --hard",
+                "f()[[ x =~ ( _) ]];git reset --hard",
+            ),
+            // A group in a `=~` regex keeps its blanks in the word.
+            (
+                "[[ x =~ ( #) ]]; git reset --hard",
+                "[[ x =~ ( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x =~ ((a) #) ]]; git reset --hard",
+                "[[ x =~ ((a) _) ]]; git reset --hard",
+            ),
+            (
+                "[[ -n x && x =~ (a| #'b') ]]",
+                "[[ -n x && x =~ (a| _'b') ]]",
+            ),
+            // Bash removes each `\`LF pair before it reads tokens.
+            (
+                "[[ x =~ \\\n ( #) ]]; git reset --hard",
+                "[[ x =~ \\\n ( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x =~\\\n( #) ]]; git reset --hard",
+                "[[ x =~\\\n( _) ]]; git reset --hard",
+            ),
+            (
+                "[\\\n[ x =~ ( #) ]]; git reset --hard",
+                "[\\\n[ x =~ ( _) ]]; git reset --hard",
+            ),
+            (
+                "[[\\\n x =~ ( #) ]]; git reset --hard",
+                "[[\\\n x =~ ( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x =\\\n~ ( #) ]]; git reset --hard",
+                "[[ x =\\\n~ ( _) ]]; git reset --hard",
+            ),
+            (
+                "if [[ x =~ \\\n( #) ]]; then :; fi; git reset --hard",
+                "if [[ x =~ \\\n( _) ]]; then :; fi; git reset --hard",
+            ),
+            (
+                "for\\\n((i=0;i<1;i++ #));do :;done;git reset --hard",
+                "for\\\n((i=0;i<1;i++ _));do :;done;git reset --hard",
+            ),
+            // `x\`LF`#` is the word `x#`: its `#` is data.
+            (
+                ": x\\\n# ; (( 1 #)); git reset --hard",
+                ": x\\\n_ ; (( 1 _)); git reset --hard",
+            ),
+            // Bash 5.3 skips a newline before a `=~` word.
+            (
+                "[[ x =~\n( #) ]]; git reset --hard",
+                "[[ x =~\n( _) ]]; git reset --hard",
+            ),
+            // Pattern groups: `[[` operands, and `extglob` groups anywhere.
+            (
+                "[[ x == @( #) ]]; git reset --hard",
+                "[[ x == @( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x == +( #) ]]; git reset --hard",
+                "[[ x == +( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x = x@( #) ]]; git reset --hard",
+                "[[ x = x@( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x == *( #) ]] || git reset --hard",
+                "[[ x == *( _) ]] || git reset --hard",
+            ),
+            (
+                "[[ x == ?( #) ]]; git reset --hard",
+                "[[ x == ?( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x != !( #) ]] || git reset --hard",
+                "[[ x != !( _) ]] || git reset --hard",
+            ),
+            (
+                "[[ x == ( #) ]]; git reset --hard",
+                "[[ x == ( _) ]]; git reset --hard",
+            ),
+            (
+                "[[ x == (a| #) ]]; git reset --hard",
+                "[[ x == (a| _) ]]; git reset --hard",
+            ),
+            (
+                "shopt -s extglob\n: @( #); git reset --hard",
+                "shopt -s extglob\n: @( _); git reset --hard",
+            ),
+            (
+                "echo x*( #); git reset --hard",
+                "echo x*( _); git reset --hard",
+            ),
+            (
+                "case x in @( #)) :;; esac; git reset --hard",
+                "case x in @( _)) :;; esac; git reset --hard",
+            ),
+            ("x\\\n#; git reset --hard", "x\\\n_; git reset --hard"),
+            // Every span reader reads `$'…'` and backquotes as quoted text.
+            (
+                "[[ x =~ $'\\'' ]]; (( 1 #)); git reset --hard",
+                "[[ x =~ $'\\'' ]]; (( 1 _)); git reset --hard",
+            ),
+            (
+                "(( 1 $'\\'' #)); git reset --hard",
+                "(( 1 $'\\'' _)); git reset --hard",
+            ),
+            (
+                "(( `echo )` + 1 #)); git reset --hard",
+                "(( `echo )` + 1 _)); git reset --hard",
+            ),
+            (
+                "[[ x == @( `echo )` #) ]]; git reset --hard",
+                "[[ x == @( `echo )` _) ]]; git reset --hard",
+            ),
+            // A backquoted command ends at the first unescaped backquote.
+            (
+                "(( `: '` + 1 #)); git reset --hard\n: '`'",
+                "(( `: '` + 1 _)); git reset --hard\n: '`'",
+            ),
+            (
+                "[[ x =~ ( `: '` #) ]]; git reset --hard\n: '`'",
+                "[[ x =~ ( `: '` _) ]]; git reset --hard\n: '`'",
+            ),
+            (
+                "(( \"$(echo \")\")\" + 1 #)); git reset --hard",
+                "(( \"$(echo \")\")\" + 1 _)); git reset --hard",
+            ),
+            (
+                "echo $\\\n( (( 1 #)); git reset --hard )",
+                "echo $\\\n( (( 1 _)); git reset --hard )",
+            ),
+        ] {
+            assert_eq!(
+                bash_spelling(command).as_deref(),
+                Some(spelled),
+                "{command:?}"
+            );
+        }
+        for command in [
+            "(( x = 1 )); git status",
+            "(( x = 1 )) # git reset --hard",
+            // A `#` after a word byte starts no comment to any reader.
+            "(( x = 2#101 )); echo $(( $# + ${#x} ))",
+            // Bash reads `#` after a blank as a comment in `[[ … ]]` outside
+            // a regex group, and in `$((…))`.
+            "[[ a == a #]]; git reset --hard",
+            "[[ x =~ a #) ]]; git reset --hard",
+            "[[ x =~ ( a ) #]]; git reset --hard",
+            "[[ ( x =~ y ) #]]; git reset --hard",
+            "echo =~ ( #)",
+            "echo $(( 1 #)); git reset --hard",
+            // Not an arithmetic command: nested subshells, quoted text, a
+            // comment, or parentheses inside a word.
+            "((cd x) #it's\n)",
+            "echo '(( 1 #))'",
+            "echo \"(( 1 #))\"",
+            "# (( 1 #))",
+            "",
+            // A `\`LF pair that ends a comment, or whose `\` is escaped, is
+            // no line continuation: the next line starts with a comment.
+            ": # it's \\\n# (( 1 #))",
+            ": \\\\\n# (( 1 #))",
+            // Only a pattern group keeps a `#` from starting a comment.
+            "[[ x == @(a|b) ]] && echo ok # git reset --hard",
+            "[[ x == a #]]; git reset --hard",
+            "arr=(a # it's\nb); git status",
+            // A `${…}` holds no command, so no group, arithmetic or comment.
+            "echo ${x:+(}; : # it's (( 1 #))",
+            "echo ${x:-((}; : # it's (( 1 #))",
+            // A command substitution in a span with no comment in it.
+            "[[ x == $(echo x) ]] && echo ok # git reset --hard",
+            "(( $(echo 1) > 0 )) && echo ok # git reset --hard",
+            "[[ x == \"$(echo '#')\" ]] && echo ok # git reset --hard",
+        ] {
+            assert_eq!(bash_spelling(command), None, "{command:?}");
+        }
+    }
+
+    /// Bash ends a `${` at its first `}` (only a nested `${` nests) and reads
+    /// `$$` as one parameter.
+    #[test]
+    fn bash_parameter_expansions_end_where_bash_ends_them() {
+        for (command, spelled) in [
+            (
+                "echo ${x:-{}; (( 1 #)); git reset --hard",
+                "echo ${x:-{}; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo ${x:-${y:-{}}; (( 1 #)); git reset --hard",
+                "echo ${x:-${y:-{}}; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo $${ ; (( 1 #)); git reset --hard",
+                "echo $${ ; (( 1 _)); git reset --hard",
+            ),
+            // A Bash 5.3 `${ …; }` is read as the shared readers read it: to
+            // its first `}`.
+            (
+                "echo \"${ (echo) }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ (echo) }; : # \"; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo \"${ { :; } }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ { :; } }; : # \"; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo \"${ if :; then :; fi }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ if :; then :; fi }; : # \"; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo \"${ for x in 1; do :; done }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ for x in 1; do :; done }; : # \"; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo \"${ case x in x) ;; esac }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ case x in x) ;; esac }; : # \"; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo \"${ [[ x ]] }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ [[ x ]] }; : # \"; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo \"${ (( 1 )) }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ (( 1 )) }; : # \"; (( 1 _)); git reset --hard",
+            ),
+            // A quote in a heredoc body opens nothing.
+            (
+                "cat <<'EOF'\ndon't\nEOF\n(( 1 #)); git reset --hard",
+                "cat <<'EOF'\ndon't\nEOF\n(( 1 _)); git reset --hard",
+            ),
+            (
+                "cat <<EOF\nsay \"hi\nEOF\n(( 1 #)); git reset --hard",
+                "cat <<EOF\nsay \"hi\nEOF\n(( 1 _)); git reset --hard",
+            ),
+        ] {
+            assert_eq!(
+                bash_spelling(command).as_deref(),
+                Some(spelled),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// A comment in a command substitution inside a span this reading spells
+    /// leaves the span without a reading: its quotes would open in the
+    /// spelling and hide what follows.
+    #[test]
+    fn bash_substitution_comments_in_spans_are_unread() {
+        let tail = "(( 1 #)); git reset --hard\n# \" ) ]]";
+        for command in [
+            format!("[[ x == $( : # \"\n) ]]; {tail}"),
+            format!("[[ x == $( : # '\n) ]]; {tail}"),
+            format!("[[ x != $( : # \"\n) ]] || {tail}"),
+            format!("[[ x =~ $( : # \"\n) ]]; {tail}"),
+            format!("[[ x = @( $( : # \"\n) ) ]]; {tail}"),
+            format!("[[ x == \"$( : # \"\n)\" ]]; {tail}"),
+            format!("[[ x == `: # \"` ]]; {tail}"),
+            format!("for (( i=$( : # \"\n) ; i<1; i++ )); do :; done; {tail}"),
+            format!("(( i=$( : # ) )\n) + 1 #)); {tail}"),
+            format!("(( `: # \"` + 1 )); {tail}"),
+            format!("echo $(( $( : # \"\n) )); {tail}"),
+            // Both `(` of a `$((` count, and `$'…'` is quoted text.
+            format!("(( i = $( echo $(( 1 )) # \"\n) + 1 )); {tail}"),
+            format!("for (( i=$( echo $(( 1 )) # '\n) ; i<1; i++ )); do :; done; {tail}"),
+            format!("for (( i=$( : $((1)) # \"\n) ; i<1; i++ )); do :; done; {tail}"),
+            format!("[[ x == $( echo $(( 1 )) # \"\n) ]]; {tail}"),
+            format!("[[ x == $( : $'\\'' # \"\n) ]]; {tail}"),
+            format!("(( $(cat <( : # \"\n)) )); {tail}"),
+            "[[ x == $( : # it's\n) ]]; git status".to_string(),
+        ] {
+            assert_eq!(
+                bash_hashes_as_data(&command, false),
+                Some(BashHashReading::Unread),
+                "{command:?}"
+            );
+        }
+        // A `#` after the substitution has closed is read as before.
+        assert_eq!(
+            bash_spelling("(( $(f) + 1 #)); git reset --hard").as_deref(),
+            Some("(( $(f) + 1 _)); git reset --hard")
+        );
+    }
+
+    /// The spelling of [`bash_hashes_as_data`]; it must read the command.
+    fn bash_spelling(command: &str) -> Option<String> {
+        match bash_hashes_as_data(command, false) {
+            None => None,
+            Some(BashHashReading::Spelled(spelled)) => Some(spelled),
+            Some(BashHashReading::Unread) => panic!("unread: {command:?}"),
+        }
+    }
+
+    /// A `!(…)` outside `[[ … ]]` is a group only once `extglob` is on;
+    /// with it off, it is a negated subshell, where `#` starts a comment.
+    #[test]
+    fn bash_negation_groups_are_read_only_with_extglob() {
+        let command = ": !( #); git reset --hard";
+        assert_eq!(bash_hashes_as_data(command, false), None);
+        assert_eq!(
+            bash_hashes_as_data(command, true),
+            Some(BashHashReading::Spelled(
+                ": !( _); git reset --hard".to_string()
+            ))
+        );
+        let command = "[[ x != !( #) ]] || git reset --hard";
+        assert_eq!(
+            bash_hashes_as_data(command, false),
+            bash_hashes_as_data(command, true)
+        );
+    }
+
+    #[test]
+    fn bash_hashes_as_data_is_linear_on_unclosed_parentheses() {
+        let start = std::time::Instant::now();
+        for command in [
+            format!("{} #)); git reset --hard", "(".repeat(60_000)),
+            format!("{} #", "$((".repeat(20_000)),
+            format!("{} #", "((".repeat(30_000)),
+            format!("{} #", "@(".repeat(30_000)),
+            format!("{} #", "x\\\n".repeat(30_000)),
+            format!("{} #", "[\\\n".repeat(30_000)),
+            format!("[[ {} #", "= x".repeat(30_000)),
+            format!("{}\n#", "\\".repeat(60_000)),
+        ] {
+            let _ = bash_hashes_as_data(&command, true);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn bash_hashes_as_data_reads_nested_parentheses_exactly() {
+        let tail = " (( 1 #)); git reset --hard";
+        // A run of nested or unclosed `(` costs one scan: a real comment
+        // after it stays a comment, and the arithmetic `#` is spelled.
+        for head in [
+            format!("{}true{}", "(".repeat(140), ") ".repeat(140)),
+            format!("{}true{}", "(".repeat(5_000), ") ".repeat(5_000)),
+            "(".repeat(5_000),
+            "@(".repeat(5_000),
+            "((true) );".repeat(2_000),
+        ] {
+            let command = format!("{head};: # \"\n{tail}\n# \"");
+            let spelled = bash_spelling(&command).expect("spelled");
+            assert!(
+                spelled.ends_with(";: # \"\n (( 1 _)); git reset --hard\n# \""),
+                "{head:.9}"
+            );
+        }
+        // An unclosed `$((` reads to the end as a command substitution, so
+        // the comment in it fails closed. Bash: unexpected end of file.
+        let command = format!("{};: # \"\n{tail}\n# \"", "$((".repeat(2_000));
+        assert_eq!(
+            bash_hashes_as_data(&command, false),
+            Some(BashHashReading::Unread)
+        );
+    }
+
+    #[test]
+    fn bash_hashes_as_data_reads_nothing_past_its_budget() {
+        let command = "(( 1 #)); (( 2 #)); git reset --hard";
+        assert_eq!(
+            bash_hashes_as_data_within(command, false, 0),
+            Some(BashHashReading::Unread)
+        );
+        assert_eq!(
+            bash_hashes_as_data_within(command, false, 64),
+            Some(BashHashReading::Spelled(
+                "(( 1 _)); (( 2 _)); git reset --hard".to_string()
+            ))
+        );
+        // Quoted text that each lookup starts inside of is read once. The
+        // unclosed `$(` holds the comment-capable `#`, so the reading fails
+        // closed. Bash: unexpected end of file.
+        let command = format!("(({} #)); git reset --hard", "\"$(((".repeat(3_000));
+        let start = std::time::Instant::now();
+        assert_eq!(
+            bash_hashes_as_data(&command, false),
+            Some(BashHashReading::Unread)
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
