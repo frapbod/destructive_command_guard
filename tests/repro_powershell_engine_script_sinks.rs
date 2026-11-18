@@ -2,7 +2,8 @@
 //! `[scriptblock]::Create`: `$ExecutionContext.InvokeCommand.InvokeScript`
 //! and `.NewScriptBlock` (also through `$ExecutionContext.SessionState`),
 //! `[powershell]::Create().AddScript`, a runspace's `CreatePipeline` and
-//! `CreateNestedPipeline`, and the `$( … )` inside `ExpandString`'s text.
+//! `CreateNestedPipeline`, a `Runspaces.Command` built with `isScript`,
+//! `Parser::ParseInput`, and the `$( … )` inside `ExpandString`'s text.
 //! dcg read their string argument as data, so
 //! `$ExecutionContext.InvokeCommand.InvokeScript("git reset --hard")` passed
 //! in the PowerShell dialect.
@@ -47,6 +48,9 @@ const RUNS_IT: &[&str] = &[
     "$n='InvokeScript'; $ExecutionContext.InvokeCommand.$n.Invoke('git reset --hard')",
     "$ExecutionContext.InvokeCommand.$('InvokeScript')('git reset --hard')",
     // ForEach-Object and the `.ForEach()` intrinsic call a member by name.
+    // A statement may start with `@(` (rows from card t_e0f360c0, PR #32).
+    "$x = $ExecutionContext.InvokeCommand; @($x).InvokeScript('git reset --hard')",
+    "@($ExecutionContext.InvokeCommand).ForEach('InvokeScript', 'git reset --hard')",
     "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard'",
     "$ExecutionContext.InvokeCommand | ForEach-Object -MemberName InvokeScript -ArgumentList 'git reset --hard'",
     "$ExecutionContext.InvokeCommand.ForEach('InvokeScript', 'git reset --hard')",
@@ -80,6 +84,36 @@ const RUNS_IT: &[&str] = &[
     // Inside a subexpression and a running block.
     "\"$($ExecutionContext.InvokeCommand.InvokeScript('git reset --hard'))\"",
     "& { $ExecutionContext.InvokeCommand.InvokeScript('git reset --hard') }",
+    // A backtick line continuation after the dot.
+    "$ExecutionContext.InvokeCommand.`\nInvokeScript('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.`\r\nInvokeScript('git reset --hard')",
+    "$ic=$ExecutionContext.InvokeCommand; $ic.`\n  InvokeScript('git reset --hard')",
+    // ForEach-Object binds positional words after -MemberName to -ArgumentList.
+    "$ExecutionContext.InvokeCommand | ForEach-Object -MemberName InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 'git reset --hard'",
+    "ForEach-Object -InputObject $ExecutionContext.InvokeCommand -MemberName:InvokeScript 'git reset --hard'",
+    // ExpandString text with a line that would close a here-string early.
+    "$ExecutionContext.InvokeCommand.ExpandString('x\n\"@\n''\n$(git reset --hard)\n''\n\"')",
+    "$ExecutionContext.InvokeCommand.ExpandString(\"x`r`n`\"@`r`n'`r`n`$(git reset --hard)`r`n'`r`n`\"\")",
+    // A pipeline made with no argument runs the script added to it.
+    "$r=[runspacefactory]::CreateRunspace(); $r.Open(); $p=$r.CreatePipeline(); [void]$p.Commands.AddScript('git reset --hard'); [void]$p.Invoke()",
+    // A Runspaces.Command built with isScript holds script that runs once added.
+    "$ps=[powershell]::Create(); [void]$ps.Commands.AddCommand([System.Management.Automation.Runspaces.Command]::new('git reset --hard', $true)); [void]$ps.Invoke()",
+    "$r=[runspacefactory]::CreateRunspace(); $r.Open(); $p=$r.CreatePipeline(); $p.Commands.Add([System.Management.Automation.Runspaces.Command]::new('git reset --hard', $true)); [void]$p.Invoke()",
+    "$ps=[powershell]::Create(); [void]$ps.Commands.AddCommand([System.Management.Automation.Runspaces.Command]::new('git reset --hard', $true, $false)); [void]$ps.Invoke()",
+    "$ps=[powershell]::Create(); [void]$ps.Commands.AddCommand([System.Management.Automation.Runspaces.Command]::new.Invoke('git reset --hard', $true)); [void]$ps.Invoke()",
+    "using namespace System.Management.Automation.Runspaces\n$ps=[powershell]::Create(); [void]$ps.Commands.AddCommand([Command]::new('git reset --hard', $true)); [void]$ps.Invoke()",
+    "$t=[System.Management.Automation.Runspaces.Command]; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($t::new('git reset --hard', $true)); [void]$ps.Invoke()",
+    "$c = New-Object System.Management.Automation.Runspaces.Command('git reset --hard', $true); $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList @('git reset --hard', $true); $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // Parser.ParseInput builds an AST whose GetScriptBlock() runs it.
+    "[System.Management.Automation.Language.Parser]::ParseInput('git reset --hard', [ref]$null, [ref]$null).GetScriptBlock().Invoke()",
+    "$a=[System.Management.Automation.Language.Parser]::ParseInput('git reset --hard',[ref]$null,[ref]$null); & $a.GetScriptBlock()",
+    "$p=[System.Management.Automation.Language.Parser]; $p::ParseInput('git reset --hard',[ref]$null,[ref]$null).GetScriptBlock().Invoke()",
+    "using namespace System.Management.Automation.Language\n[Parser]::ParseInput('git reset --hard',[ref]$null,[ref]$null).GetScriptBlock().Invoke()",
+    "[System.Management.Automation.Language.Parser]:: ParseInput('git reset --hard',[ref]$null,[ref]$null).GetScriptBlock().Invoke()",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -99,10 +133,16 @@ const HARMLESS: &[&str] = &[
     "Write-Output \"InvokeScript('git reset --hard')\"",
     "Write-Output 'use .InvokeScript() for x'",
     "Write-Output a.InvokeScript",
+    "$r=[runspacefactory]::CreateRunspace(); $r.Open(); $p=$r.CreatePipeline(); [void]$p.Commands.AddScript('git status'); [void]$p.Invoke()",
+    "$r=[runspacefactory]::CreateRunspace(); $r.Open(); $p=$r.CreatePipeline(); $p.Dispose()",
+    "$ExecutionContext.InvokeCommand.NewScriptBlock()",
+    "$ExecutionContext.InvokeCommand | ForEach-Object -MemberName InvokeScript 'git status'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 'git status'",
+    "$ExecutionContext.InvokeCommand.ExpandString('a \"@ b')",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
-/// 9a712556 as well (its POSIX reading takes the quoted text as a command),
+/// 9a712556 and e94e3692 as well (its POSIX reading takes the quoted text as a command),
 /// so they are checked in the PowerShell dialect only.
 const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // The second argument is data for the script's `$args`.
@@ -111,6 +151,13 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$ExecutionContext.InvokeCommand.ExpandString('git reset --hard')",
     "$ExecutionContext.InvokeCommand.ExpandString('`$(git reset --hard)')",
     "$ExecutionContext.InvokeCommand.ExpandString('$(\"git reset --hard\")')",
+    // Script run as a Command or parsed AST, and a constructor of another type.
+    "$r=[runspacefactory]::CreateRunspace(); $r.Open(); $p=$r.CreatePipeline(); $p.Commands.Add([System.Management.Automation.Runspaces.Command]::new('git status', $true)); [void]$p.Invoke()",
+    "[System.Management.Automation.Language.Parser]::ParseInput('git status', [ref]$null, [ref]$null).GetScriptBlock().Invoke()",
+    "$c = New-Object System.Management.Automation.Runspaces.Command('git status', $true); $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // One argument is a command name, not script: this one is not found.
+    "$ps=[powershell]::Create(); [void]$ps.Commands.AddCommand([System.Management.Automation.Runspaces.Command]::new('git reset --hard')); [void]$ps.Invoke()",
+    "$w=New-Object System.Text.StringBuilder('git reset --hard', 100); $w.ToString()",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {

@@ -12091,13 +12091,61 @@ fn collect_powershell_scriptblock_sinks(command: &str, sinks: &mut Vec<Executabl
 /// so the method name alone selects the sink. `NewScriptBlock` only builds a
 /// block, but `& $sb` and `.Invoke()` can run it anywhere later, so its source
 /// is judged where it is built.
-const POWERSHELL_ENGINE_SCRIPT_METHODS: [&str; 5] = [
+/// `[System.Management.Automation.Language.Parser]::ParseInput` builds an
+/// AST whose `GetScriptBlock()` runs it, so its source is judged there too.
+const POWERSHELL_ENGINE_SCRIPT_METHODS: [&str; 6] = [
     "invokescript",
     "newscriptblock",
     "addscript",
     "createpipeline",
     "createnestedpipeline",
+    "parseinput",
 ];
+
+/// `System.Management.Automation.Runspaces.Command` built with a second
+/// argument (`isScript`) holds its first argument as script that a pipeline
+/// or `[powershell]` instance runs once the command is added. The type is
+/// matched by its last name segment, since `using namespace` can shorten it.
+const POWERSHELL_SCRIPT_COMMAND_TYPE: &str = "command";
+
+/// Whether a type name (`System.Management.Automation.Runspaces.Command`,
+/// `Command`) names [`POWERSHELL_SCRIPT_COMMAND_TYPE`].
+fn powershell_type_is_script_command(type_name: &str) -> bool {
+    type_name
+        .trim()
+        .rsplit('.')
+        .next()
+        .is_some_and(|last| last.eq_ignore_ascii_case(POWERSHELL_SCRIPT_COMMAND_TYPE))
+}
+
+/// The name inside a type literal that ends at `end` (`[a.b]` before `::`),
+/// or `None` when no bounded type literal ends there.
+fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
+    let before = command.get(..end)?;
+    if !before.ends_with(']') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, byte) in before
+        .bytes()
+        .rev()
+        .take(MAX_POWERSHELL_MEMBER_NAME_SPELLING)
+        .enumerate()
+    {
+        match byte {
+            b']' => depth += 1,
+            b'[' => {
+                depth -= 1;
+                if depth == 0 {
+                    let open = before.len() - 1 - offset;
+                    return before.get(open + 1..before.len() - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// `$ExecutionContext.InvokeCommand.ExpandString` reads its argument as the
 /// body of a double-quoted string: text stays text, and every `$( … )` in it
@@ -12127,10 +12175,18 @@ fn powershell_member_name_after_dot(
     let bytes = command.as_bytes();
     let mut start = after_dot;
     while let Some(character) = command.get(start..)?.chars().next() {
-        if !character.is_whitespace() {
+        if character.is_whitespace() {
+            start += character.len_utf8();
+        } else if character == '`' && matches!(bytes.get(start + 1), Some(b'\n' | b'\r')) {
+            // A backtick line continuation is blank space too.
+            start += if bytes.get(start + 1..start + 3) == Some(b"\r\n") {
+                3
+            } else {
+                2
+            };
+        } else {
             break;
         }
-        start += character.len_utf8();
     }
     let mut bounded_end = command
         .len()
@@ -12306,13 +12362,28 @@ fn push_powershell_engine_sink(
     sink: PowerShellEngineSink,
     argument: Result<String, ()>,
 ) {
+    let unverified = |sinks: &mut Vec<ExecutableTextSink>| {
+        sinks.push(ExecutableTextSink::Unverified {
+            rule: POWERSHELL_ENGINE_SCRIPT_RULE,
+            reason: "a PowerShell method that runs script text receives source that dcg cannot statically verify",
+        });
+    };
     let (source, context) = match (argument, sink) {
         // A double-quoted here-string body expands as ExpandString does,
-        // without escaping the text's own quotes.
-        (Ok(text), PowerShellEngineSink::Expand) => (
-            format!("@\"\n{text}\n\"@"),
-            "ExpandString runs the subexpressions in PowerShell text",
-        ),
+        // without escaping the text's own quotes. Text holding a line that
+        // ends the here-string early would be read partly as code, so it
+        // cannot be verified this way.
+        (Ok(text), PowerShellEngineSink::Expand) => {
+            let source = format!("@\"\n{text}\n\"@");
+            if powershell_here_string_end(&source, 0).map(|(_, _, end)| end) != Some(source.len()) {
+                unverified(sinks);
+                return;
+            }
+            (
+                source,
+                "ExpandString runs the subexpressions in PowerShell text",
+            )
+        }
         (Ok(source), PowerShellEngineSink::Script) => (
             source,
             "a PowerShell engine method executes embedded PowerShell source",
@@ -12323,10 +12394,7 @@ fn push_powershell_engine_sink(
         ),
         (Err(()), PowerShellEngineSink::AnyMethod) => return,
         (Err(()), PowerShellEngineSink::Script | PowerShellEngineSink::Expand) => {
-            sinks.push(ExecutableTextSink::Unverified {
-                rule: POWERSHELL_ENGINE_SCRIPT_RULE,
-                reason: "a PowerShell method that runs script text receives source that dcg cannot statically verify",
-            });
+            unverified(sinks);
             return;
         }
     };
@@ -12348,27 +12416,54 @@ fn powershell_method_invocation(rest: &str, method: &str) -> bool {
 /// Engine methods that run a string as PowerShell script
 /// ([`POWERSHELL_ENGINE_SCRIPT_METHODS`], and `ExpandString`'s `$( … )`),
 /// called as `.Name(…)`, through the `.ForEach('Name', …)` intrinsic, or
-/// through `ForEach-Object Name …` ([`collect_powershell_foreach_member_sinks`]).
+/// through `ForEach-Object Name …` ([`collect_powershell_member_cmdlet_sinks`]).
 /// A static first argument is judged as the source it runs; any other
 /// argument, or a reference to the method that is not a call here
 /// (`$m = $ic.InvokeScript; $m.Invoke(…)`), cannot be verified. A member
 /// whose name is not static (`$ic.$n(…)`) may be one of them: a static
 /// string argument is judged as source, and anything else is left alone.
 fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
-    let mut search_start = 0usize;
     let mut examined = 0usize;
-    while let Some(dot) = find_powershell_code_marker(command, ".", search_start) {
-        search_start = dot + 1;
-        let Some((name, mut after_name)) = powershell_member_name_after_dot(command, dot + 1)
+    // Instance (`.`) and static (`::`) member access, each searched once.
+    let mut next_dot = find_powershell_code_marker(command, ".", 0);
+    let mut next_static = find_powershell_code_marker(command, "::", 0);
+    loop {
+        let (dot, after_dot, is_static) = match (next_dot, next_static) {
+            (Some(dot), Some(colons)) if colons < dot => (colons, colons + 2, true),
+            (Some(dot), _) => (dot, dot + 1, false),
+            (None, Some(colons)) => (colons, colons + 2, true),
+            (None, None) => return,
+        };
+        if is_static {
+            next_static = find_powershell_code_marker(command, "::", after_dot);
+        } else {
+            next_dot = find_powershell_code_marker(command, ".", after_dot);
+        }
+        let Some((name, mut after_name)) = powershell_member_name_after_dot(command, after_dot)
         else {
             continue;
         };
-        let intrinsic_foreach = name
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case("foreach"));
-        let Some(mut sink) = powershell_engine_sink_for_name(name.as_deref())
-            .or_else(|| intrinsic_foreach.then_some(PowerShellEngineSink::AnyMethod))
-        else {
+        let intrinsic_foreach = !is_static
+            && name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("foreach"));
+        // `[…Runspaces.Command]::new('…', $true)`; a type held in a value
+        // (`$t::new(…)`) may be that type.
+        let constructor = is_static
+            && name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("new"));
+        let sink = if constructor {
+            match powershell_type_literal_before(command, dot) {
+                Some(type_name) => powershell_type_is_script_command(type_name)
+                    .then_some(PowerShellEngineSink::Script),
+                None => Some(PowerShellEngineSink::AnyMethod),
+            }
+        } else {
+            powershell_engine_sink_for_name(name.as_deref())
+                .or_else(|| intrinsic_foreach.then_some(PowerShellEngineSink::AnyMethod))
+        };
+        let Some(mut sink) = sink else {
             continue;
         };
         // `$ic.InvokeScript.Invoke('…')` calls the method object directly.
@@ -12412,6 +12507,11 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
         };
         let (mut argument, rest) =
             powershell_first_method_argument(&command[after_name + 1..close]);
+        // A call with no argument (`$r.CreatePipeline()`) runs no script, and
+        // a `Command` built without `isScript` holds a command name.
+        if rest.is_none() && (constructor || argument.trim().is_empty()) {
+            continue;
+        }
         if intrinsic_foreach {
             // `.ForEach('InvokeScript', 'git …')` calls the named method on
             // each element with the remaining arguments. A script block or
@@ -12435,11 +12535,25 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
     }
 }
 
-/// `ForEach-Object` (`foreach`, `%`) with a member name calls that method on
-/// each input object with the remaining arguments:
-/// `$ExecutionContext.InvokeCommand | % InvokeScript 'git …'` and
-/// `ForEach-Object -MemberName InvokeScript -ArgumentList 'git …'`.
-fn collect_powershell_foreach_member_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+/// A cmdlet that reaches a member by name with an argument list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellMemberCmdlet {
+    /// `ForEach-Object` (`foreach`, `%`) with a member name calls that method
+    /// on each input object with the remaining arguments:
+    /// `$ExecutionContext.InvokeCommand | % InvokeScript 'git …'` and
+    /// `ForEach-Object -MemberName InvokeScript -ArgumentList 'git …'`.
+    ForEachObject,
+    /// `New-Object` builds a type with the argument list:
+    /// `New-Object System.Management.Automation.Runspaces.Command('git …', $true)`
+    /// ([`POWERSHELL_SCRIPT_COMMAND_TYPE`]).
+    NewObject,
+}
+
+/// Engine members reached through [`PowerShellMemberCmdlet`]. The name is
+/// the named parameter's value or the first positional word; the first
+/// argument starts after `-ArgumentList` (`-Args`) or at the next positional
+/// word, which PowerShell binds to the argument list.
+fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
     for (token_index, command_token) in tokens.iter().enumerate() {
         if command_token.kind != NormalizeTokenKind::Word {
@@ -12448,11 +12562,30 @@ fn collect_powershell_foreach_member_sinks(command: &str, sinks: &mut Vec<Execut
         let Some(raw_command) = command_token.text(command) else {
             continue;
         };
+        let cmdlet = if ["foreach-object", "foreach", "%"]
+            .iter()
+            .any(|candidate| powershell_word_equals(raw_command, candidate))
+        {
+            PowerShellMemberCmdlet::ForEachObject
+        } else if powershell_word_equals(raw_command, "new-object") {
+            PowerShellMemberCmdlet::NewObject
+        } else {
+            continue;
+        };
+        // `$c = New-Object …` runs the cmdlet on the right of the assignment.
+        let after_assignment = token_index >= 2
+            && tokens[token_index - 1]
+                .text(command)
+                .is_some_and(|operator| {
+                    matches!(operator.trim(), "=" | "+=" | "-=" | "*=" | "/=" | "%=")
+                })
+            && tokens[token_index - 2]
+                .text(command)
+                .is_some_and(|target| target.starts_with('$'))
+            && powershell_token_at_command_boundary(&tokens, token_index - 2, command);
         if raw_command.starts_with(['\'', '"'])
-            || !["foreach-object", "foreach", "%"]
-                .iter()
-                .any(|candidate| powershell_word_equals(raw_command, candidate))
-            || !powershell_token_at_command_boundary(&tokens, token_index, command)
+            || !(after_assignment
+                || powershell_token_at_command_boundary(&tokens, token_index, command))
         {
             continue;
         }
@@ -12479,9 +12612,10 @@ fn collect_powershell_foreach_member_sinks(command: &str, sinks: &mut Vec<Execut
         let Some(words) = decoded_powershell_segment_words(segment) else {
             continue;
         };
-        // The member name is `-MemberName <name>` or the first positional
-        // word. Its first argument starts after `-ArgumentList` (`-Args`) or
-        // right after a positional name.
+        let (name_parameter, value_parameter) = match cmdlet {
+            PowerShellMemberCmdlet::ForEachObject => ("membername", "inputobject"),
+            PowerShellMemberCmdlet::NewObject => ("typename", "property"),
+        };
         let mut name: Option<Option<String>> = None;
         let mut argument_start: Option<usize> = None;
         let mut other_parameter = false;
@@ -12491,11 +12625,15 @@ fn collect_powershell_foreach_member_sinks(command: &str, sinks: &mut Vec<Execut
             if *dynamic || value.len() < 2 || !value.starts_with('-') {
                 if name.is_none() {
                     // `% { … }` is the script-block form.
-                    if value.starts_with('{') {
+                    if cmdlet == PowerShellMemberCmdlet::ForEachObject && value.starts_with('{') {
                         break;
                     }
                     name = Some((!*dynamic).then(|| value.clone()));
                     argument_start.get_or_insert(range.end);
+                } else {
+                    // Once the name is bound, the next positional word starts
+                    // the argument list (with any `(` before it).
+                    argument_start.get_or_insert(words[index - 2].2.end);
                 }
                 continue;
             }
@@ -12503,9 +12641,9 @@ fn collect_powershell_foreach_member_sinks(command: &str, sinks: &mut Vec<Execut
                 .split_once(':')
                 .map_or((value.as_str(), None), |(head, tail)| (head, Some(tail)));
             let is = |candidate: &str| powershell_alias_parameter(parameter, candidate);
-            let member = is("membername");
+            let member = is(name_parameter);
             let arguments = is("argumentlist") || parameter.eq_ignore_ascii_case("-args");
-            if !(member || arguments || is("inputobject")) {
+            if !(member || arguments || is(value_parameter)) {
                 other_parameter = true;
                 continue;
             }
@@ -12533,7 +12671,18 @@ fn collect_powershell_foreach_member_sinks(command: &str, sinks: &mut Vec<Execut
         let (Some(name), Some(argument_start)) = (name, argument_start) else {
             continue;
         };
-        let Some(sink) = powershell_engine_sink_for_name(name.as_deref()) else {
+        let sink = match cmdlet {
+            PowerShellMemberCmdlet::ForEachObject => {
+                powershell_engine_sink_for_name(name.as_deref())
+            }
+            // A type name that is not static may be that type.
+            PowerShellMemberCmdlet::NewObject => match name.as_deref() {
+                Some(type_name) => powershell_type_is_script_command(type_name)
+                    .then_some(PowerShellEngineSink::Script),
+                None => Some(PowerShellEngineSink::AnyMethod),
+            },
+        };
+        let Some(sink) = sink else {
             continue;
         };
         let rest = segment.get(argument_start..).unwrap_or_default();
@@ -12544,26 +12693,39 @@ fn collect_powershell_foreach_member_sinks(command: &str, sinks: &mut Vec<Execut
             .iter()
             .find(|(_, _, range)| range.start <= position && position < range.end)
             .and_then(|(_, _, range)| segment.get(position..range.end));
-        let argument = if text.is_empty() {
+        // The first argument, and whether a second follows it.
+        let (argument, more) = if text.is_empty() {
             continue;
         } else if other_parameter || text.starts_with('-') {
-            Err(())
-        } else if let Some(group) = text.strip_prefix('(') {
-            find_powershell_subexpression_close(group, 0).and_then(|close| {
-                parse_static_powershell_source(powershell_first_method_argument(&group[..close]).0)
-            })
-        } else if text.starts_with(['\'', '"']) {
-            word_text.ok_or(()).and_then(|raw| {
-                parse_static_powershell_source(powershell_first_method_argument(raw).0)
-            })
+            (Err(()), true)
+        } else if let Some(group) = text.strip_prefix('(').or_else(|| text.strip_prefix("@(")) {
+            match find_powershell_subexpression_close(group, 0) {
+                Ok(close) => {
+                    let (first, second) = powershell_first_method_argument(&group[..close]);
+                    (parse_static_powershell_source(first), second.is_some())
+                }
+                Err(()) => (Err(()), true),
+            }
         } else {
-            // A bare word is its own text; a variable, array, type or block
-            // is not static.
-            word_text
-                .filter(|raw| !raw.starts_with(['$', '@', '[', '{']) && !raw.contains('`'))
-                .map(str::to_string)
-                .ok_or(())
+            let more = powershell_first_method_argument(text).1.is_some();
+            let argument = if text.starts_with(['\'', '"']) {
+                word_text.ok_or(()).and_then(|raw| {
+                    parse_static_powershell_source(powershell_first_method_argument(raw).0)
+                })
+            } else {
+                // A bare word is its own text; a variable, array, type or
+                // block is not static.
+                word_text
+                    .filter(|raw| !raw.starts_with(['$', '@', '[', '{']) && !raw.contains('`'))
+                    .map(|raw| powershell_first_method_argument(raw).0.to_string())
+                    .ok_or(())
+            };
+            (argument, more)
         };
+        // A `Command` built without `isScript` holds a command name.
+        if cmdlet == PowerShellMemberCmdlet::NewObject && !more {
+            continue;
+        }
         push_powershell_engine_sink(sinks, sink, argument);
     }
 }
@@ -13658,7 +13820,7 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         collect_powershell_iex_sinks(command, &mut sinks);
         collect_powershell_scriptblock_sinks(command, &mut sinks);
         collect_powershell_engine_script_sinks(command, &mut sinks);
-        collect_powershell_foreach_member_sinks(command, &mut sinks);
+        collect_powershell_member_cmdlet_sinks(command, &mut sinks);
     }
     // Native cmd/PowerShell pipeline stdin-consumer coverage (bd-1o5h): a
     // statically-known producer piped into a bare stdin-reading `cmd`/`pwsh`
@@ -66022,7 +66184,7 @@ mod tests {
 
     /// Engine methods that run script text: each spelling of the member name
     /// is found, the first argument is the source, and a long run of `.(`,
-    /// `.'` or blank space after a dot is read in one bounded pass.
+    /// `.'`, blank space or type brackets is read in one bounded pass.
     #[test]
     fn engine_script_sinks_read_member_spellings_in_bounded_time() {
         let sources = |command: &str| {
@@ -66064,6 +66226,25 @@ mod tests {
             ("@($x).ForEach({ $_ })", vec![]),
             ("@($x).ForEach('ToUpper', 'a')", vec![]),
             ("$x.GetCommand('a')", vec![]),
+            ("$x.`\nInvokeScript('a')", vec!["a"]),
+            ("$x.`\r\n InvokeScript('a')", vec!["a"]),
+            ("$r.CreatePipeline()", vec![]),
+            ("$r.CreatePipeline( )", vec![]),
+            ("[a.Runspaces.Command]::new('a', $true)", vec!["a"]),
+            ("[Command]::new.Invoke('a', $true)", vec!["a"]),
+            ("[a.Runspaces.Command]::new('a')", vec![]),
+            ("[Text.StringBuilder]::new('a', 1)", vec![]),
+            ("$t::new('a', 1)", vec!["a"]),
+            ("$t::new($a, 1)", vec![]),
+            (
+                "[a.Parser]::ParseInput('a', [ref]$null, [ref]$null)",
+                vec!["a"],
+            ),
+            (
+                "$x.ExpandString('a\n\"@\nb')",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("$x.ExpandString('a \"@ b')", vec!["@\"\na \"@ b\n\"@"]),
         ] {
             assert_eq!(sources(command), expected, "{command:?}");
         }
@@ -66075,6 +66256,9 @@ mod tests {
             "$x.a".repeat(50_000),
             format!("{}0{}", "$x.$n(".repeat(20_000), ")".repeat(20_000)),
             "$x.$n(".repeat(20_000),
+            format!("{}]::new('a', 1)", "[".repeat(200_000)),
+            "]::new('a', 1)".repeat(20_000),
+            ".`\n".repeat(100_000),
         ] {
             let _ = sources(&command);
         }
