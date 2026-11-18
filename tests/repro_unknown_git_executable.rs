@@ -151,6 +151,18 @@ fn literal_last_path_component_names_the_program() {
             r#""$HOMEBREW_PREFIX/bin/git" reset --hard"#,
             r#""$X"/bin/git reset --hard"#,
             r#""$X/bin/rm" -rf /"#,
+            r#""$X/bin/git" -c core.pager=cat reset --hard"#,
+            r#""$X/bin/git" -c user.name=x push --force origin main"#,
+            r#""$X/bin/git" -C /r -c a=b reset --hard"#,
+            r#""$X/bin/git" clean -fdx -e node_modules"#,
+            r#""$X/bin/git" -p reset --hard"#,
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#""$X/bin/python" -c "print(1)""#,
+            r#""$X/bin/bash" -c "echo hi""#,
         ],
     );
 }

@@ -18602,6 +18602,25 @@ fn posix_unknown_command_word_view(
     if rendered == raw {
         return None;
     }
+    // Unsplit, the program is named by the last path component. When it is
+    // all literal (`"$X/bin/git"`), that name is the reading: the directory
+    // an unknown value supplies cannot change which program the packs judge.
+    let mut program = None;
+    let last_slash = parts
+        .iter()
+        .rposition(|(text, kind)| kind.is_none() && text.contains('/'));
+    if let Some(at) =
+        last_slash.filter(|&at| !split && !parts[at + 1..].iter().any(|(_, kind)| kind.is_some()))
+    {
+        // Literal text after `at` is merged into it, so its last component
+        // is the whole program name.
+        let (_, name) = parts[at].0.rsplit_once('/')?;
+        if name.is_empty() {
+            return None;
+        }
+        rendered = name.to_string();
+        program = Some(name);
+    }
     // With an inline-code flag after it (`"$SHELL" -lc ...`), the launcher
     // analysis already judges the quoted spelling, including the flowctl
     // gate grammar it accepts only for `"$FLOWCTL"` (#538). The bare
@@ -18617,26 +18636,9 @@ fn posix_unknown_command_word_view(
                 .take(MAX_POSIX_EXECUTABLE_FIELDS)
                 .filter_map(|token| token.text(segment)),
         );
-        if posix_inline_flag_position(None, &words).is_some() {
+        if posix_inline_flag_position(program, &words).is_some() {
             return None;
         }
-    }
-    // Unsplit, the program is named by the last path component. When it is
-    // all literal (`"$X/bin/git"`), that name is the reading: the directory
-    // an unknown value supplies cannot change which program the packs judge.
-    let last_slash = parts
-        .iter()
-        .rposition(|(text, kind)| kind.is_none() && text.contains('/'));
-    if let Some(at) =
-        last_slash.filter(|&at| !split && !parts[at + 1..].iter().any(|(_, kind)| kind.is_some()))
-    {
-        // Literal text after `at` is merged into it, so its last component
-        // is the whole program name.
-        let (_, name) = parts[at].0.rsplit_once('/')?;
-        if name.is_empty() {
-            return None;
-        }
-        rendered = name.to_string();
     }
     let mut out = String::with_capacity(segment.len());
     out.push_str(&segment[..range.start]);
@@ -43329,6 +43331,12 @@ mod tests {
                 Some(r"python -m pytest"),
             ),
             (r#""$X/" reset"#, None),
+            // A named program counts only its own inline-code flags.
+            (
+                r#""$X/bin/git" -c core.pager=cat reset --hard"#,
+                Some(r"git -c core.pager=cat reset --hard"),
+            ),
+            (r#""$X/bin/python" -c "print(1)""#, None),
             // Only a binding before the use is the binding proof's: later
             // text, flags, comments and quoted mentions are not bindings.
             (r#""$X" reset --hard; X=1"#, Some(r"$X reset --hard; X=1")),
