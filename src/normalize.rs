@@ -5773,8 +5773,10 @@ impl<'a> SpanReader<'a> {
     ///
     /// Quoted text is read as [`bash_hashes_as_data`] reads it: `\` escapes
     /// the byte after it; `'…'`; `$'…'`, in which `\` escapes; `"…"`, in which
-    /// `$(…)`, `${…}` and backquotes nest; a backquoted command; `$(…)` and
-    /// `$((…))`, whose bodies count both parentheses of a `$((`; `${…}`,
+    /// `$(…)`, `${…}` and backquotes nest; a backquoted command, which ends at
+    /// the first unescaped backquote (a quote in it opens nothing, in Bash and
+    /// zsh); `$(…)` and `$((…))`, whose bodies count both parentheses of a
+    /// `$((`; `${…}`,
     /// which ends at its first `}` outside quotes and in double quotes reads
     /// `'` as a literal; and `$$`, after which a `(` or `{` opens nothing.
     /// [`NoReading`] when a command substitution in it holds a `#` that may
@@ -5966,6 +5968,11 @@ fn quote_opens(bytes: &[u8], i: usize, context: Option<Quoted>) -> Option<QuoteO
     let next = |at: usize| past_line_continuations(bytes, at);
     let double = context == Some(Quoted::Double);
     let quoted_braces = context == Some(Quoted::Braces { quoted: true });
+    // Bash and zsh end a backquoted command at the first unescaped
+    // backquote: nothing nests in it, not even a quote.
+    if context == Some(Quoted::Backquote) {
+        return (bytes[i] == b'\\').then_some(QuoteOpen::Skip(i + 2));
+    }
     match bytes[i] {
         b'\\' => Some(QuoteOpen::Skip(i + 2)),
         b'$' if bytes.get(next(i + 1)) == Some(&b'$') => Some(QuoteOpen::Skip(next(i + 1) + 1)),
@@ -5978,9 +5985,7 @@ fn quote_opens(bytes: &[u8], i: usize, context: Option<Quoted>) -> Option<QuoteO
             },
             next(i + 1) + 1,
         )),
-        b'`' if context != Some(Quoted::Backquote) => {
-            Some(QuoteOpen::Push(Quoted::Backquote, i + 1))
-        }
+        b'`' => Some(QuoteOpen::Push(Quoted::Backquote, i + 1)),
         b'"' if !double => Some(QuoteOpen::Push(Quoted::Double, i + 1)),
         b'$' if !double && crate::context::ansi_c_quote_starts_at(bytes, i) => Some(
             QuoteOpen::Skip(crate::context::skip_ansi_c_quoted(bytes, i + 2)),
@@ -6668,6 +6673,15 @@ mod tests {
             (
                 "[[ x == @( `echo )` #) ]]; git reset --hard",
                 "[[ x == @( `echo )` _) ]]; git reset --hard",
+            ),
+            // A backquoted command ends at the first unescaped backquote.
+            (
+                "(( `: '` + 1 #)); git reset --hard\n: '`'",
+                "(( `: '` + 1 _)); git reset --hard\n: '`'",
+            ),
+            (
+                "[[ x =~ ( `: '` #) ]]; git reset --hard\n: '`'",
+                "[[ x =~ ( `: '` _) ]]; git reset --hard\n: '`'",
             ),
             (
                 "(( \"$(echo \")\")\" + 1 #)); git reset --hard",

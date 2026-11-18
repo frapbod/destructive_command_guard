@@ -905,6 +905,9 @@ fn bash_data_hash_hides_no_later_git_command() {
         "(( `echo )` + 1 #)); git reset --hard",
         "[[ x == @( `echo )` #) ]]; git reset --hard",
         "(( \"$(echo \")\")\" + 1 #)); git reset --hard",
+        // A backquoted command ends at the first unescaped backquote.
+        "(( `: '` + 1 #)); git reset --hard\n: '`'",
+        "[[ x =~ ( `: '` #) ]]; git reset --hard\n: '`'",
         // A Bash 5.3 `${ …; }` hides nothing after its first `}`.
         "echo \"${ (echo) }; : # \"; (( 1 #)); git reset --hard",
         "echo \"${ { :; } }; : # \"; (( 1 #)); git reset --hard",
