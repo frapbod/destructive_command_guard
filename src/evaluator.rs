@@ -56035,6 +56035,14 @@ mod tests {
                 "git branch $\"-d\" feature",
                 "branch-delete",
             ),
+            // `PART=it-checkou` runs `git-checkout commit -m <path>`: `-m` is
+            // `--merge` there, so the message word is a path restored from
+            // ref `commit`.
+            (
+                ShellDialect::Posix,
+                r#"g${PART}t commit -m "Fix git reset --hard detection""#,
+                "checkout-ref-discard",
+            ),
             (
                 ShellDialect::PowerShell,
                 "Write-Output @'\nit's inert data\n'@; git branch -d feature",
@@ -56085,9 +56093,13 @@ mod tests {
                 ShellDialect::Cmd,
                 r#"%G% commit -m "Fix git reset --hard detection""#,
             ),
+            // `${G}it` can be `git` but no dashed built-in. `g${PART}t` can
+            // also be `git-checkout`, where `-m` is `--merge` and the command
+            // restores the path from ref `commit`; it is pinned as a denial
+            // below.
             (
                 ShellDialect::Posix,
-                r#"g${PART}t commit -m "Fix git reset --hard detection""#,
+                r#"${G}it commit -m "Fix git reset --hard detection""#,
             ),
             (ShellDialect::PowerShell, "'g`it' branch -d feature"),
             (ShellDialect::Cmd, "\"g^it\" branch -d feature"),
