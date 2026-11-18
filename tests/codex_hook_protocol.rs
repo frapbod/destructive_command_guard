@@ -795,10 +795,11 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
 }
 
 /// Bash and zsh read `((…))` as arithmetic and keep blanks in a `=~` regex
-/// group, where `#` starts no comment, so the git command after it runs;
-/// dash reads nested subshells and has no `[[`, so there it does. Every
-/// blocked command below runs its git command in Bash 5.2 or dash 0.5.12
-/// (measured with a `git` that only prints its arguments).
+/// group and in a pattern group, where `#` starts no comment, so the git
+/// command after it runs; dash reads nested subshells and has no `[[`, so
+/// there it does. Every blocked command below runs its git command in Bash
+/// 3.2, 5.2 or 5.3 (also with `-O extglob`), zsh 5.9 or dash 0.5.12 (measured
+/// with a `git` that only records its arguments).
 #[test]
 fn bash_data_hash_hides_no_later_git_command() {
     let payload = |command: &str, codex: bool| {
@@ -856,6 +857,33 @@ fn bash_data_hash_hides_no_later_git_command() {
         "[[ x =~|( #) ]]; git reset --hard",
         "case x in x)[[ x =~ ( #) ]];;esac;git reset --hard",
         "f()[[ x =~ ( #) ]];git reset --hard",
+        // Line continuations, which Bash removes before it reads tokens.
+        "[[ x =~ \\\n ( #) ]]; git reset --hard",
+        "[[ x =~\\\n( #) ]]; git reset --hard",
+        "[\\\n[ x =~ ( #) ]]; git reset --hard",
+        "[[\\\n x =~ ( #) ]]; git reset --hard",
+        "[[ x =\\\n~ ( #) ]]; git reset --hard",
+        ": x\\\n# ; (( 1 #)); git reset --hard",
+        "for\\\n((i=0;i<1;i++ #));do :;done;git reset --hard",
+        "if [[ x =~ \\\n( #) ]]; then :; fi; git reset --hard",
+        // Pattern groups in `[[` operands, and `extglob` groups.
+        "[[ x == @( #) ]]; git reset --hard",
+        "[[ x == +( #) ]]; git reset --hard",
+        "[[ x = x@( #) ]]; git reset --hard",
+        "[[ x == *( #) ]] || git reset --hard",
+        "[[ x == ?( #) ]]; git reset --hard",
+        "[[ x != !( #) ]] || git reset --hard",
+        "[[ x == ( #) ]]; git reset --hard",
+        "[[ x == (a| #) ]]; git reset --hard",
+        "shopt -s extglob\n: @( #); git reset --hard",
+        ": @( #); git reset --hard",
+        "echo x*( #); git reset --hard",
+        "case x in @( #)) :;; esac; git reset --hard",
+        // With `extglob` on, `!(…)` is a group too.
+        ": !( #); git reset --hard",
+        "bash -O extglob -c ': !( #); git reset --hard'",
+        "x\\\n#; git reset --hard",
+        "echo $\\\n( (( 1 #)); git reset --hard )",
         // dash's reading: the comment ends at the line end and the quote in
         // it opens nothing; Bash reads one arithmetic command to the end.
         "(( 1 #'\ngit reset --hard))\n'))",
@@ -868,6 +896,15 @@ fn bash_data_hash_hides_no_later_git_command() {
             "{} echo $((1)); (( 1 #)); git reset --hard; : {}",
             "((true) );".repeat(count),
             "x".repeat(filler)
+        )
+    }))
+    // Deeply nested subshells before it hide nothing, and a comment after
+    // them stays a comment, so its quote opens nothing.
+    .chain([100, 140].map(|levels| {
+        format!(
+            "{}true{};: # \"\n(( 1 #)); git reset --hard\n# \"",
+            "(".repeat(levels),
+            ") ".repeat(levels)
         )
     })) {
         let command = command.as_str();
@@ -888,6 +925,9 @@ fn bash_data_hash_hides_no_later_git_command() {
         "if((x>1));then :;fi; git status",
         "for((i=0;i<3;i++));do :;done # git reset --hard",
         "[[ x =~ ^(a|b)$ ]] && echo ok # git reset --hard",
+        "[[ x == @(a|b) ]] && echo ok # git reset --hard",
+        ": # it's \\\n# (( 1 #)); git reset --hard",
+        "if !(true); then :; fi # git reset --hard",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

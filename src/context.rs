@@ -4086,12 +4086,6 @@ impl Drop for PlainDollarQuoteReading {
 /// at once by another `)`; otherwise (`((cd x) && ls)`) the parentheses open
 /// nested subshells, and `None` is returned.
 fn arithmetic_end(bytes: &[u8], start: usize) -> Option<usize> {
-    arithmetic_scan(bytes, start).ok()
-}
-
-/// [`arithmetic_end`], with the index where the scan stopped as the error
-/// when the text is no arithmetic, so a caller can count the bytes it read.
-pub(crate) fn arithmetic_scan(bytes: &[u8], start: usize) -> Result<usize, usize> {
     let mut depth = 0usize;
     let mut i = start;
     while i < bytes.len() {
@@ -4101,11 +4095,7 @@ pub(crate) fn arithmetic_scan(bytes: &[u8], start: usize) -> Result<usize, usize
                 i + 1
             }
             b')' if depth == 0 => {
-                return if bytes.get(i + 1) == Some(&b')') {
-                    Ok(i + 2)
-                } else {
-                    Err(i + 1)
-                };
+                return (bytes.get(i + 1) == Some(&b')')).then_some(i + 2);
             }
             b')' => {
                 depth -= 1;
@@ -4123,7 +4113,7 @@ pub(crate) fn arithmetic_scan(bytes: &[u8], start: usize) -> Result<usize, usize
             _ => i + 1,
         };
     }
-    Err(bytes.len())
+    None
 }
 
 #[inline]
