@@ -4473,6 +4473,12 @@ enum PowerShellHostOption {
     /// `-Version`): takes the next argument as its value when there is one;
     /// as the last argument it starts nothing.
     OptionalValue,
+    /// A switch the host reads, but whose effect dcg does not model (the
+    /// Windows PowerShell 5.1 server modes, for example). It is never the
+    /// start of the command and never proves the host leaves stdin alone:
+    /// callers fail closed on it for every prefix, `/` included.
+    Unmodeled,
+    /// Not a switch dcg knows for this host.
     Unknown,
 }
 
@@ -4568,6 +4574,79 @@ fn powershell_switch_prefix(decoded: &str) -> Option<(char, &str)> {
     (is_powershell_dash(prefix) || prefix == '/').then_some((prefix, chars.as_str()))
 }
 
+/// Whether a decoded argument carries a dash switch prefix (any of the four
+/// dashes, after trimming). An unknown dashed argument is never a command or
+/// script path, so callers fail closed on it; an unknown `/name` is one.
+fn powershell_argument_is_dashed(decoded: &str) -> bool {
+    powershell_switch_prefix(decoded).is_some_and(|(prefix, _)| prefix != '/')
+}
+
+/// Reads a lower-case switch name (prefix and extra dash removed) the way
+/// Windows PowerShell 5.1 does.
+///
+/// The table is the managed console host's switch list in the order it tries
+/// them, each with its shortest accepted spelling: `ParseHelper` and
+/// `MatchSwitch` in PowerShell's `CommandLineParameterParser.cs` at tag
+/// v6.0.0-alpha.7, the last tag before pwsh-only switches (SSHServerMode
+/// first) were added, release build only. A name matches the first entry it
+/// is a prefix of and is at least as long as that entry's minimum, so `-s`
+/// is ServerMode, `-non` matches nothing and `-conf` matches nothing. 5.1
+/// starts the command string at the first argument that matches nothing
+/// ("The first parameter we fail to recognize marks the beginning of the
+/// command string"), so pwsh-only options (`-WorkingDirectory`,
+/// `-SettingsFile`, `-ConfigurationFile`, `-CustomPipeName`, `-Login`,
+/// `-Interactive`, `-NoProfileLoadTime`) and abbreviations shorter than the
+/// minimum are never skipped as options: they are `Unknown`, which callers
+/// fail closed on.
+///
+/// `-Version` is read by the native powershell.exe launcher before the
+/// managed parser; it is kept as a value option for any prefix
+/// (`powershell -v 2 -c ...` is a known spelling). The launcher's
+/// `-PSConsoleFile` and the undocumented managed switches
+/// (ImportSystemModules, the server modes, EncodedArguments) are switches
+/// 5.1 reads, so they are `Unmodeled`, never the start of the command: 5.1
+/// keeps parsing after `/imp`, and a later `-c` runs. The launcher's own
+/// abbreviation rule for `-PSConsoleFile` is unknown, so every prefix of it
+/// is `Unmodeled` (no 5.1 switch starts with `p`). Real 5.1 is unmeasured (no
+/// sandboxed route).
+fn windows_powershell_switch(name: &str) -> PowerShellHostOption {
+    use PowerShellHostOption::{Command, EncodedCommand, File, NoValue, Unknown, Unmodeled, Value};
+    const SWITCHES: &[(&str, usize, PowerShellHostOption)] = &[
+        ("psconsolefile", 1, Unmodeled),
+        ("version", 1, Value),
+        ("help", 1, NoValue),
+        ("?", 1, NoValue),
+        ("noexit", 3, NoValue),
+        ("importsystemmodules", 3, Unmodeled),
+        ("noprofile", 3, NoValue),
+        ("nologo", 3, NoValue),
+        ("noninteractive", 4, NoValue),
+        ("socketservermode", 2, Unmodeled),
+        ("servermode", 1, Unmodeled),
+        ("namedpipeservermode", 3, Unmodeled),
+        ("configurationname", 6, Value),
+        ("command", 1, Command),
+        ("windowstyle", 1, Value),
+        ("file", 1, File),
+        ("outputformat", 1, Value),
+        ("of", 1, Value),
+        ("inputformat", 1, Value),
+        ("if", 1, Value),
+        ("executionpolicy", 2, Value),
+        ("ep", 2, Value),
+        ("encodedcommand", 1, EncodedCommand),
+        ("ec", 1, EncodedCommand),
+        ("encodedarguments", 8, Unmodeled),
+        ("ea", 2, Unmodeled),
+        ("sta", 1, NoValue),
+        ("mta", 3, NoValue),
+    ];
+    SWITCHES
+        .iter()
+        .find(|(switch, minimum, _)| name.len() >= *minimum && switch.starts_with(name))
+        .map_or(Unknown, |(_, _, option)| *option)
+}
+
 fn powershell_host_option(
     raw: &str,
     host: PowerShellHost,
@@ -4618,23 +4697,23 @@ fn powershell_host_option(
         PowerShellHost::Core => name,
     };
     let name = name.to_ascii_lowercase();
+    if host == PowerShellHost::Windows {
+        // In Windows PowerShell 5.1, `-Version <v>` is read by the native
+        // powershell.exe launcher, not by the managed parser (its switch
+        // list has no Version). Whether the launcher also drops a second
+        // dash is unmeasured. If it does, `--version 2 -c "..."` runs the
+        // -Command, so the value is skipped and the rest is read. If it does
+        // not, the managed parser makes `--version ...` the command string,
+        // which is a parse error ("Missing expression after unary operator
+        // '--'", measured with pwsh 7.5) and runs nothing. Alone it starts
+        // nothing either way.
+        if extra_dash && !name.is_empty() && "version".starts_with(&name) {
+            return PowerShellHostOption::OptionalValue;
+        }
+        return windows_powershell_switch(&name);
+    }
     if !name.is_empty() && "command".starts_with(&name) {
         return PowerShellHostOption::Command;
-    }
-    // In Windows PowerShell 5.1, `-Version <v>` is read by the native
-    // powershell.exe launcher, not by the managed parser above (its switch
-    // list has no Version). Whether the launcher also drops a second dash is
-    // unmeasured. If it does, `--version 2 -c "..."` runs the -Command, so
-    // the value is skipped and the rest is read. If it does not, the managed
-    // parser makes `--version ...` the command string, which is a parse
-    // error ("Missing expression after unary operator '--'", measured with
-    // pwsh 7.5) and runs nothing. Alone it starts nothing either way.
-    if host == PowerShellHost::Windows
-        && extra_dash
-        && !name.is_empty()
-        && "version".starts_with(&name)
-    {
-        return PowerShellHostOption::OptionalValue;
     }
     if !name.is_empty() && "encodedcommand".starts_with(&name) {
         return PowerShellHostOption::EncodedCommand;
@@ -5169,12 +5248,16 @@ fn parse_powershell_launcher(
                 }
                 index += 2;
             }
+            PowerShellHostOption::Unmodeled => {
+                return WindowsLauncherParse::Unverified(format!(
+                    "PowerShell host option {raw:?} is not modeled"
+                ));
+            }
             PowerShellHostOption::Unknown => {
-                let prefix = powershell_host_option_value(raw, outer_dialect)
+                let dashed = powershell_host_option_value(raw, outer_dialect)
                     .as_deref()
-                    .and_then(powershell_switch_prefix)
-                    .map(|(prefix, _)| prefix);
-                if prefix.is_some_and(|prefix| prefix != '/') || raw.trim_start().starts_with('-') {
+                    .is_some_and(powershell_argument_is_dashed);
+                if dashed || raw.trim_start().starts_with('-') {
                     return WindowsLauncherParse::Unverified(format!(
                         "PowerShell host option {raw:?} is unknown or ambiguous"
                     ));
@@ -8335,8 +8418,11 @@ fn appended_code_input_mode(
                     }
                     index += 2;
                 }
+                PowerShellHostOption::Unmodeled => {
+                    return PipelineShellInputMode::Unverified;
+                }
                 PowerShellHostOption::Unknown => {
-                    if argument.starts_with('-') {
+                    if powershell_argument_is_dashed(argument) {
                         return PipelineShellInputMode::Unverified;
                     }
                     let kind = if join_windows_argv {
@@ -9265,8 +9351,9 @@ fn powershell_pipeline_input_mode(args: &[String], host: PowerShellHost) -> Pipe
                 }
                 index += 2;
             }
+            PowerShellHostOption::Unmodeled => return PipelineShellInputMode::Unverified,
             PowerShellHostOption::Unknown => {
-                if argument.starts_with('-') {
+                if powershell_argument_is_dashed(argument) {
                     return PipelineShellInputMode::Unverified;
                 }
                 return PipelineShellInputMode::DoesNotReadStdin;
@@ -59012,6 +59099,155 @@ mod tests {
                 PowerShellHostOption::Command,
                 PowerShellHostOption::Command,
             ),
+            // pwsh-only options are not 5.1 switches: 5.1 starts the command
+            // string there (`windows_powershell_switch`).
+            (
+                "-WorkingDirectory",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
+            ),
+            (
+                "-Work",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
+            ),
+            (
+                "-SettingsFile",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
+            ),
+            (
+                "-ConfigurationFile",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
+            ),
+            (
+                "-CustomPipeName",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
+            ),
+            (
+                "-Login",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
+            ),
+            (
+                "-Interactive",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
+            ),
+            (
+                "-NoProfileLoadTime",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
+            ),
+            (
+                "-SSHServerMode",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
+            ),
+            // 5.1 takes the first switch the name abbreviates to at least
+            // that switch's minimum length (`MatchSwitch`).
+            (
+                "-NoP",
+                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-non",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
+            ),
+            (
+                "-noni",
+                PowerShellHostOption::NoValue,
+                PowerShellHostOption::NoValue,
+            ),
+            (
+                "-W",
+                PowerShellHostOption::Value,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-conf",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-Config",
+                PowerShellHostOption::Value,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-i",
+                PowerShellHostOption::Value,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-s",
+                PowerShellHostOption::Unmodeled,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-st",
+                PowerShellHostOption::NoValue,
+                PowerShellHostOption::NoValue,
+            ),
+            (
+                "-e",
+                PowerShellHostOption::EncodedCommand,
+                PowerShellHostOption::EncodedCommand,
+            ),
+            (
+                "-ex",
+                PowerShellHostOption::Value,
+                PowerShellHostOption::Value,
+            ),
+            (
+                "-ep",
+                PowerShellHostOption::Value,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-ec",
+                PowerShellHostOption::EncodedCommand,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-ea",
+                PowerShellHostOption::Unmodeled,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-v",
+                PowerShellHostOption::Value,
+                PowerShellHostOption::Value,
+            ),
+            (
+                "/?",
+                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-PSConsoleFile",
+                PowerShellHostOption::Unmodeled,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "/imp",
+                PowerShellHostOption::Unmodeled,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "/-nam",
+                PowerShellHostOption::Unmodeled,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "/Foo",
+                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Unknown,
+            ),
         ] {
             assert_eq!(
                 powershell_host_option(raw, PowerShellHost::Windows, ShellDialect::PowerShell),
@@ -59354,7 +59590,10 @@ mod tests {
             r#"cmd /c "echo %DCG_DYNAMIC%""#.to_string(),
             "call %DCG_DYNAMIC%".to_string(),
             "@%DCG_DYNAMIC%".to_string(),
-            "powershell -NoP -Command 'Write-Output ok'".to_string(),
+            // -NoP is ambiguous in pwsh (NoProfile, NoProfileLoadTime); in
+            // Windows PowerShell 5.1 it is NoProfile.
+            "pwsh -NoP -Command 'Write-Output ok'".to_string(),
+            "powershell -WorkingDirectory C:\\ -Command 'Write-Output ok'".to_string(),
             "powershell -DefinitelyUnknown 'Write-Output ok'".to_string(),
             // A script read from stdin is no more inspectable than
             // `-Command -`; only `-File <path>` is allowed.
