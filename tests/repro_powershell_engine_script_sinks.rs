@@ -215,6 +215,43 @@ const RUNS_IT: &[&str] = &[
     // A line continuation between an argument group and its comma.
     "$c = New-Object System.Management.Automation.Runspaces.Command ('git reset --hard') `\n, $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
     "$c = New-Object System.Management.Automation.Runspaces.Command ('git reset --hard')`\n, $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // A splat binds parameters dcg cannot see (review round 6, runner
+    // rv7/truth*.out and r6/truth.out).
+    "$p = @{ErrorAction = 'Stop'}; $ExecutionContext.InvokeCommand | % @p InvokeScript 'git reset --hard'",
+    "$p = @{ErrorAction = 'Stop'}; $c = New-Object @p System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$p = @{ErrorAction = 'Stop'}; $c = New-Object -TypeName System.Management.Automation.Runspaces.Command @p -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // A redirection and its target are not the name or an argument.
+    "$ExecutionContext.InvokeCommand | % 2>$null InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % *>$null InvokeScript 'git reset --hard'",
+    "$c = New-Object 2>$null System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % 2>&1 InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 2>$null 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 2>$null 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 3>$null InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 2> $null InvokeScript 'git reset --hard'",
+    "$c = New-Object System.Management.Automation.Runspaces.Command 2>$null 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % 2>&1 -MemberName InvokeScript -ArgumentList 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 2>>$null InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % *>&1 InvokeScript 'git reset --hard'",
+    "$c = New-Object 2>&1 System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % -MemberName 2>$null InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript -ArgumentList 2>$null 'git reset --hard'",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command 2>&1 -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % 2>>$null InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % > $null InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -ArgumentList 'git reset --hard' 2>&1 -MemberName InvokeScript",
+    // A positional word before a named -MemberName or -TypeName is the
+    // first argument.
+    "$ExecutionContext.InvokeCommand | % 'git reset --hard' -MemberName InvokeScript",
+    "$c = New-Object 'git reset --hard', $true -TypeName System.Management.Automation.Runspaces.Command; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % -ArgumentList 'git reset --hard' InvokeScript",
+    "$c = New-Object -ArgumentList 'git reset --hard', $true System.Management.Automation.Runspaces.Command; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % 2>$null 'git reset --hard' -MemberName InvokeScript",
+    // Wildcard names fold case beyond ASCII (KELVIN SIGN is `k`).
+    "$ExecutionContext.InvokeCommand | % Invo\u{212a}eScr* 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName 'Invo\u{212a}e*' -ArgumentList 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % '*\u{212a}eScript' 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % [I]nvo\u{212a}eScript 'git reset --hard'",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -273,6 +310,19 @@ const HARMLESS: &[&str] = &[
     "1, 2 | ForEach-Object -Begin { $s = 0 } -Process { $s += $_ } -End { $s }",
     "$ExecutionContext.InvokeCommand | % -Verbose: $false InvokeScript 'git status'",
     "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ErrorAction Stop 'git status'",
+    // A positional word before the named name is the argument list.
+    "$ExecutionContext.InvokeCommand | % 'git status' -MemberName InvokeScript",
+    "$c = New-Object 'git status', $true -TypeName System.Management.Automation.Runspaces.Command; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % -ArgumentList 'git status' InvokeScript",
+    // Redirections, and a wildcard name with a non-ASCII letter (review
+    // round 6).
+    "$ExecutionContext.InvokeCommand | % Invo\u{212a}eScr* 'git status'",
+    "Get-ChildItem | % Name 2>&1",
+    "$null = New-Object System.Text.StringBuilder 2>&1",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' 2>&1",
+    "$ExecutionContext.InvokeCommand | % 2>&1 InvokeScript 'git status'",
+    "Get-ChildItem | % 2>&1 { $_.Name }",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command 2>&1 -ArgumentList 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -311,6 +361,13 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // PowerShell wildcards have no `[!…]` negation, so this runs nothing. In
     // Unknown the windows.filesystem pack reads `!x` as unresolved syntax.
     "$ExecutionContext.InvokeCommand | % 'Invoke[!x]cript' 'git reset --hard'",
+    // A redirection to a file: Unknown denies these on base 8bf24148 too
+    // (core.filesystem:redirect-truncate-dynamic-path).
+    "$ExecutionContext.InvokeCommand | % 2>$null InvokeScript 'git status'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' 2>$null",
+    "$c = New-Object System.Management.Automation.Runspaces.Command 2>$null 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "Get-ChildItem | % 2>$null Name",
+    "$ExecutionContext.InvokeCommand | % -MemberName 2>$null InvokeScript 'git status'",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
