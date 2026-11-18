@@ -260,3 +260,26 @@ fn rm_and_update_ref_spellings_git_reads_are_denied() {
         ],
     );
 }
+
+#[test]
+fn windows_spellings_are_read_the_same_way() {
+    let mut wrong = Vec::new();
+    for (tool, command, decision) in [
+        ("PowerShell", r"git restore --staged . -SW", "deny"),
+        ("PowerShell", r"& 'C:\Program Files\Git\cmd\git.exe' restore --staged --wor .", "deny"),
+        ("PowerShell", r"C:\x\git.exe checkout -b x -f", "deny"),
+        ("PowerShell", r"git.exe clean -f -ein", "deny"),
+        ("Shell", r"C:\x\git restore --staged . -SW", "deny"),
+        ("PowerShell", r"& 'C:\Program Files\Git\cmd\git.exe' restore --staged .", "allow"),
+        ("PowerShell", r"git.exe checkout -b feature origin/main", "allow"),
+        ("PowerShell", r"git clean -nd", "allow"),
+    ] {
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            let actual = hook_decision(protocol, command, tool);
+            if actual != decision {
+                wrong.push(format!("{tool} {protocol:?} {actual} (want {decision}): {command}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

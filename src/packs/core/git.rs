@@ -6173,47 +6173,55 @@ fn git_safe_premise_holds(subcommand: &str, args: &[&str]) -> bool {
 /// `command`, and its destructive patterns decide.
 ///
 /// `command` is a matching view (decoded words joined by blanks) or raw
-/// source. Every `git` word is read as a possible invocation, as the safe
-/// patterns do; a refusal only ever withdraws an exemption.
+/// source, so its words are read two ways: as a POSIX shell splits them, and
+/// at blanks with surrounding quotes trimmed (a Windows path such as
+/// `C:\x\git` keeps its backslashes). Every `git` word is read as a possible
+/// invocation, as the safe patterns do; a refusal only ever withdraws an
+/// exemption.
 pub(crate) fn safe_premise_refuted(command: &str) -> bool {
     crate::packs::split_command_segments(command)
         .into_iter()
         .any(|segment| {
-            let words: Vec<String> = shell_words::split(segment).unwrap_or_else(|_| {
-                segment
-                    .split_whitespace()
-                    .map(|word| word.trim_matches(['\'', '"']).to_string())
-                    .collect()
-            });
-            let semantic: Vec<GitSemanticWord> = words
-                .iter()
-                .map(|word| GitSemanticWord {
-                    decoded: word.clone(),
-                    dynamic: false,
-                    may_split: false,
-                })
+            let blank_split: Vec<String> = segment
+                .split_whitespace()
+                .map(|word| word.trim_matches(['\'', '"']).to_string())
                 .collect();
-            words.iter().enumerate().any(|(index, word)| {
-                let base = word
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(word)
-                    .to_ascii_lowercase();
-                let base = base.strip_suffix(".exe").unwrap_or(&base);
-                let (subcommand, args_from) = if base == "git" {
-                    let Some(at) = static_git_subcommand_index(&semantic, index + 1) else {
-                        return false;
-                    };
-                    (words[at].as_str(), at + 1)
-                } else if let Some(subcommand) = base.strip_prefix("git-") {
-                    (subcommand, index + 1)
-                } else {
-                    return false;
-                };
-                let args: Vec<&str> = words[args_from..].iter().map(String::as_str).collect();
-                !git_safe_premise_holds(subcommand, &args)
-            })
+            shell_words::split(segment)
+                .into_iter()
+                .chain(std::iter::once(blank_split))
+                .any(|words| git_words_refute_safe_premise(&words))
         })
+}
+
+fn git_words_refute_safe_premise(words: &[String]) -> bool {
+    let semantic: Vec<GitSemanticWord> = words
+        .iter()
+        .map(|word| GitSemanticWord {
+            decoded: word.clone(),
+            dynamic: false,
+            may_split: false,
+        })
+        .collect();
+    words.iter().enumerate().any(|(index, word)| {
+        let base = word
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(word)
+            .to_ascii_lowercase();
+        let base = base.strip_suffix(".exe").unwrap_or(&base);
+        let (subcommand, args_from) = if base == "git" {
+            let Some(at) = static_git_subcommand_index(&semantic, index + 1) else {
+                return false;
+            };
+            (words[at].as_str(), at + 1)
+        } else if let Some(subcommand) = base.strip_prefix("git-") {
+            (subcommand, index + 1)
+        } else {
+            return false;
+        };
+        let args: Vec<&str> = words[args_from..].iter().map(String::as_str).collect();
+        !git_safe_premise_holds(subcommand, &args)
+    })
 }
 
 /// Create the core git pack.
@@ -9943,6 +9951,8 @@ git x",
             "/usr/bin/git restore -S -qW src",
             "git-restore --staged --wor .",
             "GIT.EXE checkout -b x -f",
+            r"C:\x\git restore --staged . -SW",
+            r#"& 'C:\Program Files\Git\cmd\git.exe' checkout -b x -f"#,
             "git checkout --orphan x --fo",
             "git clean -f -ein",
             "git status && git clean -n --no-dry-run -f",
