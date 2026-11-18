@@ -16034,7 +16034,11 @@ fn evaluate_command_in_dialect_union(
         && primary.allowlist_override.is_none()
     {
         // An unfinished view is never proof that the command is safe.
-        match posix_proven_variable_view(command, deadline) {
+        // Unknown names are read only in the command as the agent sent it:
+        // a nested payload (an `eval` body, `bash -c`) is judged without the
+        // bindings around it, and this view's own reconstruction is judged
+        // one level down, where its bare rendering must not split again.
+        match posix_proven_variable_view(command, deadline, nested_command_depth == 0) {
             Ok(view) => view,
             Err(ProvenViewIncomplete::Budget) => {
                 return EvaluationResult::indeterminate_due_to_budget();
@@ -18268,18 +18272,26 @@ impl IfsValue {
 /// A quoted heredoc body stays as written: the outer shell does not expand
 /// it, and the heredoc analysis judges it as its own script.
 ///
+/// With `unknown_names`, a command name that holds a name the command never
+/// binds is also read the way the shell can run it
+/// ([`posix_unknown_command_word_view`]).
+///
 /// Every statement is read; the evaluation deadline bounds the cost, and
 /// `Err` means it passed first: the command is then unchecked.
 fn posix_proven_variable_view(
     command: &str,
     deadline: Option<&Deadline>,
+    unknown_names: bool,
 ) -> Result<Option<String>, ProvenViewIncomplete> {
     // Every binding source spells `=` (an assignment word) or `printf -v`;
-    // IFS holds its default with none.
-    if !command.contains('$')
-        || !(command.contains('=') || command.contains("printf") || command.contains("IFS"))
-        || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
-    {
+    // IFS holds its default with none. Without one, every reference is
+    // unknown and only [`posix_unknown_command_word_view`] can apply.
+    if !command.contains('$') || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+        return Ok(None);
+    }
+    let bindings_possible =
+        command.contains('=') || command.contains("printf") || command.contains("IFS");
+    if !bindings_possible && !unknown_names {
         return Ok(None);
     }
     let ranges = command_segment_ranges(command);
@@ -18331,16 +18343,21 @@ fn posix_proven_variable_view(
         }
         // Splitting needs the IFS in force, proven like any other binding;
         // an IFS that cannot be proven leaves the segment as written.
-        let Some(ifs) = deny_only_value_at_for_splitting(
-            command,
-            &ranges,
-            start,
-            "",
-            "IFS",
-            MAX_DENY_ONLY_COPY_DEPTH,
-            true,
-        ) else {
-            continue;
+        let ifs = if bindings_possible {
+            let Some(ifs) = deny_only_value_at_for_splitting(
+                command,
+                &ranges,
+                start,
+                "",
+                "IFS",
+                MAX_DENY_ONLY_COPY_DEPTH,
+                true,
+            ) else {
+                continue;
+            };
+            ifs
+        } else {
+            DEFAULT_POSIX_IFS.to_string()
         };
         let resolve = |text: &str| {
             resolve_proven_variables_in_segment_with_ifs(
@@ -18391,7 +18408,28 @@ fn posix_proven_variable_view(
                 Some((prefix, arguments)) => resolve_proven_eval_arguments(
                     command, &ranges, start, segment, prefix, &arguments, &ifs,
                 ),
-                None => resolve(segment),
+                None => {
+                    let resolved = if bindings_possible {
+                        resolve(segment)
+                    } else {
+                        None
+                    };
+                    // A name the command never binds is unknown.
+                    unknown_names
+                        .then(|| {
+                            posix_unknown_command_word_view(
+                                resolved.as_deref().unwrap_or(segment),
+                                &ifs,
+                                |before, name| {
+                                    !name.is_empty()
+                                        && (posix_text_may_bind_name(&command[..start], name)
+                                            || posix_text_may_bind_name(before, name))
+                                },
+                            )
+                        })
+                        .flatten()
+                        .or(resolved)
+                }
             }
         };
         let Some(resolved) = resolved else {
@@ -18429,6 +18467,232 @@ fn posix_proven_variable_view(
     }
     out.push_str(&command[copied..]);
     Ok((out != command).then_some(out))
+}
+
+/// Upper bound on the words [`posix_unknown_command_word_view`] reads before
+/// the command name.
+const MAX_UNKNOWN_COMMAND_WORD_PREFIX: usize = 32;
+
+/// The command name of `segment` read the way the shell can run it when it
+/// holds a variable that no binding proof resolves (one exported by an
+/// earlier command, or never set), for [`posix_proven_variable_view`].
+///
+/// The packs judge an unknown expansion in the command name by the literal
+/// text around it (`$X reset --hard` and `${X}t reset --hard` may be Git).
+/// Two spellings escaped that reading:
+///
+/// - Inside double quotes (`"$X" reset --hard`, `"${X}t" reset --hard`,
+///   `sudo "$X" reset --hard`) the quote characters were read as literal
+///   program-name text. A quoted expansion is one field of the same value,
+///   so it is rendered unquoted: the packs then give it the reading the bare
+///   spelling already gets. Only the unquoted reading is wider (splitting,
+///   globbing), so this can only add denials.
+/// - Unquoted, an expansion glued to literal text is split into fields at
+///   every IFS character of its value: `git${X}reset${X}--hard` runs
+///   `git reset --hard` when `X` holds a blank. While IFS can split
+///   (`ifs` is not empty), each such expansion is rendered as a field
+///   break. A word that mixes quoted and unquoted expansions keeps the
+///   unquoted reading only.
+///
+/// Literal text must be plain (letters, digits, `/._-+`) so the rendering
+/// cannot change its meaning; anything else (other quoting, escapes,
+/// command substitution, operators inside `${...}`) leaves the word as
+/// written. `bound(before, name)` says whether the command may bind `name`
+/// before the use (`before` is the text of `segment` ahead of the command
+/// name; see [`posix_text_may_bind_name`]); such a name belongs to the
+/// binding proof, which has already spliced in the values it could prove,
+/// and what it left as written keeps its spelling. Only a name nothing
+/// before the use binds is unknown here.
+fn posix_unknown_command_word_view(
+    segment: &str,
+    ifs: &str,
+    bound: impl Fn(&str, &str) -> bool,
+) -> Option<String> {
+    if !segment.contains('$') {
+        return None;
+    }
+    // The command name is the last word that only wrappers, assignments,
+    // redirections and reserved words precede; a wrapper's option value
+    // (`sudo -u root "$X"`) is not one, though it may look like one.
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let mut word = None;
+    let mut misses = 0usize;
+    for token in tokens.iter().take(MAX_UNKNOWN_COMMAND_WORD_PREFIX) {
+        if token.kind != NormalizeTokenKind::Word {
+            break;
+        }
+        let range = token.byte_range.clone();
+        if posix_words_precede_command_name(segment.get(..range.start)?) {
+            word = Some(range);
+            misses = 0;
+        } else {
+            // Past the command name and its first argument.
+            misses += 1;
+            if misses == 2 {
+                break;
+            }
+        }
+    }
+    let range = word?;
+    let raw = segment.get(range.clone())?;
+    if !raw.contains('$') {
+        return None;
+    }
+    let plain = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '+');
+    // (text, Some(quoted)) for an unknown reference, (text, None) for text
+    // kept as written.
+    let mut parts: Vec<(String, Option<bool>)> = Vec::new();
+    let push_text = |parts: &mut Vec<(String, Option<bool>)>, text: &str| match parts.last_mut() {
+        Some((kept, None)) => kept.push_str(text),
+        _ => parts.push((text.to_string(), None)),
+    };
+    let mut double = false;
+    let mut single = false;
+    let mut literal = false;
+    let mut index = 0usize;
+    while let Some(ch) = raw[index..].chars().next() {
+        match ch {
+            '\'' if !double => {
+                single = !single;
+                index += 1;
+            }
+            '"' if !single => {
+                double = !double;
+                index += 1;
+            }
+            '$' if !single => {
+                let (name, len) = posix_unknown_reference_name(&raw[index..])?;
+                let reference = &raw[index..index + len];
+                index += len;
+                // Rendered bare, a blank in its word would split it.
+                if double && reference.contains([' ', '\t']) {
+                    return None;
+                }
+                if bound(&segment[..range.start], name) {
+                    // The command may bind it: the binding proof judges
+                    // it, and what that proof left as written stays so.
+                    if double {
+                        return None;
+                    }
+                    push_text(&mut parts, reference);
+                } else {
+                    parts.push((reference.to_string(), Some(double)));
+                }
+            }
+            _ if plain(ch) => {
+                literal = true;
+                push_text(&mut parts, &raw[index..=index]);
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    if single || double || !parts.iter().any(|(_, kind)| kind.is_some()) {
+        return None;
+    }
+    let any_quoted = parts.iter().any(|(_, kind)| *kind == Some(true));
+    let split = !ifs.is_empty() && !any_quoted && literal;
+    let mut rendered = String::with_capacity(raw.len());
+    for (text, kind) in &parts {
+        match kind {
+            Some(false) if split => rendered.push(' '),
+            _ => rendered.push_str(text),
+        }
+    }
+    if rendered == raw {
+        return None;
+    }
+    // Unsplit, the program is named by the last path component. When it is
+    // all literal (`"$X/bin/git"`), that name is the reading: the directory
+    // an unknown value supplies cannot change which program the packs judge.
+    let mut program = None;
+    let last_slash = parts
+        .iter()
+        .rposition(|(text, kind)| kind.is_none() && text.contains('/'));
+    if let Some(at) =
+        last_slash.filter(|&at| !split && !parts[at + 1..].iter().any(|(_, kind)| kind.is_some()))
+    {
+        // Literal text after `at` is merged into it, so its last component
+        // is the whole program name.
+        let (_, name) = parts[at].0.rsplit_once('/')?;
+        if name.is_empty() {
+            return None;
+        }
+        rendered = name.to_string();
+        program = Some(name);
+    }
+    // With an inline-code flag after it (`"$SHELL" -lc ...`), the launcher
+    // analysis already judges the quoted spelling, including the flowctl
+    // gate grammar it accepts only for `"$FLOWCTL"` (#538). The bare
+    // spelling would read as a new launcher there.
+    if any_quoted {
+        let mut words: Vec<&str> = vec![rendered.as_str()];
+        words.extend(
+            tokens
+                .iter()
+                .filter(|token| {
+                    token.kind == NormalizeTokenKind::Word && token.byte_range.start >= range.end
+                })
+                .take(MAX_POSIX_EXECUTABLE_FIELDS)
+                .filter_map(|token| token.text(segment)),
+        );
+        if posix_inline_flag_position(program, &words).is_some() {
+            return None;
+        }
+    }
+    let mut out = String::with_capacity(segment.len());
+    out.push_str(&segment[..range.start]);
+    out.push_str(&rendered);
+    out.push_str(&segment[range.end..]);
+    Some(out)
+}
+
+/// The variable a reference at the start of `text` reads and its length:
+/// `$NAME`, `${NAME}`, a default or alternate (`${NAME:-word}`,
+/// `${NAME+word}`) with a plain word, or a positional or special parameter
+/// (`$1`, `"$@"`), whose name is returned as `""` (never proven). Anything
+/// else is `None`.
+fn posix_unknown_reference_name(text: &str) -> Option<(&str, usize)> {
+    let identifier = |text: &str| {
+        text.char_indices()
+            .take_while(|&(at, c)| {
+                c.is_ascii_alphabetic() || c == '_' || (at > 0 && c.is_ascii_digit())
+            })
+            .count()
+    };
+    let rest = text.strip_prefix('$')?;
+    if let Some(body) = rest.strip_prefix('{') {
+        let close = body.find('}')?;
+        let inner = &body[..close];
+        let name_len = identifier(inner);
+        let (name, operator_text) = if name_len > 0 {
+            (&inner[..name_len], &inner[name_len..])
+        } else if inner.starts_with(|c: char| c.is_ascii_digit() || c == '@' || c == '*') {
+            ("", &inner[1..])
+        } else {
+            return None;
+        };
+        // A default (`:-`, `-`) or alternate (`:+`, `+`) word is the text
+        // when the value does not give it, so either may be the field.
+        let word = [":-", "-", ":+", "+"]
+            .iter()
+            .find_map(|operator| operator_text.strip_prefix(operator));
+        let plain_word = |word: &str| {
+            word.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ' ' | '\t')
+            })
+        };
+        if !(operator_text.is_empty() || word.is_some_and(plain_word)) {
+            return None;
+        }
+        return Some((name, close + 3));
+    }
+    let name_len = identifier(rest);
+    if name_len > 0 {
+        return Some((&rest[..name_len], name_len + 1));
+    }
+    rest.starts_with(|c: char| c.is_ascii_digit() || c == '@' || c == '*')
+        .then_some(("", 2))
 }
 
 /// Why [`posix_proven_variable_view`] could not finish.
@@ -31443,6 +31707,21 @@ fn posix_words_precede_command_name(text: &str) -> bool {
     let (rest, _) =
         crate::packs::core::git::command_after_posix_control_prefixes(&probe, ShellDialect::Posix);
     let text = rest.strip_suffix('x').unwrap_or(rest);
+    // A wrapper (`sudo`, `env -i`, `timeout 5`, `nohup`, ...) runs its
+    // operand as the command: `sudo "$X" reset` runs the value of `X`.
+    // Peel them with the stripper the packs use, so this agrees with them.
+    if !text.trim().is_empty() {
+        let probe = format!("{text}x");
+        let stripped = crate::normalize::strip_wrapper_prefixes(&probe);
+        // Empty: the stand-in was read as a wrapper's option value
+        // (`sudo -u x`), so the command name is still to come.
+        if !stripped.stripped_wrappers.is_empty()
+            && !stripped.wrapper_limit_reached
+            && matches!(stripped.normalized.trim(), "x" | "")
+        {
+            return true;
+        }
+    }
     text.split_ascii_whitespace().all(|word| {
         matches!(
             word,
@@ -31457,6 +31736,10 @@ fn posix_words_precede_command_name(text: &str) -> bool {
                 | "command"
                 | "builtin"
                 | "time"
+                // Run their operand as a command; with no option between,
+                // the next word is its name.
+                | "doas"
+                | "xargs"
         ) || word_is_redirect_or_assignment_prefix(word)
     })
 }
@@ -32109,6 +32392,23 @@ fn segment_text_may_assign(segment: &str, name: &str) -> bool {
     false
 }
 
+/// Whether `text` may bind `name`: it names it as a whole word between
+/// separators (`unset NAME`, `read NAME`, `for NAME in`, `printf -v NAME`)
+/// or assigns it ([`segment_text_may_assign`]). Text that cannot do either
+/// leaves the value the command started with. Callers pass only the text
+/// before the use: a later mention cannot change what the use reads.
+fn posix_text_may_bind_name(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let separator = |byte: u8| byte.is_ascii_whitespace() || b";|&()".contains(&byte);
+    let named_as_word = text.match_indices(name).any(|(start, _)| {
+        (start == 0 || separator(bytes[start - 1]))
+            && bytes
+                .get(start + name.len())
+                .is_none_or(|byte| separator(*byte))
+    });
+    named_as_word || segment_text_may_assign(text, name)
+}
+
 /// Strip the reserved words that can directly precede a command inside
 /// control flow (`do`, `then`, `else`), so a nested header like
 /// `do for f in …` is still recognized as a `for` header.
@@ -32454,16 +32754,7 @@ fn deny_only_value_at_for_splitting(
             return Some(DEFAULT_POSIX_IFS.to_string());
         }
         let prefix = source.get(..segment_start)?;
-        let named_as_word = prefix.match_indices("IFS").any(|(start, _)| {
-            let end = start + 3;
-            let separator = |byte: u8| byte.is_ascii_whitespace() || b";|&()".contains(&byte);
-            (start == 0 || separator(prefix.as_bytes()[start - 1]))
-                && prefix
-                    .as_bytes()
-                    .get(end)
-                    .is_none_or(|byte| separator(*byte))
-        });
-        if !named_as_word && !segment_text_may_assign(prefix, "IFS") {
+        if !posix_text_may_bind_name(prefix, "IFS") {
             return Some(DEFAULT_POSIX_IFS.to_string());
         }
     }
@@ -42857,9 +43148,11 @@ mod tests {
             (r#"IFS=; X=" "; git${X}reset"#, None),
             // Assignment words are not split.
             (r#"X=" "; Y=a${X}b"#, None),
-            // A conditional or unknown binding proves nothing.
+            // A conditional binding proves nothing.
             (r#"X=" "; false && X=a; git${X}reset"#, None),
-            (r"git${X}reset", None),
+            // A name the command never binds is unknown and may hold a
+            // blank ([`posix_unknown_command_word_view`]).
+            (r"git${X}reset", Some(r"git reset")),
             // Values carrying shell syntax are never spliced.
             (r#"X="a;b"; git${X}reset"#, None),
             // Scalar operators whose text comes from the value.
@@ -42882,7 +43175,7 @@ mod tests {
             (r#"X=a; "gi${X+t}" reset"#, Some(r#"X=a; "git" reset"#)),
             (r#"X=; "gi${X:+t}" reset"#, Some(r#"X=; "gi" reset"#)),
             (r#""gi${IFS:+t}" reset"#, Some(r#""git" reset"#)),
-            (r#""gi${HOME:+t}" reset"#, None),
+            (r#""gi${HOME:+t}" reset"#, Some(r"gi${HOME:+t} reset")),
             (r#"X=a; "gi${X:+$Y}" reset"#, None),
             // Appends fold onto a proven value; an ambient one is unknown.
             (
@@ -42978,12 +43271,126 @@ mod tests {
             (r#"printf -v X %s t; "gi${X}" reset"#, None),
         ] {
             assert_eq!(
-                posix_proven_variable_view(command, None)
+                posix_proven_variable_view(command, None, true)
                     .expect("no deadline")
                     .as_deref(),
                 expected,
                 "{command:?}"
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn posix_proven_variable_view_reads_unknown_command_names() {
+        for (command, expected) in [
+            // Quoted, it reads as its bare spelling, which the packs judge.
+            (r#""$X" reset --hard"#, Some(r"$X reset --hard")),
+            (r#""${X}t" reset --hard"#, Some(r"${X}t reset --hard")),
+            (
+                r#""${X:-git}" reset --hard"#,
+                Some(r"${X:-git} reset --hard"),
+            ),
+            (r#"'g'"$X" reset --hard"#, Some(r"g$X reset --hard")),
+            (r#"sudo "$X" reset --hard"#, Some(r"sudo $X reset --hard")),
+            (
+                r#"sudo -u root "$X" reset --hard"#,
+                Some(r"sudo -u root $X reset --hard"),
+            ),
+            (
+                r#"timeout 5 "$X" reset --hard"#,
+                Some(r"timeout 5 $X reset --hard"),
+            ),
+            (
+                r#"cd /tmp && "$X" reset --hard"#,
+                Some(r"cd /tmp && $X reset --hard"),
+            ),
+            // A wrapper's operand is a command name for proven values too.
+            (
+                r#"X=git; sudo "$X" reset --hard"#,
+                Some(r"X=git; sudo git reset --hard"),
+            ),
+            (
+                r#"X=git; doas "$X" reset --hard"#,
+                Some(r"X=git; doas git reset --hard"),
+            ),
+            // Unquoted and glued to text, an unknown value may hold a blank.
+            (r"git${X}reset${X}--hard", Some(r"git reset --hard")),
+            (r"rm${X}-rf${X}/", Some(r"rm -rf /")),
+            (r"IFS=x; git${X}reset", Some(r"IFS=x; git reset")),
+            // Mixed: the quoted reading only.
+            (
+                r#"git"${Y}"reset${Y}--hard"#,
+                Some(r"git${Y}reset${Y}--hard"),
+            ),
+            // Unsplit, an all-literal last path component names the program.
+            (r#""$X/bin/git" reset --hard"#, Some(r"git reset --hard")),
+            (r#""$X"/bin/rm -rf /"#, Some(r"rm -rf /")),
+            (
+                r#""$VIRTUAL_ENV/bin/python" -m pytest"#,
+                Some(r"python -m pytest"),
+            ),
+            (r#""$X/" reset"#, None),
+            // A named program counts only its own inline-code flags.
+            (
+                r#""$X/bin/git" -c core.pager=cat reset --hard"#,
+                Some(r"git -c core.pager=cat reset --hard"),
+            ),
+            (r#""$X/bin/python" -c "print(1)""#, None),
+            // Only a binding before the use is the binding proof's: later
+            // text, flags, comments and quoted mentions are not bindings.
+            (r#""$X" reset --hard; X=1"#, Some(r"$X reset --hard; X=1")),
+            (r#""$X" reset --hard # X"#, Some(r"$X reset --hard # X")),
+            (r#""$D" branch -D main"#, Some(r"$D branch -D main")),
+            (
+                r#"echo "GIT is $GIT"; "$GIT" reset --hard"#,
+                Some(r#"echo "GIT is $GIT"; $GIT reset --hard"#),
+            ),
+            (r#"unset X; "$X" reset --hard"#, None),
+            (r#"read X; "$X" reset --hard"#, None),
+            // Unchanged: already bare, an argument, an empty IFS, a proven
+            // value, other expansion forms.
+            (r"$X reset --hard", None),
+            (r#"echo "$X""#, None),
+            (r"$X reset --hard; X=1", None),
+            (r"IFS=; git${X}reset${X}--hard", None),
+            (r"IFS=; X=' '; git${X}reset${X}--hard", None),
+            (r"IFS=x; X=' '; git${X}reset", None),
+            (r#""${X:+t}" reset"#, Some(r"${X:+t} reset")),
+            (r#""${X:+a b}" reset"#, None),
+            (r"git${X:+ }reset${X:+ }--hard", Some(r"git reset --hard")),
+            (r#""$(cmd)" reset"#, None),
+            (r#""a b$X" reset"#, None),
+        ] {
+            assert_eq!(
+                posix_proven_variable_view(command, None, true)
+                    .expect("no deadline")
+                    .as_deref(),
+                expected,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_words_precede_command_name_peels_wrappers() {
+        for text in [
+            "",
+            "sudo ",
+            "sudo -u root ",
+            "env -i ",
+            "timeout 5 ",
+            "nohup nice ",
+            "command -p ",
+            "doas ",
+            "xargs ",
+            "LC_ALL=C sudo ",
+            "if ",
+        ] {
+            assert!(posix_words_precede_command_name(text), "{text:?}");
+        }
+        for text in ["echo ", "git ", "sudo git ", "doas -u root "] {
+            assert!(!posix_words_precede_command_name(text), "{text:?}");
         }
     }
 
