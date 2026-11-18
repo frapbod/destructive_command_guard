@@ -588,3 +588,140 @@ fn cmd_call_inside_another_command_ends_where_its_shell_ends_it() {
         }
     }
 }
+
+/// Checks each command in its dialects and in both hook formats with
+/// `tool`, and reports every miss at once.
+fn expect_everywhere(
+    commands: &[String],
+    dialects: &[ShellDialect],
+    tool: &str,
+    want: EvaluationDecision,
+) -> Vec<String> {
+    let hook_want = if want == EvaluationDecision::Deny {
+        "deny"
+    } else {
+        "allow"
+    };
+    let mut misses = Vec::new();
+    for command in commands {
+        for &dialect in dialects {
+            let got = decision_in(command, dialect);
+            if got != want {
+                misses.push(format!("{dialect:?}: {command:?} -> {got:?}"));
+            }
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            let got = hook_decision(protocol, tool, command);
+            if got != hook_want {
+                misses.push(format!("{protocol:?} {tool}: {command:?} -> {got}"));
+            }
+        }
+    }
+    misses
+}
+
+fn with_cr(commands: &[&str]) -> Vec<String> {
+    commands
+        .iter()
+        .map(|command| command.replace("<CR>", "\r"))
+        .collect()
+}
+
+/// Every `cmd /c` call the scanner finds gets a Cmd reading, also when the
+/// launcher reader cannot verify it:
+/// - the call is inside a quoted argument of a program that runs it (the
+///   program gets the argument's value, which holds the call);
+/// - cmd expands a variable in it (`%CD%`, `!…!`): the commands written
+///   beside the variable are still judged.
+#[test]
+fn cmd_calls_the_launcher_reader_cannot_verify_still_get_a_cmd_reading() {
+    let posix = [ShellDialect::Posix, ShellDialect::Unknown];
+    let ps = [ShellDialect::PowerShell, ShellDialect::Unknown];
+    let mut misses = expect_everywhere(
+        &with_cr(&[
+            "tmux new-session -d 'cmd.exe /c gi<CR>t reset --hard'",
+            "tmux new-session -d \"cmd.exe /c gi<CR>t reset --hard\"",
+            "tmux new-session -d 'echo start; cmd.exe /c gi<CR>t reset --hard'",
+            "tmux send-keys 'cmd.exe /c gi<CR>t reset --hard' Enter",
+            "watchexec 'cmd.exe /c gi<CR>t reset --hard'",
+            "npx concurrently 'cmd.exe /c gi<CR>t reset --hard'",
+            "git rebase --exec 'cmd.exe /c gi<CR>t reset --hard' HEAD~1",
+            "xterm -e 'cmd.exe /c gi<CR>t reset --hard'",
+            "nodemon --exec 'cmd.exe /c gi<CR>t reset --hard'",
+            "(cmd.exe /c \"gi<CR>t reset --hard & echo %CD%\")",
+            "(cmd.exe /c \"gi<CR>t clean -fdx %CD%\")",
+            "(cmd.exe /c \"gi<CR>t reset --hard & echo done!!\")",
+            "if true; then cmd.exe /c \"echo %DATE%&gi<CR>t reset --hard\"; fi",
+            "for i in 1; do cmd.exe /c \"gi<CR>t reset --hard & echo %USERNAME%\"; done",
+            "xargs cmd.exe /c \"gi<CR>t reset --hard & echo %CD%\" < /dev/null",
+            "wsl cmd.exe /c \"gi<CR>t reset --hard & echo %CD%\"",
+            "(cmd.exe /c gi<CR>t reset --hard \\& echo %CD%)",
+        ]),
+        &posix,
+        "Bash",
+        EvaluationDecision::Deny,
+    );
+    misses.extend(expect_everywhere(
+        &with_cr(&[
+            "schtasks /create /tn x /sc once /st 00:00 /tr \"cmd /c gi<CR>t reset --hard\"",
+            "Start-Process wsl -ArgumentList 'cmd.exe /c \"gi<CR>t reset --hard & echo %CD%\"'",
+        ]),
+        &ps,
+        "PowerShell",
+        EvaluationDecision::Deny,
+    ));
+    misses.extend(expect_everywhere(
+        &with_cr(&[
+            "tmux new-session -d 'cmd.exe /c gi<CR>t status'",
+            "(cmd.exe /c echo %PATH%)",
+            "echo 'cmd /c gi<CR>t reset --hard'",
+            "git commit -m \"docs: cmd /c gi<CR>t reset --hard\"",
+            "grep -n 'cmd /c gi<CR>t reset' notes.md",
+        ]),
+        &[ShellDialect::Posix],
+        "Bash",
+        EvaluationDecision::Allow,
+    ));
+    assert!(misses.is_empty(), "{} misses:\n{}", misses.len(), misses.join("\n"));
+}
+
+/// A quoted cmd program name (`"cmd.exe" /c …`, `& 'C:\…\cmd.exe' /c …`) is
+/// a cmd call wherever it stands, as it is at the start of a command.
+#[test]
+fn quoted_cmd_program_names_are_cmd_calls() {
+    let posix = [ShellDialect::Posix, ShellDialect::Unknown];
+    let ps = [ShellDialect::PowerShell, ShellDialect::Unknown];
+    let mut misses = expect_everywhere(
+        &with_cr(&[
+            "(\"cmd.exe\" /c gi<CR>t reset --hard)",
+            "('cmd.exe' /c \"gi<CR>t reset --hard\")",
+            "(\"cmd.exe\" /c git reset --hard)",
+            "('cmd.exe' /c \"git reset --hard\")",
+        ]),
+        &posix,
+        "Bash",
+        EvaluationDecision::Deny,
+    );
+    misses.extend(expect_everywhere(
+        &with_cr(&[
+            "(& 'C:\\Windows\\System32\\cmd.exe' /c \"gi<CR>t reset --hard\")",
+            "(& 'cmd.exe' /c \"gi<CR>t reset --hard\")",
+        ]),
+        &ps,
+        "PowerShell",
+        EvaluationDecision::Deny,
+    ));
+    misses.extend(expect_everywhere(
+        &with_cr(&["(& 'C:\\Windows\\System32\\cmd.exe' /c \"gi<CR>t status\")"]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Allow,
+    ));
+    misses.extend(expect_everywhere(
+        &with_cr(&["(\"cmd.exe\" /c gi<CR>t status)", "('cmd.exe' /c \"git status\")"]),
+        &[ShellDialect::Posix],
+        "Bash",
+        EvaluationDecision::Allow,
+    ));
+    assert!(misses.is_empty(), "{} misses:\n{}", misses.len(), misses.join("\n"));
+}

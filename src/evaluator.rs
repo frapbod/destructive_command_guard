@@ -5101,10 +5101,38 @@ fn cmd_payload_is_dynamic(command: &str) -> bool {
     false
 }
 
+/// How a launcher reading treats a payload that expands variables at run
+/// time (`%CD%`, `!x!`, `$env:X`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LauncherExpansions {
+    /// The payload's commands are not known before it runs: the launcher is
+    /// unverified (the top-level launcher readings fail closed on it).
+    Refuse,
+    /// Read the payload as written. Only for a deny-only extra reading,
+    /// whose allow decides nothing: the variable's value stays unknown, but
+    /// a command spelled out beside it (`git reset --hard & echo %CD%`) is
+    /// still judged.
+    AsWritten,
+}
+
 fn validate_launcher_payload(
     command: String,
     dialect: ShellDialect,
     max_payload_bytes: usize,
+) -> Result<String, String> {
+    validate_launcher_payload_with(
+        command,
+        dialect,
+        max_payload_bytes,
+        LauncherExpansions::Refuse,
+    )
+}
+
+fn validate_launcher_payload_with(
+    command: String,
+    dialect: ShellDialect,
+    max_payload_bytes: usize,
+    expansions: LauncherExpansions,
 ) -> Result<String, String> {
     let command = command.trim().to_string();
     if command.is_empty() {
@@ -5115,11 +5143,12 @@ fn validate_launcher_payload(
             "embedded launcher command exceeds the {max_payload_bytes}-byte analysis limit"
         ));
     }
-    let dynamic = match dialect {
-        ShellDialect::PowerShell => powershell_payload_is_dynamic(&command),
-        ShellDialect::Cmd => cmd_payload_is_dynamic(&command),
-        ShellDialect::Posix | ShellDialect::Unknown => false,
-    };
+    let dynamic = expansions == LauncherExpansions::Refuse
+        && match dialect {
+            ShellDialect::PowerShell => powershell_payload_is_dynamic(&command),
+            ShellDialect::Cmd => cmd_payload_is_dynamic(&command),
+            ShellDialect::Posix | ShellDialect::Unknown => false,
+        };
     if dynamic {
         // A payload that is exactly one variable read with property accesses
         // (`$PSVersionTable.PSVersion`, `$env:PATH`) invokes nothing: there
@@ -5388,6 +5417,7 @@ fn parse_cmd_launcher(
     words: &[&str],
     outer_dialect: ShellDialect,
     argv: NativeArgv,
+    expansions: LauncherExpansions,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let mut index = 1usize;
@@ -5401,7 +5431,12 @@ fn parse_cmd_launcher(
                     "cmd {option} has no statically inspectable payload"
                 ));
             };
-            return match validate_launcher_payload(command, ShellDialect::Cmd, max_payload_bytes) {
+            return match validate_launcher_payload_with(
+                command,
+                ShellDialect::Cmd,
+                max_payload_bytes,
+                expansions,
+            ) {
                 Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
                     command,
                     dialect: ShellDialect::Cmd,
@@ -6135,16 +6170,19 @@ fn parse_windows_launcher_segment(
         segment,
         outer_dialect,
         NativeArgv::Verbatim,
+        LauncherExpansions::Refuse,
         max_payload_bytes,
     )
 }
 
 /// One launcher segment under one reading of the arguments the launched
-/// program receives ([`NativeArgv`]).
+/// program receives ([`NativeArgv`]). `expansions` applies to a `cmd /c` /
+/// `cmd /k` payload.
 fn parse_windows_launcher_segment_as(
     segment: &str,
     outer_dialect: ShellDialect,
     argv: NativeArgv,
+    expansions: LauncherExpansions,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let segment = segment.trim();
@@ -6229,7 +6267,7 @@ fn parse_windows_launcher_segment_as(
         "powershell" | "pwsh" => {
             parse_powershell_launcher(&words, &executable, outer_dialect, argv, max_payload_bytes)
         }
-        "cmd" => parse_cmd_launcher(&words, outer_dialect, argv, max_payload_bytes),
+        "cmd" => parse_cmd_launcher(&words, outer_dialect, argv, expansions, max_payload_bytes),
         "call" if outer_dialect == ShellDialect::Cmd => {
             let Some(command) = decoded_launcher_tail(&words, 1, outer_dialect, argv) else {
                 return WindowsLauncherParse::Unverified(
@@ -6260,12 +6298,43 @@ fn parse_windows_launcher_segment_as(
 /// outer shell, not to cmd. The boundary view keeps a CR inside a word for
 /// POSIX (a CR is not a metacharacter there) and for Cmd (cmd removes it
 /// before it reads its text); PowerShell ends the line at it.
+///
+/// Every call the scanner finds gets a reading; none is dropped because the
+/// launcher reader cannot verify it:
+/// - The payload is read as written, cmd variables included (`git reset
+///   --hard & echo %CD%`): this reading only adds denials.
+/// - When the `cmd` word is inside a larger word, that word is a quoted
+///   argument of another program (`tmux new-session -d 'cmd.exe /c …'`,
+///   `schtasks /tr "cmd /c …"`). The program gets the word's value, so the
+///   calls in that value are read the same way, under every dialect (which
+///   shell the program hands it to is not known).
 fn embedded_cmd_call_envelopes(
     command: &str,
     cmd_offset: usize,
     outer_dialect: ShellDialect,
     max_payload_bytes: usize,
 ) -> Vec<WindowsLauncherEnvelope> {
+    let mut envelopes = Vec::new();
+    let mut read_values = HashSet::new();
+    push_embedded_cmd_call_envelopes(
+        command,
+        cmd_offset,
+        outer_dialect,
+        max_payload_bytes,
+        &mut read_values,
+        &mut envelopes,
+    );
+    envelopes
+}
+
+fn push_embedded_cmd_call_envelopes(
+    command: &str,
+    cmd_offset: usize,
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+    read_values: &mut HashSet<String>,
+    envelopes: &mut Vec<WindowsLauncherEnvelope>,
+) {
     let candidate_dialects: &[ShellDialect] = if outer_dialect == ShellDialect::Unknown {
         &[
             ShellDialect::Posix,
@@ -6275,7 +6344,6 @@ fn embedded_cmd_call_envelopes(
     } else {
         std::slice::from_ref(&outer_dialect)
     };
-    let mut envelopes = Vec::new();
     for &dialect in candidate_dialects {
         let cr_as_word_byte = (dialect != ShellDialect::PowerShell && command.contains('\r'))
             .then(|| command.replace('\r', "\u{1}"));
@@ -6291,30 +6359,62 @@ fn embedded_cmd_call_envelopes(
             .iter()
             .find(|token| token.kind == NormalizeTokenKind::Separator)
             .map_or(command.len(), |token| token.byte_range.start);
-        let Some(call) = command.get(start..end) else {
+        let (Some(call), Some(raw_word)) = (
+            command.get(start..end),
+            command.get(tokens[word].byte_range.clone()),
+        ) else {
             continue;
         };
-        let call = if dialect == ShellDialect::Cmd {
-            Cow::Owned(call.replace('\r', ""))
-        } else {
-            Cow::Borrowed(call)
+        let without_cr = |text: &'_ str| -> String {
+            if dialect == ShellDialect::Cmd {
+                text.replace('\r', "")
+            } else {
+                text.to_string()
+            }
         };
         let readings: &[NativeArgv] = if dialect == ShellDialect::Posix {
             &[NativeArgv::Verbatim, NativeArgv::Msys]
         } else {
             &[NativeArgv::Verbatim]
         };
+        let mut launcher = false;
         for &argv in readings {
-            if let WindowsLauncherParse::Envelope(envelope) =
-                parse_windows_launcher_segment_as(&call, dialect, argv, max_payload_bytes)
-            {
+            if let WindowsLauncherParse::Envelope(envelope) = parse_windows_launcher_segment_as(
+                &without_cr(call),
+                dialect,
+                argv,
+                LauncherExpansions::AsWritten,
+                max_payload_bytes,
+            ) {
+                launcher = true;
                 if !envelopes.contains(&envelope) {
                     envelopes.push(envelope);
                 }
             }
         }
+        if launcher {
+            continue;
+        }
+        let raw_word = without_cr(raw_word);
+        let Some(value) = shell_word_value(&raw_word, dialect) else {
+            continue;
+        };
+        // A value no shorter than the word removed no quoting layer; each
+        // layer read makes the text shorter, so the reading ends.
+        if value.len() >= raw_word.len() || !read_values.insert(value.clone()) {
+            continue;
+        }
+        for inner_offset in crate::heredoc::cmd_inline_call_starts(&value) {
+            push_embedded_cmd_call_envelopes(
+                &value,
+                inner_offset,
+                ShellDialect::Unknown,
+                max_payload_bytes,
+                read_values,
+                envelopes,
+            );
+        }
     }
-    envelopes
 }
 
 fn windows_launcher_envelopes(
@@ -6382,8 +6482,13 @@ fn windows_launcher_envelopes(
             };
             let mut launcher_reading = false;
             for &argv in readings {
-                match parse_windows_launcher_segment_as(segment, candidate, argv, max_payload_bytes)
-                {
+                match parse_windows_launcher_segment_as(
+                    segment,
+                    candidate,
+                    argv,
+                    LauncherExpansions::Refuse,
+                    max_payload_bytes,
+                ) {
                     WindowsLauncherParse::NotLauncher => {}
                     WindowsLauncherParse::Envelope(envelope) => {
                         launcher_reading = true;
