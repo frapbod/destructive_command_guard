@@ -6,7 +6,10 @@
 //! reader for a `.NET` statement (no Windows shape turned the `windows.*`
 //! packs on), and never offered a block passed to `ForEach-Object` to
 //! `core.filesystem`, whose `Remove-Item` reader no keyword selects.
-//! Rows from card t_02cc8a24.
+//! Rows from card t_02cc8a24 and its first review: a cast glued before the
+//! type literal (`[void][IO.Directory]::Delete(…)`) was not read either, and
+//! the literal true flags other than `$true` must not turn other languages'
+//! `.delete(1)` into a PowerShell delete.
 
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
@@ -44,6 +47,29 @@ const DELETES: &[&str] = &[
     r"1 | ForEach-Object { Remove-Item -Recurse C:\Users }",
     r"{ Remove-Item -Recurse -Force C:\Users }.Invoke()",
     r"{ Remove-Item -Recurse -Force C:\Users }.InvokeReturnAsIs()",
+    r"[void][IO.Directory]::Delete('C:\Users', $true)",
+    r"[void][Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\Users', 'DeleteAllContents')",
+    r"$x=1;[void][System.IO.Directory]::Delete('C:\Users',$true)",
+];
+
+/// The cast rows above, for the `Bash` label: their PowerShell shape widens
+/// it to the Unknown reading on every host.
+const CAST_DELETES: &[&str] = &[
+    r"[void][IO.Directory]::Delete('C:\Users', $true)",
+    r"[void][Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\Users', 'DeleteAllContents')",
+    r"$x=1;[void][System.IO.Directory]::Delete('C:\Users',$true)",
+];
+
+/// Other languages' `.delete(1)`: harmless (measured: pwsh 7.5 and bash
+/// passed the script to a fake interpreter; the directory stayed). The
+/// Windows host's Unknown reading, with the `windows.*` packs on, denied
+/// them while the raw-text member pattern took `1` (first review).
+const OTHER_LANGUAGE_DELETES: &[&str] = &[
+    r#"node -e "const m = new Map([[1, 2]]); m.delete(1); console.log(m.size)""#,
+    "ruby -e 'a = [1, 2, 1]; a.delete(1); p a'",
+    r#"node -e "const s = new Set([1]); s.delete(1)" && ls"#,
+    r#"python -c "import redis; r = redis.Redis(); r.delete(1)""#,
+    "node <<'EOF'\nconst m = new Map([[1, 2]]);\nm.delete(1);\nconsole.log(m.size);\nEOF",
 ];
 
 /// Their measured harmless twins: each left the directory in place.
@@ -173,10 +199,12 @@ fn hook_decision(protocol: Protocol, tool_name: &str, command: &str) -> String {
 /// The default packs a non-Windows host enables for an unproven payload:
 /// no `windows.*` pack.
 fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
-    let enabled: std::collections::HashSet<String> = ["core.git", "core.filesystem"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    decision_with(command, dialect, &["core.git", "core.filesystem"])
+}
+
+fn decision_with(command: &str, dialect: ShellDialect, packs: &[&str]) -> EvaluationDecision {
+    let enabled: std::collections::HashSet<String> =
+        packs.iter().copied().map(str::to_string).collect();
     let ordered = REGISTRY.expand_enabled_ordered(&enabled);
     let keywords = REGISTRY.collect_enabled_keywords(&enabled);
     let index = REGISTRY.build_enabled_keyword_index(&ordered);
@@ -195,6 +223,15 @@ fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
         dialect,
     )
     .decision
+}
+
+/// The packs the Windows host enables for every payload: `windows.*` on.
+fn decision_with_windows_packs(command: &str, dialect: ShellDialect) -> EvaluationDecision {
+    decision_with(
+        command,
+        dialect,
+        &["core.git", "core.filesystem", "windows.filesystem"],
+    )
 }
 
 /// The PowerShell label, and a label that names no shell (the Unknown
@@ -225,11 +262,55 @@ fn hooks_judge_dotnet_and_block_deletes() {
                 "{protocol:?} PowerShell: {command:?}"
             );
         }
-        for command in POSIX_HARMLESS {
+        for command in POSIX_HARMLESS.iter().chain(OTHER_LANGUAGE_DELETES) {
             assert_eq!(
                 hook_decision(protocol, "Bash", command),
                 "allow",
                 "{protocol:?} Bash: {command:?}"
+            );
+        }
+        for command in CAST_DELETES {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "deny",
+                "{protocol:?} Bash: {command:?}"
+            );
+        }
+        for tool in ["PowerShell", "Shell"] {
+            for command in OTHER_LANGUAGE_DELETES {
+                assert_eq!(
+                    hook_decision(protocol, tool, command),
+                    "allow",
+                    "{protocol:?} {tool}: {command:?}"
+                );
+            }
+        }
+    }
+}
+
+/// With the `windows.*` packs on, as on the Windows host, other languages'
+/// `.delete(1)` stays allowed in the PowerShell and Unknown readings, while
+/// the PowerShell member and cast deletes still deny.
+#[test]
+fn windows_packs_keep_other_languages_delete_calls() {
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        for command in OTHER_LANGUAGE_DELETES {
+            assert_eq!(
+                decision_with_windows_packs(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        // Off Windows a variable receiver alone turns no `windows.*` pack on
+        // (accepted in the PR), so this row is checked with the packs on.
+        for command in DELETES
+            .iter()
+            .chain(&[r"$d = Get-Item C:\Users; $d.Delete(1)"])
+        {
+            assert_eq!(
+                decision_with_windows_packs(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
             );
         }
     }

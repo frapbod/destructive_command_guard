@@ -2889,23 +2889,32 @@ fn segment_is_format_drive_invocation(segment: &str) -> bool {
 /// .NET calls it makes delete trees with no cmdlet or program name in sight, so
 /// none of the other shapes saw them and the `windows.*` readers never ran off
 /// Windows. A quoted spelling (`grep '[IO.Path]::'`) is not at a word start.
+/// Casts glued before the type literal (`[void][IO.Directory]::Delete(…)`)
+/// belong to the same access.
 fn segment_has_powershell_static_member_access(segment: &str) -> bool {
-    fn member_access_at(text: &str) -> bool {
-        let rest = text.trim_start();
-        let name_len = rest
-            .bytes()
-            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
-            .count();
-        if name_len == 0 || !rest.as_bytes()[0].is_ascii_alphabetic() {
-            return false;
+    fn member_access_at(mut text: &str) -> bool {
+        loop {
+            let rest = text.trim_start();
+            let name_len = rest
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+                .count();
+            if name_len == 0 || !rest.as_bytes()[0].is_ascii_alphabetic() {
+                return false;
+            }
+            let Some(rest) = rest[name_len..].trim_start().strip_prefix(']') else {
+                return false;
+            };
+            let rest = rest.trim_start();
+            if let Some(next) = rest.strip_prefix('[') {
+                text = next;
+                continue;
+            }
+            return rest
+                .strip_prefix("::")
+                .and_then(|member| member.trim_start().bytes().next())
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
         }
-        let Some(rest) = rest[name_len..].trim_start().strip_prefix(']') else {
-            return false;
-        };
-        rest.trim_start()
-            .strip_prefix("::")
-            .and_then(|member| member.trim_start().bytes().next())
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
     }
     let bytes = segment.as_bytes();
     bytes.iter().enumerate().any(|(index, byte)| {
@@ -5735,6 +5744,8 @@ mod tests {
             r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\Users', 'DeleteAllContents')",
             r"$null = [System.IO.Directory]::Delete('C:\Users', $true)",
             "using namespace System.IO\n[Directory]::Delete('C:\\Users', $true)",
+            r"[void][IO.Directory]::Delete('C:\Users', $true)",
+            r"$x=1;[void] [System.IO.Directory]::Delete('C:\Users',$true)",
             "[IO.Path]::Combine('a','b')",
         ] {
             assert!(
@@ -5753,6 +5764,8 @@ mod tests {
             "[ -f x ] && echo ok",
             "[[ $a == b ]] && echo ok",
             "ls [a-z]::x",
+            "[ -f x ][ -f y ]::z",
+            "ls [a][b]",
         ] {
             assert!(
                 !command_is_windows_shell_payload_on_host(command, false),
