@@ -13111,9 +13111,10 @@ fn powershell_member_pattern_sink(name: Option<&str>) -> Option<PowerShellEngine
 /// Engine members reached through [`PowerShellMemberCmdlet`], called by a
 /// bare or module-qualified name, or a quoted one after `&` or `.`. The name
 /// is the named parameter's value or the first positional word (for
-/// `ForEach-Object` a wildcard pattern); the first argument starts after
-/// `-ArgumentList` (`-Args`) or at the next positional word, which
-/// PowerShell binds to the argument list. Every other parameter must be one
+/// `ForEach-Object` a wildcard pattern). The argument list is the
+/// `-ArgumentList` (`-Args`) value and every positional element not bound
+/// to the name, in order; when there are several, the first is one argument
+/// and verified only as one static value. Every other parameter must be one
 /// the cmdlet has ([`powershell_cmdlet_parameter_role`]), with its value read
 /// whole; a parameter dcg cannot place fails closed. A redirection and its
 /// target are skipped; a splat (`@p`) binds parameters dcg cannot see, so it
@@ -13218,11 +13219,15 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         // the next word as its value, so the name and the arguments after it
         // cannot be placed, and the statement is not verified.
         let mut name: Option<Option<String>> = None;
-        // Where a positional word read as the name starts: when a named
-        // `-MemberName`/`-TypeName` comes later, that word starts the
-        // argument list instead.
-        let mut positional_name: Option<usize> = None;
-        let mut argument_start: Option<usize> = None;
+        // Each positional element, from the end of the word before it to the
+        // end of its value, in order. PowerShell binds them to the name and
+        // then to the argument list.
+        let mut positional: Vec<std::ops::Range<usize>> = Vec::new();
+        // Whether the first positional element is the name. When a named
+        // `-MemberName`/`-TypeName` comes later, it is an argument instead.
+        let mut positional_name = false;
+        // The `-ArgumentList` value.
+        let mut named_arguments: Option<std::ops::Range<usize>> = None;
         let mut unplaced = false;
         // Where the last value read ends; the words before it are part of it.
         let mut value_end = 0usize;
@@ -13241,8 +13246,8 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             }
             // A redirection and its target are their own element, not the
             // name or an argument.
-            if let Some(target_follows) = powershell_redirection_word(raw) {
-                index += usize::from(target_follows);
+            if let Some(end) = powershell_redirection_element_end(segment, range.clone()) {
+                value_end = value_end.max(end);
                 continue;
             }
             let previous_end = words[index - 2].2.end.max(value_end);
@@ -13272,14 +13277,14 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                             .max(value_end);
                     }
                     name = Some(value_name.filter(|_| !array));
-                    positional_name = Some(previous_end);
+                    positional_name = true;
                 } else {
-                    // Once the name is bound, the next positional word starts
-                    // the argument list (with any `(` before it).
-                    argument_start.get_or_insert(previous_end);
+                    // Once the name is bound, each positional element is an
+                    // argument (with any `(` before it).
                     value_end = powershell_cmdlet_value_end(segment, previous_end, range.start)
                         .max(range.end);
                 }
+                positional.push(previous_end..value_end);
                 continue;
             }
             let (parameter, attached) = value
@@ -13303,10 +13308,17 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                     (tail.to_string(), *dynamic, colon, colon, range.end)
                 }
                 _ => {
-                    while let Some(target_follows) = words.get(index).and_then(|(_, _, word)| {
-                        powershell_redirection_word(segment.get(word.clone())?)
+                    let mut after = range.end;
+                    while let Some(end) = words.get(index).and_then(|(_, _, word)| {
+                        powershell_redirection_element_end(segment, word.clone())
                     }) {
-                        index += 1 + usize::from(target_follows);
+                        after = after.max(end);
+                        while words
+                            .get(index)
+                            .is_some_and(|(_, _, word)| word.start < after)
+                        {
+                            index += 1;
+                        }
                     }
                     let Some((word, word_dynamic, word_range)) = words.get(index) else {
                         break;
@@ -13315,7 +13327,7 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                         unplaced = true;
                         break;
                     }
-                    let after = words[index - 1].2.end;
+                    let after = words[index - 1].2.end.max(after);
                     index += 1;
                     (
                         word.clone(),
@@ -13328,9 +13340,7 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             };
             match role {
                 PowerShellParameterRole::Name => {
-                    if let Some(at) = positional_name.take() {
-                        argument_start.get_or_insert(at);
-                    }
+                    positional_name = false;
                     let (value_name, end) = powershell_cmdlet_name_value(
                         cmdlet,
                         segment,
@@ -13345,12 +13355,13 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                     // A `(` read as its own token opens the argument value
                     // (`-ArgumentList ('…', '…')[1]`), so the value starts there.
                     let between = segment.get(after..value_start).unwrap_or_default();
-                    argument_start = Some(match between.find('(') {
+                    let start = match between.find('(') {
                         Some(open) if between.trim() == "(" => after + open,
                         _ => value_start,
-                    });
+                    };
                     value_end =
                         powershell_cmdlet_value_end(segment, after, value_start).max(word_end);
+                    named_arguments = Some(start..value_end);
                 }
                 PowerShellParameterRole::Value | PowerShellParameterRole::Switch => {
                     value_end =
@@ -13362,7 +13373,7 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         // is not read.
         if words.len() > MAX_POWERSHELL_VISIBLE_ALIAS_WORDS
             && index >= words.len()
-            && (name.is_none() || argument_start.is_none())
+            && (name.is_none() || (named_arguments.is_none() && positional.len() < 2))
         {
             sinks.push(ExecutableTextSink::Unverified {
                 rule: SINK_ANALYSIS_BOUNDS_RULE,
@@ -13377,7 +13388,18 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             });
             continue;
         }
-        let (Some(name), Some(argument_start)) = (name, argument_start) else {
+        let Some(name) = name else {
+            continue;
+        };
+        // The argument list: the `-ArgumentList` value and the positional
+        // elements not bound to the name, in order. Several elements are
+        // several arguments; one is spread into them (`'a', $true`).
+        let mut arguments =
+            positional.split_off(usize::from(positional_name).min(positional.len()));
+        arguments.extend(named_arguments);
+        arguments.sort_unstable_by_key(|element| element.start);
+        let several = arguments.len() > 1;
+        let Some(first_element) = arguments.first() else {
             continue;
         };
         let sink = match cmdlet {
@@ -13390,9 +13412,12 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         let Some(sink) = sink else {
             continue;
         };
-        let rest = segment.get(argument_start..).unwrap_or_default();
-        let position = argument_start + (rest.len() - rest.trim_start().len());
-        let text = &segment[position..];
+        let element_end = first_element.end.min(segment.len());
+        let rest = segment
+            .get(first_element.start..element_end)
+            .unwrap_or_default();
+        let position = first_element.start + (rest.len() - rest.trim_start().len());
+        let text = segment.get(position..element_end).unwrap_or_default();
         // The rest of the word the argument starts in.
         let word_text = words
             .iter()
@@ -13446,6 +13471,15 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             };
             (argument, more)
         };
+        // With several arguments, the first element is one argument: an array
+        // (`('git', 'reset --hard') 'y'`) becomes script text joined by
+        // `$OFS`, which the command may set, so only one static value is
+        // verified.
+        let (argument, more) = if several {
+            (if more { Err(()) } else { argument }, true)
+        } else {
+            (argument, more)
+        };
         // A `Command` built from one static value holds a command name. New-Object
         // spreads one array value into the argument list (`-ArgumentList $a`),
         // so a single value whose length is not visible may carry `isScript`.
@@ -13467,11 +13501,50 @@ fn powershell_splat_word(raw: &str) -> bool {
         })
 }
 
-/// Whether an argument-mode word is a redirection (`>`, `2>>`, `*>$null`,
-/// the `2>` of `2>&1`), and if so whether its target is the next word.
-fn powershell_redirection_word(raw: &str) -> Option<bool> {
-    let (start, target_follows) = powershell_unescaped_redirect_suffix(raw)?;
-    (start == 0).then_some(target_follows)
+/// Where the redirection that the argument-mode word at `range` begins
+/// (`>`, `2>>`, `*>$null`, `2>&1`) ends, with its target. The target is one
+/// element, read whole like a parameter value: attached (`2>$null`,
+/// `2>('x' + 'y')`) or after blank space (`2> (Join-Path $HOME 'e.txt')`),
+/// with a group read to its close across blanks and lines. A merge (`2>&1`)
+/// has no target. `None` when the word is no redirection.
+fn powershell_redirection_element_end(
+    segment: &str,
+    range: std::ops::Range<usize>,
+) -> Option<usize> {
+    let (start, target_follows) =
+        powershell_unescaped_redirect_suffix(segment.get(range.clone())?)?;
+    if start != 0 {
+        return None;
+    }
+    let bytes = segment.as_bytes();
+    let mut operator_end = range.start;
+    while bytes
+        .get(operator_end)
+        .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'*')
+    {
+        operator_end += 1;
+    }
+    let redirect = *bytes.get(operator_end)?;
+    operator_end += 1;
+    if bytes.get(operator_end) == Some(&redirect) {
+        operator_end += 1;
+    }
+    if bytes.get(operator_end) == Some(&b'&') {
+        let mut end = operator_end + 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        return Some(end.max(range.end));
+    }
+    let target = if target_follows {
+        skip_powershell_blank_and_comments(segment, operator_end)
+    } else {
+        operator_end
+    };
+    if target >= segment.len() {
+        return Some(segment.len());
+    }
+    Some(powershell_cmdlet_element_end(segment, operator_end, target).max(range.end))
 }
 
 fn powershell_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
@@ -67268,6 +67341,44 @@ mod tests {
             ("% '*\u{212a}eScript' 'a'", vec!["a"]),
             ("% \u{130}nvokeScr* 'a'", vec![]),
             ("% Invo\u{212a}eScript 'a'", vec![]),
+            // With a named name, every positional element is an argument, in
+            // order.
+            ("% 'a' 'x' -MemberName InvokeScript", vec!["a"]),
+            (
+                "% 'a' -ErrorAction Stop 'x' -MemberName InvokeScript",
+                vec!["a"],
+            ),
+            ("% 'x' 'y' 'a' -MemberName InvokeScript", vec!["x"]),
+            // A redirection target is one element, a group read to its close.
+            ("% 2> ('x' + 'y') InvokeScript 'a'", vec!["a"]),
+            ("% 2>('x' + 'y') InvokeScript 'a'", vec!["a"]),
+            ("% *> ('x' +\n 'y') InvokeScript 'a'", vec!["a"]),
+            ("% 2> <# c #> ('x' + 'y') InvokeScript 'a'", vec!["a"]),
+            ("% -MemberName 2> ('x' + 'y') InvokeScript 'a'", vec!["a"]),
+            ("% InvokeScript 2> ('x' + 'y') 'a'", vec!["a"]),
+            ("New-Object 2> ('x' + 'y') a.Command 'a', $true", vec!["a"]),
+            ("% 2> ('x' + 'y') Name", vec![]),
+            // Several arguments: the first is one value, and an array or a
+            // group of several elements is not static (`$OFS` joins it).
+            ("% InvokeScript ('a') 'y'", vec!["a"]),
+            ("% InvokeScript ('a', 'b')", vec!["a"]),
+            ("% InvokeScript 'a', 'b'", vec!["a"]),
+            (
+                "% InvokeScript ('a', 'b') 'y'",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% InvokeScript @('a', 'b') -ea Stop 'y'",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% InvokeScript 'a', 'b' 'y'",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% 'a', 'b' 'y' -MemberName InvokeScript",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
         ] {
             assert_eq!(sources(command), expected, "{command:?}");
         }
@@ -67281,6 +67392,8 @@ mod tests {
         for command in [
             format!("% {} 'a'", "*?".repeat(50_000)),
             format!("% {} 'a'", "[a-z]".repeat(50_000)),
+            format!("% {}InvokeScript 'a'", "2> ('x') ".repeat(50_000)),
+            format!("% 2> {}x InvokeScript 'a'", "(".repeat(50_000)),
             "% -ea Stop ".repeat(20_000),
             format!("% -InputObject {} InvokeScript 'a'", "1, ".repeat(50_000)),
         ] {

@@ -252,6 +252,42 @@ const RUNS_IT: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % -MemberName 'Invo\u{212a}e*' -ArgumentList 'git reset --hard'",
     "$ExecutionContext.InvokeCommand | % '*\u{212a}eScript' 'git reset --hard'",
     "$ExecutionContext.InvokeCommand | % [I]nvo\u{212a}eScript 'git reset --hard'",
+    // Review round 7 (runner rv8/truth*.out, r7/truth.out): every positional
+    // element is an argument once the name is named, a redirection target is
+    // one element, and a group of several elements followed by another
+    // argument is one array argument.
+    "$ExecutionContext.InvokeCommand | % 'git reset --hard' 'x' -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | % 'git reset --hard' -ErrorAction Stop 'x' -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | ForEach-Object 'git reset --hard' 'x' -MemberName:InvokeScript",
+    "$ExecutionContext.InvokeCommand | % 'git reset --hard', 'x' 'y' -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | % 2> ('x' + 'y') InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 2> (Join-Path $HOME 'e.txt') InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 2> ('x' + 'y') 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 2> ('x' + 'y') 'git reset --hard'",
+    "$c = New-Object 2> ('x' + 'y') System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = New-Object -TypeName 2> ('x' + 'y') System.Management.Automation.Runspaces.Command -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % 2> $('x' + 'y') InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 2> \"x y\" InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 'git reset --hard' 'x' -MemberName Invoke*",
+    "$ExecutionContext.InvokeCommand | % 'git reset --hard' 'x' 2>$null -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | % 2>('x' + 'y') InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % *> ('x' +\n 'y') InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript ('git', 'reset', '--hard') 'y'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript ('git', 'reset --hard') 'y'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript @('git', 'reset --hard') 'y'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript ('git', 'reset --hard') 'y'",
+    "$ExecutionContext.InvokeCommand | % ('git', 'reset --hard') 'y' -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | % InvokeScript ('git', 'reset --hard') -ErrorAction Stop 'y'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript ('git reset --hard', 'x')",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git', 'reset --hard' 'y'",
+    "$ExecutionContext.InvokeCommand | % 2> (Join-Path $HOME 'e.txt') -MemberName InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName 2> ('x' + 'y') InvokeScript 'git reset --hard'",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command 2> ('x' + 'y') -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' 2> ('x' + 'y')",
+    "$ExecutionContext.InvokeCommand | % InvokeScript ('git reset --hard') 'y'",
+    "$ExecutionContext.InvokeCommand | % 2>(Join-Path $HOME 'e.txt') InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 2> <# c #> ('x' + 'y') InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 'git reset --hard' 'x' 'y'",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -322,7 +358,24 @@ const HARMLESS: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' 2>&1",
     "$ExecutionContext.InvokeCommand | % 2>&1 InvokeScript 'git status'",
     "Get-ChildItem | % 2>&1 { $_.Name }",
-    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command 2>&1 -ArgumentList 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command 2>&1 -ArgumentList 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()", // Their harmless twins (review round 7).
+    "$ExecutionContext.InvokeCommand | % -ArgumentList 'x' 'git reset --hard' -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | % -ArgumentList 'x' -MemberName InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 'git status' 'x' -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | % 2> ('x' + 'y') InvokeScript 'git status'",
+    "Get-ChildItem | % 2> ('x' + 'y') Name",
+    "$c = New-Object 2> ('x' + 'y') System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % InvokeScript ('git', 'reset --hard')",
+    "$ExecutionContext.InvokeCommand | % InvokeScript ('git status') 'y'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git', 'status'",
+    "$ExecutionContext.InvokeCommand | % 'x' 'y' 'git reset --hard' -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' 2> ('x' + 'y')",
+    "$ExecutionContext.InvokeCommand | % 'git status' 'x' 'y' -MemberName InvokeScript",
+    "$ExecutionContext.InvokeCommand | % InvokeScript ('git status') ('y')",
+    "$ExecutionContext.InvokeCommand | % 2> <# c #> ('x' + 'y') InvokeScript 'git status'",
+    "$ExecutionContext.InvokeCommand | % 2>&1 InvokeScript 'git status' 'x'",
+    "Get-ChildItem | % -MemberName 2> ('x' + 'y') Name",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command 2> ('x' + 'y') -ArgumentList 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
