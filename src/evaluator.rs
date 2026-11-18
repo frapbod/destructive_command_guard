@@ -5989,9 +5989,11 @@ fn parse_windows_launcher_segment_as(
 /// launcher reader cannot verify it:
 /// - The payload is read as written, cmd variables included (`git reset
 ///   --hard & echo %CD%`): this reading only adds denials.
-/// - When the `cmd` word ends a larger unquoted word (`--exec=cmd.exe /c …`),
-///   the call starts at `cmd`, where the scanner's POSIX reading starts it.
-/// - When the `cmd` word is inside a larger word, that word is a quoted
+/// - When the `cmd` program name ends a larger word, with or without quoting
+///   before it (`--exec=cmd.exe /c …`, `--exec="cmd.exe" /c …`,
+///   `"$WINDIR/System32/cmd.exe" /c …`), the call is that program and the
+///   words after its word.
+/// - When the `cmd` call is inside a larger word, that word is a quoted
 ///   argument of another program (`tmux new-session -d 'cmd.exe /c …'`,
 ///   `schtasks /tr "cmd /c …"`). The program gets the word's value, so the
 ///   calls in that value are read the same way, under every dialect (which
@@ -6086,16 +6088,16 @@ fn push_embedded_cmd_call_envelopes(
         if read_call(call) {
             continue;
         }
-        // The `cmd` word may sit later in its word (`--exec=cmd.exe /c …`):
-        // the scanner's POSIX reading starts the call there. When no quote
-        // or escape before it is open, the text from `cmd` on is the call
-        // as written; otherwise the word's value below removes the quoting.
-        if let Some(from_cmd) = command
-            .get(start..cmd_offset)
-            .filter(|prefix| !prefix.is_empty() && !may_open_quoting(prefix, dialect))
-            .and_then(|_| command.get(cmd_offset..end))
+        // The `cmd` program name may end a larger word (`--exec=cmd.exe /c …`,
+        // `--exec="cmd.exe" /c …`, `"$WINDIR/System32/cmd.exe" /c …`): the
+        // call is that program and the words after its word. What comes
+        // before it in the word does not matter.
+        if let Some(from_cmd) =
+            cmd_name_ending_word(command, cmd_offset, tokens[word].byte_range.end)
+                .zip(command.get(tokens[word].byte_range.end..end))
+                .map(|(name, args)| format!("{name}{args}"))
         {
-            if read_call(from_cmd) {
+            if read_call(&from_cmd) {
                 continue;
             }
         }
@@ -6121,17 +6123,28 @@ fn push_embedded_cmd_call_envelopes(
     }
 }
 
-/// Whether `text` holds a byte that opens or escapes quoting in `dialect`, so
-/// a later byte of the same word may be quoted. `false` proves the text after
-/// it starts unquoted.
-fn may_open_quoting(text: &str, dialect: ShellDialect) -> bool {
-    let syntax: &[char] = match dialect {
-        ShellDialect::Posix => &['\'', '"', '\\', '$', '`'],
-        ShellDialect::PowerShell => &['\'', '"', '`'],
-        ShellDialect::Cmd => &['"', '^'],
-        ShellDialect::Unknown => &['\'', '"', '\\', '$', '`', '^'],
+/// The `cmd` / `cmd.exe` program name the inline-script scanner matched at
+/// `cmd_offset`, when the word holding it ends right after that name and any
+/// closing quotes (`word_end`).
+fn cmd_name_ending_word(command: &str, cmd_offset: usize, word_end: usize) -> Option<&str> {
+    let from_cmd = command.get(cmd_offset..word_end)?;
+    let name_len = if from_cmd
+        .get(..7)
+        .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"))
+    {
+        7
+    } else if from_cmd
+        .get(..3)
+        .is_some_and(|name| name.eq_ignore_ascii_case("cmd"))
+    {
+        3
+    } else {
+        return None;
     };
-    text.contains(syntax)
+    from_cmd[name_len..]
+        .bytes()
+        .all(|byte| matches!(byte, b'\'' | b'"'))
+        .then(|| &from_cmd[..name_len])
 }
 
 fn windows_launcher_envelopes(
