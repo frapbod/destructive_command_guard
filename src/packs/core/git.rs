@@ -6708,13 +6708,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // content and uncommitted changes to it are lost (#373). Deny only the
         // same-path shape (a backreference pins redirect target == shown
         // path), so `git show HEAD:f > f.from-ref` and every other capture to
-        // a new file stays allowed. Covers `>`, `>>`, and `>|`; the piped
+        // a new file stays allowed. Covers `>`, `>>`, `>|`, `1>` and `&>`,
+        // after any other-descriptor redirects (`2>/dev/null`, `2>&1`): the
+        // shell opens (and truncates) every redirect target before git runs,
+        // whatever their order. The piped
         // `| tee <path>` spelling cannot be a core.git pattern (this pack is
         // matched per pipeline segment by design), so the prose warns about
         // it instead.
         destructive_pattern!(
             "show-redirect-overwrite-source",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+(?:[^\s;&|<>()]+\s+)*?[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+(?:[^\s;&|<>()]+\s+)*?[^\s:]+:(\S+)(?:\s+[0-9]*>&?\s*[^\s;&|<>()]+)*(?:\s*&|\s+1)?\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
             "git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'.",
             High,
             "Redirecting `git show <ref>:<path>` back onto `<path>` replaces the working-tree \
@@ -9061,6 +9064,16 @@ git x",
             "git show -q --no-patch other:f > f",
             "git show --format=%s other:f > f",
             "git --git-dir=.git show -m other:f > f",
+            // Other-descriptor redirects first, and `1>` / `&>` as the
+            // stdout redirect: the shell truncates `f` before git runs.
+            "git show other:f 2>/dev/null > f",
+            "git show other:f 2>&1 > f",
+            "git show HEAD:src/a.rs 2>/dev/null > src/a.rs",
+            "git show HEAD:src/a.rs 2> /dev/null >> src/a.rs",
+            "git show other:f 1> f",
+            "git show other:f &> f",
+            "git show other:f &>> f",
+            "git show other:f >/dev/null 2>&1 > f",
         ] {
             assert_blocks_with_pattern(&pack, cmd, "show-redirect-overwrite-source");
             assert_blocks_with_severity(&pack, cmd, Severity::High);
@@ -9079,6 +9092,9 @@ git x",
             "git show -m HEAD",
             "git show -m other:f > g",
             "git show --quiet other:f | less",
+            "git show HEAD:src/a.rs 2>/dev/null > src/b.rs",
+            "git show other:f 2>f.err > g",
+            "git show other:f1> f",
         ] {
             assert!(
                 pack.check(cmd)

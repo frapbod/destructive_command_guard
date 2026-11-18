@@ -1596,6 +1596,47 @@ fn plain_sanitize_mask_ranges(command: &str) -> Option<SmallVec<[Range<usize>; 8
     token_mask_ranges(command, &tokenize_command(command), may_have_flowctl_data)
 }
 
+/// Git subcommands whose `-m`/`--message` takes a message (or, for
+/// `update-ref`/`symbolic-ref`, a reflog reason). Under every other
+/// subcommand `-m` is a flag without a value (`checkout`/`switch`/`restore`
+/// `--merge`, `show`/`log -m`, `rebase --merge`, `branch --move`, `am
+/// --message-id`) or takes a non-message value (`cherry-pick`/`revert -m 1`),
+/// so the word after it must stay visible to the packs.
+pub(crate) fn git_m_takes_message(subcommand: Option<&str>) -> bool {
+    matches!(
+        subcommand,
+        Some(
+            "commit"
+                | "tag"
+                | "merge"
+                | "stash"
+                | "notes"
+                | "commit-tree"
+                | "update-ref"
+                | "symbolic-ref"
+                | "subtree"
+                | "fmt-merge-msg"
+        )
+    )
+}
+
+/// Git global options (git.c `handle_options`) that take the NEXT word as
+/// their value. `--super-prefix` is gone from current Git but 2.39 has it.
+/// `--exec-path` without `=` prints the path and exits, so it takes none.
+pub(crate) fn git_global_option_takes_separate_value(option: &str) -> bool {
+    matches!(
+        option,
+        "-C" | "-c"
+            | "--git-dir"
+            | "--work-tree"
+            | "--namespace"
+            | "--config-env"
+            | "--shallow-file"
+            | "--attr-source"
+            | "--super-prefix"
+    )
+}
+
 /// The masking pass of [`plain_sanitize_mask_ranges`] over `command`'s tokens.
 #[allow(clippy::too_many_lines)] // Single-pass masking logic; refactor only if it becomes unreadable
 fn token_mask_ranges(
@@ -1764,24 +1805,7 @@ fn token_mask_ranges(
             } else if flag_text == "--" {
                 git_options_ended = true;
             } else if !git_options_ended && flag_text.starts_with('-') && flag_text != "-" {
-                let takes_value = matches!(
-                    flag_text,
-                    "-C" | "-c"
-                        | "--git-dir"
-                        | "--work-tree"
-                        | "--namespace"
-                        | "--exec-path"
-                        | "--pager"
-                        | "--config-env"
-                ) || flag_text.starts_with("-C")
-                    || flag_text.starts_with("-c")
-                    || flag_text.starts_with("--git-dir=")
-                    || flag_text.starts_with("--work-tree=")
-                    || flag_text.starts_with("--namespace=")
-                    || flag_text.starts_with("--exec-path=")
-                    || flag_text.starts_with("--pager=")
-                    || flag_text.starts_with("--config-env=");
-                if takes_value && !flag_text.contains('=') {
+                if git_global_option_takes_separate_value(flag_text) {
                     git_waiting_for_value = true;
                 }
             } else {
@@ -1855,18 +1879,16 @@ fn token_mask_ranges(
             continue;
         }
 
-        // `git checkout`, `git switch` and `git restore` read `-m` as
-        // `--merge`, and `git show` reads it as "diff merges"; both are flags
-        // without a value, so the next word is a ref, a path or `--`, never a
-        // commit message (and `--message` is not one of their options).
-        // Masking it hid `git checkout -m <ref> <path>` and
-        // `git show -m <ref>:<path> > <path>`.
-        let git_m_is_merge = cmd_is_git
-            && matches!(
-                git_subcommand,
-                Some("checkout" | "switch" | "restore" | "show")
-            );
-        let is_git_message_flag = |flag: &str| git_m_is_merge && matches!(flag, "-m" | "--message");
+        // Git's `-m`/`--message` is a message only under the subcommands in
+        // `git_m_takes_message`. Elsewhere it is a flag without a value
+        // (`checkout -m` is `--merge`, `show -m` diffs merges), so masking
+        // the next word hid `git checkout -m <ref> <path>`. When the
+        // subcommand is unknown or misread (an alias, an unlisted global
+        // option), the word stays visible: the worst case is a false
+        // positive on a message, never a hidden restore.
+        let git_m_not_message = cmd_is_git && !git_m_takes_message(git_subcommand);
+        let is_git_message_flag =
+            |flag: &str| git_m_not_message && matches!(flag, "-m" | "--message");
 
         if let Some(pending) = pending_safe_flag {
             let is_flag_token = flag_text.starts_with('-') && flag_text != "-";
@@ -6155,10 +6177,23 @@ mod tests {
             "git restore -m f",
             "git restore -ms other f",
             "git switch -m other",
+            // Spaced global options whose value Git takes from the next word.
+            "git --shallow-file x checkout -m -- f",
+            "git --shallow-file x checkout -m other f",
+            "git --shallow-file x checkout -qm other f",
+            "git --shallow-file x checkout other -m f",
+            "git --shallow-file x show -m other:f > f",
+            "git --attr-source HEAD checkout -m -- f",
+            "git --attr-source HEAD show -m other:f > f",
+            // An unknown or misread subcommand leaves `-m`'s word visible:
+            // a false positive on a message, never a hidden restore.
+            "git --some-new-global x checkout -m other f",
+            "git ci -m 'git checkout other -- f'",
+            "git -m other f",
         ] {
             assert_eq!(sanitize_for_pattern_matching(command), command);
         }
-        // Every other subcommand keeps `-m` as message data.
+        // Subcommands where `-m`/`--message` takes a message keep masking it.
         for command in [
             "git commit -m 'fix checkout other f'",
             "git commit -am 'git checkout other -- f'",
@@ -6167,6 +6202,13 @@ mod tests {
             "git stash push -m 'git checkout other -- f'",
             "git --git-dir=.git commit -m 'git checkout other -- f'",
             "git '--git-dir=.git' commit -m 'git checkout other -- f'",
+            "git --shallow-file x commit -m 'git checkout other -- f'",
+            "git --attr-source HEAD tag -m 'git checkout other -- f' v1",
+            "git -C repo commit -m 'git checkout other -- f'",
+            "git -c user.name=x commit --message='git checkout other -- f'",
+            "git notes add -m 'git checkout other -- f'",
+            "git commit-tree HEAD^{tree} -m 'git checkout other -- f'",
+            "git update-ref -m 'git checkout other -- f' refs/x HEAD",
         ] {
             let sanitized = sanitize_for_pattern_matching(command);
             assert!(

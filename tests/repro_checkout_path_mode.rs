@@ -159,9 +159,23 @@ fn checkout_paths_after_options_are_denied() {
             "git --bogus=x checkout -m other f",
             "git -C . --git-dir=.git checkout -m other f",
             "git \"--git-dir=.git\" checkout -m other f",
+            // Spaced global options that take the next word as their value.
+            "git --shallow-file x checkout -m -- f",
+            "git --shallow-file x checkout -m other f",
+            "git --shallow-file x checkout -qm other f",
+            "git --shallow-file x checkout other -m f",
+            "git --shallow-file x show -m other:f > f",
+            "git --attr-source HEAD checkout -m -- f",
+            "git --attr-source HEAD show -m other:f > f",
             // `git show <ref>:<path>` redirected onto `<path>`, options first.
             "git show --quiet other:f > f",
             "git show -m other:f > f",
+            // Other-descriptor redirects first, or `1>` / `&>` for stdout.
+            "git show other:f 2>/dev/null > f",
+            "git show other:f 2>&1 > f",
+            "git show HEAD:src/a.rs 2>/dev/null > src/a.rs",
+            "git show other:f 1> f",
+            "git show other:f &> f",
             // Already denied; kept as controls.
             "git checkout other -- f",
             "git checkout -- f",
@@ -196,6 +210,18 @@ fn branch_switches_and_creation_stay_allowed() {
             "git --git-dir=.git commit -m \"git checkout other -- f\"",
             "git show other:f > g",
             "git show -m HEAD",
+            "git show HEAD:src/a.rs 2>/dev/null > src/b.rs",
+            // `-m` is a message under these subcommands: still masked.
+            "git --shallow-file x commit -m \"git checkout other -- f\"",
+            "git tag -a v1 -m \"git checkout other -- f\"",
+            "git merge -m \"git checkout other -- f\" topic",
+            "git stash push -m \"git checkout other -- f\"",
+            "git notes add -m \"git checkout other -- f\"",
+            "git -C repo commit -m \"git checkout other -- f\"",
+            // `-m` takes a non-message value or none; nothing destructive.
+            "git cherry-pick -m 1 abc",
+            "git revert -m 1 abc",
+            "git branch -m old new",
         ],
     );
 }
