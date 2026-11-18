@@ -11731,10 +11731,16 @@ enum PowerShellBraceOpener {
 /// What the code `{` at `open` opens. PowerShell decides by where the token
 /// before it starts, not by the byte before it (measured in pwsh 7.5):
 /// `$${` is the variable `$$` and then a block, `` `${ `` is a literal `$`
-/// and then a block, and in a command argument `a@{`, `$x=@{` or
-/// `[ordered]@{` is one bareword that ends in a block. Anything that is not
-/// shown to be a braced variable or a hashtable is read as a block, so its
-/// body is judged.
+/// and then a block, and in a command argument `a@{`, `$x=@{`,
+/// `[ordered]@{` or ``a` @{`` is one bareword that ends in a block.
+///
+/// `@{` is read as a hashtable only when its `@` starts a token by itself
+/// (after an unescaped blank or `( ) , ; | { } &`, or at the start) or
+/// follows `-Name:`. A glued `X@{` is read as a block wherever it stands:
+/// telling a statement start from a command argument needs the whole
+/// parse, and a wrong "hashtable" is a missed block while a wrong "block"
+/// only judges a hashtable body as code (`$h=@{a=1}` reads the command
+/// `a=1`).
 fn powershell_brace_opener(command: &str, open: usize) -> PowerShellBraceOpener {
     let bytes = command.as_bytes();
     let escaped = |at: usize| {
@@ -11765,21 +11771,24 @@ fn powershell_brace_opener(command: &str, open: usize) -> PowerShellBraceOpener 
         return PowerShellBraceOpener::Block;
     }
     let at = open - 1;
-    let separates = |byte: u8| {
-        byte.is_ascii_whitespace()
-            || matches!(byte, b'(' | b')' | b',' | b';' | b'|' | b'{' | b'}' | b'&')
+    // An escaped blank or mark (`` a` @{ ``) is part of the bareword.
+    let separates = |index: usize| {
+        (bytes[index].is_ascii_whitespace()
+            || matches!(
+                bytes[index],
+                b'(' | b')' | b',' | b';' | b'|' | b'{' | b'}' | b'&'
+            ))
+            && !escaped(index)
     };
-    // `@` starts its own token: always a hashtable.
-    if at == 0 || separates(bytes[at - 1]) {
+    if at == 0 || separates(at - 1) {
         return PowerShellBraceOpener::Hashtable;
     }
-    let token_start = bytes[..at]
-        .iter()
-        .rposition(|byte| separates(*byte))
+    let token_start = (0..at)
+        .rev()
+        .find(|index| separates(*index))
         .map_or(0, |index| index + 1);
-    let token = &command[token_start..at];
     // `-Name:@{…}` gives a parameter a hashtable.
-    if token
+    let parameter = command[token_start..at]
         .strip_prefix('-')
         .and_then(|rest| rest.strip_suffix(':'))
         .is_some_and(|name| {
@@ -11787,30 +11796,8 @@ fn powershell_brace_opener(command: &str, open: usize) -> PowerShellBraceOpener 
                 && name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        })
-    {
-        return PowerShellBraceOpener::Hashtable;
-    }
-    // At the start of a statement or an assignment value, a token such as
-    // `$x=`, `$h.a+=` or `[ordered]` is an expression and ends before the
-    // `@`. A token that starts with a letter is a command name there, and in
-    // a command argument any token runs on through `@{`: both open a block.
-    let before = command[..token_start]
-        .trim_end_matches([' ', '\t'])
-        .as_bytes();
-    let expression_position = match before {
-        [] => true,
-        [.., b'&', b'&'] => true,
-        [.., last] => matches!(
-            last,
-            b'\n' | b'\r' | b';' | b'(' | b'{' | b'}' | b'=' | b'|'
-        ),
-    };
-    let first = token.as_bytes()[0];
-    if expression_position
-        && !(first.is_ascii_alphabetic() || matches!(first, b'_' | b'\'' | b'"' | b'`'))
-        && first.is_ascii()
-    {
+        });
+    if parameter {
         PowerShellBraceOpener::Hashtable
     } else {
         PowerShellBraceOpener::Block
@@ -62467,7 +62454,9 @@ mod tests {
     fn powershell_brace_opener_reads_the_token_before_the_brace() {
         use PowerShellBraceOpener::{Block, BracedVariable, Hashtable};
         // Each shape is measured in pwsh 7.5 with `f` = Write-Output
-        // (t_a68ca4ed, review round 1).
+        // (t_a68ca4ed, review rounds 1 and 2). A glued `X@{` is a block
+        // even where pwsh reads a hashtable (`$h=@{x}`): only the body is
+        // judged.
         for (command, expected) in [
             ("${x}", BracedVariable),
             ("$${x}", Block),
@@ -62475,11 +62464,23 @@ mod tests {
             ("`${x}", Block),
             ("``${x}", BracedVariable),
             ("a$${x}", Block),
-            ("$h=@{x}", Hashtable),
-            ("$h = [ordered]@{x}", Hashtable),
-            ("[pscustomobject]@{x}", Hashtable),
+            ("@{x}", Hashtable),
+            ("$h = @{x}", Hashtable),
+            ("f a @{x}", Hashtable),
+            ("f a\n@{x}", Hashtable),
+            ("f a`\r\n@{x}", Hashtable),
             ("f -x:@{x}", Hashtable),
             ("f (1,@{x})", Hashtable),
+            ("$h=@{x}", Block),
+            ("$h = [ordered]@{x}", Block),
+            ("[pscustomobject]@{x}", Block),
+            ("f {x} $x=@{x}", Block),
+            ("f a `\n$x=@{x}", Block),
+            ("f a` @{x}", Block),
+            ("f a`;@{x}", Block),
+            ("f a`}@{x}", Block),
+            ("f a`\n@{x}", Block),
+            ("f a` -x:@{x}", Block),
             ("f a@{x}", Block),
             ("f 1@{x}", Block),
             ("f $x=@{x}", Block),

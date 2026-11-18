@@ -235,6 +235,33 @@ const RUNS_IT: &[&str] = &[
     "$l = Write-Output a{git reset --hard}; & $l[1]",
     "$l = Write-Output a<x{git reset --hard}; & $l[1]",
     "$l = Write-Output a#{git reset --hard}; & $l[1]",
+    // A glued `X@{` is a block wherever it stands, and an escaped blank or
+    // mark is part of the bareword (review round 2).
+    "$l = Write-Output a = $x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a= $x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output {x} $x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output {x} [ordered]@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a `\n$x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a `\n[ordered]@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output {x}$x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output = 1@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output {x} 1@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output @{a=1} $x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output = .@{git reset --hard}; & $l[-1]",
+    "Write-Output {x} $x=@{git reset --hard} | Select-Object -Last 1 | ForEach-Object Invoke",
+    "$l = Write-Output a `\r\n$x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a` @{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`;@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`,@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`|@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`(@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`)@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`&@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`}@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`\t@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`{@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a` -x:@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a`\n@{git reset --hard}; & $l[-1]",
 ];
 
 /// PowerShell 7.5 runs none of these: each builds a destructive block and
@@ -362,6 +389,27 @@ const HARMLESS: &[&str] = &[
     "$h=@{}; $h['k']=@{a=1}; $h.k.a",
     "$h=@{}; $h.k=[ordered]@{a=1}; $h.k.a",
     "function f { return @{a=1} }; (f).a",
+    // Twins of the round 2 rows, and glued hashtables whose bodies are
+    // now judged as code.
+    "$l = Write-Output a = $x=@{git status}; & $l[-1]",
+    "$l = Write-Output a= $x=@{git status}; & $l[-1]",
+    "$l = Write-Output {x} $x=@{git status}; & $l[-1]",
+    "$l = Write-Output {x} [ordered]@{git status}; & $l[-1]",
+    "$l = Write-Output {x}$x=@{git status}; & $l[-1]",
+    "$l = Write-Output = 1@{git status}; & $l[-1]",
+    "$l = Write-Output {x} 1@{git status}; & $l[-1]",
+    "$l = Write-Output @{a=1} $x=@{git status}; & $l[-1]",
+    "$l = Write-Output = .@{git status}; & $l[-1]",
+    "Write-Output {x} $x=@{git status} | Select-Object -Last 1 | ForEach-Object Invoke",
+    "$p=@{Path='.'; Recurse=$true}; Get-ChildItem @p | Out-Null",
+    "$h=[ordered]@{a=1}; $h.a",
+    "[pscustomobject]@{Name='x'; Size=1} | Format-List",
+    "$h=@{n='x';e={$_.Name}}; Get-Item . | Select-Object $h",
+    "$h=@{cmd='git'; args='reset --hard'}; $h.cmd",
+    "$x=@{a=1;b=@{c=2}}; $x.b.c",
+    "$h=@{a=1}; $h['b']=@{c=2}; $h.b.c",
+    "$o=[pscustomobject]@{Path='.'}; $o.Path",
+    "$h=@{s={git status}}; & $h.s",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -377,7 +425,22 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // escaped backtick before it are a variable too.
     "$l = Write-Output $$${git reset --hard}; & $l[1]",
     "$l = Write-Output ${git reset --hard}; & $l[-1]",
-    "$l = Write-Output ``${git reset --hard}; & $l[-1]",
+    "$l = Write-Output ``${git reset --hard}; & $l[-1]", // Backtick twins of the round 2 rows: the POSIX reading takes the
+    // backtick as a command substitution.
+    "$l = Write-Output a `\n$x=@{git status}; & $l[-1]",
+    "$l = Write-Output a `\n[ordered]@{git status}; & $l[-1]",
+    "$l = Write-Output a `\r\n$x=@{git status}; & $l[-1]",
+    "$l = Write-Output a` @{git status}; & $l[-1]",
+    "$l = Write-Output a`;@{git status}; & $l[-1]",
+    "$l = Write-Output a`,@{git status}; & $l[-1]",
+    "$l = Write-Output a`|@{git status}; & $l[-1]",
+    "$l = Write-Output a`(@{git status}; & $l[-1]",
+    "$l = Write-Output a`)@{git status}; & $l[-1]",
+    "$l = Write-Output a`&@{git status}; & $l[-1]",
+    "$l = Write-Output a`}@{git status}; & $l[-1]",
+    "$l = Write-Output a`\t@{git status}; & $l[-1]",
+    "$l = Write-Output a`{@{git status}; & $l[-1]",
+    "$h = Write-Output a `\n@{a=1}; $h.Count",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
