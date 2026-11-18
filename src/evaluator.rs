@@ -18362,55 +18362,57 @@ fn evaluate_command_in_dialect_union(
     // evaluate the reconstruction with those values spliced in. Running it
     // last keeps every existing denial's rule and span; only a denial (or an
     // incomplete evaluation, which fails closed) is adopted.
-    let view = if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+    let views = if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
         && primary.decision == EvaluationDecision::Allow
         && primary.allowlist_override.is_none()
     {
         // An unfinished view is never proof that the command is safe.
-        // Unknown names are read only in the command as the agent sent it:
-        // a nested payload (an `eval` body, `bash -c`) is judged without the
-        // bindings around it, and this view's own reconstruction is judged
-        // one level down, where its bare rendering must not split again.
-        match posix_proven_variable_view(command, deadline, nested_command_depth == 0) {
-            Ok(view) => view,
+        // Unknown names are read here only in the command as the agent sent
+        // it: this view's own reconstruction is judged one level down, where
+        // its bare rendering must not split again. A shell source nested in
+        // the command (`bash -c`, a heredoc body) is read with the names its
+        // parent binds in the heredoc pass (`evaluate_heredoc`).
+        let unknown_names = (nested_command_depth == 0).then_some("");
+        match posix_proven_variable_view(command, deadline, unknown_names) {
+            Ok(views) => views,
             Err(ProvenViewIncomplete::Budget) => {
                 return EvaluationResult::indeterminate_due_to_budget();
             }
         }
     } else {
-        None
+        Vec::new()
     };
-    let primary = if let Some(expanded) = view
+    let mut primary = primary;
+    if !views.is_empty()
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
-        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
-            &expanded,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
-            compiled_overrides,
-            allowlists,
-            heredoc_settings,
-            allow_once_audit,
-            project_path,
-            deadline,
-            ShellDialect::Posix,
-            nested_command_depth + 1,
-            inherited_automated_stdin,
-        );
-        if result.decision == EvaluationDecision::Allow {
-            primary
-        } else {
-            // The nested span indexes the reconstructed text.
-            if let Some(info) = result.pattern_info.as_mut() {
-                info.matched_span = None;
-                info.matched_text_preview = None;
+        for expanded in &views {
+            let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                expanded,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                allow_once_audit,
+                project_path,
+                deadline,
+                ShellDialect::Posix,
+                nested_command_depth + 1,
+                inherited_automated_stdin,
+            );
+            if result.decision != EvaluationDecision::Allow {
+                // The nested span indexes the reconstructed text.
+                if let Some(info) = result.pattern_info.as_mut() {
+                    info.matched_span = None;
+                    info.matched_text_preview = None;
+                }
+                primary = result;
+                break;
             }
-            result
         }
-    } else {
-        primary
-    };
+    }
 
     // Two PowerShell readings the line's own tokens miss, each judged as a
     // view of the same length (a denial's span still addresses the
@@ -18428,7 +18430,6 @@ fn evaluate_command_in_dialect_union(
     // the `&` spelling belongs to that request (GH#537). A grant for the
     // dot spelling itself is found at the outer entry, after this view
     // denies.
-    let mut primary = primary;
     if matches!(
         shell_dialect,
         ShellDialect::PowerShell | ShellDialect::Unknown
@@ -20655,31 +20656,38 @@ impl IfsValue {
 /// A quoted heredoc body stays as written: the outer shell does not expand
 /// it, and the heredoc analysis judges it as its own script.
 ///
-/// With `unknown_names`, a command name that holds a name the command never
-/// binds is also read the way the shell can run it
-/// ([`posix_unknown_command_word_view`]).
+/// With `unknown_names`, a command name that holds a name neither the
+/// command nor its parent binds is also read the way the shell can run it
+/// ([`posix_unknown_command_word_view`]). The text is the parent shell's
+/// source before this one (`""` for the command as sent): a name it may bind
+/// is the parent's, as one bound earlier in the command is the binding
+/// proof's, and keeps its spelling.
+///
+/// Each returned view is a whole reconstruction, judged on its own (deny
+/// wins): the unknown-name view can need two readings of one word. None is
+/// the command as written.
 ///
 /// Every statement is read; the evaluation deadline bounds the cost, and
 /// `Err` means it passed first: the command is then unchecked.
 fn posix_proven_variable_view(
     command: &str,
     deadline: Option<&Deadline>,
-    unknown_names: bool,
-) -> Result<Option<String>, ProvenViewIncomplete> {
+    unknown_names: Option<&str>,
+) -> Result<Vec<String>, ProvenViewIncomplete> {
     // Every binding source spells `=` (an assignment word) or `printf -v`;
     // IFS holds its default with none. Without one, every reference is
     // unknown and only [`posix_unknown_command_word_view`] can apply.
     if !command.contains('$') || command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let bindings_possible =
         command.contains('=') || command.contains("printf") || command.contains("IFS");
-    if !bindings_possible && !unknown_names {
-        return Ok(None);
+    if !bindings_possible && unknown_names.is_none() {
+        return Ok(Vec::new());
     }
     let ranges = command_segment_ranges(command);
     if ranges.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let _deadline = DenyOnlyDeadlineScope::enter(deadline);
     let quoted_bodies: Vec<Range<usize>> = if command.contains("<<") {
@@ -20691,9 +20699,8 @@ fn posix_proven_variable_view(
     } else {
         Vec::new()
     };
-    let mut out = String::with_capacity(command.len());
-    // (start, end, reconstruction, its command name)
-    let mut spliced: Vec<(usize, usize, String, String)> = Vec::new();
+    // (start, end, its readings: the first, then alternates)
+    let mut spliced: Vec<(usize, usize, Vec<String>)> = Vec::new();
     let mut copied = 0usize;
     // The binding proof reads the same index; it holds each range's nesting.
     let index = deny_only_segment_index(command, &ranges);
@@ -20785,41 +20792,48 @@ fn posix_proven_variable_view(
                 text.push_str(command.get(body_start..body_end).unwrap_or_default());
                 cursor = body_end.max(body_start);
             }
-            changed.then_some(text)
+            changed.then(|| vec![text])
         } else {
             match posix_eval_words(segment) {
                 Some((prefix, arguments)) => resolve_proven_eval_arguments(
                     command, &ranges, start, segment, prefix, &arguments, &ifs,
-                ),
+                )
+                .map(|resolved| vec![resolved]),
                 None => {
                     let resolved = if bindings_possible {
                         resolve(segment)
                     } else {
                         None
                     };
-                    // A name the command never binds is unknown.
-                    unknown_names
-                        .then(|| {
+                    // A name neither the command nor its parent binds is
+                    // unknown.
+                    let readings = unknown_names
+                        .map(|parent| {
                             posix_unknown_command_word_view(
                                 resolved.as_deref().unwrap_or(segment),
                                 &ifs,
                                 |before, name| {
                                     !name.is_empty()
-                                        && (posix_text_may_bind_name(&command[..start], name)
+                                        && ((posix_text_may_bind_name(parent, name)
+                                            && !posix_parent_may_export_name(parent, name))
+                                            || posix_text_may_bind_name(&command[..start], name)
                                             || posix_text_may_bind_name(before, name))
                                 },
                             )
                         })
-                        .flatten()
-                        .or(resolved)
+                        .unwrap_or_default();
+                    if readings.is_empty() {
+                        resolved.map(|resolved| vec![resolved])
+                    } else {
+                        Some(readings)
+                    }
                 }
             }
         };
         let Some(resolved) = resolved else {
             continue;
         };
-        let program = hazard_first_word(&resolved).into_owned();
-        spliced.push((start, end, resolved, program));
+        spliced.push((start, end, resolved));
         copied = end;
     }
     // A proof cut short leaves references as written that may matter.
@@ -20834,22 +20848,82 @@ fn posix_proven_variable_view(
     // (`PATH`, `source`, a removed function) leaves the reconstruction to be
     // judged: this view only adds denials. The state can go back
     // (`unset -f`, `hash -r`), so each use is asked on its own.
-    let mut copied = 0usize;
-    for (start, end, resolved, program) in &spliced {
-        if !program.is_empty()
-            && crate::heredoc::shell_name_proven_shadowed_before(command, *start, program)
-        {
+    //
+    // View `k` takes each segment's reading `k`, or its first when it has
+    // fewer.
+    let count = spliced
+        .iter()
+        .map(|(_, _, readings)| readings.len())
+        .max()
+        .unwrap_or(0);
+    let mut views: Vec<String> = Vec::with_capacity(count);
+    for k in 0..count {
+        let mut out = String::with_capacity(command.len());
+        let mut copied = 0usize;
+        for (start, end, readings) in &spliced {
+            let Some(resolved) = readings.get(k).or_else(|| readings.first()) else {
+                continue;
+            };
+            let program = hazard_first_word(resolved);
+            if !program.is_empty()
+                && crate::heredoc::shell_name_proven_shadowed_before(command, *start, &program)
+            {
+                continue;
+            }
+            out.push_str(&command[copied..*start]);
+            out.push_str(resolved);
+            copied = *end;
+        }
+        if copied == 0 {
             continue;
         }
-        out.push_str(&command[copied..*start]);
-        out.push_str(resolved);
-        copied = *end;
+        out.push_str(&command[copied..]);
+        if out != command && !views.contains(&out) {
+            views.push(out);
+        }
     }
-    if copied == 0 {
-        return Ok(None);
+    Ok(views)
+}
+
+/// Whether the parent shell text before a child shell's source (`parent`,
+/// see [`posix_proven_variable_view`]) may hand `name` to the child in its
+/// environment: an assignment in front of the command that starts the child
+/// (`X=git bash -c …`, `env X=git bash -c …`), an `export`, `declare -x` or
+/// `typeset -x` that names it, or `set -a` / `allexport`. The child then reads
+/// a value the parent set, and the name is unknown to the child's reading,
+/// not the parent's. A plain assignment (`X=' '; bash <<'EOF'`) stays in the
+/// parent.
+fn posix_parent_may_export_name(parent: &str, name: &str) -> bool {
+    if parent.contains("set -a") || parent.contains("allexport") {
+        return true;
     }
-    out.push_str(&command[copied..]);
-    Ok((out != command).then_some(out))
+    let ranges = command_segment_ranges(parent);
+    // The command that starts the child is the segment `parent` ends in:
+    // nothing but blanks follows it.
+    let launcher = ranges.last().and_then(|&(start, end)| {
+        parent
+            .get(end..)
+            .is_some_and(|rest| rest.trim().is_empty())
+            .then(|| parent.get(start..end))
+            .flatten()
+    });
+    if launcher.is_some_and(|launcher| segment_text_may_assign(launcher, name)) {
+        return true;
+    }
+    ranges
+        .iter()
+        .filter_map(|&(start, end)| parent.get(start..end))
+        .any(|segment| {
+            let mut words = strip_command_prefix_reserved_words(segment).split_ascii_whitespace();
+            let exports = match words.next() {
+                Some("export") => true,
+                Some("declare" | "typeset" | "local" | "readonly") => words
+                    .clone()
+                    .any(|word| word.starts_with('-') && word.contains('x')),
+                _ => false,
+            };
+            exports && posix_text_may_bind_name(segment, name)
+        })
 }
 
 /// Upper bound on the words [`posix_unknown_command_word_view`] reads before
@@ -20877,6 +20951,14 @@ const MAX_UNKNOWN_COMMAND_WORD_PREFIX: usize = 32;
 ///   break. A word that mixes quoted and unquoted expansions keeps the
 ///   unquoted reading only.
 ///
+/// A split is not the only way such a word runs: the value may hold no
+/// blank, or be empty, and the fields then stay one word. That word is the
+/// bare spelling with the quotes around its literal text removed
+/// (`'gi'${V}'t'` is `gi${V}t`, Git when `V` is empty), and the packs judge
+/// it as they judge that spelling sent bare. So a word that splits is read
+/// both ways, the split first: the bare spelling is a second reading when it
+/// differs from the word as written.
+///
 /// Literal text must be plain (letters, digits, `/._-+`) so the rendering
 /// cannot change its meaning; anything else (other quoting, escapes,
 /// command substitution, operators inside `${...}`) leaves the word as
@@ -20890,7 +20972,17 @@ fn posix_unknown_command_word_view(
     segment: &str,
     ifs: &str,
     bound: impl Fn(&str, &str) -> bool,
-) -> Option<String> {
+) -> Vec<String> {
+    posix_unknown_command_word_readings(segment, ifs, bound).unwrap_or_default()
+}
+
+/// [`posix_unknown_command_word_view`]; `None` when the word stays as
+/// written.
+fn posix_unknown_command_word_readings(
+    segment: &str,
+    ifs: &str,
+    bound: impl Fn(&str, &str) -> bool,
+) -> Option<Vec<String>> {
     if !segment.contains('$') {
         return None;
     }
@@ -20975,59 +21067,69 @@ fn posix_unknown_command_word_view(
     }
     let any_quoted = parts.iter().any(|(_, kind)| *kind == Some(true));
     let split = !ifs.is_empty() && !any_quoted && literal;
-    let mut rendered = String::with_capacity(raw.len());
-    for (text, kind) in &parts {
-        match kind {
-            Some(false) if split => rendered.push(' '),
-            _ => rendered.push_str(text),
+    let render = |split: bool| -> Option<String> {
+        let mut rendered = String::with_capacity(raw.len());
+        for (text, kind) in &parts {
+            match kind {
+                Some(false) if split => rendered.push(' '),
+                _ => rendered.push_str(text),
+            }
         }
-    }
-    if rendered == raw {
-        return None;
-    }
-    // Unsplit, the program is named by the last path component. When it is
-    // all literal (`"$X/bin/git"`), that name is the reading: the directory
-    // an unknown value supplies cannot change which program the packs judge.
-    let mut program = None;
-    let last_slash = parts
-        .iter()
-        .rposition(|(text, kind)| kind.is_none() && text.contains('/'));
-    if let Some(at) =
-        last_slash.filter(|&at| !split && !parts[at + 1..].iter().any(|(_, kind)| kind.is_some()))
-    {
-        // Literal text after `at` is merged into it, so its last component
-        // is the whole program name.
-        let (_, name) = parts[at].0.rsplit_once('/')?;
-        if name.is_empty() {
+        if rendered == raw {
             return None;
         }
-        rendered = name.to_string();
-        program = Some(name);
-    }
-    // With an inline-code flag after it (`"$SHELL" -lc ...`), the launcher
-    // analysis already judges the quoted spelling, including the flowctl
-    // gate grammar it accepts only for `"$FLOWCTL"` (#538). The bare
-    // spelling would read as a new launcher there.
-    if any_quoted {
-        let mut words: Vec<&str> = vec![rendered.as_str()];
-        words.extend(
-            tokens
-                .iter()
-                .filter(|token| {
-                    token.kind == NormalizeTokenKind::Word && token.byte_range.start >= range.end
-                })
-                .take(MAX_POSIX_EXECUTABLE_FIELDS)
-                .filter_map(|token| token.text(segment)),
-        );
-        if posix_inline_flag_position(program, &words).is_some() {
-            return None;
+        // Unsplit, the program is named by the last path component. When it
+        // is all literal (`"$X/bin/git"`), that name is the reading: the
+        // directory an unknown value supplies cannot change which program
+        // the packs judge.
+        let mut program = None;
+        let last_slash = parts
+            .iter()
+            .rposition(|(text, kind)| kind.is_none() && text.contains('/'));
+        if let Some(at) = last_slash
+            .filter(|&at| !split && !parts[at + 1..].iter().any(|(_, kind)| kind.is_some()))
+        {
+            // Literal text after `at` is merged into it, so its last
+            // component is the whole program name.
+            let (_, name) = parts[at].0.rsplit_once('/')?;
+            if name.is_empty() {
+                return None;
+            }
+            rendered = name.to_string();
+            program = Some(name);
         }
+        // With an inline-code flag after it (`"$SHELL" -lc ...`), the
+        // launcher analysis already judges the quoted spelling, including
+        // the flowctl gate grammar it accepts only for `"$FLOWCTL"` (#538).
+        // The bare spelling would read as a new launcher there.
+        if any_quoted {
+            let mut words: Vec<&str> = vec![rendered.as_str()];
+            words.extend(
+                tokens
+                    .iter()
+                    .filter(|token| {
+                        token.kind == NormalizeTokenKind::Word
+                            && token.byte_range.start >= range.end
+                    })
+                    .take(MAX_POSIX_EXECUTABLE_FIELDS)
+                    .filter_map(|token| token.text(segment)),
+            );
+            if posix_inline_flag_position(program, &words).is_some() {
+                return None;
+            }
+        }
+        let mut out = String::with_capacity(segment.len());
+        out.push_str(&segment[..range.start]);
+        out.push_str(&rendered);
+        out.push_str(&segment[range.end..]);
+        Some(out)
+    };
+    let mut readings = vec![render(split)?];
+    // Unsplit, the fields stay one word: the bare spelling.
+    if split && let Some(bare) = render(false) {
+        readings.push(bare);
     }
-    let mut out = String::with_capacity(segment.len());
-    out.push_str(&segment[..range.start]);
-    out.push_str(&rendered);
-    out.push_str(&segment[range.end..]);
-    Some(out)
+    Some(readings)
 }
 
 /// The variable a reference at the start of `text` reads and its length:
@@ -41244,28 +41346,34 @@ fn evaluate_heredoc(
             } else {
                 Vec::new()
             };
+            // The evaluator reads an unknown variable in a command name
+            // (`"$X" reset --hard`, `'gi'${X}'t' reset --hard`) the way the
+            // shell can run it only in the command as sent
+            // (`posix_proven_variable_view`); this source's own commands are
+            // judged one level down. So read this source's unknown-name view
+            // here, as deny-only whole readings. A name the parent shell may
+            // bind before this source is the parent's (`X=' '; bash <<'EOF'`
+            // with `git${X}reset${X}--hard`: the parent's binding, not an
+            // unknown value) and keeps its spelling.
             // A value the parent shell substituted into this source is
             // spelled `${DCG_POSIX_VALUE}`, inside the child's single quotes
             // `'"${DCG_POSIX_VALUE}"'`
-            // (`heredoc::posix_shell_source_with_outer_values`). The
-            // evaluator reads an unknown variable in a quoted command name
-            // (`"${…}" reset --hard`) only in the command as sent
-            // (`posix_proven_variable_view`), so read this source's view
-            // here, and the source with every such value empty
-            // (`$'gi'"${…}"$'t'` is `git` then). Both are deny-only readings,
-            // only for a source that holds such a value.
-            let has_outer_value = line_dialect == ShellDialect::Posix
-                && content.content.contains(crate::heredoc::POSIX_OUTER_VALUE);
-            let unknown_name_view = if has_outer_value {
-                match posix_proven_variable_view(&content.content, context.deadline, true) {
-                    Ok(view) => view,
+            // (`heredoc::posix_shell_source_with_outer_values`), so it is
+            // such a name too. The source with every such value empty is one
+            // more reading (`$'gi'"${…}"$'t'` is `git` then).
+            let unknown_name_views = if line_dialect == ShellDialect::Posix {
+                let parent = command.get(..content.byte_range.start).unwrap_or(command);
+                match posix_proven_variable_view(&content.content, context.deadline, Some(parent)) {
+                    Ok(views) => views,
                     Err(ProvenViewIncomplete::Budget) => {
                         return Some(EvaluationResult::indeterminate_due_to_budget());
                     }
                 }
             } else {
-                None
+                Vec::new()
             };
+            let has_outer_value = line_dialect == ShellDialect::Posix
+                && content.content.contains(crate::heredoc::POSIX_OUTER_VALUE);
             let empty_outer_values = has_outer_value.then(|| {
                 content
                     .content
@@ -41291,7 +41399,11 @@ fn evaluate_heredoc(
                         .into_iter()
                         .map(|envelope| whole_reading(envelope.dialect, envelope.command)),
                 )
-                .chain(unknown_name_view.map(|view| whole_reading(ShellDialect::Posix, view)))
+                .chain(
+                    unknown_name_views
+                        .into_iter()
+                        .map(|view| whole_reading(ShellDialect::Posix, view)),
+                )
                 .chain(empty_outer_values.map(|text| whole_reading(ShellDialect::Posix, text)));
             for (index, (reading_dialect, inner, alternate_reading)) in readings.enumerate() {
                 if deadline_exceeded(context.deadline) {
@@ -46046,9 +46158,10 @@ mod tests {
             (r#"printf -v X %s t; "gi${X}" reset"#, None),
         ] {
             assert_eq!(
-                posix_proven_variable_view(command, None, true)
+                posix_proven_variable_view(command, None, Some(""))
                     .expect("no deadline")
-                    .as_deref(),
+                    .first()
+                    .map(String::as_str),
                 expected,
                 "{command:?}"
             );
@@ -46138,11 +46251,68 @@ mod tests {
             (r#""a b$X" reset"#, None),
         ] {
             assert_eq!(
-                posix_proven_variable_view(command, None, true)
+                posix_proven_variable_view(command, None, Some(""))
                     .expect("no deadline")
-                    .as_deref(),
+                    .first()
+                    .map(String::as_str),
                 expected,
                 "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_proven_variable_view_reads_glued_unknown_names_split_and_unsplit() {
+        for (command, parent, expected) in [
+            // Quoted literal text around an unknown value: split, then the
+            // bare spelling an empty value leaves.
+            (
+                r"'gi'${V}'t' reset --hard",
+                "",
+                &[r"gi t reset --hard", r"gi${V}t reset --hard"][..],
+            ),
+            (
+                r#""gi"${V}"t" reset --hard"#,
+                "",
+                &[r"gi t reset --hard", r"gi${V}t reset --hard"][..],
+            ),
+            (
+                r"'git'${X}'reset'${X}--hard",
+                "",
+                &[r"git reset --hard", r"git${X}reset${X}--hard"][..],
+            ),
+            // Already bare: the word as written is the unsplit reading.
+            (r"git${X}reset${X}--hard", "", &[r"git reset --hard"][..]),
+            // No split with an empty IFS: the bare spelling only.
+            (
+                r"IFS=; 'gi'${V}'t' reset --hard",
+                "",
+                &[r"IFS=; gi${V}t reset --hard"][..],
+            ),
+            // A name the parent shell may bind is the parent's.
+            (r"git${X}reset${X}--hard", "X=' '; bash <<'EOF'\n", &[][..]),
+            (r#""$X" reset --hard"#, "X=git; bash -c ", &[][..]),
+            // One it hands the child is not.
+            (
+                r#""$X" reset --hard"#,
+                "X=git bash -c ",
+                &[r"$X reset --hard"][..],
+            ),
+            (
+                r#""$X" reset --hard"#,
+                "export X=git; bash -c ",
+                &[r"$X reset --hard"][..],
+            ),
+            (
+                r#""$X" reset --hard"#,
+                "bash -c ",
+                &[r"$X reset --hard"][..],
+            ),
+        ] {
+            assert_eq!(
+                posix_proven_variable_view(command, None, Some(parent)).expect("no deadline"),
+                expected,
+                "{command:?} after {parent:?}"
             );
         }
     }
