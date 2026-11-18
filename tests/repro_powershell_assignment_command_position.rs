@@ -1,12 +1,19 @@
-//! PowerShell runs the command on the right of an assignment that starts a
-//! statement: `$c=iex 'git reset --hard'` runs the reset just as
-//! `$c = iex 'git reset --hard'` does (pwsh 7.5 measured in the sandbox for
-//! every RUNS_IT row; Windows PowerShell 5.1 parses assignments the same way).
-//! dcg's PowerShell tokenizer kept `$c=iex` as one word, so the command word
-//! glued to `$c=` was never in command position, and the readers that take a
-//! statement's first word as its command (aliases, functions, script-block
-//! consumers, `iex`) skipped even the spaced `$c = icm {…}`. Both readings now
-//! judge the value of a statement-leading assignment as a command.
+//! PowerShell runs the command on the right of an assignment: `$c=iex 'git
+//! reset --hard'` runs the reset just as `$c = iex 'git reset --hard'` does
+//! (pwsh 7.5 measured in the sandbox for every RUNS_IT row; Windows PowerShell
+//! 5.1 parses assignments the same way). dcg's PowerShell tokenizer kept
+//! `$c=iex` as one word, so the command word glued to `$c=` was never in
+//! command position, and the readers that take a statement's first word as
+//! its command (aliases, functions, script-block consumers, `iex`) skipped
+//! even the spaced `$c = icm {…}`.
+//!
+//! The deny-only PowerShell view now puts blanks around every glued
+//! assignment operator after a target, wherever the word stands, so a glued
+//! spelling gets the verdict of its spaced twin. The readers judge the
+//! position, as they already did for the spaced spelling. That includes the
+//! spaced spelling's over-denials: `Write-Output $c=iex 'git reset --hard'`
+//! now denies, as `Write-Output $c = iex '…'` already did, although
+//! PowerShell only prints it.
 
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
@@ -84,16 +91,50 @@ const RUNS_IT: &[&str] = &[
     "$c = Set-Alias x iex; x 'git reset --hard'",
     "sal x iex; $r=x 'git reset --hard'",
     "function f { git reset --hard }; $r=f",
+    // Wherever the assignment stands: after `&`, and as the pipeline of
+    // `return`, `throw` or `exit`.
+    "Get-Date & $c=iex 'git reset --hard'",
+    "Get-Date & $c+=iex 'git reset --hard'",
+    "return $c=iex 'git reset --hard'",
+    "throw $c=iex 'git reset --hard'",
+    "exit $c=iex 'git reset --hard'",
+    // Every hashtable key, not only the first.
+    "@{a=1;b=iex 'git reset --hard'}",
+    "$h=@{a=1;b=iex 'git reset --hard'}",
+    "@{a=1\nb=iex 'git reset --hard'\n}",
+    "@{ a = 1; 'b'=iex 'git reset --hard'}",
+    "@{a=@{x=1};b=iex 'git reset --hard'}",
+    // Unicode names, quoted and dynamic members, expression targets.
+    "$c\u{e9}=iex 'git reset --hard'",
+    "$\u{3a9}=iex 'git reset --hard'",
+    "$c=@{}; $c.'p'=iex 'git reset --hard'",
+    "$c=@{}; $c.\"p\"=iex 'git reset --hard'",
+    "$c=@{}; $c.$('p')=iex 'git reset --hard'",
+    "$c=@{}; $c.$('p') =iex 'git reset --hard'",
+    "$c=@{}; $n='p'; $c.$n=iex 'git reset --hard'",
+    "$c=@(1); $c[(0)]=iex 'git reset --hard'",
+    "$o=[pscustomobject]@{p=1}; ($o).p=iex 'git reset --hard'",
+    // PowerShell reads U+2013, U+2014 and U+2015 as `-`.
+    "$c=1; $c\u{2013}=iex 'git reset --hard'",
+    "$c=1; $c\u{2014}=iex 'git reset --hard'",
+    "$c=1; $c\u{2015}=iex 'git reset --hard'",
 ];
 
 /// pwsh 7.5 runs no `git reset --hard` for any of these (sandboxed).
 const HARMLESS: &[&str] = &[
-    // The same shapes with a harmless value, data, or a word PowerShell reads
-    // as an argument (`Write-Output $c=iex`).
+    // The same shapes with a harmless value or data.
     "$c=iex 'git status'",
     "$c=iex 'git log -1'",
-    "Write-Output $c=iex 'git reset --hard'",
     "git commit -m $c=iex",
+    "Get-Date & $c=git status",
+    "return $c=git status",
+    "$c\u{e9}=git status",
+    "$c\u{e9} = git status",
+    "@{a=1;b=git status}",
+    "@{a=1\nb=git status\n}",
+    "$c=@{}; $c.'p'=git status",
+    "$c=@{}; $c.$('p')=git status",
+    "$c=1; $c\u{2013}=1",
     "$c=1; git status",
     "$c=$true",
     "$c=Get-Date",
