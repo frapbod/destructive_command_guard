@@ -10,8 +10,13 @@
 //!     `Clear-RecycleBin` (purges the Recycle Bin so deletes become unrecoverable),
 //!     and the .NET filesystem APIs PowerShell can call with no external tool:
 //!     `[System.IO.Directory]::Delete($path, $true)` (also the `[IO.Directory]`
-//!     accelerator spelling) and `<DirectoryInfo>.Delete($true)`, both of which
-//!     are the API equivalent of `Remove-Item -Recurse -Force`.
+//!     accelerator and the `using namespace System.IO` `[Directory]` spellings),
+//!     `<DirectoryInfo>.Delete($true)` and Visual Basic's
+//!     `[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($path,
+//!     'DeleteAllContents')`, each the API equivalent of
+//!     `Remove-Item -Recurse -Force`. Their one-file counterparts
+//!     (`[IO.File]::Delete`, `<FileInfo>.Delete()`, `DeleteFile`) are judged
+//!     like `Remove-Item <file>`, which this pack allows.
 //!
 //! Whitelist-first: PowerShell `-WhatIf` previews on cmdlets that actually honor
 //! it are allowed. Recursive temp cleanup is intentionally reviewed: ambient
@@ -229,11 +234,12 @@ const POWERSHELL_PROTECTED_EXECUTABLES: &[&str] = &[
 ];
 
 /// `[System.IO.Directory]::Delete($path, $true)` (or the `[IO.Directory]`
-/// accelerator spelling) with a literally-true second argument, anchored to the
-/// start of a word token by the semantic caller. PowerShell type literals are
+/// accelerator spelling, or `[Directory]` after `using namespace System.IO`)
+/// with a literally-true second argument, anchored to the start of a word
+/// token by the semantic caller. PowerShell type literals are
 /// case-insensitive and tolerate whitespace around `[`, `]`, and `::`.
 static DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION: LazyCompiledRegex = LazyCompiledRegex::new(
-    r#"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
+    r#"(?i)^\[\s*(?:(?:system\.)?io\.)?directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
 );
 
 /// Any `[System.IO.Directory]::Delete(...)` call, anchored to a word start.
@@ -242,14 +248,26 @@ static DOTNET_DIRECTORY_DELETE_RECURSIVE_EXPRESSION: LazyCompiledRegex = LazyCom
 /// (including every non-empty string) to `$true`, so an unresolved flag must
 /// still be reviewed.
 static DOTNET_DIRECTORY_DELETE_EXPRESSION: LazyCompiledRegex =
-    LazyCompiledRegex::new(r"(?i)^\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\(");
+    LazyCompiledRegex::new(r"(?i)^\[\s*(?:(?:system\.)?io\.)?directory\s*\]\s*::\s*delete\s*\(");
+
+/// Visual Basic's `[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory`
+/// (or `[FileSystem]` after `using namespace Microsoft.VisualBasic.FileIO`),
+/// anchored to a word start. PowerShell 7.5 loads the assembly on first use, and
+/// `DeleteDirectory($path, 'DeleteAllContents')` removes the whole tree; the
+/// `ThrowIfDirectoryNonEmpty` form still removes an empty directory, which this
+/// pack reviews as it does `[IO.Directory]::Delete($path)`.
+static VB_DELETE_DIRECTORY_EXPRESSION: LazyCompiledRegex = LazyCompiledRegex::new(
+    r"(?i)^\[\s*(?:(?:microsoft\.)?visualbasic\.)?(?:fileio\.)?filesystem\s*\]\s*::\s*deletedirectory\s*\(",
+);
 
 /// `<DirectoryInfo>.Delete($true)` instance-method spelling, for example
 /// `(Get-Item $path).Delete($true)` or a `[System.IO.DirectoryInfo]` variable.
-/// `$true` is required so that unrelated `.delete(...)` member calls in inline
-/// scripts of other languages do not match.
+/// The flag is one of the literal true spellings the static rule takes
+/// (`$true`, `1`, `'true'`, `"true"`; pwsh 7.5 recursed on each), so that
+/// unrelated `.delete(...)` member calls in inline scripts of other languages
+/// do not match.
 static DIRECTORYINFO_DELETE_RECURSIVE_MEMBER: LazyCompiledRegex =
-    LazyCompiledRegex::new(r"(?i)\.\s*delete\s*\(\s*\$true\s*\)");
+    LazyCompiledRegex::new(r#"(?i)\.\s*delete\s*\(\s*(?:\$true|1|"true"|'true')\s*\)"#);
 
 fn syntax_is_incomplete(raw: &str, dialect: ShellDialect) -> bool {
     let mut chars = raw.chars().peekable();
@@ -1091,7 +1109,8 @@ fn mask_powershell_comments_and_here_strings(command: &str) -> Cow<'_, str> {
 /// Detect a .NET directory-delete expression in an executable position within
 /// one PowerShell segment.
 ///
-/// `[System.IO.Directory]::Delete($path, $true)` and
+/// `[System.IO.Directory]::Delete($path, $true)`,
+/// `[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(…)` and
 /// `<DirectoryInfo>.Delete($true)` execute without any external tool, so the
 /// cmdlet-oriented executable analysis above never sees them. The scan starts
 /// only at word tokens that are not wholly quoted: a quoted string in an
@@ -1151,6 +1170,12 @@ fn powershell_dotnet_directory_delete_rule(
             let absolute = token.byte_range.start.saturating_add(match_start);
             if !inert_ranges.iter().any(|range| range.contains(&absolute)) {
                 return Some("dotnet-directory-delete");
+            }
+        }
+        if let Some((match_start, _)) = VB_DELETE_DIRECTORY_EXPRESSION.find(tail) {
+            let absolute = token.byte_range.start.saturating_add(match_start);
+            if !inert_ranges.iter().any(|range| range.contains(&absolute)) {
+                return Some("vb-delete-directory");
             }
         }
         if let Some((match_start, _)) = DIRECTORYINFO_DELETE_RECURSIVE_MEMBER.find(tail) {
@@ -1930,17 +1955,20 @@ fn contains_powershell_protected_word_case_insensitive(command: &str) -> bool {
 /// Case-insensitive candidate check for the .NET directory-delete surface.
 ///
 /// PowerShell type literals resolve case-insensitively while the shared
-/// keyword index is case-sensitive. `[System.IO.Directory]::Delete` and
-/// `[System.IO.DirectoryInfo]` both split into a bare `directory` /
-/// `directoryinfo` word here; the bounded semantic parser still decides
-/// whether the word actually occupies an executable expression.
+/// keyword index is case-sensitive. `[System.IO.Directory]::Delete`,
+/// `[System.IO.DirectoryInfo]` and Visual Basic's `FileSystem]::DeleteDirectory`
+/// split into a bare `directory` / `directoryinfo` / `deletedirectory` word
+/// here; the bounded semantic parser still decides whether the word actually
+/// occupies an executable expression.
 fn contains_dotnet_directory_word_case_insensitive(command: &str) -> bool {
     command
         .split(|character: char| {
             !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
         })
         .any(|word| {
-            word.eq_ignore_ascii_case("directory") || word.eq_ignore_ascii_case("directoryinfo")
+            ["directory", "directoryinfo", "deletedirectory"]
+                .iter()
+                .any(|candidate| word.eq_ignore_ascii_case(candidate))
         })
 }
 
@@ -2182,8 +2210,9 @@ pub fn create_pack() -> Pack {
                       `del /s`, `rd /s`, `format <drive>:`, PowerShell `Remove-Item -Recurse \
                       (with or without `-Force`; aliases included), `Clear-Content`, \
                       `Clear-RecycleBin`, and the .NET recursive-delete APIs \
-                      `[System.IO.Directory]::Delete($path, $true)` and \
-                      `<DirectoryInfo>.Delete($true)`.",
+                      `[System.IO.Directory]::Delete($path, $true)`, \
+                      `<DirectoryInfo>.Delete($true)` and Visual Basic's \
+                      `FileSystem.DeleteDirectory`.",
         // Conventional casings retained for readable metadata (see the
         // super-module docs); quick-rejection itself is ASCII
         // case-insensitive. Aliases (rm/ri/clc) remain explicit because they
@@ -2226,6 +2255,10 @@ pub fn create_pack() -> Pack {
             ".Delete(",
             ".delete(",
             ".DELETE(",
+            // Visual Basic's FileSystem.DeleteDirectory.
+            "DeleteDirectory",
+            "deletedirectory",
+            "DELETEDIRECTORY",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -2378,7 +2411,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // recursive call reports the more specific id and severity.
         destructive_pattern!(
             "dotnet-directory-delete-recursive",
-            r#"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
+            r#"(?i)\[\s*(?:(?:system\.)?io\.)?directory\s*\]\s*::\s*delete\s*\((?=[^|&\r\n]*?,\s*(?:\$true|1|"true"|'true')\s*\))"#,
             "[System.IO.Directory]::Delete with a true recursive flag deletes an entire directory tree.",
             Critical,
             "`[System.IO.Directory]::Delete($path, $true)` (or the `[IO.Directory]` accelerator \
@@ -2394,7 +2427,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === .NET: [System.IO.Directory]::Delete(...) — any other call ===
         destructive_pattern!(
             "dotnet-directory-delete",
-            r"(?i)\[\s*(?:system\.)?io\.directory\s*\]\s*::\s*delete\s*\(",
+            r"(?i)\[\s*(?:(?:system\.)?io\.)?directory\s*\]\s*::\s*delete\s*\(",
             "[System.IO.Directory]::Delete removes a directory outside the Recycle Bin.",
             High,
             "`[System.IO.Directory]::Delete` permanently removes the target directory. With a \
@@ -2409,13 +2442,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === .NET: <DirectoryInfo>.Delete($true) instance-method spelling ===
         destructive_pattern!(
             "directoryinfo-delete-recursive",
-            r"(?i)\.\s*delete\s*\(\s*\$true\s*\)",
+            r#"(?i)\.\s*delete\s*\(\s*(?:\$true|1|"true"|'true')\s*\)"#,
             ".Delete($true) on a DirectoryInfo object recursively deletes the directory tree.",
             Critical,
             "`<DirectoryInfo>.Delete($true)` — for example `(Get-Item $path).Delete($true)` or a \
              `[System.IO.DirectoryInfo]` variable — recursively deletes the directory and all of \
              its contents, bypassing the Recycle Bin exactly like \
              `[System.IO.Directory]::Delete($path, $true)`.\n\n\
+             Safer alternatives:\n\
+             - Preview with the cmdlet equivalent: Remove-Item -Recurse <path> -WhatIf\n\
+             - Move the directory to a temp/trash location instead of deleting it",
+            DOTNET_DELETE_SUGGESTIONS
+        ),
+        // === Visual Basic: FileSystem.DeleteDirectory ===
+        destructive_pattern!(
+            "vb-delete-directory",
+            r"(?i)\[\s*(?:(?:microsoft\.)?visualbasic\.)?(?:fileio\.)?filesystem\s*\]\s*::\s*deletedirectory\s*\(",
+            "Visual Basic FileSystem.DeleteDirectory removes a directory; with DeleteAllContents, its whole tree.",
+            Critical,
+            "`[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($path, 'DeleteAllContents')` \
+             is another .NET equivalent of `Remove-Item -Recurse -Force`: PowerShell loads the \
+             Visual Basic assembly on first use, and the call removes the directory and \
+             everything under it with no external tool. The `ThrowIfDirectoryNonEmpty` form \
+             still removes an empty directory, and the Windows-only dialog overloads are \
+             judged the same way.\n\n\
              Safer alternatives:\n\
              - Preview with the cmdlet equivalent: Remove-Item -Recurse <path> -WhatIf\n\
              - Move the directory to a temp/trash location instead of deleting it",
@@ -2515,6 +2565,8 @@ mod tests {
             r#"[System.IO.Directory]::Delete($root, "true")"#,
             r"[ System.IO.Directory ] :: Delete ($repo, $true)",
             r"[System.IO.Directory]::Delete((Join-Path $root 'sub'), $true)",
+            // After `using namespace System.IO`.
+            r"[Directory]::Delete($path, $true)",
         ];
         for command in checks {
             assert_blocks_with_pattern(&pack, command, "dotnet-directory-delete-recursive");
@@ -2544,10 +2596,36 @@ mod tests {
             r"(Get-Item 'C:\tmp\scratch').Delete($true)",
             r"([System.IO.DirectoryInfo]'C:\src').Delete($true)",
             r"(New-Object System.IO.DirectoryInfo 'C:\src').Delete( $true )",
+            // pwsh 7.5 recursed on each literal true spelling.
+            r"(Get-Item C:\src).Delete(1)",
+            r"(Get-Item C:\src).Delete('true')",
+            r#"$dir.Delete("true")"#,
         ];
         for command in checks {
             assert_blocks_with_pattern(&pack, command, "directoryinfo-delete-recursive");
             assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn blocks_vb_delete_directory() {
+        let pack = create_pack();
+        for command in [
+            r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\src', 'DeleteAllContents')",
+            r"[microsoft.visualbasic.fileio.filesystem]::deletedirectory($p, 'deleteallcontents')",
+            r"[FileSystem]::DeleteDirectory($p, [Microsoft.VisualBasic.FileIO.DeleteDirectoryOption]::DeleteAllContents)",
+            r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, 'ThrowIfDirectoryNonEmpty')",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "vb-delete-directory");
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+        for command in [
+            r"[Microsoft.VisualBasic.FileIO.FileSystem]::CopyDirectory('a', 'b')",
+            r"[Microsoft.VisualBasic.FileIO.FileSystem]::DirectoryExists('a')",
+            // One file, judged like `Remove-Item <file>`.
+            r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('a.txt')",
+        ] {
+            assert_no_match(&pack, command);
         }
     }
 
@@ -2584,6 +2662,18 @@ mod tests {
             (
                 r"(Get-Item 'C:\tmp\scratch').Delete($true)",
                 "directoryinfo-delete-recursive",
+            ),
+            (
+                r"(Get-Item C:\src).Delete(1)",
+                "directoryinfo-delete-recursive",
+            ),
+            (
+                r"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('C:\src', 'DeleteAllContents')",
+                "vb-delete-directory",
+            ),
+            (
+                "using namespace System.IO\n[Directory]::Delete('C:\\src', $true)",
+                "dotnet-directory-delete-recursive",
             ),
         ];
         for (command, expected) in destructive {

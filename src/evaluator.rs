@@ -14892,31 +14892,53 @@ fn powershell_block_exposes_pack_keyword(
     command: &str,
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
 ) -> bool {
-    fn at_depth(
-        command: &str,
-        keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
-        depth: usize,
-    ) -> bool {
-        if !command.contains('{') {
-            return false;
-        }
-        // Past the depth the PowerShell reading fails closed; so does this gate.
-        if depth > MAX_EMBEDDED_SHELL_DEPTH {
-            return true;
-        }
-        let Ok(bodies) = powershell_script_block_bodies(command) else {
-            return false;
-        };
-        bodies.into_iter().any(|body| {
-            keyword_index.is_none_or(|index| {
-                index.has_any_keyword(
-                    crate::normalize::normalize_command_in_dialect(body, ShellDialect::PowerShell)
-                        .as_ref(),
-                )
-            }) || at_depth(body, keyword_index, depth + 1)
+    powershell_block_body_matches(command, 0, &|body| {
+        keyword_index.is_none_or(|index| {
+            index.has_any_keyword(
+                crate::normalize::normalize_command_in_dialect(body, ShellDialect::PowerShell)
+                    .as_ref(),
+            )
         })
+    })
+}
+
+/// Whether a PowerShell script block in `command` would select a pack once
+/// its body is read as PowerShell: by a keyword, or by a pack's semantic
+/// pre-scan. `Remove-Item` is in no keyword row when the `windows.*` packs are
+/// off; `core.filesystem` reaches it through its pre-scan, so
+/// `1 | ForEach-Object { Remove-Item -Recurse -Force C:\Users }` was allowed in
+/// the Unknown reading while the bare statement was denied.
+fn powershell_block_selects_pack(
+    command: &str,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    ordered_packs: &[String],
+) -> bool {
+    powershell_block_exposes_pack_keyword(command, keyword_index)
+        || powershell_block_body_matches(command, 0, &|body| {
+            SemanticPackSelection::new(body, ShellDialect::PowerShell, ordered_packs).any()
+        })
+}
+
+/// Whether `matches` holds for the body of a script block in `command`, or of
+/// a block nested in one, up to the embedded-shell depth.
+fn powershell_block_body_matches(
+    command: &str,
+    depth: usize,
+    matches: &dyn Fn(&str) -> bool,
+) -> bool {
+    if !command.contains('{') {
+        return false;
     }
-    at_depth(command, keyword_index, 0)
+    // Past the depth the PowerShell reading fails closed; so does this gate.
+    if depth > MAX_EMBEDDED_SHELL_DEPTH {
+        return true;
+    }
+    let Ok(bodies) = powershell_script_block_bodies(command) else {
+        return false;
+    };
+    bodies
+        .into_iter()
+        .any(|body| matches(body) || powershell_block_body_matches(body, depth + 1, matches))
 }
 
 /// Whether `view`'s own decode of `command` reveals an enabled-pack keyword
@@ -15770,7 +15792,7 @@ fn evaluate_command_in_dialect_union(
     // the POSIX reading does.
     let block_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
     let block_view = block_view.as_ref();
-    if powershell_block_exposes_pack_keyword(block_view, keyword_index)
+    if powershell_block_selects_pack(block_view, keyword_index, ordered_packs)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
         for pass in [
@@ -16365,46 +16387,7 @@ fn evaluate_command_in_single_dialect_view(
     // not discard it before semantic evaluation.
     let sed_shell_sources = collect_sed_shell_sources(command, project_path);
     let tar_helper_sources = collect_tar_helper_sources(command, shell_dialect);
-    let force_core_git = dialect_may_hide_core_git(command, shell_dialect, ordered_packs);
-    let force_core_filesystem = ordered_packs
-        .iter()
-        .any(|pack_id| pack_id == "core.filesystem")
-        && crate::packs::core::filesystem::filesystem_semantic_scan_required(
-            command,
-            shell_dialect,
-        );
-    let force_cloudflare_workers = ordered_packs
-        .iter()
-        .any(|pack_id| pack_id == "cdn.cloudflare_workers")
-        && crate::packs::cdn::cloudflare_workers::cloudflare_workers_semantic_scan_required(
-            command,
-            shell_dialect,
-        );
-    let force_snowflake = ordered_packs
-        .iter()
-        .any(|pack_id| pack_id == "database.snowflake")
-        && crate::packs::database::snowflake::snowflake_semantic_scan_required(
-            command,
-            shell_dialect,
-        );
-    let force_literal_database_packs = literal_substitution_database_packs(command, shell_dialect);
-    let force_windows_filesystem = ordered_packs
-        .iter()
-        .any(|pack_id| pack_id == "windows.filesystem")
-        && crate::packs::windows::filesystem::windows_filesystem_semantic_scan_required(
-            command,
-            shell_dialect,
-        );
-    let force_scp_semantics = ordered_packs.iter().any(|pack_id| {
-        matches!(
-            pack_id.as_str(),
-            "remote.scp" | "careful_company_running_windows.transfer"
-        )
-    })
-        && crate::packs::careful_company_running_windows::transfer::scp_semantic_scan_required(
-            command,
-            shell_dialect,
-        );
+    let semantic_selection = SemanticPackSelection::new(command, shell_dialect, ordered_packs);
 
     // Step 4: Quick rejection - if no relevant keywords, allow immediately.
     //
@@ -16431,13 +16414,7 @@ fn evaluate_command_in_single_dialect_view(
                 .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
             && !index.has_any_keyword(gating_command.as_ref())
             && !contains_shell_word_obfuscation(command, shell_dialect)
-            && !force_core_git
-            && !force_core_filesystem
-            && !force_cloudflare_workers
-            && !force_snowflake
-            && force_literal_database_packs.is_empty()
-            && !force_windows_filesystem
-            && !force_scp_semantics
+            && !semantic_selection.any()
             && !external_pack_needs_identity_selection(
                 gating_command.as_ref(),
                 shell_dialect,
@@ -16451,13 +16428,7 @@ fn evaluate_command_in_single_dialect_view(
         }
     } else if sed_shell_sources.is_empty()
         && tar_helper_sources.is_empty()
-        && !force_core_git
-        && !force_core_filesystem
-        && !force_cloudflare_workers
-        && !force_snowflake
-        && force_literal_database_packs.is_empty()
-        && !force_windows_filesystem
-        && !force_scp_semantics
+        && !semantic_selection.any()
         && {
             let _phase = phase(ProfilePhase::Normalization);
             pack_aware_quick_reject(
@@ -16590,13 +16561,7 @@ fn evaluate_command_in_single_dialect_view(
     if sed_shell_sources.is_empty()
         && tar_helper_sources.is_empty()
         && quick_reject
-        && !force_core_git
-        && !force_core_filesystem
-        && !force_cloudflare_workers
-        && !force_snowflake
-        && force_literal_database_packs.is_empty()
-        && !force_windows_filesystem
-        && !force_scp_semantics
+        && !semantic_selection.any()
         && !should_check_original_control_plane_payload_for_any_pack(
             command_for_match,
             command,
@@ -17544,6 +17509,73 @@ fn dynamic_substitution_database_packs(command: &str) -> Vec<&'static str> {
         }
     }
     packs
+}
+
+/// Packs whose semantic pre-scan selects them for `command` in `dialect`,
+/// although the command may spell none of their keywords (a decoded word,
+/// a cmdlet spelling, a .NET call). Quick rejection, pack selection and the
+/// Unknown reading's script-block gate ask this one question.
+struct SemanticPackSelection {
+    core_git: bool,
+    core_filesystem: bool,
+    windows_filesystem: bool,
+    cloudflare_workers: bool,
+    snowflake: bool,
+    scp: bool,
+    literal_database_packs: Vec<&'static str>,
+}
+
+impl SemanticPackSelection {
+    fn new(command: &str, dialect: ShellDialect, ordered_packs: &[String]) -> Self {
+        let enabled = |id: &str| ordered_packs.iter().any(|pack_id| pack_id == id);
+        Self {
+            core_git: dialect_may_hide_core_git(command, dialect, ordered_packs),
+            core_filesystem: enabled("core.filesystem")
+                && crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    command, dialect,
+                ),
+            windows_filesystem: enabled("windows.filesystem")
+                && crate::packs::windows::filesystem::windows_filesystem_semantic_scan_required(
+                    command, dialect,
+                ),
+            cloudflare_workers: enabled("cdn.cloudflare_workers")
+                && crate::packs::cdn::cloudflare_workers::cloudflare_workers_semantic_scan_required(
+                    command, dialect,
+                ),
+            snowflake: enabled("database.snowflake")
+                && crate::packs::database::snowflake::snowflake_semantic_scan_required(
+                    command, dialect,
+                ),
+            scp: (enabled("remote.scp") || enabled("careful_company_running_windows.transfer"))
+                && crate::packs::careful_company_running_windows::transfer::scp_semantic_scan_required(
+                    command, dialect,
+                ),
+            literal_database_packs: literal_substitution_database_packs(command, dialect),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.core_git
+            || self.core_filesystem
+            || self.windows_filesystem
+            || self.cloudflare_workers
+            || self.snowflake
+            || self.scp
+            || !self.literal_database_packs.is_empty()
+    }
+
+    fn selects(&self, pack_id: &str) -> bool {
+        self.literal_database_packs.contains(&pack_id)
+            || match pack_id {
+                "core.git" => self.core_git,
+                "core.filesystem" => self.core_filesystem,
+                "windows.filesystem" => self.windows_filesystem,
+                "cdn.cloudflare_workers" => self.cloudflare_workers,
+                "database.snowflake" => self.snowflake,
+                "remote.scp" | "careful_company_running_windows.transfer" => self.scp,
+                _ => false,
+            }
+    }
 }
 
 fn literal_substitution_database_packs(
@@ -27349,48 +27381,8 @@ fn evaluate_packs_with_allowlists_at_depth(
     // command is the authoritative place to decide whether dialect decoding
     // may reveal a Git invocation; using the normalized view here would let
     // the no-index path discard `core.git` before its semantic decoder runs.
-    let force_core_git = dialect_may_hide_core_git(original_command, shell_dialect, ordered_packs);
-    let force_core_filesystem = ordered_packs
-        .iter()
-        .any(|pack_id| pack_id == "core.filesystem")
-        && crate::packs::core::filesystem::filesystem_semantic_scan_required(
-            original_command,
-            shell_dialect,
-        );
-
-    let force_windows_filesystem = ordered_packs
-        .iter()
-        .any(|pack_id| pack_id == "windows.filesystem")
-        && crate::packs::windows::filesystem::windows_filesystem_semantic_scan_required(
-            original_command,
-            shell_dialect,
-        );
-    let force_cloudflare_workers = ordered_packs
-        .iter()
-        .any(|pack_id| pack_id == "cdn.cloudflare_workers")
-        && crate::packs::cdn::cloudflare_workers::cloudflare_workers_semantic_scan_required(
-            original_command,
-            shell_dialect,
-        );
-    let force_snowflake = ordered_packs
-        .iter()
-        .any(|pack_id| pack_id == "database.snowflake")
-        && crate::packs::database::snowflake::snowflake_semantic_scan_required(
-            original_command,
-            shell_dialect,
-        );
-    let force_scp_semantics = ordered_packs.iter().any(|pack_id| {
-        matches!(
-            pack_id.as_str(),
-            "remote.scp" | "careful_company_running_windows.transfer"
-        )
-    })
-        && crate::packs::careful_company_running_windows::transfer::scp_semantic_scan_required(
-            original_command,
-            shell_dialect,
-        );
-    let force_literal_database_packs =
-        literal_substitution_database_packs(original_command, shell_dialect);
+    let semantic_selection =
+        SemanticPackSelection::new(original_command, shell_dialect, ordered_packs);
     // Inert redirections select no pack (#571); rules still match the text.
     let gating_command = inert_redirection_gating_view(command_for_packs, shell_dialect);
     let gating_command = gating_command.as_ref();
@@ -27418,17 +27410,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     if let Some(entry) = REGISTRY.get_entry(pack_id) {
                         return entry.might_match(gating_command)
                             && (pack_id != "core.filesystem" || core_filesystem_keyword_candidate)
-                            || force_core_git && pack_id == "core.git"
-                            || force_core_filesystem && pack_id == "core.filesystem"
-                            || force_cloudflare_workers && pack_id == "cdn.cloudflare_workers"
-                            || force_snowflake && pack_id == "database.snowflake"
-                            || force_scp_semantics
-                                && matches!(
-                                    pack_id.as_str(),
-                                    "remote.scp" | "careful_company_running_windows.transfer"
-                                )
-                            || force_literal_database_packs.contains(&pack_id.as_str())
-                            || force_windows_filesystem && pack_id == "windows.filesystem"
+                            || semantic_selection.selects(pack_id)
                             || should_check_original_control_plane_payload(
                                 pack_id,
                                 command_for_packs,
@@ -27460,17 +27442,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     let indexed_keyword_candidate = (mask >> i) & 1 != 0
                         && (pack_id != "core.filesystem" || core_filesystem_keyword_candidate);
                     if !(indexed_keyword_candidate
-                        || force_core_git && pack_id == "core.git"
-                        || force_core_filesystem && pack_id == "core.filesystem"
-                        || force_cloudflare_workers && pack_id == "cdn.cloudflare_workers"
-                        || force_snowflake && pack_id == "database.snowflake"
-                        || force_scp_semantics
-                            && matches!(
-                                pack_id.as_str(),
-                                "remote.scp" | "careful_company_running_windows.transfer"
-                            )
-                        || force_literal_database_packs.contains(&pack_id.as_str())
-                        || force_windows_filesystem && pack_id == "windows.filesystem"
+                        || semantic_selection.selects(pack_id)
                         || should_check_original_control_plane_payload(
                             pack_id,
                             command_for_packs,
