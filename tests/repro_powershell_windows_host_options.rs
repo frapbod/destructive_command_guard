@@ -388,3 +388,112 @@ fn posix_dialect_reads_windows_powershell_switches() {
         );
     }
 }
+
+/// pwsh's own switch list (`core_powershell_switch` in src/evaluator.rs,
+/// from `CommandLineParameterParser.ParseHelper` at v7.5.4 to v7.7.0): its
+/// short aliases (`-wd`, `-ep`, `-ec`, `-of`, `-if`, `-cwa`) and minimum
+/// abbreviations, first match wins. pwsh reads each after `/` as well and
+/// keeps parsing, so the later -Command runs. dcg read an unknown `/name` as
+/// the script path and judged nothing after it. Measured with pwsh 7.5.0 in
+/// the sandbox: `/wd .`, `/ep Bypass`, `/ex Bypass`, `/of text`, `/if text`,
+/// `/inp text`, `/in`, `/cus x`, `/noe`, `/l` before `-c 'git reset --hard'`,
+/// and `/cwa 'git reset --hard'`, `/ec <base64>`, `/e <base64>`, each ran
+/// `git reset --hard`.
+const PWSH_RUNS_IT: &[&str] = &[
+    "pwsh /wd x -c \"git reset --hard\"",
+    "pwsh -NoProfile /wd . -c \"git reset --hard\"",
+    "pwsh /wo x -c \"git reset --hard\"",
+    "pwsh /ep Bypass -c \"git reset --hard\"",
+    "pwsh /ex Bypass -c \"git reset --hard\"",
+    "pwsh /ec ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=",
+    "pwsh -NoProfile /e ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=",
+    "pwsh /of text -c \"git reset --hard\"",
+    "pwsh /if text -c \"git reset --hard\"",
+    "pwsh /inp text -c \"git reset --hard\"",
+    "pwsh /in -c \"git reset --hard\"",
+    "pwsh /cus x -c \"git reset --hard\"",
+    "pwsh /config x -c \"git reset --hard\"",
+    "pwsh /settings s.json -c \"git reset --hard\"",
+    "pwsh /noe /l /noprofileloadtime -c \"git reset --hard\"",
+    "pwsh -NoP -c \"git reset --hard\"",
+    // Windows-only pwsh switches (a script path on Linux and macOS).
+    "pwsh /to x /utc 2026-01-01T00:00:00Z -c \"git reset --hard\"",
+    // Switches pwsh reads but dcg does not model fail closed for every
+    // prefix: `-CommandWithArgs` runs its first argument, the server modes
+    // read a protocol stream.
+    "pwsh /cwa \"git reset --hard\"",
+    "pwsh /CommandWithArgs \"git reset --hard\"",
+    "pwsh /ea AAAA -c \"git reset --hard\"",
+    "pwsh /s -c \"git reset --hard\"",
+    "pwsh /so -c \"git reset --hard\"",
+    "pwsh /nam -c \"git reset --hard\"",
+    "pwsh /sshs -c \"git reset --hard\"",
+    // Piped input reaches the -Command -.
+    "echo \"git reset --hard\" | pwsh /wd x -c -",
+];
+
+/// Ordinary pwsh launches stay allowed, including abbreviations dcg used to
+/// refuse as ambiguous (`-nop`, `-w`). `/Foo` and `/cu` match no pwsh
+/// switch, so pwsh reads them as the script path and runs nothing after
+/// them (measured: `pwsh /Foo -c 'git reset --hard'` and
+/// `pwsh /cu x -c 'git reset --hard'` ran nothing).
+const PWSH_HARMLESS: &[&str] = &[
+    "pwsh /wd C:/ -c \"Get-Date\"",
+    "pwsh -NoProfile -File ./b.ps1",
+    "pwsh /Foo",
+    "pwsh /Foo -c \"git reset --hard\"",
+    "pwsh /cu x -c \"git reset --hard\"",
+    "pwsh -nop -c \"Get-Date\"",
+    "pwsh -w hidden -c \"Get-Date\"",
+    "pwsh /ep Bypass -File ./b.ps1",
+    "pwsh /ec RwBlAHQALQBEAGEAdABlAA==",
+    "pwsh /of text /if text -c \"Get-Date\"",
+    "pwsh /?",
+];
+
+/// Both hook formats, under the PowerShell and the Bash tool labels.
+#[test]
+fn hooks_read_pwsh_switch_aliases() {
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for tool in ["PowerShell", "Bash"] {
+            for command in PWSH_RUNS_IT {
+                assert_eq!(
+                    hook_decision(protocol, tool, command),
+                    "deny",
+                    "{protocol:?} {tool}: {command:?}"
+                );
+            }
+            for command in PWSH_HARMLESS {
+                assert_eq!(
+                    hook_decision(protocol, tool, command),
+                    "allow",
+                    "{protocol:?} {tool}: {command:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_dialect_reads_pwsh_switch_aliases() {
+    for dialect in [
+        ShellDialect::PowerShell,
+        ShellDialect::Unknown,
+        ShellDialect::Posix,
+    ] {
+        for command in PWSH_RUNS_IT {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for command in PWSH_HARMLESS {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+}

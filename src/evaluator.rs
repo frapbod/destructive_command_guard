@@ -4286,9 +4286,13 @@ fn msys_native_argument(decoded: &str) -> Option<&str> {
 /// included, so under [`NativeArgv::Msys`] a decoded word that starts with
 /// `//` (after leading blanks) loses one `/`: `cmd //c powershell //c ...`
 /// reaches powershell.exe as `/c`. A word with a single leading `/` stays as
-/// written. Git Bash makes it a path, which the verbatim reading of the same
-/// word covers as well or better (a host that reads `/x` as a switch is
-/// judged on that switch either way). A single word that holds the whole
+/// written, although Git Bash makes it a path. This misses a value switch:
+/// in `cmd //c powershell /ep 'x;git reset --hard'` the verbatim
+/// reading takes `x;git` as the value of `/ep`, while under Git Bash
+/// powershell.exe receives a path, which starts the command string, so the
+/// command runs and dcg allows it. That spelling is an accepted risk (the
+/// command must be glued to the value with `;`), recorded in PR #29; it has
+/// no code unless a real occurrence turns up. A single word that holds the whole
 /// nested command (`cmd //c "powershell //c ..."`) starts with no `/`, so
 /// Git Bash and this reading leave its inner `//c` alone.
 fn decoded_launcher_tail(
@@ -4479,79 +4483,81 @@ fn powershell_host_option(
         }
         return windows_powershell_switch(&name);
     }
-    if !name.is_empty() && "command".starts_with(&name) {
-        return PowerShellHostOption::Command;
-    }
-    if !name.is_empty() && "encodedcommand".starts_with(&name) {
-        return PowerShellHostOption::EncodedCommand;
-    }
+    core_powershell_switch(&name)
+}
 
-    const NO_VALUE: &[&str] = &[
-        "help",
-        "interactive",
-        "login",
-        "mta",
-        "noexit",
-        "nologo",
-        "noninteractive",
-        "noprofile",
-        "noprofileloadtime",
-        "sshservermode",
-        "sta",
+/// Reads a lower-case switch name (prefix and repeated dash removed) the
+/// way pwsh (PowerShell 6 and later) does.
+///
+/// The table is pwsh's switch list in the order it tries them, each alias
+/// with its shortest accepted spelling: `ParseHelper` and `MatchSwitch` in
+/// `CommandLineParameterParser.cs`, the same list at tags v7.5.4 through
+/// v7.7.0 (v7.4.0 and v7.5.0 lack the three Windows-only V2 socket entries),
+/// release build only. A name matches the first entry it is a prefix of and
+/// is at least as long as that entry's minimum, so `-NoP` is NoProfile,
+/// `-in` is Interactive, `-w` is WindowStyle and `-cu` matches nothing.
+/// Short aliases such as `-wd`, `-ep`, `-ec`, `-of`, `-if` and `-cwa` are
+/// their own entries. pwsh reads any of them after `/` too and keeps
+/// parsing, so `pwsh /wd x -c "..."` runs the -Command (measured with pwsh
+/// 7.5.0 on Linux). A name that matches nothing makes pwsh read the argument
+/// as the script path; callers fail closed on it when it is dashed.
+///
+/// The Windows-only entries (`v2socketservermode`, `token`, `utctimestamp`,
+/// `removeworkingdirectorytrailingcharacter`) are kept: on Linux and macOS
+/// pwsh reads them as a script path, which runs no inline command either.
+/// The server modes, `-CommandWithArgs` and `-EncodedArguments` are
+/// `Unmodeled`: pwsh reads them, and dcg does not model what they run.
+/// `-Version` stops pwsh's parse and starts nothing; it stays a value
+/// option, which judges at least what pwsh would.
+fn core_powershell_switch(name: &str) -> PowerShellHostOption {
+    use PowerShellHostOption::{Command, EncodedCommand, File, NoValue, Unknown, Unmodeled, Value};
+    const SWITCHES: &[(&str, usize, PowerShellHostOption)] = &[
+        ("version", 1, Value),
+        ("help", 1, NoValue),
+        ("?", 1, NoValue),
+        ("login", 1, NoValue),
+        ("noexit", 3, NoValue),
+        ("noprofile", 3, NoValue),
+        ("nologo", 3, NoValue),
+        ("noninteractive", 4, NoValue),
+        ("socketservermode", 2, Unmodeled),
+        ("v2socketservermode", 4, Unmodeled),
+        ("servermode", 1, Unmodeled),
+        ("namedpipeservermode", 3, Unmodeled),
+        ("sshservermode", 4, Unmodeled),
+        ("noprofileloadtime", 17, NoValue),
+        ("interactive", 1, NoValue),
+        ("configurationfile", 17, Value),
+        ("configurationname", 6, Value),
+        ("custompipename", 3, Value),
+        ("commandwithargs", 15, Unmodeled),
+        ("cwa", 3, Unmodeled),
+        ("command", 1, Command),
+        ("windowstyle", 1, Value),
+        ("file", 1, File),
+        ("outputformat", 1, Value),
+        ("of", 1, Value),
+        ("inputformat", 3, Value),
+        ("if", 2, Value),
+        ("executionpolicy", 2, Value),
+        ("ep", 2, Value),
+        ("encodedcommand", 1, EncodedCommand),
+        ("ec", 1, EncodedCommand),
+        ("encodedarguments", 8, Unmodeled),
+        ("ea", 2, Unmodeled),
+        ("settingsfile", 8, Value),
+        ("sta", 3, NoValue),
+        ("mta", 3, NoValue),
+        ("workingdirectory", 2, Value),
+        ("wd", 2, Value),
+        ("removeworkingdirectorytrailingcharacter", 39, NoValue),
+        ("token", 2, Value),
+        ("utctimestamp", 3, Value),
     ];
-    if NO_VALUE.iter().any(|option| *option == name) {
-        return PowerShellHostOption::NoValue;
-    }
-
-    const VALUE: &[&str] = &[
-        "configurationfile",
-        "configurationname",
-        "custompipename",
-        "executionpolicy",
-        "inputformat",
-        "outputformat",
-        "settingsfile",
-        "version",
-        "windowstyle",
-        "workingdirectory",
-    ];
-    if VALUE.iter().any(|option| *option == name) {
-        return PowerShellHostOption::Value;
-    }
-
-    // `-File` takes a value like the VALUE options but ENDS host-option
-    // parsing, so it needs its own category. It resolves through the same
-    // unique-prefix pool below rather than an unconditional
-    // `"file".starts_with(name)` arm: `-f` is unambiguous only for as long as
-    // no other f-prefixed host option exists, and that is the pool's job to
-    // decide, not this function's to assume.
-    const FILE: &[&str] = &["file"];
-    if FILE.iter().any(|option| *option == name) {
-        return PowerShellHostOption::File;
-    }
-
-    // Native PowerShell host parameters accept case-insensitive unique
-    // prefixes. Count names rather than result categories: for example,
-    // `-NoP` is ambiguous between NoProfile and NoProfileLoadTime in current
-    // pwsh and must not be guessed, even though both options take no value.
-    let mut matches = NO_VALUE
+    SWITCHES
         .iter()
-        .map(|name| (*name, PowerShellHostOption::NoValue))
-        .chain(
-            VALUE
-                .iter()
-                .map(|name| (*name, PowerShellHostOption::Value)),
-        )
-        .chain(FILE.iter().map(|name| (*name, PowerShellHostOption::File)))
-        .filter(|(option, _)| option.starts_with(name.as_str()));
-    let Some((_, option)) = matches.next() else {
-        return PowerShellHostOption::Unknown;
-    };
-    if matches.next().is_some() {
-        PowerShellHostOption::Unknown
-    } else {
-        option
-    }
+        .find(|(switch, minimum, _)| name.len() >= *minimum && switch.starts_with(name))
+        .map_or(Unknown, |(_, _, option)| *option)
 }
 
 fn launcher_executable_name(raw: &str, dialect: ShellDialect) -> Option<String> {
@@ -61427,8 +61433,8 @@ mod tests {
                 ShellDialect::PowerShell,
                 NativeArgv::Verbatim
             ),
-            PowerShellHostOption::Unknown,
-            "NoProfile and NoProfileLoadTime make -NoP ambiguous"
+            PowerShellHostOption::NoValue,
+            "pwsh tries NoProfile (minimum -nop) before NoProfileLoadTime"
         );
         assert_eq!(
             powershell_host_option(
@@ -61437,8 +61443,8 @@ mod tests {
                 ShellDialect::PowerShell,
                 NativeArgv::Verbatim
             ),
-            PowerShellHostOption::Unknown,
-            "WindowStyle and WorkingDirectory make -W ambiguous"
+            PowerShellHostOption::Value,
+            "pwsh tries WindowStyle (minimum -w) before WorkingDirectory (-wo)"
         );
         assert_eq!(
             powershell_host_option(
@@ -61554,19 +61560,20 @@ mod tests {
             (
                 "-SSHServerMode",
                 PowerShellHostOption::Unknown,
-                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unmodeled,
             ),
-            // 5.1 takes the first switch the name abbreviates to at least
-            // that switch's minimum length (`MatchSwitch`).
+            // Each host takes the first switch the name abbreviates to at
+            // least that switch's minimum length (`MatchSwitch`), from its
+            // own list (`windows_powershell_switch`, `core_powershell_switch`).
             (
                 "-NoP",
                 PowerShellHostOption::NoValue,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
             ),
             (
                 "-non",
                 PowerShellHostOption::Unknown,
-                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unknown,
             ),
             (
                 "-noni",
@@ -61576,7 +61583,7 @@ mod tests {
             (
                 "-W",
                 PowerShellHostOption::Value,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
             ),
             (
                 "-conf",
@@ -61586,22 +61593,22 @@ mod tests {
             (
                 "-Config",
                 PowerShellHostOption::Value,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
             ),
             (
                 "-i",
                 PowerShellHostOption::Value,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
             ),
             (
                 "-s",
                 PowerShellHostOption::Unmodeled,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Unmodeled,
             ),
             (
                 "-st",
                 PowerShellHostOption::NoValue,
-                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unknown,
             ),
             (
                 "-e",
@@ -61616,17 +61623,17 @@ mod tests {
             (
                 "-ep",
                 PowerShellHostOption::Value,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
             ),
             (
                 "-ec",
                 PowerShellHostOption::EncodedCommand,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::EncodedCommand,
             ),
             (
                 "-ea",
                 PowerShellHostOption::Unmodeled,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Unmodeled,
             ),
             (
                 "-v",
@@ -61636,7 +61643,7 @@ mod tests {
             (
                 "/?",
                 PowerShellHostOption::NoValue,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
             ),
             (
                 "-PSConsoleFile",
@@ -61669,6 +61676,48 @@ mod tests {
                 windows,
                 "powershell {raw:?}"
             );
+            assert_eq!(
+                powershell_host_option(
+                    raw,
+                    PowerShellHost::Core,
+                    ShellDialect::PowerShell,
+                    NativeArgv::Verbatim
+                ),
+                core,
+                "pwsh {raw:?}"
+            );
+        }
+        // pwsh's short aliases are their own entries, and pwsh reads them
+        // after `/` too (`pwsh /wd x -c "..."` runs the -Command, measured
+        // with pwsh 7.5.0); names below an entry's minimum match nothing.
+        for (raw, core) in [
+            ("/wd", PowerShellHostOption::Value),
+            ("/wo", PowerShellHostOption::Value),
+            ("/ep", PowerShellHostOption::Value),
+            ("/ec", PowerShellHostOption::EncodedCommand),
+            ("/e", PowerShellHostOption::EncodedCommand),
+            ("/of", PowerShellHostOption::Value),
+            ("/if", PowerShellHostOption::Value),
+            ("/in", PowerShellHostOption::NoValue),
+            ("/inp", PowerShellHostOption::Value),
+            ("/cus", PowerShellHostOption::Value),
+            ("/settings", PowerShellHostOption::Value),
+            ("/to", PowerShellHostOption::Value),
+            ("/utc", PowerShellHostOption::Value),
+            ("/cwa", PowerShellHostOption::Unmodeled),
+            ("/CommandWithArgs", PowerShellHostOption::Unmodeled),
+            ("/so", PowerShellHostOption::Unmodeled),
+            ("/v2so", PowerShellHostOption::Unmodeled),
+            ("/nam", PowerShellHostOption::Unmodeled),
+            ("/sshs", PowerShellHostOption::Unmodeled),
+            ("/encodeda", PowerShellHostOption::Unmodeled),
+            ("/noprofileloadtime", PowerShellHostOption::NoValue),
+            ("/noprofilel", PowerShellHostOption::Unknown),
+            ("/cu", PowerShellHostOption::Unknown),
+            ("/m", PowerShellHostOption::Unknown),
+            ("-settingsf", PowerShellHostOption::Value),
+            ("-sett", PowerShellHostOption::Unknown),
+        ] {
             assert_eq!(
                 powershell_host_option(
                     raw,
@@ -62048,9 +62097,6 @@ mod tests {
             r#"cmd /c "echo %DCG_DYNAMIC%""#.to_string(),
             "call %DCG_DYNAMIC%".to_string(),
             "@%DCG_DYNAMIC%".to_string(),
-            // -NoP is ambiguous in pwsh (NoProfile, NoProfileLoadTime); in
-            // Windows PowerShell 5.1 it is NoProfile.
-            "pwsh -NoP -Command 'Write-Output ok'".to_string(),
             "powershell -WorkingDirectory C:\\ -Command 'Write-Output ok'".to_string(),
             "powershell -DefinitelyUnknown 'Write-Output ok'".to_string(),
             // A script read from stdin is no more inspectable than
