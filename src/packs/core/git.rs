@@ -6194,7 +6194,11 @@ pub(crate) fn safe_premise_refuted(command: &str) -> bool {
                 })
                 .collect();
             words.iter().enumerate().any(|(index, word)| {
-                let base = word.rsplit(['/', '\\']).next().unwrap_or(word).to_ascii_lowercase();
+                let base = word
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(word)
+                    .to_ascii_lowercase();
                 let base = base.strip_suffix(".exe").unwrap_or(&base);
                 let (subcommand, args_from) = if base == "git" {
                     let Some(at) = static_git_subcommand_index(&semantic, index + 1) else {
@@ -9850,27 +9854,50 @@ git x",
     fn git_option_settings_read_argv_as_git_does() {
         let read = |args: &str, table| {
             let args: Vec<&str> = args.split_whitespace().collect();
-            git_option_settings(&args, table)
-                .map(|settings| {
-                    ["staged", "worktree", "source", "force", "dry-run", "exclude"]
-                        .into_iter()
-                        .filter_map(|name| {
-                            git_option_setting(&settings, name).map(|set| (name, set))
-                        })
-                        .collect::<Vec<_>>()
-                })
+            git_option_settings(&args, table).map(|settings| {
+                [
+                    "staged", "worktree", "source", "force", "dry-run", "exclude",
+                ]
+                .into_iter()
+                .filter_map(|name| git_option_setting(&settings, name).map(|set| (name, set)))
+                .collect::<Vec<_>>()
+            })
         };
         let restore = &GIT_RESTORE_OPTIONS;
-        assert_eq!(read("--staged . -SW", restore), Some(vec![("staged", true), ("worktree", true)]));
-        assert_eq!(read("--staged --wor .", restore), Some(vec![("staged", true), ("worktree", true)]));
-        assert_eq!(read("-W --no-w -S .", restore), Some(vec![("staged", true), ("worktree", false)]));
+        assert_eq!(
+            read("--staged . -SW", restore),
+            Some(vec![("staged", true), ("worktree", true)])
+        );
+        assert_eq!(
+            read("--staged --wor .", restore),
+            Some(vec![("staged", true), ("worktree", true)])
+        );
+        assert_eq!(
+            read("-W --no-w -S .", restore),
+            Some(vec![("staged", true), ("worktree", false)])
+        );
         // A value letter takes the rest of its cluster, or else the next word.
-        assert_eq!(read("--staged -sWIP .", restore), Some(vec![("staged", true), ("source", true)]));
-        assert_eq!(read("-Ss -W .", restore), Some(vec![("staged", true), ("source", true)]));
-        assert_eq!(read("--source -W --staged .", restore), Some(vec![("staged", true), ("source", true)]));
+        assert_eq!(
+            read("--staged -sWIP .", restore),
+            Some(vec![("staged", true), ("source", true)])
+        );
+        assert_eq!(
+            read("-Ss -W .", restore),
+            Some(vec![("staged", true), ("source", true)])
+        );
+        assert_eq!(
+            read("--source -W --staged .", restore),
+            Some(vec![("staged", true), ("source", true)])
+        );
         // Options end at `--`; an unknown or ambiguous option is unreadable.
-        assert_eq!(read("--staged -- -W", restore), Some(vec![("staged", true)]));
-        assert_eq!(read("--staged --end-of-options -W", restore), Some(vec![("staged", true)]));
+        assert_eq!(
+            read("--staged -- -W", restore),
+            Some(vec![("staged", true)])
+        );
+        assert_eq!(
+            read("--staged --end-of-options -W", restore),
+            Some(vec![("staged", true)])
+        );
         assert_eq!(read("--staged --bogus .", restore), None);
         assert_eq!(read("--staged -Z .", restore), None);
         assert_eq!(read("--staged --p .", restore), None);
@@ -9880,17 +9907,32 @@ git x",
         assert_eq!(read("-b x --forc", checkout), Some(vec![("force", true)]));
         assert_eq!(read("-bf x", checkout), Some(vec![]));
         assert_eq!(read("-tf -b x", checkout), Some(vec![]));
-        assert_eq!(read("-b x -f --no-force", checkout), Some(vec![("force", false)]));
+        assert_eq!(
+            read("-b x -f --no-force", checkout),
+            Some(vec![("force", false)])
+        );
 
         let clean = &GIT_CLEAN_OPTIONS;
-        assert_eq!(read("-f -ein", clean), Some(vec![("force", true), ("exclude", true)]));
-        assert_eq!(read("-f -e -n", clean), Some(vec![("force", true), ("exclude", true)]));
+        assert_eq!(
+            read("-f -ein", clean),
+            Some(vec![("force", true), ("exclude", true)])
+        );
+        assert_eq!(
+            read("-f -e -n", clean),
+            Some(vec![("force", true), ("exclude", true)])
+        );
         assert_eq!(
             read("-n --no-dry-run -f", clean),
             Some(vec![("force", true), ("dry-run", false)])
         );
-        assert_eq!(read("-fn --no-d", clean), Some(vec![("force", true), ("dry-run", false)]));
-        assert_eq!(read("-f -e foo -n", clean), Some(vec![("force", true), ("dry-run", true), ("exclude", true)]));
+        assert_eq!(
+            read("-fn --no-d", clean),
+            Some(vec![("force", true), ("dry-run", false)])
+        );
+        assert_eq!(
+            read("-f -e foo -n", clean),
+            Some(vec![("force", true), ("dry-run", true), ("exclude", true)])
+        );
     }
 
     #[test]
