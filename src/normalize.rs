@@ -3308,10 +3308,295 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
     tokenize_powershell_with_comments(command, false).0
 }
 
-/// Read PowerShell comments and smart quotes in a separate deny-only view.
+/// Read PowerShell comments, smart quotes and glued assignments in a
+/// separate deny-only view, or `None` when the command has none of them.
 /// Masked comments preserve line ends; block-comment line ends are spaces.
 /// Smart quotes use their ASCII spelling so the existing readers see them.
-pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
+/// A statement-leading assignment gets blanks around its operator
+/// ([`space_powershell_assignments`]).
+pub(crate) fn powershell_deny_only_view(command: &str) -> Option<String> {
+    let masked = mask_powershell_comments(command);
+    let text = masked.as_deref().unwrap_or(command);
+    space_powershell_assignments(text).or(masked)
+}
+
+/// PowerShell's assignment operators, longest first.
+const POWERSHELL_ASSIGNMENT_OPERATORS: [&str; 7] = ["??=", "+=", "-=", "*=", "/=", "%=", "="];
+
+/// `command` with a blank on each side of every assignment operator that is
+/// glued to a statement-leading assignment target or to the value after it,
+/// or `None` when there is none.
+///
+/// PowerShell runs the command on the right of `$c=iex '…'` as it does in
+/// `$c = iex '…'` (pwsh 7.5, measured in the sandbox). The PowerShell
+/// tokenizer keeps `$c=iex` as one word, and the readers that judge an
+/// assignment's command (the assignment envelope, the `iex` reader, the
+/// script-block readers) find it only after a separate `=` word. So every
+/// glued spelling hid the command: `$c=iex`, `$c =iex`, `$c+=`, `[int]$c=`,
+/// `$a=$b=`, `{$c=iex …}`, `$c=@{a=iex …}`. With the blanks those readers see
+/// the spelling they already judge.
+///
+/// A statement starts at the beginning; after `;`, `(` or a line break;
+/// after a block brace (`{`, `}`); after an assignment operator (its value
+/// is a statement: `$a=$b=…`); and after a word that holds only a target or
+/// a type constraint, which the next word continues (`[string] $c=…`,
+/// `$a, $b=…`). A hashtable key is a target directly after `@{`. Quoted
+/// text, here-strings and escapes are skipped. After `|`, `&&` or `||` an
+/// assignment is a parse error, and elsewhere (`Write-Output $c=iex`)
+/// PowerShell reads the word as an argument, so those stay as written.
+pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let mut blanks: Vec<usize> = Vec::new();
+    let mut statement_start = true;
+    let mut after_target = false;
+    for token in &tokenize_powershell_raw(command) {
+        let (start, end) = (token.byte_range.start, token.byte_range.end);
+        if token.kind == NormalizeTokenKind::Separator {
+            let raw = token.text(command).unwrap_or_default();
+            statement_start = matches!(raw.trim(), ";" | "(") || raw.contains(['\r', '\n']);
+            after_target = false;
+            continue;
+        }
+        let mut i = start;
+        let mut at_start = statement_start;
+        let mut hash_key = false;
+        // `$c =iex`: the operator opens this word.
+        if after_target && let Some(len) = powershell_assignment_operator_len(bytes, i, end) {
+            i += len;
+            if i < end {
+                blanks.push(i);
+            }
+            at_start = true;
+        }
+        after_target = false;
+        while i < end {
+            if at_start
+                && let Some(target_end) = powershell_assignment_target_end(bytes, i, end, hash_key)
+            {
+                if target_end == end {
+                    // `$c`, `[string]` or `$a,`: the next word continues it.
+                    after_target = true;
+                    break;
+                }
+                if let Some(len) = powershell_assignment_operator_len(bytes, target_end, end) {
+                    blanks.push(target_end);
+                    i = target_end + len;
+                    if i < end {
+                        blanks.push(i);
+                    }
+                    hash_key = false;
+                    continue;
+                }
+            }
+            at_start = false;
+            hash_key = false;
+            match bytes[i] {
+                b'{' | b'}' => {
+                    at_start = true;
+                    hash_key = bytes[i] == b'{' && i > start && bytes[i - 1] == b'@';
+                    i += 1;
+                }
+                b'`' => i = consume_shell_escape(bytes, i, end),
+                b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                    i = braced_variable_end(bytes, i, end).unwrap_or(end);
+                }
+                b'@' => i = consume_powershell_here_string(bytes, i, end).unwrap_or(i + 1),
+                b'\'' | b'"' => i = powershell_quoted_end(bytes, i, end),
+                _ => i += 1,
+            }
+        }
+        statement_start = at_start;
+    }
+    if blanks.is_empty() {
+        return None;
+    }
+    blanks.dedup();
+    let mut spelled = String::with_capacity(command.len() + blanks.len());
+    let mut last = 0;
+    for at in blanks {
+        spelled.push_str(&command[last..at]);
+        spelled.push(' ');
+        last = at;
+    }
+    spelled.push_str(&command[last..]);
+    Some(spelled)
+}
+
+/// Whether `word` is exactly a PowerShell assignment operator (`=`, `+=`, …).
+pub(crate) fn is_powershell_assignment_operator(word: &str) -> bool {
+    POWERSHELL_ASSIGNMENT_OPERATORS.contains(&word)
+}
+
+/// Whether `word` is a whole assignment target, or the part of one that a
+/// following word continues: `$c`, `$c.p[0]`, `[int]$c`, `[string]`, `$a,`.
+pub(crate) fn is_powershell_assignment_target(word: &str) -> bool {
+    powershell_assignment_target_end(word.as_bytes(), 0, word.len(), false) == Some(word.len())
+}
+
+/// Length of the assignment operator at `i`, if one starts there.
+fn powershell_assignment_operator_len(bytes: &[u8], i: usize, end: usize) -> Option<usize> {
+    let rest = bytes.get(i..end)?;
+    POWERSHELL_ASSIGNMENT_OPERATORS
+        .iter()
+        .find(|operator| rest.starts_with(operator.as_bytes()))
+        .map(|operator| operator.len())
+}
+
+/// End of an assignment target that starts at `i`: one or more variables
+/// separated by commas (`$c`, `${c}`, `$env:C`, `$a,$b`), each with members
+/// and indexes (`$c.p`, `$c[0]`) and optional type constraints before it
+/// (`[int[]]$c`), a static property (`[T]::P`), a bare type constraint, or,
+/// for a hashtable key, a bare or quoted name. `None` when no target starts
+/// at `i`.
+fn powershell_assignment_target_end(
+    bytes: &[u8],
+    i: usize,
+    end: usize,
+    hash_key: bool,
+) -> Option<usize> {
+    if hash_key {
+        return match bytes.get(i)? {
+            b'\'' | b'"' => Some(powershell_quoted_end(bytes, i, end)),
+            _ => {
+                let name = bytes[i..end]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                    .count();
+                (name > 0).then_some(i + name)
+            }
+        };
+    }
+    let mut j = i;
+    let mut typed = false;
+    while bytes.get(j) == Some(&b'[') && j < end {
+        j = powershell_bracket_end(bytes, j, end)?;
+        typed = true;
+    }
+    if typed {
+        if j == end {
+            return Some(j);
+        }
+        if bytes[j..end].starts_with(b"::") {
+            let name_end = powershell_name_end(bytes, j + 2, end)?;
+            return powershell_member_chain_end(bytes, name_end, end);
+        }
+    }
+    loop {
+        if j >= end || bytes[j] != b'$' {
+            return None;
+        }
+        j = if bytes.get(j + 1) == Some(&b'{') {
+            braced_variable_end(bytes, j, end)?
+        } else {
+            // `?` belongs to a variable name, except where `??=` begins.
+            let mut k = j + 1;
+            while k < end
+                && (bytes[k].is_ascii_alphanumeric() || matches!(bytes[k], b'_' | b':' | b'?'))
+                && !(bytes[k] == b'?' && bytes[k..end].starts_with(b"??="))
+            {
+                k += 1;
+            }
+            if k == j + 1 {
+                return None;
+            }
+            k
+        };
+        j = powershell_member_chain_end(bytes, j, end)?;
+        if j < end && bytes[j] == b',' {
+            j += 1;
+            if j == end {
+                return Some(j);
+            }
+            continue;
+        }
+        return Some(j);
+    }
+}
+
+/// End of the `.name` and `[index]` members that follow position `j`.
+fn powershell_member_chain_end(bytes: &[u8], mut j: usize, end: usize) -> Option<usize> {
+    while j < end {
+        match bytes[j] {
+            b'.' => match powershell_name_end(bytes, j + 1, end) {
+                Some(name_end) => j = name_end,
+                None => break,
+            },
+            b'[' => j = powershell_bracket_end(bytes, j, end)?,
+            _ => break,
+        }
+    }
+    Some(j)
+}
+
+/// End of a non-empty run of identifier bytes starting at `i`.
+fn powershell_name_end(bytes: &[u8], i: usize, end: usize) -> Option<usize> {
+    let name = bytes
+        .get(i..end)?
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+        .count();
+    (name > 0).then_some(i + name)
+}
+
+/// Position after the `]` that closes the `[` at `i`, within `end`.
+fn powershell_bracket_end(bytes: &[u8], i: usize, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut j = i;
+    while j < end {
+        match bytes[j] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            b'\'' | b'"' => {
+                j = powershell_quoted_end(bytes, j, end);
+                continue;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Position after the `}` that closes the braced variable `${…}` at `i`.
+fn braced_variable_end(bytes: &[u8], i: usize, end: usize) -> Option<usize> {
+    let mut j = i + 2;
+    while j < end {
+        match bytes[j] {
+            b'`' => j = consume_shell_escape(bytes, j, end),
+            b'}' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Position after the single- or double-quoted string that opens at `i`
+/// (`''` and `""` are quote characters inside it), or `end` when unclosed.
+fn powershell_quoted_end(bytes: &[u8], i: usize, end: usize) -> usize {
+    let quote = bytes[i];
+    let mut j = i + 1;
+    while j < end {
+        if quote == b'"' && bytes[j] == b'`' {
+            j = consume_shell_escape(bytes, j, end);
+        } else if bytes[j] == quote {
+            if bytes.get(j + 1) == Some(&quote) && j + 1 < end {
+                j += 2;
+            } else {
+                return j + 1;
+            }
+        } else {
+            j += 1;
+        }
+    }
+    end
+}
+
+fn mask_powershell_comments(command: &str) -> Option<String> {
     let has_smart_quotes = command
         .chars()
         .any(|c| matches!(c, '\u{2018}'..='\u{201e}'));
@@ -6491,6 +6776,66 @@ mod tests {
                 mask_powershell_comments(command)
             );
         }
+    }
+
+    #[test]
+    fn glued_powershell_assignments_get_blanks_only_at_statement_starts() {
+        let spaced = |command: &str| space_powershell_assignments(command);
+        for (glued, blanks) in [
+            ("$c=iex 'x'", "$c = iex 'x'"),
+            ("$c =iex 'x'", "$c = iex 'x'"),
+            ("$c= iex 'x'", "$c = iex 'x'"),
+            ("$c+=iex 'x'", "$c += iex 'x'"),
+            ("$c??=iex 'x'", "$c ??= iex 'x'"),
+            ("[int[]]$c=iex 'x'", "[int[]]$c = iex 'x'"),
+            ("[string] $c=iex 'x'", "[string] $c = iex 'x'"),
+            ("${c}=iex 'x'", "${c} = iex 'x'"),
+            ("$env:C=iex 'x'", "$env:C = iex 'x'"),
+            ("$a=$b=iex 'x'", "$a = $b = iex 'x'"),
+            ("$a = $b=iex 'x'", "$a = $b = iex 'x'"),
+            ("$a, $b=iex 'x'", "$a, $b = iex 'x'"),
+            ("$c.p[0]=iex 'x'", "$c.p[0] = iex 'x'"),
+            ("$h['k=v']=iex 'x'", "$h['k=v'] = iex 'x'"),
+            ("[T]::P=iex 'x'", "[T]::P = iex 'x'"),
+            ("$c=@{a=iex 'x'}", "$c = @{a = iex 'x'}"),
+            ("echo a;$c=iex 'x'", "echo a;$c = iex 'x'"),
+            ("echo a\n$c=iex 'x'", "echo a\n$c = iex 'x'"),
+            ("if(1){$c=iex 'x'}", "if(1){$c = iex 'x'}"),
+            ("if(1){'a'}$c=iex 'x'", "if(1){'a'}$c = iex 'x'"),
+            ("while($c=iex 'x'){}", "while($c = iex 'x'){}"),
+        ] {
+            assert_eq!(spaced(glued).as_deref(), Some(blanks), "{glued:?}");
+            // The spelling is a fixed point: the view does not grow.
+            assert_eq!(spaced(blanks), None, "{blanks:?}");
+        }
+        for unchanged in [
+            "$c = iex 'x'",
+            "Write-Output $c=iex 'x'",
+            "git commit -m $c=x",
+            "1|$c=iex 'x'",
+            "Get-Date && $c=iex 'x'",
+            "Write-Output '$c=iex x'",
+            "Write-Output \"a;$c=iex\"",
+            "$c -eq 'a=b'",
+            "x=1 git status",
+            "@'\n$c=iex 'x'\n'@",
+            "git -c core.x=$y status",
+        ] {
+            assert_eq!(spaced(unchanged), None, "{unchanged:?}");
+        }
+    }
+
+    #[test]
+    fn powershell_deny_only_view_spaces_assignments_after_masking_comments() {
+        assert_eq!(
+            powershell_deny_only_view("<#x#>$c=iex 'git reset --hard'").as_deref(),
+            Some("     $c = iex 'git reset --hard'")
+        );
+        assert_eq!(
+            powershell_deny_only_view("$c=iex 'x' # note").as_deref(),
+            Some("$c = iex 'x'       ")
+        );
+        assert_eq!(powershell_deny_only_view("$c = iex 'x'"), None);
     }
 
     #[test]
