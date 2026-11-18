@@ -15538,25 +15538,23 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         };
         adopt_alternate_reading(&mut result, alternate, command);
     }
-    // Read comment and smart-quote syntax as a separate deny-only PowerShell
-    // view. Keep the original tokenizer's decisions and grants intact.
-    if result.decision == EvaluationDecision::Allow
-        && result.bypass_method != Some(BypassMethod::AllowOnce)
-        && matches!(
-            shell_dialect,
-            ShellDialect::PowerShell | ShellDialect::Unknown
-        )
-        && let Some(masked) = crate::normalize::mask_powershell_comments(command)
-        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
-    {
-        // The copy's incomplete analyses count only if its result is used.
-        let alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
-        let alternate = if deadline_exceeded(deadline) {
-            EvaluationResult::indeterminate_due_to_budget()
-        } else {
+    // Deny-only PowerShell views; each keeps the original tokenizer's
+    // decisions and grants intact. One reads comment and smart-quote syntax.
+    // The others read what PowerShell runs as an assignment's value: a value
+    // in command mode starts its own statement in place (`$c=iex '…'` reads
+    // as `$c;iex '…'`), and any other value is read as its own command
+    // `$c = <value>` (`@{a = 1|%{…}}`).
+    if matches!(
+        shell_dialect,
+        ShellDialect::PowerShell | ShellDialect::Unknown
+    ) {
+        let read = |view: &str, dialect: ShellDialect| {
+            if deadline_exceeded(deadline) {
+                return EvaluationResult::indeterminate_due_to_budget();
+            }
             let _allow_once_scope = AllowOnceSuppressionScope::enter();
             evaluate_command_in_dialect_union(
-                &masked,
+                view,
                 enabled_keywords,
                 ordered_packs,
                 keyword_index,
@@ -15566,40 +15564,102 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 None,
                 project_path,
                 deadline,
-                ShellDialect::PowerShell,
+                dialect,
                 nested_command_depth,
                 inherited_automated_stdin,
             )
         };
-        let adopt = match alternate.decision {
-            EvaluationDecision::Deny => true,
-            // This copy only adds denials. Text it cannot read keeps the
-            // original verdict (a smart quote in POSIX data is not a
-            // PowerShell quote); running out of time still fails closed.
-            EvaluationDecision::Indeterminate => deadline_exceeded(deadline),
-            EvaluationDecision::Allow => {
-                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum View {
+            Masked,
+            Separated,
+            Value,
+        }
+        let masked = crate::normalize::mask_powershell_comments(command);
+        let assignments =
+            crate::normalize::powershell_assignment_views(masked.as_deref().unwrap_or(command));
+        let views = masked
+            .map(|view| (view, View::Masked))
+            .into_iter()
+            .chain(assignments.separated.map(|view| (view, View::Separated)))
+            .chain(
+                assignments
+                    .values
+                    .into_iter()
+                    .map(|view| (view, View::Value)),
+            );
+        let mut unseparated_reading = None;
+        for (view, kind) in views {
+            if result.decision != EvaluationDecision::Allow
+                || result.bypass_method == Some(BypassMethod::AllowOnce)
+                || explicitly_allowed_as_written(
+                    command,
+                    compiled_overrides,
+                    allowlists,
+                    project_path,
+                )
+            {
+                break;
             }
-        };
-        if adopt {
+            // The copy's incomplete analyses count only if its result is used.
+            let mut alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+            let mut alternate = read(&view, ShellDialect::PowerShell);
+            if kind == View::Masked {
+                unseparated_reading = Some(alternate.decision);
+            } else if shell_dialect == ShellDialect::Unknown
+                && alternate.decision == EvaluationDecision::Deny
+                && unseparated_reading.unwrap_or_else(|| {
+                    let probe = crate::packs::regex_engine::RegexEvaluationScope::enter();
+                    let decision = read(command, ShellDialect::PowerShell).decision;
+                    probe.discard();
+                    decision
+                }) != EvaluationDecision::Allow
+            {
+                // PowerShell already rejects the text as written, which the
+                // Unknown dialect tolerates (a Node heredoc's `()=>{` is an
+                // unbalanced PowerShell block), so a PowerShell denial of the
+                // view is no news about the assignment. Judge a separated
+                // view as Unknown judges such text; a copied value stays
+                // unread (POSIX reads `$c = $a * 2` as a command).
+                alternate_scope.discard();
+                if kind == View::Value {
+                    continue;
+                }
+                alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+                alternate = read(&view, ShellDialect::Unknown);
+            }
+            let adopt = match alternate.decision {
+                EvaluationDecision::Deny => true,
+                // A view only adds denials. Text it cannot read keeps the
+                // original verdict (a smart quote in POSIX data is not a
+                // PowerShell quote); running out of time still fails closed.
+                EvaluationDecision::Indeterminate => deadline_exceeded(deadline),
+                EvaluationDecision::Allow => {
+                    result.effective_mode.is_none() && alternate.effective_mode.is_some()
+                }
+            };
+            if !adopt {
+                alternate_scope.discard();
+                continue;
+            }
             drop(alternate_scope);
             result = alternate;
             if let Some(info) = result.pattern_info.as_mut() {
-                if masked.len() == command.len()
+                // A value view's offsets are its own.
+                let same_offsets = kind != View::Value && view.len() == command.len();
+                if same_offsets
                     && let Some(span) = info.matched_span.as_ref()
                     && span.end <= command.len()
                     && command.is_char_boundary(span.start)
                     && command.is_char_boundary(span.end)
                 {
                     info.matched_text_preview = Some(extract_match_preview(command, span));
-                } else if masked.len() != command.len() {
+                } else if !same_offsets {
                     // Smart-quote spelling changes byte offsets.
                     info.matched_span = None;
                     info.matched_text_preview = None;
                 }
             }
-        } else {
-            alternate_scope.discard();
         }
     }
     // cmd.exe removes every CR from its command-line text before it reads
