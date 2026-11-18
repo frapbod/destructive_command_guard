@@ -682,7 +682,12 @@ fn cmd_calls_the_launcher_reader_cannot_verify_still_get_a_cmd_reading() {
         "Bash",
         EvaluationDecision::Allow,
     ));
-    assert!(misses.is_empty(), "{} misses:\n{}", misses.len(), misses.join("\n"));
+    assert!(
+        misses.is_empty(),
+        "{} misses:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
 }
 
 /// A quoted cmd program name (`"cmd.exe" /c …`, `& 'C:\…\cmd.exe' /c …`) is
@@ -718,10 +723,18 @@ fn quoted_cmd_program_names_are_cmd_calls() {
         EvaluationDecision::Allow,
     ));
     misses.extend(expect_everywhere(
-        &with_cr(&["(\"cmd.exe\" /c gi<CR>t status)", "('cmd.exe' /c \"git status\")"]),
+        &with_cr(&[
+            "(\"cmd.exe\" /c gi<CR>t status)",
+            "('cmd.exe' /c \"git status\")",
+        ]),
         &[ShellDialect::Posix],
         "Bash",
         EvaluationDecision::Allow,
     ));
-    assert!(misses.is_empty(), "{} misses:\n{}", misses.len(), misses.join("\n"));
+    assert!(
+        misses.is_empty(),
+        "{} misses:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
 }
