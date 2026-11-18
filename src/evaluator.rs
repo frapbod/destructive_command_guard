@@ -4469,6 +4469,10 @@ enum PowerShellHostOption {
     File,
     NoValue,
     Value,
+    /// Windows PowerShell 5.1 `--version` (any doubled-dash spelling of
+    /// `-Version`): takes the next argument as its value when there is one;
+    /// as the last argument it starts nothing.
+    OptionalValue,
     Unknown,
 }
 
@@ -4584,21 +4588,29 @@ fn powershell_host_option(
             PowerShellHostOption::Unknown
         };
     };
-    // `--version` and `--help` start nothing in either host: pwsh accepts
-    // exactly these two GNU-style spellings as print-and-exit informational
-    // flags (issue #304); Windows PowerShell 5.1 reads them as `-Version`
-    // without its value (a usage error) and `-Help`.
+    // pwsh accepts exactly `--version` and `--help` as GNU-style
+    // print-and-exit informational flags (issue #304); they start nothing.
+    // Windows PowerShell 5.1 reads `--help` as `-Help` (the table below).
     let doubled = name.strip_prefix(prefix).filter(|_| prefix != '/');
-    if doubled
-        .is_some_and(|gnu| gnu.eq_ignore_ascii_case("version") || gnu.eq_ignore_ascii_case("help"))
+    if host == PowerShellHost::Core
+        && doubled.is_some_and(|gnu| {
+            gnu.eq_ignore_ascii_case("version") || gnu.eq_ignore_ascii_case("help")
+        })
     {
         return PowerShellHostOption::NoValue;
     }
+    let mut extra_dash = false;
     let name = match host {
         // Windows PowerShell 5.1 drops one more dash of any kind after any
         // prefix, `/` included (same file, lines 357-362), so `/-c`, `--c`
         // and `/–c` are `-Command`.
-        PowerShellHost::Windows => name.strip_prefix(is_powershell_dash).unwrap_or(name),
+        PowerShellHost::Windows => match name.strip_prefix(is_powershell_dash) {
+            Some(rest) => {
+                extra_dash = true;
+                rest
+            }
+            None => name,
+        },
         // pwsh drops a second dash only when it repeats the first
         // (`GetSwitchKey`, v7.5.0 line 699); dcg does not guess any other
         // double-dash token as a pwsh host option. `/-c` is a script path.
@@ -4608,6 +4620,21 @@ fn powershell_host_option(
     let name = name.to_ascii_lowercase();
     if !name.is_empty() && "command".starts_with(&name) {
         return PowerShellHostOption::Command;
+    }
+    // In Windows PowerShell 5.1, `-Version <v>` is read by the native
+    // powershell.exe launcher, not by the managed parser above (its switch
+    // list has no Version). Whether the launcher also drops a second dash is
+    // unmeasured. If it does, `--version 2 -c "..."` runs the -Command, so
+    // the value is skipped and the rest is read. If it does not, the managed
+    // parser makes `--version ...` the command string, which is a parse
+    // error ("Missing expression after unary operator '--'", measured with
+    // pwsh 7.5) and runs nothing. Alone it starts nothing either way.
+    if host == PowerShellHost::Windows
+        && extra_dash
+        && !name.is_empty()
+        && "version".starts_with(&name)
+    {
+        return PowerShellHostOption::OptionalValue;
     }
     if !name.is_empty() && "encodedcommand".starts_with(&name) {
         return PowerShellHostOption::EncodedCommand;
@@ -5133,6 +5160,7 @@ fn parse_powershell_launcher(
                 return WindowsLauncherParse::NotLauncher;
             }
             PowerShellHostOption::NoValue => index += 1,
+            PowerShellHostOption::OptionalValue => index += 2,
             PowerShellHostOption::Value => {
                 if words.get(index + 1).is_none() {
                     return WindowsLauncherParse::Unverified(format!(
@@ -8300,6 +8328,7 @@ fn appended_code_input_mode(
                     };
                 }
                 PowerShellHostOption::NoValue => index += 1,
+                PowerShellHostOption::OptionalValue => index += 2,
                 PowerShellHostOption::Value => {
                     if args.get(index + 1).is_none() {
                         return PipelineShellInputMode::Unverified;
@@ -9229,6 +9258,7 @@ fn powershell_pipeline_input_mode(args: &[String], host: PowerShellHost) -> Pipe
                 return PipelineShellInputMode::DoesNotReadStdin;
             }
             PowerShellHostOption::NoValue => index += 1,
+            PowerShellHostOption::OptionalValue => index += 2,
             PowerShellHostOption::Value => {
                 if args.get(index + 1).is_none() {
                     return PipelineShellInputMode::Unverified;
@@ -58959,7 +58989,22 @@ mod tests {
             ),
             (
                 "--version",
+                PowerShellHostOption::OptionalValue,
+                PowerShellHostOption::NoValue,
+            ),
+            (
+                "/-ver",
+                PowerShellHostOption::OptionalValue,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-Version",
                 PowerShellHostOption::Value,
+                PowerShellHostOption::Value,
+            ),
+            (
+                "--help",
+                PowerShellHostOption::NoValue,
                 PowerShellHostOption::NoValue,
             ),
             (

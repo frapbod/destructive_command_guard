@@ -77,6 +77,14 @@ const RUNS_IT: &[&str] = &[
     "powershell -\u{2013}Command \"git reset --hard\"",
     "powershell --c \"git reset --hard\"",
     "powershell \"\" /-NoProfile \"git reset --hard\"",
+    // 5.1's `-Version` is read by the native launcher; its handling of a
+    // doubled dash is unmeasured. If it reads `--version 2`, what follows
+    // runs; if not, `--version ...` is the command string, a parse error
+    // (measured with pwsh 7.5), so reading `2` as the value fails closed.
+    "powershell --version 2 -c \"git reset --hard\"",
+    "powershell --version 2 \"git reset --hard\"",
+    "powershell /-version 2 -c \"git reset --hard\"",
+    "'git reset --hard' | powershell --version 2 -c -",
 ];
 
 /// A separator inside quotes is data; characters PowerShell does not split on
@@ -116,6 +124,8 @@ const HARMLESS: &[&str] = &[
     "powershell /-NoProfile \"Get-Date\"",
     "powershell --version",
     "pwsh --version",
+    "powershell /-ver",
+    "powershell --version 2 -c \"Get-Date\"",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
