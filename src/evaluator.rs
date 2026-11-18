@@ -3478,7 +3478,7 @@ fn collect_visible_powershell_block_splat_mutations(
             }
             variables.push(variable);
         }
-        for body in powershell_executable_block_bodies(statement)? {
+        for body in powershell_script_block_bodies(statement)? {
             collect_visible_powershell_block_splat_mutations(body, depth + 1, variables)?;
         }
     }
@@ -3831,107 +3831,6 @@ fn evaluate_visible_powershell_start_process_invocations(
     (self_contained_splat_flow && resolved_splat_invocation).then(EvaluationResult::allowed)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum VisiblePowerShellScriptBlockSource {
-    Static(String),
-    Dynamic,
-}
-
-fn powershell_variable_prefix(expression: &str) -> Option<(String, usize)> {
-    let bytes = expression.as_bytes();
-    if bytes.first() != Some(&b'$') {
-        return None;
-    }
-    if bytes.get(1) == Some(&b'{') {
-        let close = expression.get(2..)?.find('}')? + 2;
-        let name = expression.get(2..close)?;
-        // Braced PowerShell variable names deliberately admit punctuation that
-        // is not legal in the unbraced form (for example `${x-y}`). Keep the
-        // parser bounded by the closing brace, but do not narrow PowerShell's
-        // valid name grammar to identifier characters.
-        if name.is_empty() || name.chars().any(char::is_control) {
-            return None;
-        }
-        return Some((name.to_ascii_lowercase(), close + 1));
-    }
-
-    let mut end = 1usize;
-    while bytes
-        .get(end)
-        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'?'))
-    {
-        end += 1;
-    }
-    (end > 1).then(|| (expression[1..end].to_ascii_lowercase(), end))
-}
-
-fn visible_powershell_scriptblock_assignment(
-    statement: &str,
-) -> Option<(String, VisiblePowerShellScriptBlockSource)> {
-    let mut statement = statement.trim_start();
-    if let Some((type_start, type_end)) = find_powershell_scriptblock_type_literal(statement, 0)
-        && type_start == 0
-    {
-        statement = statement.get(type_end..)?.trim_start();
-    }
-    let (name, variable_end) = powershell_variable_prefix(statement)?;
-    let remainder = statement.get(variable_end..)?.trim_start();
-    let rhs = remainder.strip_prefix('=')?;
-    if rhs.starts_with('=') {
-        return None;
-    }
-    let rhs = rhs.trim_start();
-    let Some((marker_start, marker_end)) = find_powershell_scriptblock_create(rhs, 0) else {
-        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
-    };
-    if marker_start != 0 {
-        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
-    }
-
-    let mut open = marker_end;
-    while rhs
-        .as_bytes()
-        .get(open)
-        .is_some_and(u8::is_ascii_whitespace)
-    {
-        open += 1;
-    }
-    if rhs.as_bytes().get(open) != Some(&b'(') {
-        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
-    }
-    let Ok(close) = find_powershell_subexpression_close(rhs, open + 1) else {
-        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
-    };
-    if !rhs[close + 1..].trim().is_empty() {
-        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
-    }
-    let source = parse_static_powershell_source(&rhs[open + 1..close])
-        .map(VisiblePowerShellScriptBlockSource::Static)
-        .unwrap_or(VisiblePowerShellScriptBlockSource::Dynamic);
-    Some((name, source))
-}
-
-fn powershell_method_invocation(rest: &str, method: &str) -> bool {
-    rest.get(..method.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(method))
-        && rest.as_bytes().get(method.len()) == Some(&b'(')
-}
-
-fn powershell_method_token_invocation(
-    rest: &str,
-    method: &str,
-    tokens: &crate::normalize::NormalizeTokens,
-    token_index: usize,
-    command: &str,
-) -> bool {
-    rest.eq_ignore_ascii_case(method)
-        && tokens.get(token_index + 1).is_some_and(|next| {
-            next.kind == NormalizeTokenKind::Separator
-                && next.byte_range.start == tokens[token_index].byte_range.end
-                && next.text(command).is_some_and(|raw| raw == "(")
-        })
-}
-
 fn powershell_token_at_command_boundary(
     tokens: &crate::normalize::NormalizeTokens,
     index: usize,
@@ -3954,219 +3853,6 @@ fn powershell_token_at_command_boundary(
     raw.trim_end().ends_with('{')
 }
 
-fn push_exact_powershell_variable(names: &mut Vec<String>, value: &str) {
-    if let Some((name, end)) = powershell_variable_prefix(value)
-        && end == value.len()
-        && !names.contains(&name)
-    {
-        names.push(name);
-    }
-}
-
-fn visible_powershell_scriptblock_invocations(statement: &str) -> Vec<String> {
-    let tokens = tokenize_for_shell_dialect(statement, ShellDialect::PowerShell);
-    let mut names = Vec::new();
-    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
-    let mut executable_consumer_seen = false;
-
-    for (index, token) in tokens.iter().enumerate() {
-        let Some(raw) = token.text(statement) else {
-            continue;
-        };
-
-        if token.kind == NormalizeTokenKind::Word {
-            let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
-                continue;
-            };
-            if let Some((name, variable_end)) = powershell_variable_prefix(decoded.as_ref()) {
-                let remainder = decoded.get(variable_end..).unwrap_or_default();
-                let remainder = remainder.strip_prefix('?').unwrap_or(remainder);
-                if powershell_method_token_invocation(
-                    remainder, ".invoke", &tokens, index, statement,
-                ) || powershell_method_token_invocation(
-                    remainder,
-                    ".invokereturnasis",
-                    &tokens,
-                    index,
-                    statement,
-                ) || powershell_method_token_invocation(
-                    remainder,
-                    ".invokewithcontext",
-                    &tokens,
-                    index,
-                    statement,
-                ) {
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
-                }
-            }
-        }
-
-        let call_operator = token.kind == NormalizeTokenKind::Separator && raw.trim() == "&";
-        let dot_source = token.kind == NormalizeTokenKind::Word && raw == ".";
-        let consumer = token.kind == NormalizeTokenKind::Word
-            && powershell_token_at_command_boundary(&tokens, index, statement)
-            && !raw.starts_with(['\'', '"'])
-            && [
-                "invoke-command",
-                "icm",
-                "start-job",
-                "sajb",
-                "start-threadjob",
-                "foreach-object",
-                "foreach",
-                "%",
-                "where-object",
-                "where",
-                "?",
-            ]
-            .iter()
-            .any(|candidate| powershell_word_equals(raw, candidate));
-        executable_consumer_seen |= consumer;
-        if !call_operator && !dot_source && !consumer {
-            continue;
-        }
-
-        let mut next = index + 1;
-        while let Some(candidate) = tokens.get(next) {
-            let Some(candidate_raw) = candidate.text(statement) else {
-                break;
-            };
-            if candidate.kind == NormalizeTokenKind::Separator && candidate_raw.trim() == "(" {
-                next += 1;
-                continue;
-            }
-            if candidate.kind == NormalizeTokenKind::Word {
-                let mut value_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
-                if let Some(value) = value_decoder.decode(candidate_raw, ShellTokenRole::Syntax) {
-                    push_exact_powershell_variable(&mut names, value.as_ref());
-                }
-            }
-            break;
-        }
-    }
-
-    // Named ScriptBlock parameters can occur after other named arguments.
-    if executable_consumer_seen && let Some(words) = decoded_powershell_segment_words(statement) {
-        for pair in words.windows(2) {
-            let (parameter, parameter_dynamic, _) = &pair[0];
-            let (value, _, _) = &pair[1];
-            if !*parameter_dynamic
-                && [
-                    "scriptblock",
-                    "process",
-                    "filterscript",
-                    "initializationscript",
-                    "begin",
-                    "end",
-                    "parallel",
-                    "remainingscripts",
-                ]
-                .iter()
-                .any(|candidate| powershell_alias_parameter(parameter, candidate))
-            {
-                push_exact_powershell_variable(&mut names, value);
-            }
-        }
-    }
-    names
-}
-
-#[allow(clippy::too_many_arguments)]
-fn evaluate_visible_powershell_scriptblock_invocations(
-    command: &str,
-    nested_command_depth: usize,
-    enabled_keywords: &[&str],
-    ordered_packs: &[String],
-    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
-    compiled_overrides: &crate::config::CompiledOverrides,
-    allowlists: &LayeredAllowlist,
-    heredoc_settings: &crate::config::HeredocSettings,
-    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
-    project_path: Option<&Path>,
-    deadline: Option<&Deadline>,
-    inherited_automated_stdin: bool,
-) -> Option<EvaluationResult> {
-    find_powershell_scriptblock_create(command, 0)?;
-    let statements = match split_top_level_powershell_statements(command) {
-        Ok(statements) => statements,
-        Err(()) => {
-            return Some(EvaluationResult::denied_by_legacy(
-                "A visible PowerShell ScriptBlock flow has syntax that dcg cannot safely segment",
-            ));
-        }
-    };
-    let mut scriptblocks = HashMap::<String, VisiblePowerShellScriptBlockSource>::new();
-    if statements.len() >= 2 {
-        for statement in statements {
-            if let Some((name, source)) = visible_powershell_scriptblock_assignment(statement) {
-                if scriptblocks.len() >= MAX_POWERSHELL_VISIBLE_ALIASES
-                    && !scriptblocks.contains_key(&name)
-                {
-                    return Some(EvaluationResult::denied_by_legacy(
-                        "PowerShell script creates too many visible ScriptBlock variables for bounded analysis",
-                    ));
-                }
-                scriptblocks.insert(name, source);
-                continue;
-            }
-
-            for name in visible_powershell_scriptblock_invocations(statement) {
-                let Some(source) = scriptblocks.get(&name) else {
-                    continue;
-                };
-                let source = match source {
-                    VisiblePowerShellScriptBlockSource::Static(source) => source,
-                    VisiblePowerShellScriptBlockSource::Dynamic => {
-                        return Some(EvaluationResult::denied_by_legacy(
-                            "An invoked PowerShell ScriptBlock receives source that dcg cannot statically verify",
-                        ));
-                    }
-                };
-                if nested_command_depth >= MAX_EMBEDDED_SHELL_DEPTH
-                    || source.len() > heredoc_settings.limits.max_body_bytes
-                {
-                    return Some(EvaluationResult::denied_by_legacy(
-                        "An invoked PowerShell ScriptBlock exceeds dcg's bounded static-analysis limit",
-                    ));
-                }
-                let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
-                    source,
-                    enabled_keywords,
-                    ordered_packs,
-                    keyword_index,
-                    compiled_overrides,
-                    allowlists,
-                    heredoc_settings,
-                    allow_once_audit,
-                    project_path,
-                    deadline,
-                    ShellDialect::PowerShell,
-                    nested_command_depth + 1,
-                    inherited_automated_stdin,
-                );
-                if nested_evaluation_incomplete(&result) {
-                    return Some(result);
-                }
-                if result.is_denied() {
-                    if let Some(info) = result.pattern_info.as_mut() {
-                        info.reason = format!(
-                            "a later invocation of PowerShell ScriptBlock variable ${name} executes embedded source: {}",
-                            info.reason
-                        );
-                        info.matched_span = None;
-                        info.matched_text_preview = None;
-                    }
-                    return Some(result);
-                }
-            }
-        }
-    }
-
-    None
-}
-
 #[allow(clippy::too_many_arguments)]
 fn evaluate_powershell_executable_blocks(
     command: &str,
@@ -4182,7 +3868,7 @@ fn evaluate_powershell_executable_blocks(
     deadline: Option<&Deadline>,
     inherited_automated_stdin: bool,
 ) -> Option<EvaluationResult> {
-    let block_bodies = match powershell_executable_block_bodies(command) {
+    let block_bodies = match powershell_script_block_bodies(command) {
         Ok(bodies) => bodies,
         Err(()) => {
             return Some(EvaluationResult::denied_by_legacy(
@@ -11983,199 +11669,6 @@ fn local_powershell_prefix(prefix: &str) -> &str {
     prefix.rsplit([';', '\n', '|']).next().unwrap_or(prefix)
 }
 
-fn powershell_words_begin_with_scriptblock_consumer(
-    words: &[(String, bool, std::ops::Range<usize>)],
-) -> bool {
-    let Some((command, dynamic, _)) = words.first() else {
-        return false;
-    };
-    if *dynamic {
-        return false;
-    }
-    let Some(command) = powershell_unqualified_command_name(command) else {
-        return false;
-    };
-    matches!(
-        command.to_ascii_lowercase().as_str(),
-        "invoke-command"
-            | "icm"
-            | "start-job"
-            | "sajb"
-            | "start-threadjob"
-            | "foreach-object"
-            | "foreach"
-            | "%"
-            | "where-object"
-            | "where"
-            | "?"
-    )
-}
-
-fn powershell_scriptblock_consumer_tail(prefix: &str) -> Option<&str> {
-    let tokens = tokenize_for_shell_dialect(prefix, ShellDialect::PowerShell);
-    tokens
-        .iter()
-        .enumerate()
-        .filter(|(index, token)| {
-            if token.kind != NormalizeTokenKind::Word
-                || !powershell_token_at_command_boundary(&tokens, *index, prefix)
-            {
-                return false;
-            }
-            token.text(prefix).is_some_and(|raw| {
-                !raw.starts_with(['\'', '"'])
-                    && [
-                        "invoke-command",
-                        "icm",
-                        "start-job",
-                        "sajb",
-                        "start-threadjob",
-                        "foreach-object",
-                        "foreach",
-                        "%",
-                        "where-object",
-                        "where",
-                        "?",
-                    ]
-                    .iter()
-                    .any(|candidate| powershell_word_equals(raw, candidate))
-            })
-        })
-        .filter_map(|(_, token)| prefix.get(token.byte_range.start..))
-        .next_back()
-}
-
-fn powershell_prefix_executes_scriptblock(prefix: &str) -> bool {
-    let Some(consumer_tail) = powershell_scriptblock_consumer_tail(prefix) else {
-        return false;
-    };
-    let Some(words) = decoded_powershell_segment_words(consumer_tail) else {
-        return false;
-    };
-    if !powershell_words_begin_with_scriptblock_consumer(&words) {
-        return false;
-    }
-    // Bind the expression to the parameter immediately before it. Looking for
-    // any earlier ScriptBlock-valued parameter is incorrect when the Create
-    // expression belongs to a later data parameter, e.g. Invoke-Command's
-    // `-ArgumentList ([scriptblock]::Create(...))`.
-    if let Some((parameter, dynamic, _)) = words.last()
-        && !*dynamic
-        && parameter.starts_with('-')
-    {
-        if [
-            "scriptblock",
-            "process",
-            "filterscript",
-            "initializationscript",
-            "begin",
-            "end",
-            "parallel",
-            "remainingscripts",
-        ]
-        .iter()
-        .any(|candidate| powershell_alias_parameter(parameter, candidate))
-        {
-            return true;
-        }
-
-        // A switch does not consume the following expression, so the normal
-        // positional ScriptBlock binding still applies after it.
-        if [
-            "asjob",
-            "usenewrunspace",
-            "nonewscope",
-            "hidecomputername",
-            "enablenetworkaccess",
-            "indisconnectedsession",
-            "runas32",
-            "verbose",
-            "debug",
-            "whatif",
-            "confirm",
-        ]
-        .iter()
-        .any(|candidate| powershell_alias_parameter(parameter, candidate))
-        {
-            return true;
-        }
-
-        // Any other immediately preceding parameter receives this expression
-        // as data, not as the consumer's positional ScriptBlock.
-        return false;
-    }
-
-    // The object/property forms of these pipeline cmdlets treat following
-    // values as data rather than executable ScriptBlocks.
-    let command = powershell_unqualified_command_name(&words[0].0)
-        .unwrap_or(&words[0].0)
-        .to_ascii_lowercase();
-    let has_parameter = |candidate: &str| {
-        words
-            .iter()
-            .skip(1)
-            .any(|(word, dynamic, _)| !*dynamic && powershell_alias_parameter(word, candidate))
-    };
-    if matches!(command.as_str(), "where-object" | "where" | "?") && has_parameter("property") {
-        return false;
-    }
-    if matches!(command.as_str(), "foreach-object" | "foreach" | "%") && has_parameter("membername")
-    {
-        return false;
-    }
-    true
-}
-
-/// The keyword that starts the statement a script block belongs to, lowercase.
-///
-/// `prefix` is the text before the block's `{`. The statement is read as
-/// PowerShell parses it: blank space and line breaks may stand between the
-/// keyword and its block (`try` + newline + `{`), the parenthesized header of
-/// `if`, `while`, `for`, `foreach` and `switch` may hold any statement text
-/// (the `;` in `for ($i=0; $i -lt 1; $i++)`), and a loop may carry a
-/// `:label`. None is a dynamic first word or no statement at all.
-fn powershell_block_statement_keyword(prefix: &str) -> Option<String> {
-    let mut head = prefix.trim_end();
-    if head.ends_with(')') {
-        let close = head.len() - 1;
-        // The `(` whose group ends at the final `)`. Past the bound, or when
-        // none matches, read the text as written.
-        if let Some(open) = head
-            .match_indices('(')
-            .rev()
-            .take(MAX_POWERSHELL_VISIBLE_STATEMENTS)
-            .map(|(open, _)| open)
-            .find(|&open| find_powershell_subexpression_close(head, open + 1) == Ok(close))
-        {
-            head = head[..open].trim_end();
-        }
-    }
-    let local = head
-        .rsplit([';', '\r', '\n', '|', '{', '}'])
-        .next()
-        .unwrap_or(head)
-        .trim();
-    let words = decoded_powershell_segment_words(local)?;
-    let mut first = words.first()?;
-    // A script block's attributes and `param(…)` precede its first named
-    // block with only blank space between: `[CmdletBinding()] param()
-    // dynamicparam { … }`.
-    if !first.1
-        && (first.0.starts_with('[') || first.0.to_ascii_lowercase().starts_with("param"))
-        && let Some(last) = words.last().filter(|last| {
-            !last.1
-                && ["begin", "process", "end", "clean", "dynamicparam"]
-                    .iter()
-                    .any(|named| last.0.eq_ignore_ascii_case(named))
-        })
-    {
-        first = last;
-    } else if first.0.starts_with(':') && !first.1 {
-        first = words.get(1)?;
-    }
-    (!first.1).then(|| first.0.to_ascii_lowercase())
-}
-
 /// Whether `keyword` defines a command whose body runs when it is called:
 /// `function`, `filter`, and in Windows PowerShell 5.1 `workflow` and
 /// `configuration`.
@@ -12185,174 +11678,44 @@ fn powershell_keyword_defines_function(keyword: &str) -> bool {
         .any(|definer| keyword.eq_ignore_ascii_case(definer))
 }
 
-fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
-    let local = prefix
-        .rsplit([';', '\r', '\n', '|', '{', '}'])
-        .next()
-        .unwrap_or(prefix)
-        .trim();
-    if !local.is_empty()
-        && (powershell_prefix_ends_with_execution_operator(local)
-            || powershell_prefix_dot_sources_block(local)
-            || powershell_prefix_executes_scriptblock(local))
-    {
-        return true;
-    }
-
-    // Control-flow bodies, and the named blocks of a script block or
-    // function (`begin`, `process`, `end`, `dynamicparam`, and `clean` in
-    // PowerShell 7.3+). A named block outside a script block's top level is a
-    // parse error, so reading one anywhere loses nothing.
-    powershell_block_statement_keyword(prefix).is_some_and(|keyword| {
-        matches!(
-            keyword.as_str(),
-            "if" | "elseif"
-                | "else"
-                | "switch"
-                | "while"
-                | "for"
-                | "foreach"
-                | "do"
-                | "try"
-                | "catch"
-                | "finally"
-                | "trap"
-                | "begin"
-                | "process"
-                | "end"
-                | "clean"
-                | "dynamicparam"
-        )
-    })
-}
-
-fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
-    powershell_block_bodies(command, false)
-}
-
-/// The bodies of blocks that run and of `function`/`filter` definitions,
-/// whose bodies run when called (`evaluate_visible_powershell_function_invocations`).
-fn powershell_running_or_function_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
-    powershell_block_bodies(command, true)
-}
-
-/// The bodies of the script blocks in `command` that run, outermost first;
-/// blocks nested in a body are the recursive evaluator's.
+/// The bodies of the script blocks in `command`, outermost first; blocks
+/// nested in a body are the recursive evaluator's.
 ///
-/// Inside a `switch` body every block runs: a clause's condition block and
-/// its action block. Inside a `class` body every block is a method or
-/// constructor body; dcg does not follow method calls, so each is read as
-/// running. With `with_function_bodies`, `function`-like definitions count too.
-fn powershell_block_bodies(command: &str, with_function_bodies: bool) -> Result<Vec<&str>, ()> {
-    fn push<'a>(body: Option<&'a str>, bodies: &mut Vec<&'a str>) -> Result<(), ()> {
+/// Every block counts, wherever it is written. A block that does not run
+/// where it stands can run later from a variable, a hashtable value, an array
+/// element, a splat, a property, the pipeline, or any command or operator
+/// that takes a block (`Sort-Object {…}`, `-replace 'a',{…}`, a calculated
+/// property). dcg cannot follow every such path, so a block's body is judged
+/// where it is built, as the Unknown reading already does. A hashtable
+/// literal (`@{ … }`) is data and is searched for blocks inside it; `${name}`
+/// is a variable name.
+fn powershell_script_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
+    let mut bodies = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(open) = find_powershell_code_marker(command, "{", search_start) {
+        if command[..open].ends_with('$') {
+            search_start = command[open..]
+                .find('}')
+                .map_or(command.len(), |close| open + close + 1);
+            continue;
+        }
+        let close = find_powershell_script_block_close(command, open + 1).ok_or(())?;
+        if command[..open].ends_with('@') {
+            search_start = open + 1;
+            continue;
+        }
         if bodies.len() >= MAX_POWERSHELL_VISIBLE_STATEMENTS {
             return Err(());
         }
-        bodies.push(body.ok_or(())?);
-        Ok(())
-    }
-    let mut bodies = Vec::new();
-    let mut search_start = 0usize;
-    while search_start < command.len() {
-        let Some(open) = find_powershell_code_marker(command, "{", search_start) else {
-            break;
-        };
-        let Some(close) = find_powershell_script_block_close(command, open + 1) else {
-            return Err(());
-        };
-        let prefix = &command[..open];
-        let keyword = powershell_block_statement_keyword(prefix);
-        if powershell_prefix_opens_executable_block(prefix)
-            || (with_function_bodies
-                && keyword
-                    .as_deref()
-                    .is_some_and(powershell_keyword_defines_function))
-        {
-            push(command.get(open + 1..close), &mut bodies)?;
-        }
-        if matches!(keyword.as_deref(), Some("switch" | "class")) {
-            let mut inner_start = open + 1;
-            while let Some(inner_open) = find_powershell_code_marker(command, "{", inner_start)
-                .filter(|&inner_open| inner_open < close)
-            {
-                let inner_close =
-                    find_powershell_script_block_close(command, inner_open + 1).ok_or(())?;
-                // A hashtable literal (`@{ … }`) is data.
-                if !command[..inner_open].ends_with('@') {
-                    push(command.get(inner_open + 1..inner_close), &mut bodies)?;
-                }
-                inner_start = inner_close + 1;
-            }
-        }
-
-        // Nested blocks inside an executable body are visited by the recursive
-        // evaluator. Nested blocks inside an inert ScriptBlock literal must not
-        // be treated as executing merely because they contain control flow.
+        bodies.push(command.get(open + 1..close).ok_or(())?);
         search_start = close + 1;
     }
     Ok(bodies)
 }
 
-/// Whether a trimmed statement prefix is the dot-source operator of the
-/// script block that follows it. `. { … }` and `.{ … }` both run the block in
-/// the current scope, like `& { … }`. The general check above wants blank
-/// space after a `.` (so `./x` and member access stay inert), which the
-/// trimmed prefix no longer has; a `.` ending a word (`$x.`) is still none.
-fn powershell_prefix_dot_sources_block(local: &str) -> bool {
-    local.strip_suffix('.').is_some_and(|before| {
-        before.is_empty() || before.ends_with(|c: char| c.is_ascii_whitespace() || c == '(')
-    })
-}
-
-fn powershell_prefix_ends_with_execution_operator(prefix: &str) -> bool {
-    let bytes = prefix.as_bytes();
-    let mut end = bytes.len();
-    loop {
-        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-        if end > 0 && bytes[end - 1] == b'(' {
-            end -= 1;
-            continue;
-        }
-        break;
-    }
-    if end == 0 {
-        return false;
-    }
-    match bytes[end - 1] {
-        b'&' => end == 1 || bytes[end - 2] != b'&',
-        b'.' => {
-            // Dot-sourcing requires whitespace between `.` and its operand;
-            // member access and relative paths must remain inert here.
-            prefix[end..].bytes().any(|byte| byte.is_ascii_whitespace())
-                && (end == 1
-                    || bytes[end - 2].is_ascii_whitespace()
-                    || matches!(bytes[end - 2], b'(' | b'{' | b';' | b'|'))
-        }
-        _ => false,
-    }
-}
-
-fn powershell_scriptblock_create_is_executed(
-    command: &str,
-    marker_start: usize,
-    argument_close: usize,
-) -> bool {
-    let local_prefix = local_powershell_prefix(&command[..marker_start]);
-    let call_operator = powershell_prefix_ends_with_execution_operator(local_prefix);
-    let named_or_positional_consumer = powershell_prefix_executes_scriptblock(local_prefix);
-
-    let mut suffix = command[argument_close + 1..].trim_start();
-    while let Some(rest) = suffix.strip_prefix(')') {
-        suffix = rest.trim_start();
-    }
-    let invoked_method = powershell_method_invocation(suffix, ".invoke")
-        || powershell_method_invocation(suffix, ".invokereturnasis")
-        || powershell_method_invocation(suffix, ".invokewithcontext");
-    call_operator || named_or_positional_consumer || invoked_method
-}
-
+/// `[scriptblock]::Create(…)` builds a block from a string. Like a literal
+/// block ([`powershell_script_block_bodies`]), the result can run anywhere
+/// later, so its source is judged where it is built.
 fn collect_powershell_scriptblock_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     let mut search_start = 0usize;
     while let Some((marker_start, marker_end)) =
@@ -12384,76 +11747,21 @@ fn collect_powershell_scriptblock_sinks(command: &str, sinks: &mut Vec<Executabl
             });
             return;
         };
-        if powershell_scriptblock_create_is_executed(command, marker_start, close) {
-            let expression = &command[open + 1..close];
-            match parse_static_powershell_source(expression) {
-                Ok(source) => sinks.push(ExecutableTextSink::Payload {
-                    source,
-                    dialect: ShellDialect::PowerShell,
-                    context: "an invoked ScriptBlock executes embedded PowerShell source",
-                    nonlocal_filesystem: false,
-                }),
-                Err(()) => sinks.push(ExecutableTextSink::Unverified {
-                    rule: POWERSHELL_SCRIPTBLOCK_RULE,
-                    reason: "an invoked ScriptBlock receives source that dcg cannot statically verify",
-                }),
-            }
+        let expression = &command[open + 1..close];
+        match parse_static_powershell_source(expression) {
+            Ok(source) => sinks.push(ExecutableTextSink::Payload {
+                source,
+                dialect: ShellDialect::PowerShell,
+                context: "a ScriptBlock built from a string can run its PowerShell source",
+                nonlocal_filesystem: false,
+            }),
+            Err(()) => sinks.push(ExecutableTextSink::Unverified {
+                rule: POWERSHELL_SCRIPTBLOCK_RULE,
+                reason: "a ScriptBlock is built from source that dcg cannot statically verify",
+            }),
         }
         search_start = close + 1;
     }
-}
-
-fn mask_inert_powershell_scriptblock_sources<'a>(
-    command_for_match: &'a str,
-    original_command: &str,
-    dialect: ShellDialect,
-) -> Cow<'a, str> {
-    if dialect != ShellDialect::PowerShell
-        || command_for_match.len() != original_command.len()
-        || find_powershell_scriptblock_create(original_command, 0).is_none()
-    {
-        return Cow::Borrowed(command_for_match);
-    }
-
-    let mut masked: Option<Vec<u8>> = None;
-    let mut search_start = 0usize;
-    let mut seen = 0usize;
-    while let Some((marker_start, marker_end)) =
-        find_powershell_scriptblock_create(original_command, search_start)
-    {
-        seen += 1;
-        if seen > MAX_EXECUTABLE_TEXT_SINKS {
-            return Cow::Borrowed(command_for_match);
-        }
-        let mut open = marker_end;
-        while original_command
-            .as_bytes()
-            .get(open)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            open += 1;
-        }
-        if original_command.as_bytes().get(open) != Some(&b'(') {
-            search_start = open.max(marker_start + 1);
-            continue;
-        }
-        let Ok(close) = find_powershell_subexpression_close(original_command, open + 1) else {
-            return Cow::Borrowed(command_for_match);
-        };
-        if !powershell_scriptblock_create_is_executed(original_command, marker_start, close) {
-            let bytes = masked.get_or_insert_with(|| command_for_match.as_bytes().to_vec());
-            for byte in &mut bytes[open + 1..close] {
-                if !matches!(*byte, b'\r' | b'\n') {
-                    *byte = b' ';
-                }
-            }
-        }
-        search_start = close + 1;
-    }
-
-    masked.map_or(Cow::Borrowed(command_for_match), |bytes| {
-        Cow::Owned(String::from_utf8(bytes).expect("ASCII masking preserves valid UTF-8"))
-    })
 }
 
 fn powershell_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
@@ -15501,7 +14809,7 @@ fn powershell_block_exposes_pack_keyword(
         if depth > MAX_EMBEDDED_SHELL_DEPTH {
             return true;
         }
-        let Ok(bodies) = powershell_running_or_function_block_bodies(command) else {
+        let Ok(bodies) = powershell_script_block_bodies(command) else {
             return false;
         };
         bodies.into_iter().any(|body| {
@@ -16811,22 +16119,6 @@ fn evaluate_command_in_single_dialect_view(
         ) {
             return blocked;
         }
-        if let Some(blocked) = evaluate_visible_powershell_scriptblock_invocations(
-            command,
-            nested_command_depth,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
-            compiled_overrides,
-            allowlists,
-            heredoc_settings,
-            allow_once_audit,
-            project_path,
-            deadline,
-            inherited_automated_stdin,
-        ) {
-            return blocked;
-        }
         if let Some(blocked) = evaluate_powershell_executable_blocks(
             command,
             nested_command_depth,
@@ -17144,13 +16436,8 @@ fn evaluate_command_in_single_dialect_view(
         command,
         shell_dialect,
     );
-    let inert_scriptblock_mask = mask_inert_powershell_scriptblock_sources(
-        powershell_literal_sources.as_ref(),
-        command,
-        shell_dialect,
-    );
     let powershell_output_argument_mask = mask_powershell_output_argument_data(
-        inert_scriptblock_mask.as_ref(),
+        powershell_literal_sources.as_ref(),
         command,
         shell_dialect,
     );
