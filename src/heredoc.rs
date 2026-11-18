@@ -164,8 +164,10 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     r#"(?i)\b(?:powershell|pwsh)(?:\.exe)?["']?(?:\s+-\S+(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-e(?:n(?:c(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?\s+[A-Za-z0-9+/=]"#,
     // cmd.exe inline execution (`cmd /c "..."`, `cmd /k ...`, `cmd /s /c ...`,
     // `cmd.exe /c ...`). The /c (run-then-exit) and /k (run-then-stay) switches run an
-    // arbitrary inner command line that Tier 2 extracts and re-evaluates.
-    r"(?i)\bcmd(?:\.exe)?\b(?:\s+/[A-Za-z]+)*\s+/[ck]\b",
+    // arbitrary inner command line that Tier 2 extracts and re-evaluates. A
+    // possible closing quote of a quoted program name (`"cmd.exe" /c`) is
+    // allowed before the switches, as for PowerShell above.
+    r#"(?i)\bcmd(?:\.exe)?\b["']?(?:\s+/[A-Za-z]+)*\s+/[ck]\b"#,
     // PowerShell Invoke-Expression / its `iex` alias: executes a string as code. Tier 2
     // extracts the quoted argument and re-evaluates it.
     r"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b",
