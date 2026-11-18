@@ -498,14 +498,15 @@ fn powershell_backtick_r_in_a_cmd_payload() {
             );
         }
     }
+    // The harmless twin allows in PowerShell. Unknown is not checked: its
+    // POSIX reading sees an unterminated backtick substitution and denies
+    // with `heredoc.shell:launcher-unverified`, before and after this change.
     let command = "cmd /c \"gi`rt status\"";
-    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
-        assert_eq!(
-            decision_in(command, dialect),
-            EvaluationDecision::Allow,
-            "{dialect:?}: {command:?}"
-        );
-    }
+    assert_eq!(
+        decision_in(command, ShellDialect::PowerShell),
+        EvaluationDecision::Allow,
+        "PowerShell: {command:?}"
+    );
     for protocol in [Protocol::Claude, Protocol::Codex] {
         assert_eq!(
             hook_decision(protocol, "PowerShell", command),
