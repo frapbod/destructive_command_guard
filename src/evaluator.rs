@@ -13198,17 +13198,7 @@ fn mask_cmd_safe_argument_data<'a>(
             } else if decoded == "--" {
                 git_options_ended = true;
             } else if !git_options_ended && decoded.starts_with('-') && decoded != "-" {
-                let takes_separate_value = matches!(
-                    decoded.as_str(),
-                    "-C" | "-c"
-                        | "--git-dir"
-                        | "--work-tree"
-                        | "--namespace"
-                        | "--exec-path"
-                        | "--pager"
-                        | "--config-env"
-                );
-                if takes_separate_value {
+                if crate::context::git_global_option_takes_separate_value(&decoded) {
                     git_waiting_for_value = true;
                 }
             } else {
@@ -13240,6 +13230,13 @@ fn mask_cmd_safe_argument_data<'a>(
             mask_ranges.push(token.byte_range.clone());
             continue;
         }
+
+        // Same rule as the generic sanitizer: git `-m`/`--message` is a
+        // message only under `git_m_takes_message` subcommands.
+        let git_m_not_message =
+            command == "git" && !crate::context::git_m_takes_message(git_subcommand.as_deref());
+        let skips_git_message =
+            |flag: &str| git_m_not_message && matches!(flag, "-m" | "--message");
 
         if let Some(mut pending) = pending_data_flag.take() {
             let is_flag = !pending.argv_quote_open && decoded.starts_with('-') && decoded != "-";
@@ -13277,6 +13274,7 @@ fn mask_cmd_safe_argument_data<'a>(
         if let Some((flag, value)) = decoded.split_once('=')
             && !value.is_empty()
             && crate::context::SAFE_STRING_REGISTRY.is_flag_data(command, flag)
+            && !skips_git_message(flag)
         {
             let redirect = cmd_unescaped_redirect_suffix(raw);
             let maskable = redirect.map_or_else(
@@ -13314,7 +13312,9 @@ fn mask_cmd_safe_argument_data<'a>(
             continue;
         }
 
-        if let Some((flag, value)) = cmd_attached_short_data_value(command, &decoded) {
+        if let Some((flag, value)) = cmd_attached_short_data_value(command, &decoded)
+            && !skips_git_message(flag)
+        {
             let redirect = cmd_unescaped_redirect_suffix(raw);
             let maskable = redirect.map_or_else(
                 || {
@@ -13347,7 +13347,9 @@ fn mask_cmd_safe_argument_data<'a>(
             continue;
         }
 
-        if crate::context::SAFE_STRING_REGISTRY.is_flag_data(command, &decoded) {
+        if crate::context::SAFE_STRING_REGISTRY.is_flag_data(command, &decoded)
+            && !skips_git_message(&decoded)
+        {
             pending_data_flag = Some(CmdPendingDataFlag {
                 flag: decoded.clone(),
                 multi_value: crate::context::SAFE_STRING_REGISTRY
@@ -13356,7 +13358,9 @@ fn mask_cmd_safe_argument_data<'a>(
             });
             continue;
         }
-        if let Some(flag) = cmd_trailing_short_data_flag(command, &decoded) {
+        if let Some(flag) = cmd_trailing_short_data_flag(command, &decoded)
+            && !skips_git_message(flag)
+        {
             pending_data_flag = Some(CmdPendingDataFlag {
                 flag: flag.to_string(),
                 multi_value: crate::context::SAFE_STRING_REGISTRY
@@ -56730,6 +56734,14 @@ mod tests {
                 "git branch $\"-d\" feature",
                 "branch-delete",
             ),
+            // `PART=it-checkou` runs `git-checkout commit -m <path>`: `-m` is
+            // `--merge` there, so the message word is a path restored from
+            // ref `commit`.
+            (
+                ShellDialect::Posix,
+                r#"g${PART}t commit -m "Fix git reset --hard detection""#,
+                "checkout-ref-discard",
+            ),
             (
                 ShellDialect::PowerShell,
                 "Write-Output @'\nit's inert data\n'@; git branch -d feature",
@@ -56780,9 +56792,13 @@ mod tests {
                 ShellDialect::Cmd,
                 r#"%G% commit -m "Fix git reset --hard detection""#,
             ),
+            // `${G}it` can be `git` but no dashed built-in. `g${PART}t` can
+            // also be `git-checkout`, where `-m` is `--merge` and the command
+            // restores the path from ref `commit`; it is pinned as a denial
+            // below.
             (
                 ShellDialect::Posix,
-                r#"g${PART}t commit -m "Fix git reset --hard detection""#,
+                r#"${G}it commit -m "Fix git reset --hard detection""#,
             ),
             (ShellDialect::PowerShell, "'g`it' branch -d feature"),
             (ShellDialect::Cmd, "\"g^it\" branch -d feature"),
