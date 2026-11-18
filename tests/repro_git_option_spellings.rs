@@ -208,6 +208,10 @@ fn clean_dry_run_that_git_does_not_read_is_denied() {
             "git clean -n --no-dry-run -f",
             "git clean -fn --no-d",
             "git clean -fn --no-dry-ru",
+            "git clean -Xf",
+            "git clean -dXf",
+            "git clean -n --no-dry-run -Xf",
+            "git clean -n -Xdf --no-dry-run",
             // Already denied; kept as controls.
             "git clean --forc -d",
             "git clean -fdx",
@@ -228,6 +232,11 @@ fn clean_dry_run_stays_allowed() {
             "git clean -n -e foo",
             "git clean -dn -e '*.f'",
             "git clean -f -e foo -n",
+            "git clean -X -n",
+            "git clean -nX",
+            "git clean -Xn",
+            "git clean -Xnf",
+            "git clean -Xn -f",
         ],
     );
 }
@@ -274,6 +283,15 @@ fn windows_spellings_are_read_the_same_way() {
         ("PowerShell", r"C:\x\git.exe checkout -b x -f", "deny"),
         ("PowerShell", r"git.exe clean -f -ein", "deny"),
         ("Shell", r"C:\x\git restore --staged . -SW", "deny"),
+        // `--%` is PowerShell's stop-parsing token: the rest reaches Git as
+        // plain words. The Shell label may be PowerShell; Bash's Git refuses
+        // `--%`, so denying there costs nothing.
+        ("Shell", r"git --% restore --staged . -SW", "deny"),
+        ("Shell", r"git --% checkout -b x -f", "deny"),
+        ("PowerShell", r"git --% restore --staged . -SW", "deny"),
+        ("PowerShell", r"git --% checkout -b x -f", "deny"),
+        ("Shell", r"git --% restore --staged .", "allow"),
+        ("Shell", r"git --% checkout -b feature", "allow"),
         (
             "PowerShell",
             r"& 'C:\Program Files\Git\cmd\git.exe' restore --staged .",

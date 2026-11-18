@@ -3248,10 +3248,31 @@ fn static_git_executable_index(words: &[GitSemanticWord], dialect: ShellDialect)
     None
 }
 
-fn static_git_subcommand_index(words: &[GitSemanticWord], mut index: usize) -> Option<usize> {
+fn static_git_subcommand_index(words: &[GitSemanticWord], index: usize) -> Option<usize> {
+    match walk_git_global_options(words, index) {
+        GitGlobalWalk::Subcommand(at) => Some(at),
+        GitGlobalWalk::NoSubcommand | GitGlobalWalk::UnknownOption(_) => None,
+    }
+}
+
+/// Where the walk over `git`'s global options stops.
+enum GitGlobalWalk {
+    /// The subcommand word is at this index.
+    Subcommand(usize),
+    /// No subcommand runs, or it cannot be read statically: an info option
+    /// (`--version`, `help`), a dynamic word, a missing value, or no word.
+    NoSubcommand,
+    /// A dash word at this index that is not a Git global option. Git
+    /// refuses it, but a dialect that rewrites it (PowerShell's `--%`) can
+    /// still run the words after it as a subcommand.
+    UnknownOption(usize),
+}
+
+fn walk_git_global_options(words: &[GitSemanticWord], mut index: usize) -> GitGlobalWalk {
+    use GitGlobalWalk::{NoSubcommand, Subcommand, UnknownOption};
     while let Some(word) = words.get(index) {
         if word.dynamic {
-            return None;
+            return NoSubcommand;
         }
         let token = word.decoded.as_str();
         if matches!(
@@ -3266,7 +3287,7 @@ fn static_git_subcommand_index(words: &[GitSemanticWord], mut index: usize) -> O
                 | "help"
         ) || token.starts_with("--list-cmds=")
         {
-            return None;
+            return NoSubcommand;
         }
         if matches!(
             token,
@@ -3299,7 +3320,7 @@ fn static_git_subcommand_index(words: &[GitSemanticWord], mut index: usize) -> O
                 | "--attr-source"
         ) {
             if words.get(index + 1).is_none_or(|value| value.dynamic) {
-                return None;
+                return NoSubcommand;
             }
             index += 2;
             continue;
@@ -3325,9 +3346,13 @@ fn static_git_subcommand_index(words: &[GitSemanticWord], mut index: usize) -> O
             index += 1;
             continue;
         }
-        return (!token.starts_with('-')).then_some(index);
+        return if token.starts_with('-') {
+            UnknownOption(index)
+        } else {
+            Subcommand(index)
+        };
     }
-    None
+    NoSubcommand
 }
 
 fn record_cross_segment_environment(
@@ -6210,8 +6235,17 @@ fn git_words_refute_safe_premise(words: &[String]) -> bool {
             .to_ascii_lowercase();
         let base = base.strip_suffix(".exe").unwrap_or(&base);
         let (subcommand, args_from) = if base == "git" {
-            let Some(at) = static_git_subcommand_index(&semantic, index + 1) else {
-                return false;
+            // The safe patterns take any dash word as a global option, so read
+            // past one Git does not know as they do: a dialect that rewrites
+            // it (`git --% restore --staged . -SW` in PowerShell) still runs
+            // the subcommand after it.
+            let mut from = index + 1;
+            let at = loop {
+                match walk_git_global_options(&semantic, from) {
+                    GitGlobalWalk::Subcommand(at) => break at,
+                    GitGlobalWalk::NoSubcommand => return false,
+                    GitGlobalWalk::UnknownOption(at) => from = at + 1,
+                }
             };
             (words[at].as_str(), at + 1)
         } else if let Some(subcommand) = base.strip_prefix("git-") {
@@ -6362,7 +6396,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // clean dry-run just previews, doesn't delete
         safe_pattern!(
             "clean-dry-run-short",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+-[a-z]*n[a-z]*"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+-[A-Za-z]*n[A-Za-z]*"
         ),
         safe_pattern!(
             "clean-dry-run-long",
@@ -6860,7 +6894,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // clean -f deletes untracked files (CRITICAL - permanently removes files)
         destructive_pattern!(
             "clean-force",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()]+)*\s+(?:-[a-z]*f|--f(?:o(?:r(?:ce?)?)?)?\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()]+)*\s+(?:-[A-Za-z]*f|--f(?:o(?:r(?:ce?)?)?)?\b)",
             "git clean -f/--force removes untracked files permanently. Review with 'git clean -n' first.",
             Critical,
             "git clean -f permanently deletes untracked files from your working directory. \
@@ -9957,6 +9991,9 @@ git x",
             "git clean -f -ein",
             "git status && git clean -n --no-dry-run -f",
             "git restore --staged --bogus .",
+            "git --% restore --staged . -SW",
+            "git --% checkout -b x -f",
+            "git -x --% clean -n --no-dry-run -Xf",
         ] {
             assert!(safe_premise_refuted(command), "{command}");
         }
@@ -9970,6 +10007,11 @@ git x",
             "git status",
             "git stash drop",
             "echo restore -SW",
+            "git --% restore --staged .",
+            "git --% checkout -b feature",
+            "git restore --staged . && grep git -r src",
+            "git clean -nX",
+            "git clean -Xn -f",
         ] {
             assert!(!safe_premise_refuted(command), "{command}");
         }
