@@ -161,6 +161,11 @@ enum Unit {
     Argument(Vec<Range<usize>>),
     /// `--`: every later word is an argument.
     EndOfParameters,
+    /// Arguments glued to each other with no blank (`'reset'.Foo`, where
+    /// PowerShell may go on in a way the scan does not model), read as one
+    /// argument whose value is unknown. Only made when the call as scanned
+    /// does not bind (see [`merge_glued`]).
+    Unknown,
 }
 
 /// A bound value: elements of the text, or a word PowerShell passed as is
@@ -169,6 +174,8 @@ enum Unit {
 enum Value {
     Elements(Vec<Range<usize>>),
     Literal(String),
+    /// A value dcg cannot read (see [`Unit::Unknown`]).
+    Unknown,
 }
 
 fn horizontal_space_len(text: &str, at: usize) -> Option<usize> {
@@ -318,21 +325,31 @@ fn index_end(bytes: &[u8], at: usize) -> usize {
     bytes.len()
 }
 
-/// The end of what follows a group that ends at `at` and still belongs to
-/// its element: member access (`.Name`, `::Name`, a quoted or `$` name),
-/// a method call right after a member (`.Trim()`), and an index (`[1]`).
-/// Anything else starts the next argument: PowerShell 7.5 binds
-/// `('reset')x` and `('reset','--hard')-Wait` as two arguments.
-fn group_postfix_end(text: &str, mut at: usize) -> usize {
+/// The end of what follows a primary expression that ends at `at` (a
+/// group, `@( )`, `$( )`, `@{ }`, a script block, a quoted string, a
+/// here-string or a `$` variable) and still belongs to its argument:
+/// member access (`.Name`, `::Name`, a quoted or `$` name), a method call
+/// right after a member (`.Trim()`), an index (`[1]`), and their
+/// null-conditional forms `?.` and `?[` (PowerShell 7.1 and later), with
+/// no blank before them. Anything else starts the next argument:
+/// PowerShell 7.5 binds `('reset')x`, `'reset'('--hard')` and
+/// `('reset','--hard')-Wait` as two arguments, and `('x') ?.Trim()` is a
+/// parse error.
+fn postfix_end(text: &str, mut at: usize) -> usize {
     let bytes = text.as_bytes();
     loop {
-        let name_start = match bytes.get(at) {
+        let null_conditional =
+            bytes.get(at) == Some(&b'?') && matches!(bytes.get(at + 1), Some(b'.' | b'['));
+        let operator = at + usize::from(null_conditional);
+        let name_start = match bytes.get(operator) {
             Some(b'[') => {
-                at = index_end(bytes, at);
+                at = index_end(bytes, operator);
                 continue;
             }
-            Some(b'.') if bytes.get(at + 1) != Some(&b'.') => at + 1,
-            Some(b':') if bytes.get(at + 1) == Some(&b':') => at + 2,
+            Some(b'.') if bytes.get(operator + 1) != Some(&b'.') => operator + 1,
+            Some(b':') if !null_conditional && bytes.get(operator + 1) == Some(&b':') => {
+                operator + 2
+            }
             _ => return at,
         };
         let name_end = match bytes.get(name_start) {
@@ -360,26 +377,73 @@ fn group_postfix_end(text: &str, mut at: usize) -> usize {
     }
 }
 
-/// End of one element (a word, string, group or here-string) at `at`.
-fn element_end(text: &str, at: usize) -> usize {
+/// The end of a variable that starts at `at` (`$name`, `$scope:name`,
+/// `${name}`, `$_`, `$$`, `$?`, `$^`), if one does.
+fn variable_end(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes.get(at) != Some(&b'$') {
+        return None;
+    }
+    match bytes.get(at + 1)? {
+        b'{' => Some(group_end(bytes, at + 1)),
+        b'$' | b'?' | b'^' => Some(at + 2),
+        byte if byte.is_ascii_alphanumeric() || *byte == b'_' => {
+            let mut index = at + 1;
+            loop {
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    index += 1;
+                }
+                // A scope or drive (`$env:ComSpec`), not `::`.
+                if bytes.get(index) == Some(&b':')
+                    && bytes
+                        .get(index + 1)
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    index += 1;
+                } else {
+                    return Some(index);
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The end of the primary expression at `at` that member access or an
+/// index may follow: a here-string, a quoted string, or a group (`( )`,
+/// `{ }`, `@( )`, `@{ }`, `$( )`).
+fn primary_end(text: &str, at: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     if let Some(end) = here_string_end(text, at) {
-        return end;
+        return Some(end);
     }
-    let mut index = match bytes.get(at) {
-        // A string that starts a word ends the word (`'a'b` is two).
-        Some(b'\'' | b'"') => return quoted_end(bytes, at),
-        // A group (`( )`, `{ }`, `@( )`, `@{ }`, `$( )`) ends its element
-        // unless member access or an index follows.
-        Some(b'(' | b'{') => return group_postfix_end(text, group_end(bytes, at)),
-        Some(b'@') if matches!(bytes.get(at + 1), Some(b'(' | b'{')) => {
-            return group_postfix_end(text, group_end(bytes, at + 1));
-        }
-        Some(b'$') if bytes.get(at + 1) == Some(&b'(') => {
-            return group_postfix_end(text, group_end(bytes, at + 1));
-        }
-        // `${name}` is a variable: the word goes on (`${a}x` is one word).
-        Some(b'$') if bytes.get(at + 1) == Some(&b'{') => group_end(bytes, at + 1),
+    match bytes.get(at)? {
+        b'\'' | b'"' => Some(quoted_end(bytes, at)),
+        b'(' | b'{' => Some(group_end(bytes, at)),
+        b'@' if matches!(bytes.get(at + 1), Some(b'(' | b'{')) => Some(group_end(bytes, at + 1)),
+        b'$' if bytes.get(at + 1) == Some(&b'(') => Some(group_end(bytes, at + 1)),
+        _ => None,
+    }
+}
+
+/// End of one element (a word, string, group or here-string) at `at`.
+/// Every primary expression ends its element through [`postfix_end`].
+fn element_end(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    // A string that starts a word ends the word (`'a'b` is two), and a
+    // group ends its element, unless member access or an index follows.
+    if let Some(end) = primary_end(text, at) {
+        return postfix_end(text, end);
+    }
+    let mut index = match variable_end(bytes, at) {
+        // A variable with member access or an index (`$a.Trim()`,
+        // `${a}[0]`) is one expression.
+        Some(end) if postfix_end(text, end) > end => return postfix_end(text, end),
+        // `${name}` is a variable: the word goes on (`${a}x` is one word),
+        // as after `$name` (`$HOME\x`).
+        Some(end) if bytes.get(at + 1) == Some(&b'{') => end,
         _ => at,
     };
     // A bare word: quoted parts and escapes belong to it.
@@ -481,26 +545,34 @@ fn redirection_end(text: &str, at: usize) -> Option<usize> {
 }
 
 /// The argument units of the command whose arguments start at `at`, up to
-/// the end of its statement, and that end. Scanning stops after `limit`
-/// units: no binding needs more (each parameter binds once).
-fn units(text: &str, mut at: usize, limit: usize) -> (Vec<Unit>, usize) {
+/// the end of its statement, whether each starts right where the one before
+/// it ends (glued, with no blank or redirection between), and that end.
+/// Scanning stops after `limit` units: no binding needs more (each
+/// parameter binds once).
+fn units(text: &str, mut at: usize, limit: usize) -> (Vec<Unit>, Vec<bool>, usize) {
     let bytes = text.as_bytes();
     let mut units = Vec::new();
+    let mut glued = Vec::new();
     let mut end = at;
+    let mut previous_end = None;
     while units.len() < limit {
         at = skip_blanks(text, at, false);
         if let Some(after) = redirection_end(text, at) {
             at = after;
             end = at;
+            previous_end = None;
             continue;
         }
+        let starts_glued = previous_end == Some(at);
         if at >= bytes.len() || ends_statement(bytes, at) {
             break;
         }
         if let Some(after) = end_of_parameters(text, at) {
             units.push(Unit::EndOfParameters);
+            glued.push(starts_glued);
             at = after;
             end = at;
+            previous_end = Some(at);
             continue;
         }
         if is_parameter_start(text, at) {
@@ -522,6 +594,7 @@ fn units(text: &str, mut at: usize, limit: usize) -> (Vec<Unit>, usize) {
                         name: name_start..name_end,
                         attached: Some(Vec::new()),
                     });
+                    glued.push(starts_glued);
                     end = value_start;
                     break;
                 }
@@ -537,15 +610,43 @@ fn units(text: &str, mut at: usize, limit: usize) -> (Vec<Unit>, usize) {
                 name: name_start..name_end,
                 attached,
             });
+            glued.push(starts_glued);
             end = at;
+            previous_end = Some(at);
             continue;
         }
         let (elements, list_end) = element_list(text, at);
         units.push(Unit::Argument(elements));
+        glued.push(starts_glued);
         at = list_end;
         end = at;
+        previous_end = Some(at);
     }
-    (units, end)
+    (units, glued, end)
+}
+
+/// The units with every argument glued to the argument before it merged
+/// into one [`Unit::Unknown`], or `None` when no argument is glued to
+/// another. An argument glued to a parameter name stays its value
+/// (`-ArgumentList('reset')`). PowerShell continues an argument after a
+/// primary expression in ways the scan may not model; when the call as
+/// scanned does not bind, this reading fails closed on that argument
+/// instead of reading nothing.
+fn merge_glued(units: &[Unit], glued: &[bool]) -> Option<Vec<Unit>> {
+    let mut merged: Vec<Unit> = Vec::with_capacity(units.len());
+    let mut changed = false;
+    for (unit, glued) in units.iter().zip(glued) {
+        let joins = *glued
+            && matches!(unit, Unit::Argument(_) | Unit::Unknown)
+            && matches!(merged.last(), Some(Unit::Argument(_) | Unit::Unknown));
+        if joins {
+            *merged.last_mut()? = Unit::Unknown;
+            changed = true;
+        } else {
+            merged.push(unit.clone());
+        }
+    }
+    changed.then_some(merged)
 }
 
 /// A bound call: the program (`None` when it is not a literal) and the
@@ -597,6 +698,11 @@ fn bind(text: &str, units: &[Unit], version_7: bool) -> Option<Bound> {
             (Unit::Argument(elements), None) => {
                 positionals.push(Value::Elements(elements.clone()));
             }
+            (Unit::Unknown, Some(parameter)) => {
+                assign(parameter, Some(Value::Unknown))?;
+                pending = None;
+            }
+            (Unit::Unknown, None) => positionals.push(Value::Unknown),
             (
                 Unit::Parameter {
                     start,
@@ -750,6 +856,10 @@ fn element_strings_within(raw: &str, depth: usize) -> Option<Vec<String>> {
         return Some(Vec::new());
     }
     if raw.starts_with("@'") || raw.starts_with("@\"") {
+        // Only a here-string that is the whole element is its text.
+        if here_string_end(raw, 0) != Some(raw.len()) {
+            return None;
+        }
         return here_string_text(raw).map(|text| vec![text]);
     }
     if raw.starts_with('{') && group_end(raw.as_bytes(), 0) == raw.len() {
@@ -800,6 +910,18 @@ fn element_strings_within(raw: &str, depth: usize) -> Option<Vec<String>> {
     decode_powershell_static_word(raw).map(|text| vec![text])
 }
 
+/// The strings of the literal that an element applies member access or an
+/// index to (`('-rf','/')?[0..1]`, `'reset --hard'.Trim()`), or `None`.
+/// The element's own value is unknown, but it is most often made from
+/// these strings, so they are read along with one unknown word.
+fn derived_strings(raw: &str) -> Option<Vec<String>> {
+    let raw = raw.trim();
+    let end = primary_end(raw, 0)?;
+    (end < raw.len() && postfix_end(raw, end) == raw.len())
+        .then(|| element_strings(&raw[..end]))
+        .flatten()
+}
+
 fn value_strings(text: &str, value: &Value) -> Option<Vec<String>> {
     match value {
         Value::Literal(word) => Some(vec![word.clone()]),
@@ -810,6 +932,7 @@ fn value_strings(text: &str, value: &Value) -> Option<Vec<String>> {
             }
             Some(strings)
         }
+        Value::Unknown => None,
     }
 }
 
@@ -920,6 +1043,10 @@ const SHELL_READERS: [&str; 3] = ["cmd", "powershell", "sh"];
 /// literal (`'reset','--hard',$rest` still runs a hard reset).
 const DYNAMIC_ARGUMENT: &str = "DCG_START_PROCESS_ARGUMENT";
 
+/// The variable that stands for a program that is not a literal and may
+/// be any program (`Start-Process $g.Trim() reset,--hard`).
+const DYNAMIC_PROGRAM: &str = "DCG_START_PROCESS_PROGRAM";
+
 /// How a program's reader spells an element that is not a literal: a
 /// shell reads it as its own variable, unknown text it fails closed on
 /// (`cmd /c %DCG_START_PROCESS_ARGUMENT%`); another program gets one argv
@@ -942,18 +1069,29 @@ fn joined_arguments(
     dynamic: &str,
     need_literal: bool,
 ) -> Option<String> {
-    let Value::Elements(elements) = value else {
-        return value_strings(text, value).map(|strings| strings.join(" "));
+    let elements = match value {
+        Value::Elements(elements) => elements,
+        Value::Unknown => return (!need_literal).then(|| dynamic.to_string()),
+        Value::Literal(_) => {
+            return value_strings(text, value).map(|strings| strings.join(" "));
+        }
     };
     let mut strings = Vec::new();
     let mut literal = false;
     for element in elements {
-        match element_strings(text.get(element.clone())?) {
+        let raw = text.get(element.clone())?;
+        match element_strings(raw) {
             Some(decoded) => {
                 literal = true;
                 strings.extend(decoded);
             }
-            None => strings.push(dynamic.to_string()),
+            None => {
+                if let Some(derived) = derived_strings(raw) {
+                    literal = true;
+                    strings.extend(derived);
+                }
+                strings.push(dynamic.to_string());
+            }
         }
     }
     (literal || !need_literal).then(|| strings.join(" "))
@@ -969,15 +1107,26 @@ fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
         None => None,
     };
     let Some(file) = file else {
-        // Any program: read the line as each shell would, when some of it
-        // is known.
-        return SHELL_READERS
+        // Any program, when some of the line is known: read the line as
+        // each shell would, and as the argv of a program dcg cannot name,
+        // which PowerShell's reading fails closed on as it does for the
+        // program called directly (`& $g reset --hard`).
+        let mut lines: Vec<String> = SHELL_READERS
             .iter()
             .filter_map(|shell| {
                 joined_arguments(text, arguments, &dynamic_argument(shell), true)
                     .map(|joined| format!("{shell} {joined}"))
             })
             .collect();
+        if let Some(joined) = joined_arguments(text, arguments, DYNAMIC_ARGUMENT, true) {
+            let mut line = format!("& ${DYNAMIC_PROGRAM}");
+            for word in windows_argv(&joined) {
+                line.push(' ');
+                line.push_str(&powershell_word(&word));
+            }
+            lines.push(line);
+        }
+        return lines;
     };
     if file.is_empty() {
         return Vec::new();
@@ -1083,14 +1232,24 @@ pub(crate) fn start_process_lines(text: &str) -> Vec<(Range<usize>, Vec<String>)
                 (None, _) => (name, quote_end),
             }
         };
-        let (units, end) = units(text, after, UNIT_LIMIT + 1);
+        let (units, glued, end) = units(text, after, UNIT_LIMIT + 1);
+        let bind_both = |units: &[Unit]| -> Vec<Bound> {
+            [true, false]
+                .into_iter()
+                .filter_map(|version_7| bind(text, units, version_7))
+                .collect()
+        };
+        let mut bindings = bind_both(&units);
+        if bindings.is_empty() {
+            if let Some(merged) = merge_glued(&units, &glued) {
+                bindings = bind_both(&merged);
+            }
+        }
         let mut lines: Vec<String> = Vec::new();
-        for version_7 in [true, false] {
-            if let Some(bound) = bind(text, &units, version_7) {
-                for line in bound_lines(text, &bound) {
-                    if !lines.contains(&line) {
-                        lines.push(line);
-                    }
+        for bound in &bindings {
+            for line in bound_lines(text, bound) {
+                if !lines.contains(&line) {
+                    lines.push(line);
                 }
             }
         }
@@ -1213,7 +1372,6 @@ mod tests {
             "Start-Process git -ArgumentList -Wait",
             "Start-Process -Verb -Wait git reset",
             "Start-Process git -ArgumentList reset -ArgumentList hard",
-            "Start-Process git 'a'b",
             "Start-Process git reset -Wait:",
         ] {
             assert!(
@@ -1250,6 +1408,7 @@ mod tests {
                 "cmd /c git reset --hard".to_string(),
                 "powershell /c git reset --hard".to_string(),
                 "sh /c git reset --hard".to_string(),
+                "& $DCG_START_PROCESS_PROGRAM /c git reset --hard".to_string(),
             ]
         );
         assert!(lines("Start-Process $tool -ArgumentList $rest").is_empty());
@@ -1266,9 +1425,6 @@ mod tests {
             "Start-Process git -ArgumentList (\"{0} --hard\" -f 'reset')",
             "Start-Process git -ArgumentList ('reset','--hard' -join ' ')",
             "Start-Process git -ArgumentList @{a='reset --hard'}.a",
-            "Start-Process git ('a','reset --hard')[1] -Wait",
-            "Start-Process git (' reset --hard ').Trim() -Wait",
-            "Start-Process git {reset --hard}.ToString() -Wait",
         ] {
             assert_eq!(
                 lines(spelling),
@@ -1280,6 +1436,22 @@ mod tests {
             lines("Start-Process notepad $file"),
             program("notepad DCG_START_PROCESS_ARGUMENT")
         );
+        // Member access or an index on a literal: its strings and one
+        // unknown word.
+        assert_eq!(
+            lines("Start-Process git ('a','reset --hard')[1] -Wait"),
+            program("git a reset --hard DCG_START_PROCESS_ARGUMENT")
+        );
+        for spelling in [
+            "Start-Process git (' reset --hard ').Trim() -Wait",
+            "Start-Process git {reset --hard}.ToString() -Wait",
+        ] {
+            assert_eq!(
+                lines(spelling),
+                program("git reset --hard DCG_START_PROCESS_ARGUMENT"),
+                "{spelling:?}"
+            );
+        }
     }
 
     /// Measured with PowerShell 7.5: a script block where a string belongs
@@ -1366,6 +1538,9 @@ mod tests {
             lines("Start-Process rm ('-rf','/')-Wait -NoNewWindow"),
             program("rm -rf /")
         );
+        // PowerShell 7.5 stops on these with a binding error (two
+        // arguments). The glued arguments are read as one unknown argument
+        // instead, which fails closed (see `glued_arguments_fail_closed`).
         for spelling in [
             "Start-Process git -ArgumentList ('reset')x",
             "Start-Process git -ArgumentList ('reset')'--hard'",
@@ -1375,10 +1550,10 @@ mod tests {
             "Start-Process git @{a='reset'}x",
             "Start-Process git ('reset --hard').Trim()x",
         ] {
-            assert!(
-                lines(spelling).is_empty(),
-                "{spelling:?}: {:?}",
-                lines(spelling)
+            assert_eq!(
+                lines(spelling),
+                program("git DCG_START_PROCESS_ARGUMENT"),
+                "{spelling:?}"
             );
         }
         // `${a}` is a variable: the word goes on.
@@ -1542,6 +1717,134 @@ mod tests {
         assert_eq!(lines("Start-Process git 2>&1reset"), program("git reset"));
         // `reset` is the redirection's target; no argument list.
         assert!(lines("Start-Process git > reset").is_empty());
+    }
+
+    /// Measured with PowerShell 7.5: member access, a method call after a
+    /// member, an index and their null-conditional forms continue the
+    /// argument after every primary expression, with no blank before them.
+    #[test]
+    fn primary_expressions_continue_their_argument() {
+        let unknown = program("git DCG_START_PROCESS_ARGUMENT");
+        let derived = program("git reset --hard DCG_START_PROCESS_ARGUMENT");
+        for (spelling, expected) in [
+            ("Start-Process git $a.Trim() -Wait -NoNewWindow", &unknown),
+            ("Start-Process git ${a}.Trim()", &unknown),
+            ("Start-Process git $a.Substring(0)", &unknown),
+            ("Start-Process git $a.Trim( )", &unknown),
+            ("Start-Process git $a.Split(' ')", &unknown),
+            ("Start-Process git $a.'Trim'()", &unknown),
+            ("Start-Process git $a.Trim()-Wait -NoNewWindow", &unknown),
+            ("Start-Process git -ArgumentList $a.Trim() -Wait", &unknown),
+            (
+                "Start-Process -FilePath git -ArgumentList:$a.Trim()",
+                &unknown,
+            ),
+            ("Start-Process git $a.Clone()", &unknown),
+            ("Start-Process git $_.Trim() -Wait", &unknown),
+            ("Start-Process git $a.Trim()[0]", &unknown),
+            ("Start-Process git $env:A.Trim()", &unknown),
+            ("Start-Process git @{a='reset --hard'}?['a']", &unknown),
+            ("Start-Process git 'reset --hard'.Trim() -Wait", &derived),
+            ("Start-Process git \"reset --hard\".Trim()", &derived),
+            (
+                "Start-Process git 'reset --hard'.Trim().ToString()",
+                &derived,
+            ),
+            ("Start-Process git 'reset --hard'.'Trim'()", &derived),
+            ("Start-Process git 'reset --hard'?.Trim()", &derived),
+            ("Start-Process git 'reset','--hard'.Trim()", &derived),
+            ("Start-Process git @'\nreset --hard\n'@.Trim()", &derived),
+            ("Start-Process git ('reset --hard')?.Trim() -Wait", &derived),
+            ("Start-Process git ('reset','--hard')?[0..1]", &derived),
+            ("Start-Process git @('reset','--hard')?[0..1]", &derived),
+            ("Start-Process git $('reset --hard')?.Trim()", &derived),
+            ("Start-Process git {reset --hard}?.ToString()", &derived),
+            ("Start-Process git ('reset --hard')?.'Trim'()", &derived),
+            (
+                "Start-Process git ('reset --hard')?.Trim()?.ToString()",
+                &derived,
+            ),
+            ("Start-Process git ('reset --hard')?.Trim()-Wait", &derived),
+            (
+                "Start-Process git -ArgumentList:('reset --hard')?.Trim()",
+                &derived,
+            ),
+        ] {
+            assert_eq!(&lines(spelling), expected, "{spelling:?}");
+        }
+        assert_eq!(
+            lines("Start-Process git 'a'.Replace('a','reset --hard')"),
+            program("git a DCG_START_PROCESS_ARGUMENT")
+        );
+        assert_eq!(
+            lines("Start-Process rm ('-rf','x')?[0..1] -Wait -NoNewWindow"),
+            program("rm -rf x DCG_START_PROCESS_ARGUMENT")
+        );
+        assert_eq!(
+            lines("Start-Process cmd $c.Trim()"),
+            vec!["cmd %DCG_START_PROCESS_ARGUMENT%".to_string()]
+        );
+        assert_eq!(
+            lines("Start-Process cmd ('/c git reset --hard')?.Trim()"),
+            vec!["cmd /c git reset --hard %DCG_START_PROCESS_ARGUMENT%".to_string()]
+        );
+        assert_eq!(
+            lines("Start-Process notepad $f.FullName"),
+            program("notepad DCG_START_PROCESS_ARGUMENT")
+        );
+        assert_eq!(
+            lines("Start-Process msedge 'https://example.com'.Trim()"),
+            program("msedge https://example.com DCG_START_PROCESS_ARGUMENT")
+        );
+        // A blank before `?.` is a parse error; nothing binds.
+        assert!(lines("Start-Process git ('reset --hard') ?.Trim()").is_empty());
+    }
+
+    /// A program that is not a literal is also read as the argv of a
+    /// program dcg cannot name, as `& $g reset --hard` is.
+    #[test]
+    fn a_computed_program_is_any_program() {
+        let any = vec![
+            "cmd reset --hard".to_string(),
+            "powershell reset --hard".to_string(),
+            "sh reset --hard".to_string(),
+            "& $DCG_START_PROCESS_PROGRAM reset --hard".to_string(),
+        ];
+        for spelling in [
+            "Start-Process $g reset,--hard",
+            "Start-Process $g.Trim() reset,--hard -Wait -NoNewWindow",
+            "Start-Process ('git')?.Trim() reset,--hard",
+            "Start-Process -FilePath ('git')?.Trim() reset,--hard",
+        ] {
+            assert_eq!(lines(spelling), any, "{spelling:?}");
+        }
+    }
+
+    /// Arguments glued with no blank that do not bind as scanned are read
+    /// as one argument of unknown value, so a continuation the scan does
+    /// not model fails closed instead of reading nothing.
+    #[test]
+    fn glued_arguments_fail_closed() {
+        for spelling in [
+            "Start-Process git 'a'b",
+            "Start-Process git ('reset')--hard -Wait",
+            "Start-Process git ('reset','--hard')('x')",
+            "Start-Process git 'reset'('--hard')",
+            "Start-Process git -ArgumentList('reset')x",
+        ] {
+            assert_eq!(
+                lines(spelling),
+                program("git DCG_START_PROCESS_ARGUMENT"),
+                "{spelling:?}"
+            );
+        }
+        // Glued arguments that bind as scanned keep their reading.
+        assert_eq!(
+            lines("Start-Process git 'reset','--hard'-Wait"),
+            program("git reset --hard")
+        );
+        // A call that does not bind with nothing glued still reads nothing.
+        assert!(lines("Start-Process git reset --hard").is_empty());
     }
 
     /// A string cast in an expression keeps its strings.

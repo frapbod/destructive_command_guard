@@ -273,15 +273,20 @@ fn parameters_bind_by_name_prefix_alias_and_position() {
 #[test]
 fn dynamic_programs_are_read_as_shells() {
     assert_everywhere(
-        &["Start-Process -FilePath $env:ComSpec -ArgumentList '/c git reset --hard'"],
-        EvaluationDecision::Deny,
-    );
-    assert_everywhere(
         &[
-            "Start-Process -FilePath $env:ComSpec -ArgumentList '/c dir'",
+            "Start-Process -FilePath $env:ComSpec -ArgumentList '/c git reset --hard'",
+            // `$tool` may be git: read as any program, as `& $tool reset
+            // --hard` is.
             "Start-Process $tool -ArgumentList 'reset','--hard'",
         ],
-        EvaluationDecision::Allow,
+        EvaluationDecision::Deny,
+    );
+    // A computed program with a literal argument list fails closed, as the
+    // program called directly does (`& $env:ComSpec /c dir` denies in the
+    // PowerShell dialect on the base too).
+    assert_everywhere(
+        &["Start-Process -FilePath $env:ComSpec -ArgumentList '/c dir'"],
+        EvaluationDecision::Deny,
     );
 }
 
@@ -493,6 +498,61 @@ fn review_round_2_spellings_bind() {
             "& 'Start-Process' notepad 'C:\\x\\notes.txt'",
             "Start-Process git ('status')-Wait",
             "Write-Output 'Start-Process' git reset,--hard",
+        ],
+        EvaluationDecision::Allow,
+    );
+}
+
+/// Review round 3: PowerShell continues an argument after every primary
+/// expression (a variable, a quoted string, a here-string, a group) with
+/// member access, a method call, an index, `?.` or `?[`; pwsh 7.5 ran
+/// `git reset --hard` (or `rm -rf`) for each. A computed program is read as
+/// any program, and glued arguments that do not bind fail closed.
+#[test]
+fn review_round_3_spellings_bind() {
+    assert_everywhere(
+        &[
+            "$a='reset --hard'; Start-Process git $a.Trim() -Wait -NoNewWindow",
+            "$a='reset --hard'; Start-Process git ${a}.Trim() -Wait -NoNewWindow",
+            "$a='reset --hard'; Start-Process git $a.Substring(0)",
+            "$a='reset --hard'; Start-Process git $a.Split(' ')",
+            "$a='reset --hard'; Start-Process git $a.'Trim'()",
+            "$a='reset --hard'; Start-Process git $a.Trim()-Wait -NoNewWindow",
+            "$a='reset --hard'; Start-Process git -ArgumentList:$a.Trim()",
+            "$a='reset','--hard'; Start-Process git $a.Clone()",
+            "'reset --hard' | ForEach-Object { Start-Process git $_.Trim() -Wait -NoNewWindow }",
+            "Start-Process git 'reset --hard'.Trim() -Wait -NoNewWindow",
+            "Start-Process git \"reset --hard\".Trim()",
+            "Start-Process git 'a'.Replace('a','reset --hard')",
+            "Start-Process git 'reset','--hard'.Trim()",
+            "Start-Process git @'\nreset --hard\n'@.Trim()",
+            "$g='git'; Start-Process $g.Trim() reset,--hard",
+            "$c='/c git reset --hard'; Start-Process cmd $c.Trim()",
+            "Start-Process git ('reset --hard')?.Trim() -Wait -NoNewWindow",
+            "Start-Process git ('reset','--hard')?[0..1]",
+            "Start-Process git @('reset','--hard')?[0..1]",
+            "Start-Process git $('reset --hard')?.Trim()",
+            "Start-Process git {reset --hard}?.ToString()",
+            "Start-Process git @{a='reset --hard'}?['a']",
+            "Start-Process git ('reset --hard')?.Trim()?.ToString()",
+            "Start-Process git -ArgumentList:('reset --hard')?.Trim()",
+            "Start-Process git 'reset --hard'?.Trim()",
+            "Start-Process ('git')?.Trim() reset,--hard",
+            "Start-Process -FilePath ('git')?.Trim() reset,--hard",
+            "Start-Process rm ('-rf','/')?[0..1] -Wait -NoNewWindow",
+            "Start-Process cmd ('/c git reset --hard')?.Trim()",
+            "Start-Process $g reset,--hard",
+        ],
+        EvaluationDecision::Deny,
+    );
+    assert_everywhere(
+        &[
+            "Start-Process notepad $f.FullName",
+            "Start-Process notepad $f.ToString()",
+            "Start-Process msedge 'https://example.com'.Trim()",
+            "Start-Process git ('status')-Wait",
+            "Start-Process notepad",
+            "Start-Process $file",
         ],
         EvaluationDecision::Allow,
     );
