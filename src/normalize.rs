@@ -2687,7 +2687,7 @@ fn consume_radix_digits(
 /// Reads the `{hex}` of a PowerShell 6+ `` `u{hex} `` escape (one to six hex
 /// digits, a valid code point). On anything else nothing is consumed: the
 /// escape is then the letter `u`, as Windows PowerShell 5.1 reads it.
-fn decode_powershell_unicode_escape(
+pub(crate) fn decode_powershell_unicode_escape(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Option<char> {
     let mut probe = chars.clone();

@@ -52,8 +52,8 @@ use crate::heredoc::{
 };
 use crate::normalize::{
     NormalizeTokenKind, PATH_NORMALIZER, PowerShellHashRole, QUOTED_PATH_NORMALIZER, ShellDialect,
-    ShellTokenDecoder, ShellTokenRole, powershell_hash_role, strip_wrapper_prefixes,
-    tokenize_for_shell_dialect,
+    ShellTokenDecoder, ShellTokenRole, decode_powershell_unicode_escape, powershell_hash_role,
+    strip_wrapper_prefixes, tokenize_for_shell_dialect,
 };
 use crate::packs::{
     PatternSuggestion, REGISTRY, pack_aware_quick_reject, pack_aware_quick_reject_pre_normalized,
@@ -7925,12 +7925,36 @@ impl<'a> PowerShellStaticStringParser<'a> {
                         '0' => value.push('\0'),
                         'a' => value.push('\u{0007}'),
                         'b' => value.push('\u{0008}'),
-                        'e' => value.push('\u{001b}'),
+                        // `` `e `` is ESC in PowerShell 6+ and the letter `e` in
+                        // Windows PowerShell 5.1. ESC is not a separator, so it
+                        // cannot add a word break or a statement; the letter can
+                        // spell a command (`` r`es`et ``). Keep the letter in
+                        // every reading, as the tokenizer does.
                         'f' => value.push('\u{000c}'),
                         'n' => value.push('\n'),
                         'r' => value.push('\r'),
                         't' => value.push('\t'),
                         'v' => value.push('\u{000b}'),
+                        // PowerShell 6+ reads `` `u{hex} `` as that code point;
+                        // Windows PowerShell 5.1 reads the letter `u`. The first
+                        // reading keeps the letter. The evaluator reads a
+                        // command that holds `` `u `` again inside
+                        // `PowerShellControlEscapeScope`, where the code point
+                        // is decoded, and deny wins, so both hosts are judged.
+                        // On a malformed escape nothing more is consumed and
+                        // the letter stays.
+                        'u' if crate::normalize::powershell_control_escapes_active() => {
+                            let rest = &self.expression[self.index..];
+                            match decode_powershell_unicode_escape(&mut rest.chars().peekable()) {
+                                Some(decoded) => {
+                                    value.push(decoded);
+                                    // A decoded escape is `{`, 1-6 ASCII hex
+                                    // digits and `}`: the first `}` closes it.
+                                    self.index += rest.find('}').map_or(0, |close| close + 1);
+                                }
+                                None => value.push('u'),
+                            }
+                        }
                         '\n' => {}
                         '\r' if self.expression.as_bytes().get(self.index) == Some(&b'\n') => {
                             self.index += 1;
@@ -59695,6 +59719,50 @@ mod tests {
                     "{host:?} Git Bash {raw}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn powershell_static_string_reads_unicode_escapes() {
+        // (expression, Windows PowerShell 5.1 reading, PowerShell 6+ reading)
+        for (expression, letter, decoded) in [
+            (
+                "\"git`u{a0}reset`u{a0}--hard\"",
+                "gitu{a0}resetu{a0}--hard",
+                "git\u{a0}reset\u{a0}--hard",
+            ),
+            ("\"a`u{20}b`u{0020}c\"", "au{20}bu{0020}c", "a b c"),
+            ("\"`u{1F600}\"", "u{1F600}", "\u{1F600}"),
+            ("\"`u{a0}x\" + '`u{a0}'", "u{a0}x`u{a0}", "\u{a0}x`u{a0}"),
+            (
+                "\"`u{23}`u{20}\" + \"; git reset --hard\"",
+                "u{23}u{20}; git reset --hard",
+                "# ; git reset --hard",
+            ),
+            // Malformed: the letter `u`, and the rest is read as text.
+            ("\"a`u{zz}b\"", "au{zz}b", "au{zz}b"),
+            ("\"a`u{110000}b\"", "au{110000}b", "au{110000}b"),
+            ("\"a`u{0000041}b\"", "au{0000041}b", "au{0000041}b"),
+            ("\"a`ub\"", "aub", "aub"),
+            ("\"a`u{a0\"", "au{a0", "au{a0"),
+            // `` `e `` keeps its letter in both readings.
+            (
+                "\"git r`es`et\" + \" --hard\"",
+                "git reset --hard",
+                "git reset --hard",
+            ),
+        ] {
+            assert_eq!(
+                parse_static_powershell_source(expression).as_deref(),
+                Ok(letter),
+                "{expression}"
+            );
+            let _escape_scope = crate::normalize::PowerShellControlEscapeScope::enter();
+            assert_eq!(
+                parse_static_powershell_source(expression).as_deref(),
+                Ok(decoded),
+                "{expression} with control escapes"
+            );
         }
     }
 
