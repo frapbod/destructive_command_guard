@@ -398,7 +398,8 @@ fn powershell_and_unknown_dialects_judge_block_command_words() {
 }
 
 /// Windows PowerShell 5.1 ran harmless marker bodies in every one of these
-/// layouts with LF, CRLF and lone CR. ScriptBlock literals remain inert.
+/// layouts with LF, CRLF and lone CR. A lone ScriptBlock literal stays
+/// inert; one stored in a variable is judged where it is built.
 fn multiline_control_cases() -> Vec<(String, bool)> {
     let layouts = [
         "if (1)\n{ BODY }",
@@ -421,12 +422,15 @@ fn multiline_control_cases() -> Vec<(String, bool)> {
                 cases.push((layout.replace("BODY", body).replace('\n', newline), deny));
             }
         }
-        for inert in [
+        // A command that is only a block prints it.
+        cases.push(("{ git reset --hard }".to_string(), false));
+        // A stored block can run later from anywhere, so it is judged where
+        // it is built (card t_a68ca4ed).
+        for built in [
             "$b = { git reset --hard }",
-            "{ git reset --hard }",
             "$b = { if (1)\n{ git reset --hard } }",
         ] {
-            cases.push((inert.replace('\n', newline), false));
+            cases.push((built.replace('\n', newline), true));
         }
     }
     cases
