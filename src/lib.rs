@@ -89,6 +89,7 @@ pub mod sarif;
 pub mod scan;
 pub mod session;
 pub mod simulate;
+pub(crate) mod start_process;
 pub mod stats;
 pub mod suggest;
 pub mod suggestions;
