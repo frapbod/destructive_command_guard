@@ -365,6 +365,11 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "Write-Output x; Write-Output a<# ; & {git reset --hard} #>",
         "Write-Output ${c}<# ; & {git reset --hard} #>",
         "Write-Output ${c}#; git reset --hard",
+        // With the comment masked, a glued assignment (PR #33's class).
+        "$c<#x#>=iex 'git reset --hard'",
+        "${c}<#x#>=iex 'git reset --hard'",
+        // A block glued after the `<#` text (PR #34's class).
+        "$l = Write-Output a<#{git reset --hard}; & $l[1]",
     ];
     let harmless = [
         "Write-Output $c#'\ngit reset --hard\n#'",
