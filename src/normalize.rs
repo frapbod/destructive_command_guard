@@ -301,6 +301,7 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
     let rest = after_sudo.trim_start();
     let mut idx = 0;
     let bytes = rest.as_bytes();
+    let mut braces = BraceLookup::default();
 
     while idx < bytes.len() {
         // Skip whitespace
@@ -329,7 +330,7 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
 
         // Parse one option word (e.g., -E, -EH, -uuser)
         let word_start = idx;
-        let word_end = consume_word_token(bytes, idx, bytes.len());
+        let word_end = consume_word_token_with(bytes, idx, bytes.len(), &mut braces);
 
         if word_end <= word_start + 1 {
             break;
@@ -396,7 +397,7 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
             }
             // Skip argument token
             let arg_start = idx;
-            idx = consume_word_token(bytes, idx, bytes.len());
+            idx = consume_word_token_with(bytes, idx, bytes.len(), &mut braces);
             if token_has_shell_effect(&bytes[arg_start..idx]) {
                 return None;
             }
@@ -521,7 +522,8 @@ fn parse_env_options(
     mut idx: usize,
     filesystem_context_changed: &mut bool,
 ) -> EnvParseResult {
-    let consume_env_arg = |mut idx: usize| -> Option<usize> {
+    let mut braces = BraceLookup::default();
+    let consume_env_arg = |mut idx: usize, braces: &mut BraceLookup| -> Option<usize> {
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
         }
@@ -529,7 +531,7 @@ fn parse_env_options(
             return None;
         }
         let arg_start = idx;
-        let end = consume_word_token(bytes, idx, bytes.len());
+        let end = consume_word_token_with(bytes, idx, bytes.len(), braces);
         if token_has_shell_effect(&bytes[arg_start..end]) {
             return None;
         }
@@ -551,7 +553,7 @@ fn parse_env_options(
         }
 
         let word_start = idx;
-        let word_end = consume_word_token(bytes, idx, bytes.len());
+        let word_end = consume_word_token_with(bytes, idx, bytes.len(), &mut braces);
         if word_end <= word_start + 1 {
             break;
         }
@@ -597,7 +599,7 @@ fn parse_env_options(
                         idx = word_end;
                         continue;
                     }
-                    let Some(next_idx) = consume_env_arg(word_end) else {
+                    let Some(next_idx) = consume_env_arg(word_end, &mut braces) else {
                         return EnvParseResult::Abort;
                     };
                     *filesystem_context_changed |=
@@ -612,7 +614,7 @@ fn parse_env_options(
                         }
                         value.to_string()
                     } else {
-                        let Some(next_idx) = consume_env_arg(word_end) else {
+                        let Some(next_idx) = consume_env_arg(word_end, &mut braces) else {
                             return EnvParseResult::Abort;
                         };
                         let arg = &rest[word_end..next_idx];
@@ -626,7 +628,7 @@ fn parse_env_options(
                         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
                             idx += 1;
                         }
-                        idx = consume_word_token(bytes, idx, bytes.len());
+                        idx = consume_word_token_with(bytes, idx, bytes.len(), &mut braces);
                     }
 
                     while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
@@ -657,7 +659,7 @@ fn parse_env_options(
                     let raw_arg = if pos + 1 < word_bytes.len() {
                         word[pos + 1..].to_string()
                     } else {
-                        let Some(next_idx) = consume_env_arg(word_end) else {
+                        let Some(next_idx) = consume_env_arg(word_end, &mut braces) else {
                             return EnvParseResult::Abort;
                         };
                         let arg = &rest[word_end..next_idx];
@@ -670,7 +672,7 @@ fn parse_env_options(
                         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
                             idx += 1;
                         }
-                        idx = consume_word_token(bytes, idx, bytes.len());
+                        idx = consume_word_token_with(bytes, idx, bytes.len(), &mut braces);
                     }
 
                     while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
@@ -694,7 +696,7 @@ fn parse_env_options(
                             flag == 'u' && filesystem_context_env_name(&word[pos + 1..]);
                         idx = word_end;
                     } else {
-                        let Some(next_idx) = consume_env_arg(word_end) else {
+                        let Some(next_idx) = consume_env_arg(word_end, &mut braces) else {
                             return EnvParseResult::Abort;
                         };
                         *filesystem_context_changed |=
@@ -715,6 +717,7 @@ fn parse_env_options(
 }
 
 fn parse_env_assignments(bytes: &[u8], mut idx: usize) -> usize {
+    let mut braces = BraceLookup::default();
     while idx < bytes.len() {
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
@@ -724,7 +727,7 @@ fn parse_env_assignments(bytes: &[u8], mut idx: usize) -> usize {
         }
 
         let start = idx;
-        let end = consume_word_token(bytes, idx, bytes.len());
+        let end = consume_word_token_with(bytes, idx, bytes.len(), &mut braces);
         if start >= end {
             return start;
         }
@@ -1644,45 +1647,89 @@ pub(crate) fn starts_with_shell_redirection(s: &str) -> bool {
 
 #[must_use]
 pub fn consume_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
-    consume_word_token_inner(bytes, i, len, false)
+    consume_word_token_inner(bytes, i, len, false, false, &mut BraceLookup::default())
+}
+
+/// [`consume_word_token`] for a loop over the words of one input: the
+/// `braces` state is shared across the loop so a run of unclosed `${` is read
+/// to the end once, not once per word.
+fn consume_word_token_with(bytes: &[u8], i: usize, len: usize, braces: &mut BraceLookup) -> usize {
+    consume_word_token_inner(bytes, i, len, false, false, braces)
 }
 
 /// Consume one POSIX argv word, excluding adjacent local redirections.
 /// Normalization deliberately keeps redirections in its token view; program
 /// extraction needs the argv boundary, but must use the same quote walker.
 pub(crate) fn consume_posix_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
-    consume_word_token_inner(bytes, i, len, true)
+    consume_word_token_inner(bytes, i, len, true, true, &mut BraceLookup::default())
 }
 
-// Keep a parameter expansion in its argv word: punctuation inside `${...}`
-// is not a shell separator. Reuse the context reader so quotes, nested
-// parameters and command substitutions have the same boundaries here.
+// Keep a parameter expansion inside `$(...)` whole: punctuation inside
+// `${...}` is not a shell separator. Reuse the context reader so quotes,
+// nested parameters and command substitutions have the same boundaries here.
+// It reads the bytes directly: a UTF-8 check of the whole input per `${`
+// would make a run of them quadratic.
 fn consume_word_braced_parameter(bytes: &[u8], i: usize, len: usize) -> usize {
-    std::str::from_utf8(&bytes[..len]).map_or(len, |command| {
-        crate::context::consume_braced_parameter(command, i).0
-    })
+    crate::context::consume_braced_parameter(&bytes[..len], i).0
 }
 
+/// Whether a `${` may still close. Looking for its `}` reads ahead, to the
+/// end of the input when none closes it; such a `${` is a shell syntax error.
+/// After one, later `${` are read as plain text, as on the base and as the
+/// segmenter does (`ParameterExpansion::unclosed`), so a run of them stays
+/// linear across a whole tokenization, not only within one word.
+#[derive(Default)]
+struct BraceLookup {
+    unclosed: bool,
+}
+
+impl BraceLookup {
+    /// End of the `${…}` at `i` through its matching `}`, within
+    /// `bytes[..len]` (see [`crate::context::braced_parameter_span`]); `None`
+    /// when it is not one, when no `}` closes it, or once an earlier one did
+    /// not close.
+    fn end(&mut self, bytes: &[u8], i: usize, len: usize, in_double_quotes: bool) -> Option<usize> {
+        if self.unclosed || i + 1 >= len || bytes[i] != b'$' || bytes[i + 1] != b'{' {
+            return None;
+        }
+        let close = crate::context::braced_parameter_span(&bytes[..len], i, in_double_quotes);
+        self.unclosed = close.is_none();
+        close
+    }
+}
+
+/// A `${…}` is one piece of the word through its matching `}`, looked up
+/// through `braces` (see [`BraceLookup`]).
 fn consume_word_token_inner(
     bytes: &[u8],
     mut i: usize,
     len: usize,
     stop_at_redirect: bool,
+    posix_blanks: bool,
+    braces: &mut BraceLookup,
 ) -> usize {
     while i < len {
         let b = bytes[i];
 
-        if b.is_ascii_whitespace() {
+        if if posix_blanks {
+            matches!(b, b' ' | b'\t' | b'\n')
+        } else {
+            b.is_ascii_whitespace()
+        } {
             break;
-        }
-
-        if b == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
-            i = consume_word_braced_parameter(bytes, i, len);
-            continue;
         }
 
         if b == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
             i = consume_shell_paren_construct(bytes, i + 2, len);
+            continue;
+        }
+
+        // `${…}` is one piece of the word through its matching `}`: a blank
+        // in it is no word break and a `#` in it is no comment (`x=${y:- #}`).
+        if b == b'$'
+            && let Some(close) = braces.end(bytes, i, len, false)
+        {
+            i = close;
             continue;
         }
 
@@ -1768,11 +1815,12 @@ fn consume_word_token_inner(
                         b'\\' => {
                             i = (i + 2).min(len);
                         }
-                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
-                            i = consume_word_braced_parameter(bytes, i, len);
-                        }
                         b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
                             i = consume_shell_paren_construct(bytes, i + 2, len);
+                        }
+                        // Quotes nest inside `${…}`: `"${y:-" #"}"` is one string.
+                        b'$' if let Some(close) = braces.end(bytes, i, len, true) => {
+                            i = close;
                         }
                         _ => {
                             i += 1;
@@ -2900,7 +2948,8 @@ pub(crate) fn powershell_assignment_rhs(candidate: &str) -> Option<&str> {
 #[must_use]
 pub(crate) fn tokenize_for_shell_dialect(command: &str, dialect: ShellDialect) -> NormalizeTokens {
     match dialect {
-        ShellDialect::Posix | ShellDialect::Unknown => tokenize_for_normalization(command),
+        ShellDialect::Posix => tokenize_normalization_inner(command, true),
+        ShellDialect::Unknown => tokenize_for_normalization(command),
         ShellDialect::PowerShell => tokenize_powershell_raw(command),
         ShellDialect::Cmd => tokenize_cmd_raw(command),
     }
@@ -3525,17 +3574,44 @@ fn cmd_byte_is_caret_escaped(bytes: &[u8], index: usize) -> bool {
 
 #[must_use]
 pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
+    tokenize_normalization_inner(command, false)
+}
+
+/// With `posix_comments`, a `#` where a word starts is a comment to the end
+/// of its line (the newline stays a separator), so a quote inside it opens no
+/// string that would hide the next line.
+fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> NormalizeTokens {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
 
     let mut tokens = NormalizeTokens::new();
     let mut i = 0;
+    let mut braces = BraceLookup::default();
 
     while i < len {
-        i = skip_ascii_whitespace(bytes, i, len);
+        if posix_comments {
+            while i < len && matches!(bytes[i], b' ' | b'\t') {
+                i += 1;
+            }
+        } else {
+            i = skip_ascii_whitespace(bytes, i, len);
+        }
         if i >= len {
             break;
+        }
+
+        if posix_comments && bytes[i] == b'#' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // A line continuation between words is removed, so a word still
+        // starts after it (`echo a \` LF `# it's` is a comment).
+        if posix_comments && bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 2;
+            continue;
         }
 
         if bytes[i] == b'\n' {
@@ -3553,7 +3629,7 @@ pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
         }
 
         let start = i;
-        let end = consume_word_token(bytes, i, len);
+        let end = consume_word_token_inner(bytes, i, len, false, posix_comments, &mut braces);
         i = end;
 
         if start < i {
@@ -5172,6 +5248,101 @@ mod tests {
             );
         }
     }
+
+    /// A `${` that no `}` closes is read to the end once per tokenization or
+    /// wrapper parse; later ones are plain, so a run of them, in one word, in
+    /// quotes or one per word, stays linear (64 KB took up to 21 s) and the
+    /// separator after them is still found.
+    #[test]
+    fn unclosed_braced_parameters_are_read_in_linear_time() {
+        let started = std::time::Instant::now();
+        for command in [
+            format!("echo {}; ls", "${".repeat(100_000)),
+            format!("echo \"{}\"; ls", "${".repeat(100_000)),
+            format!("echo {}; ls", "${a ".repeat(50_000)),
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let tokens = tokenize_for_shell_dialect(&command, dialect);
+                let tail: Vec<&str> = tokens
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(|token| &command[token.byte_range.clone()])
+                    .collect();
+                assert_eq!(tail, ["ls", ";"], "{dialect:?}");
+            }
+        }
+        // The wrapper and assignment-prefix parsers read one word at a time.
+        for command in [
+            format!("env {}git status", "A=${a ".repeat(30_000)),
+            format!("sudo {}git status", "-u ${a ".repeat(30_000)),
+            format!("{}git status", "A=${a ".repeat(30_000)),
+        ] {
+            let _ = strip_wrapper_prefixes(&command);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A `#` inside `${…}` is data in the POSIX tokenizer: the blank before it
+    /// ends no word, so no comment starts. After the `}` a comment starts again.
+    #[test]
+    fn posix_tokenizer_keeps_braced_parameter_whole() {
+        let words = |command: &str| -> Vec<String> {
+            tokenize_for_shell_dialect(command, ShellDialect::Posix)
+                .iter()
+                .map(|token| {
+                    let kind = match token.kind {
+                        NormalizeTokenKind::Separator => "sep",
+                        _ => "word",
+                    };
+                    format!("{kind}:{}", &command[token.byte_range.clone()])
+                })
+                .collect()
+        };
+        for (command, expected) in [
+            (
+                "x=${y:- #}; git status",
+                vec!["word:x=${y:- #}", "sep:;", "word:git", "word:status"],
+            ),
+            (
+                "x=${y:-\t#}; ls",
+                vec!["word:x=${y:-\t#}", "sep:;", "word:ls"],
+            ),
+            ("x=${y/ #/} ls", vec!["word:x=${y/ #/}", "word:ls"]),
+            (
+                "x=${y:-${z:- #} #}; ls",
+                vec!["word:x=${y:-${z:- #} #}", "sep:;", "word:ls"],
+            ),
+            (
+                "x=${y:-\"a #\"}; ls",
+                vec!["word:x=${y:-\"a #\"}", "sep:;", "word:ls"],
+            ),
+            (
+                "x=${y:-$(echo a)} #c\nls",
+                vec!["word:x=${y:-$(echo a)}", "sep:\n", "word:ls"],
+            ),
+            (
+                "echo \"${y:-\" #\"}\"; ls",
+                vec!["word:echo", "word:\"${y:-\" #\"}\"", "sep:;", "word:ls"],
+            ),
+            (
+                "echo \"${y:-it's}\"; ls",
+                vec!["word:echo", "word:\"${y:-it's}\"", "sep:;", "word:ls"],
+            ),
+            // No closing `}`: read as before, the `;` still separates.
+            (
+                "echo ${y:- ; ls",
+                vec!["word:echo", "word:${y:-", "sep:;", "word:ls"],
+            ),
+        ] {
+            assert_eq!(words(command), expected, "{command:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
