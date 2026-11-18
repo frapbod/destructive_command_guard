@@ -127,6 +127,35 @@ fn literal_git_mutation_after_unknown_executable() {
 }
 
 #[test]
+fn only_a_binding_before_the_use_keeps_the_name_known() {
+    // Later text, flags, comments and quoted mentions of the name do not
+    // bind it before the use.
+    assert_both(
+        "deny",
+        &[
+            r#""$D" branch -D main"#,
+            r#""$X" reset --hard; X=1"#,
+            r#""$X" reset --hard # X"#,
+            r#"echo "GIT is $GIT"; "$GIT" reset --hard"#,
+            r#""$GIT" reset --hard origin/main && echo "GIT reset done""#,
+        ],
+    );
+}
+
+#[test]
+fn literal_last_path_component_names_the_program() {
+    assert_both(
+        "deny",
+        &[
+            r#""$X/bin/git" reset --hard"#,
+            r#""$HOMEBREW_PREFIX/bin/git" reset --hard"#,
+            r#""$X"/bin/git reset --hard"#,
+            r#""$X/bin/rm" -rf /"#,
+        ],
+    );
+}
+
+#[test]
 fn unquoted_unknown_values_can_split_a_composite_executable() {
     assert_both(
         "deny",
