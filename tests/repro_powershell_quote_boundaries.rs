@@ -327,7 +327,8 @@ fn powershell_comments_do_not_hide_following_commands() {
 /// A `#` or `<#` glued to the token before it starts a comment in expression
 /// mode (`$c#x`, `$c=1#x`) and after a member access or a leading string in
 /// argument mode (`echo $c.p#x`, `echo 'a'#x`), but stays text in other
-/// argument words (`echo a#x`, `echo $c#x`). Every row was measured with
+/// argument words (`echo a#x`, `echo $c#x`, `echo ${c}#x`). A glued `<` or
+/// `>` follows the same rule, so `echo a<#` is text too. Every row was measured with
 /// sandboxed pwsh 7.5: each dangerous row ran `git reset --hard`, no harmless
 /// row did.
 #[test]
@@ -350,6 +351,15 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "Write-Output ($c).p#'\ngit reset --hard\n#'",
         "Write-Output a,$c.p#'\ngit reset --hard\n#'",
         "Write-Output 'a'#'\ngit reset --hard\n#'",
+        "Write-Output 'a'.Length#'\ngit reset --hard\n#'",
+        // A glued `<` is text after a bareword, so `<#` opens no comment.
+        "Write-Output a<#; git reset --hard",
+        "Write-Output a<# ; & {git reset --hard} #>",
+        "Write-Host a<#; git reset --hard",
+        "Write-Output a,b<#; git reset --hard",
+        "Write-Output -a<#; git reset --hard",
+        "Write-Output a><#; git reset --hard",
+        "Write-Output 'a'b<#; git reset --hard",
     ];
     let harmless = [
         "Write-Output $c#'\ngit reset --hard\n#'",
@@ -364,6 +374,10 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "$c=@{p='V'}; $c.p#x",
         "$c<#x#> = git status",
         "[int]$c<#x#> = 1; git status",
+        "Write-Output x${c}#'\ngit reset --hard\n#'",
+        "Write-Output ${c}<#'\ngit reset --hard\n#>'",
+        "Write-Output a<#x#>b; git status",
+        "Write-Output a>x; git status",
     ];
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
         for command in dangerous {

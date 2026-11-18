@@ -13841,6 +13841,14 @@ fn powershell_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
                 } else {
                     index
                 };
+                // Glued to a bareword or a variable, `<` and `>` are text
+                // (`a>x`, `a<#`), as a glued `#` would be.
+                if operator_start > 0
+                    && !crate::normalize::powershell_argument_text_ends_at(word, index)
+                {
+                    index += 1;
+                    continue;
+                }
                 let mut operator_end = index + 1;
                 if bytes.get(operator_end) == Some(&redirect) {
                     operator_end += 1;
