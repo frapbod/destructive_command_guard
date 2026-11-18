@@ -2325,14 +2325,37 @@ fn powershell_alias_word_is_dynamic(raw: &str) -> bool {
     single || double
 }
 
+/// The statement's words from its command on: a statement-leading
+/// assignment (`$c = sal x iex`, `[int] $a, $b += Start-Process …`) is
+/// skipped, because PowerShell runs its value as the statement's command.
 fn decoded_powershell_segment_words(
     segment: &str,
 ) -> Option<Vec<(String, bool, std::ops::Range<usize>)>> {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
     let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
-    tokens
+    let words: Vec<_> = tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .collect();
+    let mut command_start = 0usize;
+    loop {
+        let raw = |index: usize| words.get(index).and_then(|token| token.text(segment));
+        let targets = (command_start..words.len())
+            .take_while(|index| {
+                raw(*index).is_some_and(crate::normalize::is_powershell_assignment_target)
+            })
+            .count();
+        if targets == 0
+            || !raw(command_start + targets)
+                .is_some_and(crate::normalize::is_powershell_assignment_operator)
+        {
+            break;
+        }
+        command_start += targets + 1;
+    }
+    words
+        .into_iter()
+        .skip(command_start)
         .take(MAX_POWERSHELL_VISIBLE_ALIAS_WORDS + 1)
         .map(|token| {
             let raw = token.text(segment)?;
@@ -3946,6 +3969,31 @@ fn powershell_token_at_command_boundary(
     if previous.kind == NormalizeTokenKind::Separator {
         return matches!(raw.trim(), ";" | "|" | "|&" | "||" | "&&" | "&" | "(")
             || raw.contains(['\r', '\n']);
+    }
+
+    // The value of an assignment that starts a statement is a pipeline:
+    // `$c = iex '…'` and `[int]$a, $b += icm {…}` run their command. Glued
+    // spellings (`$c=iex`) reach here through the deny-only view's blanks.
+    if crate::normalize::is_powershell_assignment_operator(raw) {
+        let mut first = index - 1;
+        while let Some(target) = first.checked_sub(1).and_then(|prior| tokens.get(prior)) {
+            let Some(word) = (target.kind == NormalizeTokenKind::Word)
+                .then(|| target.text(command))
+                .flatten()
+            else {
+                break;
+            };
+            let unbraced = word.trim_start_matches(['{', '}']);
+            if !crate::normalize::is_powershell_assignment_target(unbraced) {
+                break;
+            }
+            first -= 1;
+            if unbraced.len() != word.len() {
+                // `{$c = …`: a block brace starts the statement.
+                return true;
+            }
+        }
+        return first < index - 1 && powershell_token_at_command_boundary(tokens, first, command);
     }
 
     // Braces are intentionally retained in raw PowerShell words by the
@@ -15887,15 +15935,16 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         };
         adopt_alternate_reading(&mut result, alternate, command);
     }
-    // Read comment and smart-quote syntax as a separate deny-only PowerShell
-    // view. Keep the original tokenizer's decisions and grants intact.
+    // Read comment, smart-quote and glued-assignment syntax as a separate
+    // deny-only PowerShell view. Keep the original tokenizer's decisions and
+    // grants intact.
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
         && matches!(
             shell_dialect,
             ShellDialect::PowerShell | ShellDialect::Unknown
         )
-        && let Some(masked) = crate::normalize::mask_powershell_comments(command)
+        && let Some(masked) = crate::normalize::powershell_deny_only_view(command)
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
         // The copy's incomplete analyses count only if its result is used.
@@ -15942,7 +15991,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 {
                     info.matched_text_preview = Some(extract_match_preview(command, span));
                 } else if masked.len() != command.len() {
-                    // Smart-quote spelling changes byte offsets.
+                    // Smart-quote spelling and assignment blanks change
+                    // byte offsets.
                     info.matched_span = None;
                     info.matched_text_preview = None;
                 }
