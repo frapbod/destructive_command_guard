@@ -33323,6 +33323,69 @@ fn rm_segment_denied_after_literal_substitution(
     }
 }
 
+/// The rm decision for a segment read with every parameter unset, then with
+/// every parameter set, when that is a DENY the segment's own text did not
+/// produce.
+///
+/// An expansion's text becomes rm's argv: `rm ${X:--rf /tmp/zz}` runs
+/// `rm -rf /tmp/zz` when `X` is unset, and `rm -r${X}f ~/zz` runs
+/// `rm -rf ~/zz`. The readings are the ones core.git uses
+/// ([`crate::normalize::posix_parameter_word_readings`]); a word with no
+/// reading (a command substitution) and an assignment word stay as written.
+/// Deny-only, so a reading never makes a command more permitted than its
+/// text.
+fn rm_segment_denied_under_parameter_readings(
+    segment: &str,
+    automated_stdin: bool,
+    dialect: ShellDialect,
+) -> Option<crate::packs::core::filesystem::RmParseDecision> {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) || !segment.contains('$') {
+        return None;
+    }
+    let mut readings = [String::new(), String::new()];
+    let mut copied = 0usize;
+    for token in tokenize_for_shell_dialect(segment, ShellDialect::Posix).iter() {
+        if token.kind != NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(raw) = token.text(segment) else {
+            continue;
+        };
+        if !raw.contains('$') || posix_word_is_assignment_prefix(raw) {
+            continue;
+        }
+        let Some(fields) = crate::normalize::posix_parameter_word_readings(raw) else {
+            continue;
+        };
+        for (reading, fields) in readings.iter_mut().zip(&fields) {
+            reading.push_str(&segment[copied..token.byte_range.start]);
+            let quoted: Vec<_> = fields
+                .iter()
+                .map(|field| shell_words::quote(field))
+                .collect();
+            reading.push_str(&quoted.join(" "));
+        }
+        copied = token.byte_range.end;
+    }
+    if copied == 0 {
+        return None;
+    }
+    readings.iter().find_map(|reading| {
+        let reading = format!("{reading}{}", &segment[copied..]);
+        match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+            &reading,
+            automated_stdin,
+            dialect,
+        ) {
+            crate::packs::core::filesystem::RmParseDecision::Deny(mut hit) => {
+                hit.span = Some(0..segment.len());
+                Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit))
+            }
+            _ => None,
+        }
+    })
+}
+
 /// `segment` with its relative operands anchored to the directory a literal
 /// `cd` before it provably moved the shell into, or `None` when there is no
 /// such directory or no anchored word names a protected file (#480).
@@ -35179,6 +35242,18 @@ fn evaluate_core_filesystem_pack(
             &rm_decision,
             crate::packs::core::filesystem::RmParseDecision::NoMatch
         ) && let Some(denied) = rm_segment_denied_after_literal_substitution(
+            dialect_segment,
+            rm_automated_stdin,
+            shell_dialect,
+        ) {
+            rm_decision = denied;
+        } else if !matches!(
+            &rm_decision,
+            crate::packs::core::filesystem::RmParseDecision::Deny(_)
+        ) && let Some(denied) = rm_segment_denied_under_parameter_readings(
+            // An expansion's operand can supply rm's flags and operands
+            // (`rm ${X:--rf /tmp/zz}`). Deny-only, and only reached when the
+            // segment's text did not deny on its own.
             dialect_segment,
             rm_automated_stdin,
             shell_dialect,
