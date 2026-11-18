@@ -6289,6 +6289,12 @@ fn windows_launcher_envelopes(
     for segment in segments {
         let mut segment_envelopes = Vec::new();
         let mut unverified = None;
+        // Whether some candidate dialect reads this segment as an ordinary
+        // command rather than a launcher. Under Unknown that reading is as
+        // viable as the launcher one: `@(…) + …` is a cmd.exe `@` prefix to
+        // cmd.exe and an array subexpression to PowerShell. Only the outer
+        // passes judge the ordinary reading, so it keeps them running.
+        let mut ordinary_reading = false;
         for &candidate in candidate_dialects {
             // A POSIX outer shell may be Git Bash, which rewrites the
             // launched program's arguments, or not: read both.
@@ -6297,18 +6303,24 @@ fn windows_launcher_envelopes(
             } else {
                 &[NativeArgv::Verbatim]
             };
+            let mut launcher_reading = false;
             for &argv in readings {
                 match parse_windows_launcher_segment_as(segment, candidate, argv, max_payload_bytes)
                 {
                     WindowsLauncherParse::NotLauncher => {}
                     WindowsLauncherParse::Envelope(envelope) => {
+                        launcher_reading = true;
                         if !segment_envelopes.contains(&envelope) {
                             segment_envelopes.push(envelope);
                         }
                     }
-                    WindowsLauncherParse::Unverified(reason) => unverified = Some(reason),
+                    WindowsLauncherParse::Unverified(reason) => {
+                        launcher_reading = true;
+                        unverified = Some(reason);
+                    }
                 }
             }
+            ordinary_reading |= !launcher_reading;
         }
         // Unknown-mode parsing is a conservative union of viable shell
         // interpretations. A valid envelope in one dialect cannot make an
@@ -6328,11 +6340,10 @@ fn windows_launcher_envelopes(
                 return Err(reason);
             }
         }
-        if segment_envelopes.is_empty() {
+        if segment_envelopes.is_empty() || ordinary_reading {
             all_segments_are_envelopes = false;
-        } else {
-            envelopes.extend(segment_envelopes);
         }
+        envelopes.extend(segment_envelopes);
     }
     Ok((envelopes, all_segments_are_envelopes))
 }
@@ -60121,6 +60132,44 @@ mod tests {
             windows_launcher_envelopes("call %DCG_DYNAMIC%", ShellDialect::Unknown, 1024, false,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn windows_launcher_envelopes_keep_unknown_ordinary_readings() {
+        use crate::normalize::ShellDialect;
+
+        // cmd.exe reads a leading `@` as echo suppression; PowerShell reads
+        // `@(…)` as an array subexpression and POSIX as an ordinary word.
+        // Under Unknown the envelope is judged, and the ordinary readings
+        // still reach the outer passes.
+        for command in [
+            "@($x) + [scriptblock]::Create('git reset --hard').Invoke()",
+            "@{a=1} + [scriptblock]::Create('git reset --hard').Invoke()",
+            "@git status",
+        ] {
+            let (envelopes, all_segments_are_envelopes) =
+                windows_launcher_envelopes(command, ShellDialect::Unknown, 1024, false)
+                    .expect("static cmd @ prefix");
+            assert!(
+                envelopes
+                    .iter()
+                    .any(|envelope| envelope.launcher == "cmd @ echo-suppressed command"),
+                "{command:?}: {envelopes:?}"
+            );
+            assert!(!all_segments_are_envelopes, "{command:?}");
+        }
+        // A launcher every dialect reads as one stays fully decoded.
+        for command in [
+            "powershell -NoProfile -Command \"Get-Date\"",
+            "pwsh -c 'Get-Date'",
+            "cmd /c echo hi",
+        ] {
+            let (envelopes, all_segments_are_envelopes) =
+                windows_launcher_envelopes(command, ShellDialect::Unknown, 1024, false)
+                    .expect("static launcher");
+            assert!(!envelopes.is_empty(), "{command:?}");
+            assert!(all_segments_are_envelopes, "{command:?}");
+        }
     }
 
     #[test]
