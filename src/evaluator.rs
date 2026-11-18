@@ -33351,7 +33351,12 @@ fn rm_segment_denied_under_parameter_readings(
         let Some(raw) = token.text(segment) else {
             continue;
         };
-        if !raw.contains('$') || posix_word_is_assignment_prefix(raw) {
+        // A redirection (`2>$LOG`) is not argv; quoting its reading would
+        // turn it into an operand.
+        let redirection = raw
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with(['<', '>', '&']);
+        if !raw.contains('$') || redirection || posix_word_is_assignment_prefix(raw) {
             continue;
         }
         let Some(fields) = crate::normalize::posix_parameter_word_readings(raw) else {
@@ -33370,12 +33375,14 @@ fn rm_segment_denied_under_parameter_readings(
     if copied == 0 {
         return None;
     }
+    // The readings are POSIX argv, so only the POSIX rm grammar judges them;
+    // under `Unknown` that is one reading of the union.
     readings.iter().find_map(|reading| {
         let reading = format!("{reading}{}", &segment[copied..]);
         match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
             &reading,
             automated_stdin,
-            dialect,
+            ShellDialect::Posix,
         ) {
             crate::packs::core::filesystem::RmParseDecision::Deny(mut hit) => {
                 hit.span = Some(0..segment.len());
