@@ -239,6 +239,87 @@ fn powershell_and_unknown_dialects_read_windows_powershell_switches() {
     }
 }
 
+/// Git Bash (MSYS2) rewrites a native program's argument before it starts:
+/// a word that starts with `//` loses one `/` (its escape for Windows
+/// switches), and a word that starts with one `/` becomes a Windows path
+/// (`C:/Program Files/Git/...`). WSL and Linux pass both unchanged, and dcg
+/// cannot tell them apart in the POSIX dialect, so it judges both readings.
+/// Source: `find_path_start_and_type` in msys2-runtime's
+/// `winsup/cygwin/msys2_path_conv.cc` (tag msys2-3.6.5). Real Git Bash
+/// argument conversion is unmeasured here.
+const GIT_BASH_RUNS_IT: &[&str] = &[
+    // `//c` reaches the host as `/c`, which is -Command.
+    "powershell //c \"git reset --hard\"",
+    "powershell //Command \"git reset --hard\"",
+    "powershell.exe -NoProfile //c \"git reset --hard\"",
+    "powershell //nop //c \"git reset --hard\"",
+    "powershell //imp -c \"git reset --hard\"",
+    "pwsh //c \"git reset --hard\"",
+    "pwsh -NoProfile //Command 'git reset --hard'",
+    "powershell \" //c\" \"git reset --hard\"",
+    // A single `/` value switch becomes a path, so 5.1 starts the command
+    // string there instead of skipping a value.
+    "powershell /ep \"x; git reset --hard\"",
+    "powershell /WindowStyle \"x; git reset --hard\"",
+    // Unchanged under WSL: the word is the start of the command string.
+    "powershell //ep \"x; git reset --hard\"",
+    "powershell //WorkingDirectory \"x; git reset --hard\"",
+    // Piped input reaches the host's -Command - or -File -.
+    "echo \"git reset --hard\" | powershell //c -",
+    "echo \"git reset --hard\" | pwsh //File -",
+];
+
+/// Ordinary Git Bash launches stay allowed.
+const GIT_BASH_HARMLESS: &[&str] = &[
+    "powershell //nop //c \"Get-Date\"",
+    "pwsh //c \"Get-Date\"",
+    "pwsh -NoProfile -File ./b.ps1",
+    "powershell -File /c/Users/x/b.ps1",
+    "powershell //c \"git status\"",
+];
+
+/// The Bash tool label in both hook formats: Claude Code on Windows runs it
+/// in Git Bash.
+#[test]
+fn bash_tool_reads_git_bash_powershell_arguments() {
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in GIT_BASH_RUNS_IT {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+        for command in GIT_BASH_HARMLESS {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn posix_and_unknown_dialects_read_git_bash_powershell_arguments() {
+    for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+        for command in GIT_BASH_RUNS_IT {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for command in GIT_BASH_HARMLESS {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+}
+
 /// Git Bash or WSL starting powershell.exe: the outer shell is POSIX.
 #[test]
 fn posix_dialect_reads_windows_powershell_switches() {
