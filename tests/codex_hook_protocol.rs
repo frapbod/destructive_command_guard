@@ -3697,7 +3697,11 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
 fn unclosed_braced_parameters_keep_the_hook_within_budget() {
     let body = "${".repeat(30_000);
     let deny = format!("cat <<'EOF' > notes.txt\n{body}\nEOF\ngit reset --hard");
-    let allow = format!("cat <<'EOF' > notes.txt\n{body}\nEOF\ngit status");
+    // 32 KB: the base also asks for a 60 KB heredoc, whatever its text.
+    let allow = format!(
+        "cat <<'EOF' > notes.txt\n{}\nEOF\ngit status",
+        "${".repeat(16_000)
+    );
     let quoted = format!("echo \"{body}\"; git reset --hard");
     for codex in [true, false] {
         for command in [&deny, &quoted] {
