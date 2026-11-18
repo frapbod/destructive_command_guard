@@ -1764,9 +1764,11 @@ static INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::ne
 /// `bash -c`). Group 1 = double-quoted inner, group 2 = single-quoted inner,
 /// group 3 = unquoted rest-of-line. The inner command line is re-evaluated by the
 /// full pipeline, so `cmd /c "del /s /q C:\src"` is blocked like the bare `del`.
+/// A quoted program name (`"cmd.exe" /c …`, `& 'C:\…\cmd.exe' /c …`) ends in
+/// its closing quote, as in the inline shell patterns above.
 static CMD_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\bcmd(?:\.exe)?\b(?:\s+/[A-Za-z]+)*\s+/[ck]\s+(?:"([^"]*)"|'([^']*)'|([^\n]+))"#,
+        r#"(?i)\bcmd(?:\.exe)?\b['"]?(?:\s+/[A-Za-z]+)*\s+/[ck]\s+(?:"([^"]*)"|'([^']*)'|([^\n]+))"#,
     )
     .expect("cmd inline script regex compiles")
 });
@@ -3464,6 +3466,28 @@ fn extract_windows_inline_scripts(
 /// that matched) was already captured at the same range: the views are the
 /// same length, so that is the same payload read twice. Lazy, so a caller
 /// that stops at the extraction limit stops the scan too.
+/// Where each `cmd /c` / `cmd /k` call that [`extract_windows_inline_scripts`]
+/// reads in `text` starts (the byte of its `cmd` word), in the same views.
+/// Calls may nest or follow one another on a line, so every start is found,
+/// not only the first of a line.
+pub(crate) fn cmd_inline_call_starts(text: &str) -> Vec<usize> {
+    let redirect_view = blank_local_redirects(text);
+    let mut starts = Vec::new();
+    for view in std::iter::once(text).chain(redirect_view.as_deref()) {
+        let mut from = 0;
+        while let Some(found) = CMD_INLINE_SCRIPT.find_at(view, from) {
+            starts.push(found.start());
+            from = found.start() + 1;
+            while !view.is_char_boundary(from) {
+                from += 1;
+            }
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
 fn windows_view_captures<'a>(
     pattern: &'a Regex,
     views: &'a [&'a str],
