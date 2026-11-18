@@ -12676,12 +12676,104 @@ fn powershell_group_name(
     (name, Some(close))
 }
 
+/// The first of `separators` (sorted, all at or after `start`) that is
+/// outside every `( )`, `@( )`, `$( )` and `{ }` group opened from `start`:
+/// a line break inside `-ArgumentList (<LF>'…'<LF>)` does not end the
+/// statement. A group that does not close runs to the end of the command, so
+/// the reader of that group fails closed.
+fn powershell_separator_outside_groups(command: &str, start: usize, separators: &[usize]) -> usize {
+    let bytes = command.as_bytes();
+    let mut next = 0usize;
+    let mut index = start;
+    loop {
+        let Some(&separator) = separators.get(next) else {
+            return command.len();
+        };
+        if separator <= index || index >= bytes.len() {
+            return separator;
+        }
+        let group_close = match bytes[index] {
+            b'`' => {
+                index = escape_sequence_end(command, index);
+                continue;
+            }
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline);
+                continue;
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(command, index);
+                continue;
+            }
+            b'\'' => {
+                index = skip_powershell_single_quote(command, index);
+                continue;
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'`' => index = escape_sequence_end(command, index),
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                            match find_powershell_subexpression_close(command, index + 2) {
+                                Ok(close) => index = close + 1,
+                                Err(()) => return command.len(),
+                            }
+                        }
+                        _ => index += 1,
+                    }
+                }
+                continue;
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                index =
+                    powershell_here_string_end(command, index).map_or(index + 1, |(_, _, end)| end);
+                continue;
+            }
+            b'(' => find_powershell_subexpression_close(command, index + 1).ok(),
+            b'{' => find_powershell_script_block_close(command, index + 1),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        let Some(close) = group_close else {
+            return command.len();
+        };
+        index = close + 1;
+        while separators
+            .get(next)
+            .is_some_and(|&separator| separator < index)
+        {
+            next += 1;
+        }
+    }
+}
+
 /// Engine members reached through [`PowerShellMemberCmdlet`]. The name is
 /// the named parameter's value or the first positional word; the first
 /// argument starts after `-ArgumentList` (`-Args`) or at the next positional
 /// word, which PowerShell binds to the argument list.
 fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+    // Where statements may end, in order; a `(` or `)` token opens or closes
+    // a group instead.
+    let mut separators: Vec<usize> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Separator)
+        .filter_map(|token| {
+            let separator = token.text(command)?;
+            (!matches!(separator.trim(), "(" | ")")).then_some(token.byte_range.start)
+        })
+        .collect();
+    separators.sort_unstable();
+    let mut spanning_groups = 0usize;
     for (token_index, command_token) in tokens.iter().enumerate() {
         if command_token.kind != NormalizeTokenKind::Word {
             continue;
@@ -12723,18 +12815,21 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             });
             return;
         }
-        let segment_end = tokens
-            .iter()
-            .filter(|token| {
-                token.kind == NormalizeTokenKind::Separator
-                    && token.byte_range.start >= command_token.byte_range.end
-            })
-            .filter_map(|token| {
-                let separator = token.text(command)?;
-                (!matches!(separator.trim(), "(" | ")")).then_some(token.byte_range.start)
-            })
-            .min()
-            .unwrap_or(command.len());
+        let start = command_token.byte_range.end;
+        let separators = &separators[separators.partition_point(|&at| at < start)..];
+        let segment_end = powershell_separator_outside_groups(command, start, separators);
+        // Each group read across a line break may rescan the rest of the
+        // command; the bound keeps nested or unclosed groups from repeating it.
+        if separators.first().is_some_and(|&first| segment_end > first) {
+            spanning_groups += 1;
+            if spanning_groups > MAX_POWERSHELL_ENGINE_SCRIPT_CALLS {
+                sinks.push(ExecutableTextSink::Unverified {
+                    rule: SINK_ANALYSIS_BOUNDS_RULE,
+                    reason: "command contains too many executable text sinks for bounded analysis",
+                });
+                return;
+            }
+        }
         let segment = &command[command_token.byte_range.start..segment_end];
         let Some(words) = decoded_powershell_segment_words(segment) else {
             continue;
@@ -66440,6 +66535,64 @@ mod tests {
                 "(".repeat(100_000),
                 ")".repeat(100_000)
             ),
+        ] {
+            let _ = sources(&command);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn member_cmdlet_groups_read_across_lines_in_bounded_time() {
+        let sources = |command: &str| {
+            let mut sinks = Vec::new();
+            collect_powershell_member_cmdlet_sinks(command, &mut sinks);
+            sinks
+                .into_iter()
+                .map(|sink| match sink {
+                    ExecutableTextSink::Payload { source, .. } => source,
+                    ExecutableTextSink::Unverified { rule, .. } => rule.to_string(),
+                    _ => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        for (command, expected) in [
+            ("$x | % InvokeScript (\n'a'\n)\nb", vec!["a"]),
+            ("$x | % -MemberName (\n'InvokeScript'\n) 'a'", vec!["a"]),
+            (
+                "New-Object a.Command -ArgumentList @(\n'a',\n$true\n)\nb",
+                vec!["a"],
+            ),
+            (
+                "New-Object -TypeName (\n[a.Command]\n) 'a', $true",
+                vec!["a"],
+            ),
+            (
+                "New-Object a.Command -ArgumentList ('a' # c\n, $true)",
+                vec!["a"],
+            ),
+            // An unclosed group is a parse error; its text is still judged.
+            (
+                "New-Object a.Command -ArgumentList (\n'a',\n$true",
+                vec!["a"],
+            ),
+            ("% InvokeScript (\n$x", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            ("New-Object a.Command 'a'\n$true", vec![]),
+            (
+                "New-Object PSObject -Property @{\na = 1\n}\n% InvokeScript",
+                vec![],
+            ),
+        ] {
+            assert_eq!(sources(command), expected, "{command:?}");
+        }
+        let started = std::time::Instant::now();
+        for command in [
+            "% (\n".repeat(20_000),
+            format!("% {}a{}", "(\n".repeat(50_000), "\n)".repeat(50_000)),
+            "New-Object a.Command {\n".repeat(20_000),
         ] {
             let _ = sources(&command);
         }

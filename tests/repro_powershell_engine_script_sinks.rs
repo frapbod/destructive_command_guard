@@ -134,6 +134,24 @@ const RUNS_IT: &[&str] = &[
     "$ExecutionContext.InvokeCommand | ForEach-Object ('Invoke' + 'Script') 'git reset --hard'",
     "$c = New-Object ([System.Management.Automation.Runspaces.Command, System.Management.Automation]) 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
     "$c = New-Object -TypeName ('System.Management.Automation.Runspaces.Command, System.Management.Automation') -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // A line break inside a grouped value or argument list does not end the
+    // statement.
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList @(\n  'git reset --hard',\n  $true\n)\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList @(\n  'git reset --hard'\n  $true\n)\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList (\n  'git reset --hard',\n  $true\n)\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$c = New-Object System.Management.Automation.Runspaces.Command @(\n  'git reset --hard',\n  $true\n)\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$c = New-Object -TypeName (\n  [System.Management.Automation.Runspaces.Command]\n) -ArgumentList 'git reset --hard', $true\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % -MemberName (\n'InvokeScript'\n) 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ArgumentList (\n  'git reset --hard'\n)",
+    "$ExecutionContext.InvokeCommand | % InvokeScript (\n  'git reset --hard'\n)",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command `\n    -ArgumentList 'git reset --hard', $true\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$c = New-Object `\n    -TypeName System.Management.Automation.Runspaces.Command `\n    -ArgumentList 'git reset --hard', $true\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | ForEach-Object -MemberName InvokeScript `\n    -ArgumentList 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand |\n  ForEach-Object -MemberName InvokeScript -ArgumentList 'git reset --hard'",
+    "$c = [System.Management.Automation.Runspaces.Command]::new.Invoke(@(\n  'git reset --hard',\n  $true\n))\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$c = [System.Management.Automation.Runspaces.Command]::new(\n  'git reset --hard',\n  $true\n)\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand.InvokeScript(\n  'git reset --hard'\n)",
+    "$c = New-Object -TypeName (\n[System.Management.Automation.Runspaces.Command]\n) -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -160,6 +178,10 @@ const HARMLESS: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 'git status'",
     "$ExecutionContext.InvokeCommand.ExpandString('a \"@ b')",
     "Get-ChildItem / | % -MemberName ('Na' + 'me') | Out-Null",
+    // Grouped values that span lines are read to their close.
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList @(\n  'git status',\n  $true\n)\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ArgumentList (\n  'git status'\n)",
+    "$l = New-Object -TypeName System.Collections.Generic.List[string] -ArgumentList @(\n  ,[string[]]@('a', 'b')\n)\n$l.Count",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -191,6 +213,7 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$c = New-Object -TypeName ([System.Text.StringBuilder]) -ArgumentList 'git reset --hard', 100; $c.ToString()",
     "$ExecutionContext.InvokeCommand | % -MemberName ('Invoke' + 'Script') 'git status'",
     "$c = New-Object ([System.Text.StringBuilder]) 'git reset --hard', 100; $c.ToString()",
+    "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command `\n    -ArgumentList 'git status', $true\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
