@@ -9846,19 +9846,37 @@ git x",
         for (command, rule) in [
             ("git checkout -q other -- f", "checkout-ref-discard"),
             ("git checkout --quiet other -- f", "checkout-ref-discard"),
-            ("git checkout --no-overlay other -- f", "checkout-ref-discard"),
-            ("git checkout --recurse-submodules other -- f", "checkout-ref-discard"),
-            ("git checkout --conflict merge other -- f", "checkout-ref-discard"),
+            (
+                "git checkout --no-overlay other -- f",
+                "checkout-ref-discard",
+            ),
+            (
+                "git checkout --recurse-submodules other -- f",
+                "checkout-ref-discard",
+            ),
+            (
+                "git checkout --conflict merge other -- f",
+                "checkout-ref-discard",
+            ),
             ("git checkout -q -q -- f", "checkout-ref-discard"),
             ("git -C repo checkout -q other -- f", "checkout-ref-discard"),
             ("git-checkout -q other -- f", "checkout-ref-discard"),
             ("git checkout other f", "checkout-ref-discard"),
             ("git checkout -q other f", "checkout-ref-discard"),
-            ("git checkout --conflict=merge other f", "checkout-ref-discard"),
+            (
+                "git checkout --conflict=merge other f",
+                "checkout-ref-discard",
+            ),
             ("git --no-pager checkout main a b", "checkout-ref-discard"),
-            ("git checkout other --pathspec-from-file=list", "checkout-discard"),
+            (
+                "git checkout other --pathspec-from-file=list",
+                "checkout-discard",
+            ),
             ("git checkout --pathspec-from-file=list", "checkout-discard"),
-            ("git checkout -q other --pathspec-from-file list", "checkout-discard"),
+            (
+                "git checkout -q other --pathspec-from-file list",
+                "checkout-discard",
+            ),
             ("git checkout --pathspec-fr=list", "checkout-discard"),
             // Already denied; kept as controls.
             ("git checkout other -- f", "checkout-ref-discard"),
