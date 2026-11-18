@@ -3201,6 +3201,88 @@ fn decode_powershell_pattern_view(command: &str) -> Cow<'_, str> {
     Cow::Owned(output)
 }
 
+/// Read each statement-leading PowerShell dot-source operator as the call
+/// operator.
+///
+/// `. git reset --hard` runs Git exactly as `& git reset --hard` does: the dot
+/// only changes the scope a script runs in. Every reader that understands the
+/// call operator can judge the dot form once the `.` byte becomes `&`. The
+/// view has the same length as `command`, so spans still address it.
+///
+/// Only a static command word is rewritten. Dot-sourcing a variable or an
+/// expandable string (`. $profile`, `. "$PSScriptRoot\x.ps1"`) loads a script
+/// whose name is not known here, and keeps the reading it had. A `.` in an
+/// argument (`git add .`) is data. Returns `None` when nothing changes.
+#[must_use]
+pub(crate) fn powershell_dot_source_call_view(command: &str) -> Option<String> {
+    if !command.contains('.') {
+        return None;
+    }
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+    let mut dots = Vec::new();
+    // `None` at a statement start; otherwise whether the statement so far is
+    // only an assignment target (`$x =`), after which a command starts again.
+    let mut statement: Option<bool> = None;
+    let mut iter = tokens.iter().peekable();
+    while let Some(token) = iter.next() {
+        let raw = token.text(command)?;
+        if token.kind == NormalizeTokenKind::Separator {
+            // A closing parenthesis completes an expression; what follows it
+            // is not a new statement.
+            statement = (raw == ")").then_some(false);
+            continue;
+        }
+        match statement {
+            Some(true) if raw == "=" => statement = None,
+            Some(_) => {
+                // Block braces start statements of their own.
+                if matches!(raw, "{" | "}") {
+                    statement = None;
+                } else {
+                    statement = Some(false);
+                }
+            }
+            None if matches!(raw, "{" | "}") => {}
+            None => {
+                let assignment = raw.starts_with('$') && !raw.contains('(');
+                // `$r=.` is one word: the target, `=` and the operator.
+                let operator = if raw == "." {
+                    Some(token.byte_range.start)
+                } else if assignment && raw.ends_with("=.") {
+                    Some(token.byte_range.end - 1)
+                } else {
+                    None
+                };
+                if let Some(operator) = operator {
+                    let static_operand = iter.peek().is_some_and(|next| {
+                        next.kind == NormalizeTokenKind::Word
+                            && next.byte_range.start > token.byte_range.end
+                            && next.text(command).is_some_and(|word| {
+                                !word.contains('$') && !word.starts_with(['@', '{'])
+                            })
+                    });
+                    if static_operand {
+                        dots.push(operator);
+                    }
+                    statement = Some(false);
+                } else if assignment && raw.ends_with('=') {
+                    statement = None;
+                } else {
+                    statement = Some(assignment);
+                }
+            }
+        }
+    }
+    if dots.is_empty() {
+        return None;
+    }
+    let mut view = command.as_bytes().to_vec();
+    for dot in dots {
+        view[dot] = b'&';
+    }
+    String::from_utf8(view).ok()
+}
+
 /// Return the executable right-hand side of a simple PowerShell variable
 /// assignment.
 ///
@@ -8310,6 +8392,44 @@ mod tests {
                 decode_powershell_pattern_view(command),
                 expected,
                 "executed command words still expose their literal spelling: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_dot_source_call_view_reads_statement_leading_dots() {
+        for (command, expected) in [
+            (". git reset --hard", "& git reset --hard"),
+            (". 'git' reset --hard", "& 'git' reset --hard"),
+            ("echo a; . git x", "echo a; & git x"),
+            ("a | . git x", "a | & git x"),
+            ("a\n. git x", "a\n& git x"),
+            ("if ($true) { . git x }", "if ($true) { & git x }"),
+            ("$r = . git x", "$r = & git x"),
+            ("$r=. git x", "$r=& git x"),
+            (". ./x.ps1", "& ./x.ps1"),
+        ] {
+            assert_eq!(
+                powershell_dot_source_call_view(command).as_deref(),
+                Some(expected),
+                "{command:?}"
+            );
+        }
+        for command in [
+            ". $profile",
+            ". \"$PSScriptRoot\\x.ps1\"",
+            ". { Get-Date }",
+            ". @('git')",
+            "git add .",
+            "echo . git x",
+            ".git x",
+            "(Get-Item x) . git",
+            "Write-Output '. git x'",
+        ] {
+            assert_eq!(
+                powershell_dot_source_call_view(command),
+                None,
+                "{command:?}"
             );
         }
     }

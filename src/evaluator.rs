@@ -16036,6 +16036,43 @@ fn evaluate_command_in_dialect_union(
         primary
     };
 
+    // PowerShell's dot-source operator runs a command like the call operator:
+    // `. git reset --hard` runs Git. Judge the line with each statement-leading
+    // dot read as `&`, deny wins. The view has the same length, so a denial's
+    // span still addresses the command. What the user allowed as written stays
+    // allowed.
+    let primary = if matches!(
+        shell_dialect,
+        ShellDialect::PowerShell | ShellDialect::Unknown
+    ) && primary.decision == EvaluationDecision::Allow
+        && primary.allowlist_override.is_none()
+        && let Some(view) = crate::normalize::powershell_dot_source_call_view(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &view,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            shell_dialect,
+            nested_command_depth,
+            inherited_automated_stdin,
+        );
+        if result.decision == EvaluationDecision::Allow {
+            primary
+        } else {
+            result
+        }
+    } else {
+        primary
+    };
+
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
         || primary.decision != EvaluationDecision::Allow
