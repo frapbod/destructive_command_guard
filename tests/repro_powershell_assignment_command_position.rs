@@ -210,6 +210,11 @@ const RUNS_IT: &[&str] = &[
     "$c=@{}; (Get-Variable c).Value = git reset --hard",
     "$c=@{}; (Get-Variable c).Value = icm {git reset --hard}",
     "$h = @{a = 1 | ForEach-Object { Remove-Item -Recurse -Force C:\\Users }}",
+    // .NET directory deletes (pwsh 7.5 deletes a real directory).
+    "$c=[IO.Directory]::Delete('C:\\Users', $true)",
+    "$null=[System.IO.Directory]::Delete('C:\\Users',$true)",
+    "$c=@(1,2); $c[ 0 ]=[IO.Directory]::Delete('C:\\Users', $true)",
+    "@{a=[IO.Directory]::Delete('C:\\Users', $true)}",
 ];
 
 /// pwsh 7.5 hands `cmd` a value it reads at run time (`%X%`), as the bare
@@ -218,16 +223,6 @@ const RUNS_IT: &[&str] = &[
 /// must get that verdict too (card t_3bdbf4bf's rows).
 const FAILS_CLOSED_LIKE_THE_BARE_COMMAND: &[&str] =
     &["$r = cmd /c \"echo %X%\"", "$r=cmd /c \"echo %X%\""];
-
-/// pwsh 7.5 runs these too (a real directory is deleted). The Unknown
-/// dialect allows the bare .NET call on the base commit (card t_02cc8a24),
-/// so only the PowerShell dialect is held to them here.
-const RUNS_IT_IN_POWERSHELL: &[&str] = &[
-    "$c=[IO.Directory]::Delete('C:\\Users', $true)",
-    "$null=[System.IO.Directory]::Delete('C:\\Users',$true)",
-    "$c=@(1,2); $c[ 0 ]=[IO.Directory]::Delete('C:\\Users', $true)",
-    "@{a=[IO.Directory]::Delete('C:\\Users', $true)}",
-];
 
 /// pwsh 7.5 runs no `git reset --hard` for any of these (sandboxed).
 const HARMLESS: &[&str] = &[
@@ -442,11 +437,7 @@ fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
 #[test]
 fn powershell_tool_judges_the_value_of_a_statement_leading_assignment() {
     for protocol in [Protocol::Claude, Protocol::Codex] {
-        for command in RUNS_IT
-            .iter()
-            .chain(RUNS_IT_IN_POWERSHELL)
-            .chain(FAILS_CLOSED_LIKE_THE_BARE_COMMAND)
-        {
+        for command in RUNS_IT.iter().chain(FAILS_CLOSED_LIKE_THE_BARE_COMMAND) {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "deny",
@@ -480,13 +471,6 @@ fn powershell_and_unknown_dialects_judge_the_value_of_a_statement_leading_assign
                 "{dialect:?}: {command:?}"
             );
         }
-    }
-    for command in RUNS_IT_IN_POWERSHELL {
-        assert_eq!(
-            decision_in(command, ShellDialect::PowerShell),
-            EvaluationDecision::Deny,
-            "{command:?}"
-        );
     }
     for command in HARMLESS_IN_POWERSHELL {
         assert_eq!(
