@@ -6902,7 +6902,6 @@ mod tests {
             format!("{}true{}", "(".repeat(140), ") ".repeat(140)),
             format!("{}true{}", "(".repeat(5_000), ") ".repeat(5_000)),
             "(".repeat(5_000),
-            "$((".repeat(2_000),
             "@(".repeat(5_000),
             "((true) );".repeat(2_000),
         ] {
@@ -6913,6 +6912,13 @@ mod tests {
                 "{head:.9}"
             );
         }
+        // An unclosed `$((` reads to the end as a command substitution, so
+        // the comment in it fails closed. Bash: unexpected end of file.
+        let command = format!("{};: # \"\n{tail}\n# \"", "$((".repeat(2_000));
+        assert_eq!(
+            bash_hashes_as_data(&command, false),
+            Some(BashHashReading::Unread)
+        );
     }
 
     #[test]
@@ -6928,9 +6934,20 @@ mod tests {
                 "(( 1 _)); (( 2 _)); git reset --hard".to_string()
             ))
         );
-        // Quoted text that each lookup starts inside of is read once.
+        // Quoted text that each lookup starts inside of is read once. The
+        // unclosed `$(` holds the comment-capable `#`, so the reading fails
+        // closed. Bash: unexpected end of file.
         let command = format!("(({} #)); git reset --hard", "\"$(((".repeat(3_000));
-        let _ = bash_spelling(&command);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            bash_hashes_as_data(&command, false),
+            Some(BashHashReading::Unread)
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

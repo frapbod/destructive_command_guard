@@ -970,7 +970,8 @@ fn bash_data_hash_hides_no_later_git_command() {
         "[[ x == $(echo x) ]] && echo ok # git reset --hard",
         "(( $(echo 1) > 0 )) && echo ok # git reset --hard",
         "cat <<'EOF'\ndon't\nEOF\n(( 1 #)); git status",
-        "[[ x =~ ( $'\\'' ) ]] && echo ok # git reset --hard",
+        "[[ x == $'\\'' ]] && echo ok # git reset --hard",
+        "[[ x =~ ( $'a' ) ]] && echo ok # git reset --hard",
         "(( `echo 1` > 0 )) && echo ok # git reset --hard",
         "[[ x == $( echo $(( 1 )) ) ]] && echo ok # git reset --hard",
     ] {
