@@ -5,6 +5,8 @@
 //! 5.1 (`powershell.exe`) reads its first non-switch argument as `-Command`,
 //! and the host takes `/` and the Unicode dashes as switch prefixes; dcg read
 //! `powershell "git reset --hard"` and `pwsh /c "..."` as no launcher at all.
+//! Windows PowerShell 5.1 also skips empty arguments and takes `/-c` and
+//! `--c` as `-Command`; pwsh does neither.
 
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
@@ -61,6 +63,20 @@ const RUNS_IT: &[&str] = &[
     "pwsh \u{2013}c \"git reset --hard\"",
     "pwsh \u{2014}Command \"git reset --hard\"",
     "pwsh \" -c\" \"git reset --hard\"",
+    // Windows PowerShell 5.1 skips an argument that is empty after trimming,
+    // and after any switch prefix (`/` included) drops one more dash of any
+    // kind. Source: PowerShell's ConsoleHost `CommandLineParameterParser.
+    // ParseHelper` at tag v6.0.0-alpha.9 (the 5.1-lineage parser), lines
+    // 338-342 and 357-362. Unmeasured on real 5.1 (no sandboxed route).
+    "powershell \"\" -c \"git reset --hard\"",
+    "powershell \" \" -c \"git reset --hard\"",
+    "powershell '' -NoProfile -Command 'git reset --hard'",
+    "powershell /-c \"git reset --hard\"",
+    "powershell /-Command \"git reset --hard\"",
+    "powershell /\u{2013}c \"git reset --hard\"",
+    "powershell -\u{2013}Command \"git reset --hard\"",
+    "powershell --c \"git reset --hard\"",
+    "powershell \"\" /-NoProfile \"git reset --hard\"",
 ];
 
 /// A separator inside quotes is data; characters PowerShell does not split on
@@ -91,6 +107,15 @@ const HARMLESS: &[&str] = &[
     "powershell \"git status; git log -1\"",
     "powershell /NoLogo /NoProfile \"Get-Date\"",
     "powershell -Version 5.1 Get-Date",
+    // pwsh 7.5 reads an empty argument as `-File ''` (an error, measured) and
+    // drops a second dash only when it repeats the first, so `/-c` is a
+    // script path (`GetSwitchKey`, v7.5.0 line 699).
+    "pwsh \"\" -c \"git reset --hard\"",
+    "pwsh /-c \"git reset --hard\"",
+    "powershell \"\" -c \"Get-Date\"",
+    "powershell /-NoProfile \"Get-Date\"",
+    "powershell --version",
+    "pwsh --version",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {

@@ -3176,7 +3176,7 @@ fn skip_shell_horizontal_whitespace(bytes: &[u8], mut i: usize, len: usize) -> u
 /// byte is ASCII, 0xC2 or 0xE1..=0xE3, so a scan that steps byte by byte
 /// meets the lead byte first.
 #[inline]
-pub(crate) fn powershell_horizontal_space_len(bytes: &[u8], i: usize) -> Option<usize> {
+fn powershell_horizontal_space_len(bytes: &[u8], i: usize) -> Option<usize> {
     let lead = *bytes.get(i)?;
     let width = match lead {
         b' ' | b'\t' | 0x0b | 0x0c => return Some(1),

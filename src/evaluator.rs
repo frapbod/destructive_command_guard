@@ -4525,6 +4525,32 @@ fn powershell_host_option_value(raw: &str, outer_dialect: ShellDialect) -> Optio
     shell_word_value(raw, outer_dialect)
 }
 
+/// Which PowerShell host reads the command line: their switch parsers differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PowerShellHost {
+    /// `powershell.exe`, Windows PowerShell 5.1.
+    Windows,
+    /// `pwsh`, PowerShell 6 and later.
+    Core,
+}
+
+impl PowerShellHost {
+    /// `executable` is the launcher's lower-case base name without `.exe`.
+    fn from_executable(executable: &str) -> Self {
+        if executable == "powershell" {
+            Self::Windows
+        } else {
+            Self::Core
+        }
+    }
+}
+
+/// `CharExtensions.IsDash` / `SpecialCharacters.IsDash` in PowerShell's
+/// console host: hyphen-minus, en dash, em dash and horizontal bar.
+fn is_powershell_dash(c: char) -> bool {
+    matches!(c, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}')
+}
+
 /// The switch prefix a PowerShell host reads on an argument, if it reads one.
 ///
 /// The host trims the argument, then takes `-`, an en dash, an em dash, a
@@ -4535,27 +4561,50 @@ fn powershell_host_option_value(raw: &str, outer_dialect: ShellDialect) -> Optio
 fn powershell_switch_prefix(decoded: &str) -> Option<(char, &str)> {
     let mut chars = decoded.trim().chars();
     let prefix = chars.next()?;
-    matches!(prefix, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}' | '/')
-        .then(|| (prefix, chars.as_str()))
+    (is_powershell_dash(prefix) || prefix == '/').then_some((prefix, chars.as_str()))
 }
 
-fn powershell_host_option(raw: &str, outer_dialect: ShellDialect) -> PowerShellHostOption {
+fn powershell_host_option(
+    raw: &str,
+    host: PowerShellHost,
+    outer_dialect: ShellDialect,
+) -> PowerShellHostOption {
     let Some(decoded) = powershell_host_option_value(raw, outer_dialect) else {
         return PowerShellHostOption::Unknown;
     };
     let Some((prefix, name)) = powershell_switch_prefix(&decoded) else {
-        return PowerShellHostOption::Unknown;
-    };
-    // pwsh additionally accepts exactly two GNU-style spellings, both
-    // print-and-exit informational flags (issue #304). Any other
-    // double-dash token is not a pwsh host option.
-    if let Some(gnu) = name.strip_prefix(prefix).filter(|_| prefix != '/') {
-        return if gnu.eq_ignore_ascii_case("version") || gnu.eq_ignore_ascii_case("help") {
+        // Windows PowerShell 5.1 skips an argument that is empty after
+        // trimming (`CommandLineParameterParser.ParseHelper`, PowerShell
+        // v6.0.0-alpha.9 lines 338-342, the 5.1-lineage parser), so
+        // `powershell "" -c "..."` still runs the -Command. pwsh 7.5 reads it
+        // as `-File ''` and fails (measured).
+        return if host == PowerShellHost::Windows && decoded.trim().is_empty() {
             PowerShellHostOption::NoValue
         } else {
             PowerShellHostOption::Unknown
         };
+    };
+    // `--version` and `--help` start nothing in either host: pwsh accepts
+    // exactly these two GNU-style spellings as print-and-exit informational
+    // flags (issue #304); Windows PowerShell 5.1 reads them as `-Version`
+    // without its value (a usage error) and `-Help`.
+    let doubled = name.strip_prefix(prefix).filter(|_| prefix != '/');
+    if doubled
+        .is_some_and(|gnu| gnu.eq_ignore_ascii_case("version") || gnu.eq_ignore_ascii_case("help"))
+    {
+        return PowerShellHostOption::NoValue;
     }
+    let name = match host {
+        // Windows PowerShell 5.1 drops one more dash of any kind after any
+        // prefix, `/` included (same file, lines 357-362), so `/-c`, `--c`
+        // and `/–c` are `-Command`.
+        PowerShellHost::Windows => name.strip_prefix(is_powershell_dash).unwrap_or(name),
+        // pwsh drops a second dash only when it repeats the first
+        // (`GetSwitchKey`, v7.5.0 line 699); dcg does not guess any other
+        // double-dash token as a pwsh host option. `/-c` is a script path.
+        PowerShellHost::Core if doubled.is_some() => return PowerShellHostOption::Unknown,
+        PowerShellHost::Core => name,
+    };
     let name = name.to_ascii_lowercase();
     if !name.is_empty() && "command".starts_with(&name) {
         return PowerShellHostOption::Command;
@@ -5026,9 +5075,10 @@ fn parse_powershell_launcher(
     outer_dialect: ShellDialect,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
+    let host = PowerShellHost::from_executable(executable);
     let mut index = 1usize;
     while let Some(raw) = words.get(index) {
-        match powershell_host_option(raw, outer_dialect) {
+        match powershell_host_option(raw, host, outer_dialect) {
             PowerShellHostOption::Command => {
                 return powershell_command_payload(
                     words,
@@ -5108,7 +5158,7 @@ fn parse_powershell_launcher(
                 // payload; pwsh's documented default changed from Command to
                 // File). An unrecognized `/name` is such an argument too: in
                 // pwsh it is the absolute path of a script.
-                if executable == "powershell" {
+                if host == PowerShellHost::Windows {
                     return powershell_command_payload(
                         words,
                         index,
@@ -8208,9 +8258,10 @@ fn appended_code_input_mode(
         if args.iter().any(|argument| replacement.occurs_in(argument)) {
             return PipelineShellInputMode::Unverified;
         }
+        let host = PowerShellHost::from_executable(&executable);
         let mut index = 0usize;
         while let Some(argument) = args.get(index) {
-            match powershell_host_option(argument, ShellDialect::Posix) {
+            match powershell_host_option(argument, host, ShellDialect::Posix) {
                 PowerShellHostOption::Command => {
                     let Some(source) = args.get(index + 1) else {
                         let kind = if join_windows_argv {
@@ -9148,10 +9199,10 @@ fn python_pipeline_input_mode(
     PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
 }
 
-fn powershell_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
+fn powershell_pipeline_input_mode(args: &[String], host: PowerShellHost) -> PipelineShellInputMode {
     let mut index = 0usize;
     while let Some(argument) = args.get(index) {
-        match powershell_host_option(argument, ShellDialect::Posix) {
+        match powershell_host_option(argument, host, ShellDialect::Posix) {
             // Resolved through the shared option table rather than an exact
             // `-file` string match, so abbreviations such as `pwsh -f -` are
             // recognized as reading a script from stdin.
@@ -9730,7 +9781,7 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
         return parallel_pipeline_input_mode(&args);
     }
     if matches!(executable.as_str(), "powershell" | "pwsh") {
-        return powershell_pipeline_input_mode(&args);
+        return powershell_pipeline_input_mode(&args, PowerShellHost::from_executable(&executable));
     }
     if executable == "cmd" {
         return cmd_pipeline_input_mode(&args);
@@ -11280,7 +11331,10 @@ fn dialect_stdin_reading_shell(argv: &[String]) -> Option<PipelineShellInputMode
     let rest = &argv[1..];
     match exe.as_str() {
         "cmd" => Some(cmd_pipeline_input_mode(rest)),
-        "powershell" | "pwsh" => Some(powershell_pipeline_input_mode(rest)),
+        "powershell" | "pwsh" => Some(powershell_pipeline_input_mode(
+            rest,
+            PowerShellHost::from_executable(&exe),
+        )),
         _ => None,
     }
 }
@@ -58821,54 +58875,110 @@ mod tests {
             Some("powershell")
         );
         assert_eq!(
-            powershell_host_option("-Co", ShellDialect::PowerShell),
+            powershell_host_option("-Co", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::Command
         );
         assert_eq!(
-            powershell_host_option("-En", ShellDialect::PowerShell),
+            powershell_host_option("-En", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::EncodedCommand
         );
         assert_eq!(
-            powershell_host_option("-NoL", ShellDialect::PowerShell),
+            powershell_host_option("-NoL", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::NoValue
         );
         assert_eq!(
-            powershell_host_option("-Work", ShellDialect::PowerShell),
+            powershell_host_option("-Work", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::Value
         );
         assert_eq!(
-            powershell_host_option("-File", ShellDialect::PowerShell),
+            powershell_host_option("-File", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::File
         );
         assert_eq!(
-            powershell_host_option("-file", ShellDialect::PowerShell),
+            powershell_host_option("-file", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::File,
             "host options are case-insensitive"
         );
         assert_eq!(
-            powershell_host_option("-Fi", ShellDialect::PowerShell),
+            powershell_host_option("-Fi", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::File
         );
         assert_eq!(
-            powershell_host_option("-f", ShellDialect::PowerShell),
+            powershell_host_option("-f", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::File,
             "no other host option starts with f, so -f resolves to -File"
         );
         assert_eq!(
-            powershell_host_option("-NoP", ShellDialect::PowerShell),
+            powershell_host_option("-NoP", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::Unknown,
             "NoProfile and NoProfileLoadTime make -NoP ambiguous"
         );
         assert_eq!(
-            powershell_host_option("-W", ShellDialect::PowerShell),
+            powershell_host_option("-W", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::Unknown,
             "WindowStyle and WorkingDirectory make -W ambiguous"
         );
         assert_eq!(
-            powershell_host_option("-Com`mand", ShellDialect::PowerShell),
+            powershell_host_option("-Com`mand", PowerShellHost::Core, ShellDialect::PowerShell),
             PowerShellHostOption::Unknown,
             "a mid-token bare backtick is passed literally to the native host"
         );
+        // Windows PowerShell 5.1 skips an argument that is empty after
+        // trimming and drops one more dash of any kind after any prefix;
+        // pwsh does neither (see `powershell_host_option`).
+        for (raw, windows, core) in [
+            (
+                "\"\"",
+                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "' '",
+                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "/-c",
+                PowerShellHostOption::Command,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "/\u{2014}Command",
+                PowerShellHostOption::Command,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "-\u{2013}c",
+                PowerShellHostOption::Command,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "--c",
+                PowerShellHostOption::Command,
+                PowerShellHostOption::Unknown,
+            ),
+            (
+                "--version",
+                PowerShellHostOption::Value,
+                PowerShellHostOption::NoValue,
+            ),
+            (
+                "/c",
+                PowerShellHostOption::Command,
+                PowerShellHostOption::Command,
+            ),
+        ] {
+            assert_eq!(
+                powershell_host_option(raw, PowerShellHost::Windows, ShellDialect::PowerShell),
+                windows,
+                "powershell {raw:?}"
+            );
+            assert_eq!(
+                powershell_host_option(raw, PowerShellHost::Core, ShellDialect::PowerShell),
+                core,
+                "pwsh {raw:?}"
+            );
+        }
         assert!(matches!(
             parse_windows_launcher_segment("call %DCG_DYNAMIC%", ShellDialect::Cmd, 1024),
             WindowsLauncherParse::Unverified(_)
