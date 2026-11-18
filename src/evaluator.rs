@@ -2325,37 +2325,14 @@ fn powershell_alias_word_is_dynamic(raw: &str) -> bool {
     single || double
 }
 
-/// The statement's words from its command on: a statement-leading
-/// assignment (`$c = sal x iex`, `[int] $a, $b += Start-Process …`) is
-/// skipped, because PowerShell runs its value as the statement's command.
 fn decoded_powershell_segment_words(
     segment: &str,
 ) -> Option<Vec<(String, bool, std::ops::Range<usize>)>> {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
     let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
-    let words: Vec<_> = tokens
+    tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
-        .collect();
-    let mut command_start = 0usize;
-    loop {
-        let raw = |index: usize| words.get(index).and_then(|token| token.text(segment));
-        let targets = (command_start..words.len())
-            .take_while(|index| {
-                raw(*index).is_some_and(crate::normalize::is_powershell_assignment_target)
-            })
-            .count();
-        if targets == 0
-            || !raw(command_start + targets)
-                .is_some_and(crate::normalize::is_powershell_assignment_operator)
-        {
-            break;
-        }
-        command_start += targets + 1;
-    }
-    words
-        .into_iter()
-        .skip(command_start)
         .take(MAX_POWERSHELL_VISIBLE_ALIAS_WORDS + 1)
         .map(|token| {
             let raw = token.text(segment)?;
@@ -3969,31 +3946,6 @@ fn powershell_token_at_command_boundary(
     if previous.kind == NormalizeTokenKind::Separator {
         return matches!(raw.trim(), ";" | "|" | "|&" | "||" | "&&" | "&" | "(")
             || raw.contains(['\r', '\n']);
-    }
-
-    // The value of an assignment that starts a statement is a pipeline:
-    // `$c = iex '…'` and `[int]$a, $b += icm {…}` run their command. Glued
-    // spellings (`$c=iex`) reach here through the deny-only view's blanks.
-    if crate::normalize::is_powershell_assignment_operator(raw) {
-        let mut first = index - 1;
-        while let Some(target) = first.checked_sub(1).and_then(|prior| tokens.get(prior)) {
-            let Some(word) = (target.kind == NormalizeTokenKind::Word)
-                .then(|| target.text(command))
-                .flatten()
-            else {
-                break;
-            };
-            let unbraced = word.trim_start_matches(['{', '}']);
-            if !crate::normalize::is_powershell_assignment_target(unbraced) {
-                break;
-            }
-            first -= 1;
-            if unbraced.len() != word.len() {
-                // `{$c = …`: a block brace starts the statement.
-                return true;
-            }
-        }
-        return first < index - 1 && powershell_token_at_command_boundary(tokens, first, command);
     }
 
     // Braces are intentionally retained in raw PowerShell words by the
@@ -15937,8 +15889,9 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     }
     // Two deny-only PowerShell views; each keeps the original tokenizer's
     // decisions and grants intact. One reads comment and smart-quote syntax.
-    // The other reads a glued assignment (`$c=iex '…'`) with blanks around
-    // its operator, so it gets the verdict of its spaced twin.
+    // The other ends each assignment's target at its operator (`$c=iex '…'`
+    // reads as `$c;iex '…'`), so every reader and pack judges the value as
+    // the command PowerShell runs.
     if matches!(
         shell_dialect,
         ShellDialect::PowerShell | ShellDialect::Unknown
@@ -15965,10 +15918,11 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             )
         };
         let masked = crate::normalize::mask_powershell_comments(command);
-        let spaced =
-            crate::normalize::space_powershell_assignments(masked.as_deref().unwrap_or(command));
-        let mut unspaced_reading = None;
-        for (view, blanks) in [(masked, false), (spaced, true)] {
+        let separated = crate::normalize::separate_powershell_assignment_values(
+            masked.as_deref().unwrap_or(command),
+        );
+        let mut unseparated_reading = None;
+        for (view, separates) in [(masked, false), (separated, true)] {
             let Some(view) = view else {
                 continue;
             };
@@ -15986,22 +15940,22 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             // The copy's incomplete analyses count only if its result is used.
             let mut alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
             let mut alternate = read(&view, ShellDialect::PowerShell);
-            if !blanks {
-                unspaced_reading = Some(alternate.decision);
+            if !separates {
+                unseparated_reading = Some(alternate.decision);
             } else if shell_dialect == ShellDialect::Unknown
                 && alternate.decision == EvaluationDecision::Deny
-                && unspaced_reading.unwrap_or_else(|| {
+                && unseparated_reading.unwrap_or_else(|| {
                     let probe = crate::packs::regex_engine::RegexEvaluationScope::enter();
                     let decision = read(command, ShellDialect::PowerShell).decision;
                     probe.discard();
                     decision
                 }) != EvaluationDecision::Allow
             {
-                // PowerShell already rejects the unblanked text, which the
-                // Unknown dialect tolerates as written (a Node heredoc's
-                // `()=>{` is an unbalanced PowerShell block), so a denial
-                // here is no news from the blanks. Judge the spaced text as
-                // Unknown judges its spaced twin.
+                // PowerShell already rejects the text as written, which the
+                // Unknown dialect tolerates (a Node heredoc's `()=>{` is an
+                // unbalanced PowerShell block), so a PowerShell denial of the
+                // view is no news about the assignment. Judge the view as
+                // Unknown judges such text.
                 alternate_scope.discard();
                 alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
                 alternate = read(&view, ShellDialect::Unknown);
@@ -16031,8 +15985,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 {
                     info.matched_text_preview = Some(extract_match_preview(command, span));
                 } else if view.len() != command.len() {
-                    // Smart-quote spelling and assignment blanks change
-                    // byte offsets.
+                    // Smart-quote spelling changes byte offsets.
                     info.matched_span = None;
                     info.matched_text_preview = None;
                 }

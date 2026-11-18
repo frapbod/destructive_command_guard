@@ -1,24 +1,26 @@
-//! PowerShell runs the command on the right of an assignment: `$c=iex 'git
-//! reset --hard'` runs the reset just as `$c = iex 'git reset --hard'` does
-//! (pwsh 7.5 measured in the sandbox for every RUNS_IT row; Windows PowerShell
-//! 5.1 parses assignments the same way). dcg's PowerShell tokenizer kept
-//! `$c=iex` as one word, so the command word glued to `$c=` was never in
-//! command position, and the readers that take a statement's first word as
-//! its command (aliases, functions, script-block consumers, `iex`) skipped
-//! even the spaced `$c = icm {…}`.
+//! PowerShell runs the value of an assignment as a pipeline: `$c=iex 'git
+//! reset --hard'`, `$null = Remove-Item -Recurse -Force .git`, `$c[ 0 ]=git
+//! reset --hard` and `@{a=git reset --hard}` run their command (pwsh 7.5
+//! measured in the sandbox for every RUNS_IT row; Windows PowerShell 5.1
+//! parses assignments the same way). dcg's readers and packs each found a
+//! statement's command by themselves: the tokenizer kept `$c=iex` as one
+//! word, several readers wanted `$name =` as separate words, the filesystem
+//! pack skipped every statement starting with `$name =`, and none read a
+//! target with a blank inside (`$c[ 0 ]`, `$a, $b`) or a hashtable value.
 //!
-//! A deny-only PowerShell view now puts blanks around a glued assignment
-//! operator after a target, wherever the word stands, so the glued spellings
-//! below get the verdict of their spaced twins. Targets: variables (`${c}`,
-//! `$env:C`, Unicode names), members (`.p`, `.'p'`, `.$n`, `.$('p')`),
-//! indexes, type constraints, static properties, hashtable keys and
-//! `(expr).p`; brackets and braced names may hold blanks (`$c[$i + 1]`,
+//! A deny-only PowerShell view now ends each assignment's target at its
+//! operator (`$c=iex '…'` reads as `$c;iex '…'`), wherever the target stands,
+//! so every reader and pack judges the value as a command. Only a value that
+//! PowerShell parses in command mode (a bare word, `&` or `.`) is split off;
+//! an expression (`$y=$x*2`, `$x = $(Get-Date)`) stays as written. Targets:
+//! variables (`${c}`, `$env:C`, Unicode names), members (`.p`, `.'p'`, `.$n`,
+//! `.$('p')`), indexes, type constraints, static properties, hashtable keys
+//! and `(expr).p`; brackets and braced names may hold blanks (`$c[$i + 1]`,
 //! `[Dictionary[string, int]]$c`, `${c d}`). A comment glued between target
-//! and operator (`$c<#x#>=`) is not covered yet. The readers judge the
-//! position, as they already did for the spaced spelling. That includes the
-//! spaced spelling's over-denials: `Write-Output $c=iex 'git reset --hard'`
-//! now denies, as `Write-Output $c = iex '…'` already did, although
-//! PowerShell only prints it.
+//! and operator (`$c<#x#>=`) is not covered yet. An argument spelled like an
+//! assignment has its value judged as a command too: `Write-Output $c=iex
+//! 'git reset --hard'` denies, as `Write-Output $c = iex '…'` already did on
+//! base, although PowerShell only prints it.
 
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
@@ -135,6 +137,54 @@ const RUNS_IT: &[&str] = &[
     "[System.Collections.Generic.Dictionary[string, int]]$c=iex 'git reset --hard'",
     "[System.Collections.Generic.Dictionary[string, int]] $c=iex 'git reset --hard'",
     "${c d}=iex 'git reset --hard'",
+    // Any command in the value, glued or spaced, read by any reader or pack:
+    // the filesystem pack's Remove-Item reader, the Windows launchers, and
+    // direct commands after targets the readers did not take as words.
+    "$null = Remove-Item -Recurse -Force .git",
+    "$null=Remove-Item -Recurse -Force .git",
+    "$c = Remove-Item -Recurse -Force C:\\Windows",
+    "$c=Remove-Item -Recurse -Force $env:USERPROFILE\\.ssh",
+    "$c=Remove-Item -LiteralPath C:\\x -Recurse -Force",
+    "$c = ri -r -fo C:\\Users",
+    "$c = rd -r -fo C:\\Users",
+    "$c=del -Recurse -Force C:\\Users",
+    "$c = cmd /c rd /s /q C:\\Users",
+    "$c = powershell -c 'Remove-Item -Recurse -Force C:\\Windows'",
+    "$c=@(1,2); $c[ 0 ]=git reset --hard",
+    "$c=@(1,2); $c[ 0 ] = git reset --hard",
+    "$c=@(1,2); $c[ 0 ]=icm {git reset --hard}",
+    "$c=@(1,2); $i=0; $c[$i + 1]=git reset --hard",
+    "$c=@{}; $c[ 'a' ]=git reset --hard",
+    "$c=@{}; $c['a b']=git reset --hard",
+    "$c=@(@{}); $c[ 0 ].p=git reset --hard",
+    "$c=@{p=@(1)}; $c.p[ 0 ]=git reset --hard",
+    "$c=@{}; $c.'p q'=git reset --hard",
+    "[System.Collections.Generic.Dictionary[string, int]]$c=git reset --hard",
+    "[int] [string] $c=git reset --hard",
+    "$a, $b = git reset --hard",
+    "$a, $b=git reset --hard",
+    "[int] $a, $b=git reset --hard",
+    "$c=1; (Get-Variable c).Value=git reset --hard",
+    "[System.Environment]::CurrentDirectory=git reset --hard",
+    "${c}=icm {git reset --hard}",
+    "@{a=git reset --hard}",
+    "@{a=1; b=git reset --hard}",
+    "$c=@(1,2); if(1){$c[ 0 ]=git reset --hard}",
+    "$c=@(1,2); function f {$c[ 0 ]=git reset --hard}; f",
+    "$c=@(1,2); foreach($i in 1){$c[ 0 ]=git reset --hard}",
+    "echo hi; $a, $b = git reset --hard",
+    // Hashtable values, spaced or glued, typed or nested (card t_9c78e651).
+    "$h = @{a = git reset --hard}",
+    "@{a = git reset --hard}",
+    "$h = @{a = 1; b = git reset --hard}",
+    "$h = [ordered]@{a = git reset --hard}",
+    "$h=@{a=git reset --hard}",
+    "$h=[ordered]@{a=git reset --hard}",
+    "$h = [pscustomobject]@{a = git reset --hard}",
+    "$h = @{a = @{b = git reset --hard}}",
+    "$p = @{a = git reset --hard}; Get-ChildItem @p",
+    "$h = @{a = $(git reset --hard)}",
+    "$h = @{a = (git reset --hard)}",
 ];
 
 /// pwsh 7.5 runs no `git reset --hard` for any of these (sandboxed).
@@ -142,7 +192,6 @@ const HARMLESS: &[&str] = &[
     // The same shapes with a harmless value or data.
     "$c=iex 'git status'",
     "$c=iex 'git log -1'",
-    "git commit -m $c=iex",
     "Get-Date & $c=git status",
     "return $c=git status",
     "$c\u{e9}=git status",
@@ -156,6 +205,18 @@ const HARMLESS: &[&str] = &[
     "$c=@(1,2); $i=0; $c[$i + 1]=git status",
     "$c=@(1,2); $c[ 0 ] =git status",
     "[System.Collections.Generic.Dictionary[string, int]]$c=@{}",
+    "$c=@(1,2); $c[ 0 ] = git status",
+    "$a, $b = git status",
+    "@{a=git status}",
+    "$null = Get-ChildItem",
+    "$null=Remove-Item -WhatIf x",
+    // A value in expression mode is not a command.
+    "foreach($i in 1..3){ $y=$i*2 }",
+    "if(1){$y=$x*2}",
+    "$el=$('#x')",
+    "$x = $(Get-Date)",
+    "$x = @{a='git reset --hard'}; $x.a",
+    "Get-Process | Select-Object -Property @{n='x';e={$_.Name}}",
     "$c=1; git status",
     "$c=$true",
     "$c=Get-Date",
@@ -178,10 +239,6 @@ const HARMLESS: &[&str] = &[
     "$x = 1 | % {git status}",
     "$c = Get-ChildItem | ForEach-Object { $_.Name }",
     "$r = Invoke-Command -ScriptBlock { Get-Date }",
-    // A statement-leading assignment no longer hides the function or alias a
-    // reader resolves; these resolve to harmless commands (base denied them).
-    "function f { git status }; $r = f",
-    "sal x Write-Output; $r = x 'git reset --hard'",
     "$c = Set-Alias x Write-Output; x 'git reset --hard'",
     "$x = 5; sal y iex; y 'git status'",
 ];
@@ -194,10 +251,14 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$c=@'\ngit reset --hard\n'@",
     "$c={git reset --hard}",
     "$msg='git reset --hard is dangerous'; Write-Output $msg",
+    // A here-string value is data, not a command (the filesystem pack's
+    // reason to skip assignments).
+    "$text = @'\n[System.IO.Directory]::Delete($path, $true)\n'@; Write-Output $text",
+    "$p = @{Path='.'; Recurse=$true}; Get-ChildItem @p",
 ];
 
 /// Text PowerShell cannot parse (it runs none of it) that the Unknown dialect
-/// allows on the base commit. The blanks must not turn PowerShell's parse
+/// allows on the base commit. The view must not turn PowerShell's parse
 /// failure into an Unknown denial: the first row is a Node heredoc from real
 /// Codex history, reduced (`()=>{…` in JavaScript).
 const HARMLESS_IN_UNKNOWN: &[&str] = &["node <<'JS'\n)={\nJS", "x)={"];

@@ -3309,33 +3309,38 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
     tokenize_powershell_with_comments(command, false).0
 }
 
-/// `command` with a blank on each side of every assignment operator that is
-/// glued to an assignment target or to the value after it, or `None` when
-/// there is none.
+/// `command` with every assignment operator that follows an assignment
+/// target replaced by `;` and blanks, so the value starts a statement of its
+/// own, or `None` when there is none. The text keeps its length and byte
+/// offsets.
 ///
-/// PowerShell runs the command on the right of `$c=iex '…'` as it does in
-/// `$c = iex '…'` (pwsh 7.5, measured in the sandbox). The PowerShell
-/// tokenizer keeps `$c=iex` as one word, and the readers that judge an
-/// assignment's command (the assignment envelope, the `iex` reader, the
-/// script-block readers) find it only after a separate `=` word. So every
-/// glued spelling hid the command: `$c=iex`, `$c =iex`, `$c+=`, `$c–=`,
-/// `[int]$c=`, `$cé=`, `$c.'p'=`, `$a=$b=`, `{$c=iex …}`, `@{a=1;b=iex …}`.
-/// With the blanks those readers see the spelling they already judge.
+/// PowerShell runs the value of an assignment as a pipeline: `$c=iex '…'`,
+/// `$null = Remove-Item -Recurse -Force x`, `$c[ 0 ]=git reset --hard` and
+/// `@{a=git reset --hard}` run their command (pwsh 7.5, measured in the
+/// sandbox). The readers and packs each find a statement's command by
+/// themselves, and each has its own idea of an assignment: the tokenizer
+/// keeps `$c=iex` as one word, some readers want `$name =` as separate
+/// words, and the filesystem pack skips any statement that starts with
+/// `$name =`. In this view the value stands where a statement's command
+/// stands, so every reader and pack judges it as the command it is.
 ///
-/// This pass does not decide whether the assignment stands where PowerShell
-/// runs it: the readers already decide that for the spaced spelling, so the
-/// glued one gets the same verdict wherever it stands (`Get-Date & $c=…`,
-/// `return $c=…`, `Write-Output $c=…`). A target starts a word, or follows a
-/// block brace or an assignment operator inside one (`if(1){$c=…`,
-/// `$a=$b=…`). A word that holds only a target or a type constraint is
-/// continued by the next word (`[string] $c=…`, `$c =iex`). Brackets and
-/// braced names with blanks inside continue a target across words
-/// (`$c[$i + 1]=…`, `[Dictionary[string, int]]$c=…`, `${c d}=…`); the words
-/// inside are still read as usual. After a closing parenthesis a word may
-/// continue the target (`$c.$('p')=…`, `(Get-Item x).p=…`). A bare or quoted
-/// name is a target only as a hashtable key: after `@{`, or after `;` or a
-/// line break inside one. Quoted text, here-strings and escapes are skipped.
-pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
+/// Only a value that PowerShell parses in command mode is separated (see
+/// [`powershell_value_is_command`]): `$y=$x*2` and `$t = $(Get-Date)` stay as
+/// written. This pass does not decide whether the assignment stands where
+/// PowerShell runs it. An argument spelled like an assignment (`Write-Output $c = x`,
+/// `git commit -m $c=iex`) is judged as a command too: the view only adds
+/// denials, and base already denied such spaced spellings with `iex`. A
+/// target starts a word, or follows a block brace or an assignment operator
+/// inside one (`if(1){$c=…`, `$a=$b=…`). A word that holds only a target or
+/// a type constraint is continued by the next word (`[string] $c=…`,
+/// `$c = iex`). Brackets and braced names with blanks inside continue a
+/// target across words (`$c[$i + 1]=…`, `[Dictionary[string, int]]$c=…`,
+/// `${c d}=…`); the words inside are still read as usual. After a closing
+/// parenthesis a word may continue the target (`$c.$('p')=…`,
+/// `(Get-Item x).p=…`). A bare or quoted name is a target only as a
+/// hashtable key: after `@{`, or after `;` or a line break inside one.
+/// Quoted text, here-strings and escapes are skipped.
+pub(crate) fn separate_powershell_assignment_values(command: &str) -> Option<String> {
     if !command.contains('=') {
         return None;
     }
@@ -3347,7 +3352,8 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
                 .binary_search_by_key(&at, |token| token.byte_range.end)
                 .is_ok()
     };
-    let mut blanks: Vec<usize> = Vec::new();
+    // Where each operator starts, and its length.
+    let mut operators: Vec<(usize, usize)> = Vec::new();
     // Open braces, innermost last: `true` for a hashtable literal `@{`.
     let mut braces: Vec<bool> = Vec::new();
     let mut key_next = false;
@@ -3382,13 +3388,8 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
                 j = powershell_member_chain_end(bytes, j, end, None).unwrap_or(j);
             }
             if let Some(len) = powershell_assignment_operator_len(bytes, j, end) {
-                if group_end == Some(start) {
-                    blanks.push(j);
-                }
+                operators.push((j, len));
                 i = j + len;
-                if i < end {
-                    blanks.push(i);
-                }
                 key = false;
             }
         }
@@ -3410,10 +3411,9 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
                     if let Some(len) =
                         powershell_assignment_operator_len(bytes, target_end, bytes.len())
                     {
-                        blanks.push(target_end);
+                        operators.push((target_end, len));
                         let value = target_end + len;
                         if !word_ends_at(value) {
-                            blanks.push(value);
                             value_starts.insert(value);
                         }
                     } else if word_ends_at(target_end) {
@@ -3426,11 +3426,8 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
                     break;
                 } else if let Some(len) = powershell_assignment_operator_len(bytes, target_end, end)
                 {
-                    blanks.push(target_end);
+                    operators.push((target_end, len));
                     i = target_end + len;
-                    if i < end {
-                        blanks.push(i);
-                    }
                     key = false;
                     continue;
                 }
@@ -3466,20 +3463,52 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
         // `@{` ends the word: the next word is a key.
         key_next = key;
     }
-    if blanks.is_empty() {
+    operators.retain(|&(at, len)| powershell_value_is_command(&command[at + len..]));
+    if operators.is_empty() {
         return None;
     }
-    blanks.sort_unstable();
-    blanks.dedup();
-    let mut spelled = String::with_capacity(command.len() + blanks.len());
-    let mut last = 0;
-    for at in blanks {
-        spelled.push_str(&command[last..at]);
-        spelled.push(' ');
-        last = at;
+    // An operator is ASCII, or a dash character followed by `=`, so these
+    // bytes are whole characters.
+    let mut separated = bytes.to_vec();
+    for (at, len) in operators {
+        separated[at] = b';';
+        separated[at + 1..at + len].fill(b' ');
     }
-    spelled.push_str(&command[last..]);
-    Some(spelled)
+    String::from_utf8(separated).ok()
+}
+
+/// Whether an assignment value that starts `rest` is parsed in command mode,
+/// as PowerShell decides from its first character: a bare word, `&` or `.`
+/// runs a command (`git …`, `& $exe`, `. ./x.ps1`, `.{…}`). A variable,
+/// parenthesis, `@`, type, script block, string, number or unary operator
+/// starts an expression (`$x*2`, `$(Get-Date)`, `'text'`, `-not $x`), whose
+/// commands, if any, sit inside parentheses or subexpressions that dcg
+/// already reads wherever they stand. Splitting such a value off would only
+/// make the expression look like a command with a dynamic name.
+fn powershell_value_is_command(rest: &str) -> bool {
+    let mut chars = rest.trim_start().chars();
+    match chars.next() {
+        None => false,
+        Some('.') => !chars.next().is_some_and(|next| next.is_ascii_digit()),
+        Some(first) => {
+            !(first.is_ascii_digit()
+                || matches!(
+                    first,
+                    '$' | '('
+                        | '@'
+                        | '['
+                        | '{'
+                        | '\''
+                        | '"'
+                        | '-'
+                        | '+'
+                        | '!'
+                        | ','
+                        | '\u{2013}'..='\u{2015}'
+                        | '\u{2018}'..='\u{201e}'
+                ))
+        }
+    }
 }
 
 /// Position after the `]` or `}` that closes each `[` and `${` in the text,
@@ -3526,18 +3555,6 @@ fn powershell_closing_ends(bytes: &[u8]) -> HashMap<usize, usize> {
         }
     }
     closes
-}
-
-/// Whether `word` is exactly a PowerShell assignment operator (`=`, `+=`, …).
-pub(crate) fn is_powershell_assignment_operator(word: &str) -> bool {
-    powershell_assignment_operator_len(word.as_bytes(), 0, word.len()) == Some(word.len())
-}
-
-/// Whether `word` is a whole assignment target, or the part of one that a
-/// following word continues: `$c`, `$c.p[0]`, `[int]$c`, `[string]`, `$a,`.
-pub(crate) fn is_powershell_assignment_target(word: &str) -> bool {
-    powershell_assignment_target_end(word.as_bytes(), 0, word.len(), false, None)
-        == Some(word.len())
 }
 
 /// Length of the assignment operator at `i`, if one starts there: `=`,
@@ -6714,86 +6731,111 @@ mod tests {
     }
 
     #[test]
-    fn glued_powershell_assignments_get_blanks_wherever_a_target_starts() {
-        let spaced = |command: &str| space_powershell_assignments(command);
-        for (glued, blanks) in [
-            ("$c=iex 'x'", "$c = iex 'x'"),
-            ("$c =iex 'x'", "$c = iex 'x'"),
-            ("$c= iex 'x'", "$c = iex 'x'"),
-            ("$c+=iex 'x'", "$c += iex 'x'"),
-            ("$c??=iex 'x'", "$c ??= iex 'x'"),
-            ("[int[]]$c=iex 'x'", "[int[]]$c = iex 'x'"),
-            ("[string] $c=iex 'x'", "[string] $c = iex 'x'"),
-            ("${c}=iex 'x'", "${c} = iex 'x'"),
-            ("$env:C=iex 'x'", "$env:C = iex 'x'"),
-            ("$a=$b=iex 'x'", "$a = $b = iex 'x'"),
-            ("$a = $b=iex 'x'", "$a = $b = iex 'x'"),
-            ("$a, $b=iex 'x'", "$a, $b = iex 'x'"),
-            ("$c.p[0]=iex 'x'", "$c.p[0] = iex 'x'"),
-            ("$h['k=v']=iex 'x'", "$h['k=v'] = iex 'x'"),
-            ("[T]::P=iex 'x'", "[T]::P = iex 'x'"),
-            ("$c=@{a=iex 'x'}", "$c = @{a = iex 'x'}"),
-            ("echo a;$c=iex 'x'", "echo a;$c = iex 'x'"),
-            ("echo a\n$c=iex 'x'", "echo a\n$c = iex 'x'"),
-            ("if(1){$c=iex 'x'}", "if(1){$c = iex 'x'}"),
-            ("if(1){'a'}$c=iex 'x'", "if(1){'a'}$c = iex 'x'"),
-            ("while($c=iex 'x'){}", "while($c = iex 'x'){}"),
-            // Wherever the word stands: the readers judge the position.
-            ("Get-Date & $c=iex 'x'", "Get-Date & $c = iex 'x'"),
-            ("return $c=iex 'x'", "return $c = iex 'x'"),
-            ("Write-Output $c=iex 'x'", "Write-Output $c = iex 'x'"),
-            ("1|$c=iex 'x'", "1|$c = iex 'x'"),
-            // Every target shape and operator spelling.
-            ("$c\u{e9}=iex 'x'", "$c\u{e9} = iex 'x'"),
-            ("$\u{3a9}=iex 'x'", "$\u{3a9} = iex 'x'"),
-            ("$c.'p'=iex 'x'", "$c.'p' = iex 'x'"),
-            ("$c.\"p\"=iex 'x'", "$c.\"p\" = iex 'x'"),
-            ("$c.$n=iex 'x'", "$c.$n = iex 'x'"),
-            ("$c.$('p')=iex 'x'", "$c.$('p') = iex 'x'"),
-            ("(Get-Item x).p=iex 'x'", "(Get-Item x).p = iex 'x'"),
-            ("$c[(0)]=iex 'x'", "$c[(0)] = iex 'x'"),
-            ("$c.$('p') =iex 'x'", "$c.$('p') = iex 'x'"),
-            ("$c\u{2013}=iex 'x'", "$c \u{2013}= iex 'x'"),
-            ("$c\u{2014}=iex 'x'", "$c \u{2014}= iex 'x'"),
-            ("$c\u{2015}=iex 'x'", "$c \u{2015}= iex 'x'"),
-            // Brackets and braced names with blanks inside span words.
-            ("$c[$i + 1]=iex 'x'", "$c[$i + 1] = iex 'x'"),
-            ("$c[ 0 ]=iex 'x'", "$c[ 0 ] = iex 'x'"),
-            ("$c[0 ]=iex 'x'", "$c[0 ] = iex 'x'"),
-            ("$c[ 'a' ]=iex 'x'", "$c[ 'a' ] = iex 'x'"),
-            ("$c[ 0 ] =iex 'x'", "$c[ 0 ] = iex 'x'"),
-            ("$c[ 0 ][ 1 ]=iex 'x'", "$c[ 0 ][ 1 ] = iex 'x'"),
-            ("$c[ 0 ].p=iex 'x'", "$c[ 0 ].p = iex 'x'"),
-            ("$a[ 0 ]=$b=iex 'x'", "$a[ 0 ] = $b = iex 'x'"),
-            ("$a[ 0 ],$b=iex 'x'", "$a[ 0 ],$b = iex 'x'"),
-            ("[D[string, int]]$c=iex 'x'", "[D[string, int]]$c = iex 'x'"),
+    fn powershell_assignment_values_start_a_statement_wherever_a_target_starts() {
+        let separated = |command: &str| separate_powershell_assignment_values(command);
+        for (assignment, view) in [
+            // Glued or spaced, every operator, every statement start.
+            ("$c=iex 'x'", "$c;iex 'x'"),
+            ("$c = iex 'x'", "$c ; iex 'x'"),
+            ("$c \u{2013}= iex 'x'", "$c ;    iex 'x'"),
             (
-                "[D[string, int]] $c=iex 'x'",
-                "[D[string, int]] $c = iex 'x'",
+                "$null = Remove-Item -Recurse x",
+                "$null ; Remove-Item -Recurse x",
             ),
-            ("${c d}=iex 'x'", "${c d} = iex 'x'"),
-            ("if(1){$c[ 0 ]=iex 'x'}", "if(1){$c[ 0 ] = iex 'x'}"),
-            // The words inside are still read: a target there is spaced too.
-            ("$c[ $($d=1) ]=iex 'x'", "$c[ $($d = 1) ] = iex 'x'"),
+            ("$a, $b = git x", "$a, $b ; git x"),
+            ("$c[ 0 ] = git x", "$c[ 0 ] ; git x"),
+            ("@{a = git x}", "@{a ; git x}"),
+            ("$c =iex 'x'", "$c ;iex 'x'"),
+            ("$c= iex 'x'", "$c; iex 'x'"),
+            ("$c+=iex 'x'", "$c; iex 'x'"),
+            ("$c??=iex 'x'", "$c;  iex 'x'"),
+            ("[int[]]$c=iex 'x'", "[int[]]$c;iex 'x'"),
+            ("[string] $c=iex 'x'", "[string] $c;iex 'x'"),
+            ("${c}=iex 'x'", "${c};iex 'x'"),
+            ("$env:C=iex 'x'", "$env:C;iex 'x'"),
+            ("$a=$b=iex 'x'", "$a=$b;iex 'x'"),
+            ("$a = $b=iex 'x'", "$a = $b;iex 'x'"),
+            ("$a, $b=iex 'x'", "$a, $b;iex 'x'"),
+            ("$c.p[0]=iex 'x'", "$c.p[0];iex 'x'"),
+            ("$h['k=v']=iex 'x'", "$h['k=v'];iex 'x'"),
+            ("[T]::P=iex 'x'", "[T]::P;iex 'x'"),
+            ("$c=@{a=iex 'x'}", "$c=@{a;iex 'x'}"),
+            ("echo a;$c=iex 'x'", "echo a;$c;iex 'x'"),
+            ("echo a\n$c=iex 'x'", "echo a\n$c;iex 'x'"),
+            ("if(1){$c=iex 'x'}", "if(1){$c;iex 'x'}"),
+            ("if(1){'a'}$c=iex 'x'", "if(1){'a'}$c;iex 'x'"),
+            ("while($c=iex 'x'){}", "while($c;iex 'x'){}"),
+            // Wherever the word stands: the readers judge the position.
+            ("Get-Date & $c=iex 'x'", "Get-Date & $c;iex 'x'"),
+            ("return $c=iex 'x'", "return $c;iex 'x'"),
+            ("Write-Output $c=iex 'x'", "Write-Output $c;iex 'x'"),
+            ("1|$c=iex 'x'", "1|$c;iex 'x'"),
+            // Every target shape and operator spelling.
+            ("$c\u{e9}=iex 'x'", "$c\u{e9};iex 'x'"),
+            ("$\u{3a9}=iex 'x'", "$\u{3a9};iex 'x'"),
+            ("$c.'p'=iex 'x'", "$c.'p';iex 'x'"),
+            ("$c.\"p\"=iex 'x'", "$c.\"p\";iex 'x'"),
+            ("$c.$n=iex 'x'", "$c.$n;iex 'x'"),
+            ("$c.$('p')=iex 'x'", "$c.$('p');iex 'x'"),
+            ("(Get-Item x).p=iex 'x'", "(Get-Item x).p;iex 'x'"),
+            ("$c[(0)]=iex 'x'", "$c[(0)];iex 'x'"),
+            ("$c.$('p') =iex 'x'", "$c.$('p') ;iex 'x'"),
+            ("$c\u{2013}=iex 'x'", "$c;   iex 'x'"),
+            ("$c\u{2014}=iex 'x'", "$c;   iex 'x'"),
+            ("$c\u{2015}=iex 'x'", "$c;   iex 'x'"),
+            // Brackets and braced names with blanks inside span words.
+            ("$c[$i + 1]=iex 'x'", "$c[$i + 1];iex 'x'"),
+            ("$c[ 0 ]=iex 'x'", "$c[ 0 ];iex 'x'"),
+            ("$c[0 ]=iex 'x'", "$c[0 ];iex 'x'"),
+            ("$c[ 'a' ]=iex 'x'", "$c[ 'a' ];iex 'x'"),
+            ("$c[ 0 ] =iex 'x'", "$c[ 0 ] ;iex 'x'"),
+            ("$c[ 0 ][ 1 ]=iex 'x'", "$c[ 0 ][ 1 ];iex 'x'"),
+            ("$c[ 0 ].p=iex 'x'", "$c[ 0 ].p;iex 'x'"),
+            ("$a[ 0 ]=$b=iex 'x'", "$a[ 0 ]=$b;iex 'x'"),
+            ("$a[ 0 ],$b=iex 'x'", "$a[ 0 ],$b;iex 'x'"),
+            ("[D[string, int]]$c=iex 'x'", "[D[string, int]]$c;iex 'x'"),
+            ("[D[string, int]] $c=iex 'x'", "[D[string, int]] $c;iex 'x'"),
+            ("${c d}=iex 'x'", "${c d};iex 'x'"),
+            ("if(1){$c[ 0 ]=iex 'x'}", "if(1){$c[ 0 ];iex 'x'}"),
+            // The words inside are still read: a target there is separated too.
+            ("$c[ $($d=1) ]=iex 'x'", "$c[ $($d=1) ];iex 'x'"),
             (
                 "Write-Output [a ; $c=iex 'x'",
-                "Write-Output [a ; $c = iex 'x'",
+                "Write-Output [a ; $c;iex 'x'",
             ),
             // Every hashtable key.
-            ("@{a=1;b=iex 'x'}", "@{a = 1;b = iex 'x'}"),
-            ("@{a=1\nb=iex 'x'\n}", "@{a = 1\nb = iex 'x'\n}"),
-            ("@{ a=iex 'x'}", "@{ a = iex 'x'}"),
-            ("@{a=@{x=1};'b'=iex 'x'}", "@{a = @{x = 1};'b' = iex 'x'}"),
-            // A script block's statements are not keys.
-            ("@{a={b=1;c=iex 'x'}}", "@{a = {b=1;c=iex 'x'}}"),
+            ("@{a=1;b=iex 'x'}", "@{a=1;b;iex 'x'}"),
+            ("@{a=1\nb=iex 'x'\n}", "@{a=1\nb;iex 'x'\n}"),
+            ("@{ a=iex 'x'}", "@{ a;iex 'x'}"),
+            ("@{a=@{x=1};'b'=iex 'x'}", "@{a=@{x=1};'b';iex 'x'}"),
+            // A value in command mode: `&`, `.`, a path.
+            ("$x = & $exe --version", "$x ; & $exe --version"),
+            ("$c=.{x}", "$c;.{x}"),
+            ("$c = ./x.ps1", "$c ; ./x.ps1"),
         ] {
-            assert_eq!(spaced(glued).as_deref(), Some(blanks), "{glued:?}");
-            // The spelling is a fixed point: the view does not grow.
-            assert_eq!(spaced(blanks), None, "{blanks:?}");
+            assert_eq!(
+                separated(assignment).as_deref(),
+                Some(view),
+                "{assignment:?}"
+            );
+            assert_eq!(view.len(), assignment.len(), "{assignment:?}");
+            // The view is a fixed point: it does not change again.
+            assert_eq!(separated(view), None, "{view:?}");
         }
         for unchanged in [
-            "$c = iex 'x'",
-            "$c \u{2013}= iex 'x'",
+            // A value in expression mode, and a script block's statements,
+            // which are not keys.
+            "$y=$x*2",
+            "$el=$('#x')",
+            "$c = (Get-Date)",
+            "$n = 1",
+            "$n = .5",
+            "$s = 'git x'",
+            "$t = [int]$s * 2",
+            "$h = @{a = 1}",
+            "$y = -not $x",
+            "$c = ",
+            "@{a={b=1;c=iex 'x'}}",
             "Write-Output '$c=iex x'",
             "Write-Output a$c=iex",
             "{a=1;b=iex 'x'}",
@@ -6809,7 +6851,7 @@ mod tests {
             "[a ]=b",
             "${c d} -eq 'a=b'",
         ] {
-            assert_eq!(spaced(unchanged), None, "{unchanged:?}");
+            assert_eq!(separated(unchanged), None, "{unchanged:?}");
         }
     }
 
