@@ -10701,6 +10701,96 @@ fn parallel_process_substitution_input_mode(
     Some(parallel_pipeline_input_mode(&filtered))
 }
 
+/// Whether a PowerShell host runs a process-substitution file (`marker`
+/// stands for its `/dev/fd/N` path) as source, under one reading of its
+/// arguments ([`NativeArgv`]). The arguments are read with the shared switch
+/// table ([`powershell_host_option`]), so every spelling of a switch counts.
+///
+/// A File switch in any spelling (`-f`, `/f`, `-File`) whose value is the
+/// marker runs the file as a script, and so does a first non-switch argument
+/// for pwsh, which reads it as the -File script. Measured with pwsh 7.5.0 on
+/// Linux: `pwsh -f <(...)`, `pwsh -File <(...)`, `pwsh <(...)` and `pwsh
+/// -NoProfile <(...)` each run the substituted text. Windows PowerShell 5.1
+/// starts the command string at its first non-switch argument instead, so
+/// there that argument opens a -Command tail. A -Command tail that holds the
+/// marker, alone or inside a word, becomes command text naming the file,
+/// which dcg does not follow, so it fails closed: `pwsh -c
+/// 'iex ([IO.File]::ReadAllText("'<(...)'"))'` runs the substituted text
+/// (measured), while `pwsh -c <(...)` runs nothing. pwsh keeps parsing after
+/// `-EncodedCommand <value>`, so a later File or script argument is still
+/// read (`pwsh -ec <value> <(...)` runs the substituted text, measured).
+/// Unmodeled switches, unknown dashed switches and a missing value fail
+/// closed.
+fn powershell_process_substitution_input_mode(
+    args: &[String],
+    marker: &str,
+    host: PowerShellHost,
+    argv: NativeArgv,
+) -> PipelineShellInputMode {
+    let command_tail = |start: usize| {
+        if args[start..]
+            .iter()
+            .any(|argument| argument.contains(marker))
+        {
+            PipelineShellInputMode::Unverified
+        } else {
+            PipelineShellInputMode::DoesNotReadStdin
+        }
+    };
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index) {
+        // A redirect word (`2>/dev/null`) belongs to the outer shell, not
+        // to pwsh's argv, as in the POSIX shell branch.
+        if argument != marker
+            && let Some(next) =
+                skip_redirect_token(classify_shell_positional(argument), index, args.len())
+        {
+            index = next;
+            continue;
+        }
+        match powershell_host_option(argument, host, ShellDialect::Posix, argv) {
+            PowerShellHostOption::File => {
+                return match args.get(index + 1) {
+                    Some(path) if path == marker => {
+                        PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
+                    }
+                    Some(_) => PipelineShellInputMode::DoesNotReadStdin,
+                    None => PipelineShellInputMode::Unverified,
+                };
+            }
+            PowerShellHostOption::Command => {
+                return if args.get(index + 1).is_some() {
+                    command_tail(index + 1)
+                } else {
+                    PipelineShellInputMode::Unverified
+                };
+            }
+            PowerShellHostOption::NoValue => index += 1,
+            PowerShellHostOption::OptionalValue => index += 2,
+            PowerShellHostOption::EncodedCommand | PowerShellHostOption::Value => {
+                if args.get(index + 1).is_none() {
+                    return PipelineShellInputMode::Unverified;
+                }
+                index += 2;
+            }
+            PowerShellHostOption::Unmodeled => return PipelineShellInputMode::Unverified,
+            PowerShellHostOption::Unknown => {
+                if powershell_argument_is_dashed(argument) {
+                    return PipelineShellInputMode::Unverified;
+                }
+                return match host {
+                    PowerShellHost::Core if argument == marker => {
+                        PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
+                    }
+                    PowerShellHost::Core => PipelineShellInputMode::DoesNotReadStdin,
+                    PowerShellHost::Windows => command_tail(index),
+                };
+            }
+        }
+    }
+    PipelineShellInputMode::DoesNotReadStdin
+}
+
 fn process_substitution_file_input_mode(command: &str, marker: &str) -> PipelineShellInputMode {
     if pipeline_wrapper_limit_reached(command) {
         return PipelineShellInputMode::Unverified;
@@ -10876,14 +10966,11 @@ fn process_substitution_file_input_mode(command: &str, marker: &str) -> Pipeline
         }
     }
     if matches!(executable.as_str(), "powershell" | "pwsh") {
-        return if args.windows(2).any(|pair| {
-            matches!(pair[0].to_ascii_lowercase().as_str(), "-file" | "-command")
-                && pair[1] == marker
-        }) {
-            PipelineShellInputMode::Unverified
-        } else {
-            PipelineShellInputMode::DoesNotReadStdin
-        };
+        let host = PowerShellHost::from_executable(&executable);
+        return either_pipeline_reading(
+            powershell_process_substitution_input_mode(&args, marker, host, NativeArgv::Verbatim),
+            powershell_process_substitution_input_mode(&args, marker, host, NativeArgv::Msys),
+        );
     }
     if executable == "cmd"
         && args.windows(2).any(|pair| {

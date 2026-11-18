@@ -497,3 +497,78 @@ fn every_dialect_reads_pwsh_switch_aliases() {
         }
     }
 }
+
+/// A pwsh launched by a POSIX shell can run a process-substitution file. dcg
+/// matched only the exact `-File` spelling there, so `pwsh -f <(...)` and
+/// `pwsh <(...)` were allowed. Measured with pwsh 7.5.0 under bash 5.2 in the
+/// sandbox: `-f`, `/f`, `-File`, `/wd . -f`, `-nop -noni`, a bare
+/// `<(...)` and `-ec <value> <(...)` each ran the substituted
+/// `git reset --hard`, and so did a -Command that embeds the path
+/// (`-c 'iex ([IO.File]::ReadAllText("'<(...)'"))'`).
+const PWSH_PROCESS_SUBSTITUTION_RUNS_IT: &[&str] = &[
+    "pwsh -f <(echo \"git reset --hard\")",
+    "pwsh /f <(echo \"git reset --hard\")",
+    "pwsh -File <(echo \"git reset --hard\")",
+    "pwsh /wd x -f <(echo \"git reset --hard\")",
+    "pwsh <(echo \"git reset --hard\")",
+    "pwsh -NoProfile <(echo \"git reset --hard\")",
+    "pwsh -nop -noni <(echo \"git reset --hard\")",
+    "pwsh -f <(echo \"git reset --hard\") extra",
+    "pwsh 2>/dev/null -f <(echo \"git reset --hard\")",
+    "pwsh -ec RwBlAHQALQBEAGEAdABlAA== <(echo \"git reset --hard\")",
+    "pwsh -c 'iex ([IO.File]::ReadAllText(\"'<(echo \"git reset --hard\")'\"))'",
+    "powershell -File <(echo \"git reset --hard\")",
+];
+
+/// The substituted text is judged as PowerShell source, so a harmless one
+/// stays allowed, and a process substitution pwsh only takes as a switch
+/// value runs nothing (measured: `pwsh -f <(echo Get-Date)` and
+/// `pwsh -wd <(echo 'git reset --hard') -c Get-Date` ran no git).
+const PWSH_PROCESS_SUBSTITUTION_HARMLESS: &[&str] = &[
+    "pwsh -f <(echo Get-Date)",
+    "pwsh <(echo Get-Date)",
+    "pwsh /wd x -f <(echo Get-Date)",
+    "pwsh -wd <(echo \"git reset --hard\") -c Get-Date",
+];
+
+/// Process substitution exists only in a POSIX outer shell, so the Bash tool
+/// label in both hook formats, and the Unknown and POSIX dialects.
+#[test]
+fn hooks_read_pwsh_process_substitution_files() {
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in PWSH_PROCESS_SUBSTITUTION_RUNS_IT {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+        for command in PWSH_PROCESS_SUBSTITUTION_HARMLESS {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn posix_dialects_read_pwsh_process_substitution_files() {
+    for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+        for command in PWSH_PROCESS_SUBSTITUTION_RUNS_IT {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for command in PWSH_PROCESS_SUBSTITUTION_HARMLESS {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+}
