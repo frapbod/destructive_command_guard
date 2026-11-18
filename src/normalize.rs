@@ -5470,33 +5470,47 @@ pub(crate) enum BashHashReading {
 /// A `((` needs no token start, as `(` is a metacharacter (`for((`, `if((`,
 /// `!((`, `case x in x)((`); any `((` not right after `$` counts. An
 /// arithmetic command ends where Bash ends it (see
-/// [`ParenMatches::arithmetic`]); a `[[` operand word ends at a
+/// [`SpanReader::arithmetic`]); a `[[` operand word ends at a
 /// blank, `;`, `&` or `)` outside its parentheses (`|` stays in it), and an
 /// `extglob` group at its own `)`. Quoted text and comments outside them are
-/// passed over, and so is a `${…}` outside the `$(…)` in it, where Bash
-/// reads no comment, arithmetic command or group (it ends at its first `}`;
-/// a Bash 5.3 `${ …; }`, also in double quotes, is command text). Inside them, only a `#` outside
-/// quotes that follows a blank or an operator byte is spelled: one after a
-/// word byte (`2#101`, `$#`, `${#x}`) starts no comment to any reader.
+/// passed over, and so is a `${…}` outside the `$(…)` in it, which ends at
+/// its first `}` (also a Bash 5.3 `${ …; }`, which the shared readers read
+/// the same way). Inside them, only a `#` outside quotes that follows a
+/// blank or an operator byte is spelled: one after a word byte (`2#101`,
+/// `$#`, `${#x}`) starts no comment to any reader.
 ///
 /// A heredoc body is raw text, and passed over: a quote in it (`don't`)
 /// opens nothing. Only text that every shell reads as a body is (see
 /// [`crate::context::undisputed_heredoc_body_ranges`]).
 ///
-/// A command substitution inside such a span (`[[ x == $( : # "` LF
-/// `) ]]`) holds command text, where Bash reads a comment whose quotes open
-/// nothing. The span readers do not read those comments, so such a span is
-/// [`BashHashReading::Unread`] (see [`substitution_comment_in`]).
+/// Every reader of those spans passes over quoted text with one reader,
+/// [`SpanReader::quoted_end`], which reads `\`, `'…'`, `$'…'`, `"…"`,
+/// backquotes, `$(…)`, `$((…))` and `${…}` as this function does. A command
+/// substitution there holds command text, where Bash reads a comment whose
+/// quotes open nothing and whose `)` closes nothing (`[[ x == $( : # "` LF
+/// `) ]]`). That reader does not read comments, so such a span is
+/// [`BashHashReading::Unread`]. Known limit, shared with dcg's other
+/// readers: the `)` that ends a `case` pattern in such a substitution ends
+/// the substitution there.
 ///
 /// Each `((`, `$((` and `extglob` group costs a lookup of the `)` that
 /// closes it, which a run of nested or unclosed `(` shares (see
-/// [`ParenMatches`]). A command whose lookups would read more than 16 times
-/// its length (plus 4 KiB) is [`BashHashReading::Unread`].
+/// [`SpanReader`]). A command whose lookups would read more than 16 times its
+/// length (plus 4 KiB) is [`BashHashReading::Unread`].
 ///
 /// Length preserving (one ASCII byte for another), so every range in the
 /// view is the same range in `command`.
 #[must_use]
 pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHashReading> {
+    bash_hashes_as_data_within(command, extglob, 16 * command.len() + 4096)
+}
+
+/// [`bash_hashes_as_data`] with lookups that may read `budget` bytes.
+fn bash_hashes_as_data_within(
+    command: &str,
+    extglob: bool,
+    budget: usize,
+) -> Option<BashHashReading> {
     let bytes = command.as_bytes();
     if memchr::memchr(b'#', bytes).is_none()
         || (memchr::memchr(b'(', bytes).is_none()
@@ -5505,9 +5519,24 @@ pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHa
     {
         return None;
     }
+    match spell_bash_data_hashes(command, extglob, budget) {
+        Ok(spelled) => spelled
+            // Only an ASCII byte changed into another ASCII byte.
+            .and_then(|spelled| String::from_utf8(spelled).ok())
+            .map(BashHashReading::Spelled),
+        Err(NoReading) => Some(BashHashReading::Unread),
+    }
+}
+
+fn spell_bash_data_hashes(
+    command: &str,
+    extglob: bool,
+    budget: usize,
+) -> Result<Option<Vec<u8>>, NoReading> {
+    let bytes = command.as_bytes();
     let len = bytes.len();
     let next = |at: usize| past_line_continuations(bytes, at);
-    let mut parens = ParenMatches::new(bytes);
+    let mut spans = SpanReader::new(bytes, budget);
     let mut spelled: Option<Vec<u8>> = None;
     let mut frames: Vec<Frame> = Vec::new();
     // Inside `[[ … ]]`, where operators take a pattern or regex word.
@@ -5548,32 +5577,23 @@ pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHa
             // `$$` is one parameter: a `{` or `(` after it opens nothing.
             b'$' if bytes.get(next(i + 1)) == Some(&b'$') => next(i + 1) + 1,
             b'$' if bytes.get(next(i + 1)) == Some(&b'{') => {
-                let open = next(i + 1);
-                // Bash 5.3 reads `${ …; }` (a blank, newline or `|` after the
-                // `{`) as a command substitution, whose body is command text.
-                if function_substitution_at(bytes, open) {
-                    frames.push(Frame::FunctionSubstitution(0));
-                } else {
-                    let quoted = in_double || top == Some(Frame::Braces { quoted: true });
-                    frames.push(Frame::Braces { quoted });
-                }
-                open + 1
+                let quoted = in_double || top == Some(Frame::Braces { quoted: true });
+                frames.push(Frame::Braces { quoted });
+                next(i + 1) + 1
             }
             b'$' if bytes.get(next(i + 1)) == Some(&b'(') => {
                 let open = next(i + 1);
                 let second = next(open + 1);
                 let lookup = if bytes.get(second) == Some(&b'(') {
-                    parens.arithmetic(second)
+                    spans.arithmetic(second)?
                 } else {
-                    Lookup::NotArithmetic
+                    None
                 };
-                match lookup {
-                    Lookup::End(end) => end,
-                    Lookup::NotArithmetic => {
-                        frames.push(Frame::Substitution(0));
-                        open + 1
-                    }
-                    Lookup::NoReading => return Some(BashHashReading::Unread),
+                if let Some(end) = lookup {
+                    end
+                } else {
+                    frames.push(Frame::Substitution(0));
+                    open + 1
                 }
             }
             _ if in_double => i + 1,
@@ -5593,29 +5613,6 @@ pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHa
                 next(i + 1) + 1
             }
             _ if in_braces => i + 1,
-            // A `{ …; }` group in a `${ …; }` body, and the `}` that ends
-            // either: both are reserved words, after a command separator.
-            b'{' if matches!(top, Some(Frame::FunctionSubstitution(_)))
-                && follows_separator(bytes, i)
-                && matches!(bytes.get(next(i + 1)), Some(b' ' | b'\t' | b'\n')) =>
-            {
-                if let Some(Frame::FunctionSubstitution(open)) = frames.last_mut() {
-                    *open += 1;
-                }
-                i + 1
-            }
-            b'}' if matches!(top, Some(Frame::FunctionSubstitution(_)))
-                && follows_separator(bytes, i) =>
-            {
-                match frames.last_mut() {
-                    Some(Frame::FunctionSubstitution(0)) => {
-                        frames.pop();
-                    }
-                    Some(Frame::FunctionSubstitution(open)) => *open -= 1,
-                    _ => {}
-                }
-                i + 1
-            }
             b'#' if token_starts_at(bytes, i, floor) => {
                 let end = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |at| i + at);
                 floor = end + 1;
@@ -5632,32 +5629,26 @@ pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHa
             b'(' if byte_before(bytes, i, floor) != Some(b'$')
                 && let Some(second) = second_open_paren(bytes, i) =>
             {
-                match parens.arithmetic(second) {
-                    Lookup::End(end) => {
-                        spell_comment_hashes(bytes, second + 1, end - 2, &mut spelled);
-                        end
+                if let Some(end) = spans.arithmetic(second)? {
+                    spans.spell_hashes(second + 1, end - 2, false, &mut spelled)?;
+                    end
+                } else {
+                    if let Some(Frame::Substitution(open)) = frames.last_mut() {
+                        *open += 1;
                     }
-                    Lookup::NotArithmetic => {
-                        if let Some(Frame::Substitution(open)) = frames.last_mut() {
-                            *open += 1;
-                        }
-                        i + 1
-                    }
-                    Lookup::NoReading => return Some(BashHashReading::Unread),
+                    i + 1
                 }
             }
             b'@' | b'*' | b'?' | b'+' | b'!'
                 if (byte != b'!' || extglob) && bytes.get(next(i + 1)) == Some(&b'(') =>
             {
                 let open = next(i + 1);
-                match parens.close(open) {
-                    Ok(Some(end)) => {
-                        spell_group_hashes(bytes, open, end, &mut spelled);
-                        end
-                    }
+                if let Some(end) = spans.close(open)? {
+                    spans.spell_hashes(open, end, true, &mut spelled)?;
+                    end
+                } else {
                     // Unclosed, a syntax error: nothing after it runs.
-                    Ok(None) => i + 1,
-                    Err(NoReading) => return Some(BashHashReading::Unread),
+                    i + 1
                 }
             }
             b'[' if bytes.get(next(i + 1)) == Some(&b'[')
@@ -5694,14 +5685,10 @@ pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHa
                         break;
                     }
                 }
-                let Ok(end) = operand_word_end(bytes, start) else {
-                    return Some(BashHashReading::Unread);
-                };
-                if regex {
-                    spell_comment_hashes(bytes, start, end, &mut spelled);
-                } else {
-                    spell_group_hashes(bytes, start, end, &mut spelled);
-                }
+                let end = spans.operand_word_end(start)?;
+                // A regex spells every `#` in it, a pattern only those in
+                // its groups.
+                spans.spell_hashes(start, end, !regex, &mut spelled)?;
                 end
             }
             b'(' => {
@@ -5723,57 +5710,146 @@ pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHa
             _ => i + 1,
         };
     }
-    // Only an ASCII byte changed into another ASCII byte.
-    spelled
-        .and_then(|spelled| String::from_utf8(spelled).ok())
-        .map(BashHashReading::Spelled)
+    Ok(spelled)
 }
 
-/// What an arithmetic lookup of [`bash_hashes_as_data`] found.
-enum Lookup {
-    /// Arithmetic, which ends before this index.
-    End(usize),
-    NotArithmetic,
-    /// See [`NoReading`].
-    NoReading,
-}
-
-/// A paren lookup or `[[` operand of [`bash_hashes_as_data`] has no reading:
-/// the lookups have read all the bytes they may, or the span read holds a
-/// comment in a command substitution (see [`substitution_comment_in`]).
+/// A span of [`bash_hashes_as_data`] has no reading: the lookups have read
+/// all the bytes they may, or the span holds a comment in a command
+/// substitution (see [`SpanReader::quoted_end`]).
 struct NoReading;
 
-/// Where the parentheses of a command close, read as Bash reads an
-/// arithmetic command or a pattern group: quoted text and escaped bytes
-/// count no parenthesis.
+/// The span readers of [`bash_hashes_as_data`]: where the parentheses of an
+/// arithmetic command or a pattern group close, where a `[[` operand word
+/// ends, and which `#` in such a span to spell. All of them pass over quoted
+/// text with one reader, [`Self::quoted_end`].
 ///
 /// A scan from a `(` to its `)` also matches every `(` it passes outside
 /// quotes, and a scan from one of those reads the same bytes the same way,
 /// so the matches are kept and such a lookup reads nothing again. A run of
-/// nested or unclosed `(` costs one scan, not one per `(`. A lookup the kept
-/// matches do not answer scans afresh; those scans may read 16 times the
-/// input (plus 4 KiB) in all.
-struct ParenMatches<'a> {
+/// nested or unclosed `(` costs one scan, not one per `(`. The end of every
+/// quoted text read is kept too (its reading does not depend on where it
+/// is), so a later scan passes it at once. Lookups the kept matches do not
+/// answer scan afresh; all the scans may read `budget` bytes.
+struct SpanReader<'a> {
     bytes: &'a [u8],
     budget: usize,
     spent: usize,
     /// Each `(` the last scan passed, with the index past its `)`, or `None`
     /// when no `)` closes it.
     closes: std::collections::HashMap<usize, Option<usize>>,
+    /// The index past each quoted text read (other than a `${…}`, whose
+    /// reading depends on quotes around it), by where it starts.
+    quoted: std::collections::HashMap<usize, usize>,
 }
 
-impl<'a> ParenMatches<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+/// Quoted text [`SpanReader::quoted_end`] is inside of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quoted {
+    /// A double-quoted string.
+    Double,
+    /// A backquoted command.
+    Backquote,
+    /// A `$(…)` or `$((…))` body, with the parentheses open in it (the
+    /// second `(` of a `$((` is one).
+    Parens(usize),
+    /// A `${…}`, and whether it is in double quotes, where a `'` in it is a
+    /// literal.
+    Braces { quoted: bool },
+}
+
+impl<'a> SpanReader<'a> {
+    fn new(bytes: &'a [u8], budget: usize) -> Self {
         Self {
             bytes,
-            budget: 16 * bytes.len() + 4096,
+            budget,
             spent: 0,
             closes: std::collections::HashMap::new(),
+            quoted: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Index past the quoted text that starts at `at`, or `end` when it does
+    /// not close before `end`; `None` when no quoted text starts there.
+    ///
+    /// Quoted text is read as [`bash_hashes_as_data`] reads it: `\` escapes
+    /// the byte after it; `'…'`; `$'…'`, in which `\` escapes; `"…"`, in which
+    /// `$(…)`, `${…}` and backquotes nest; a backquoted command; `$(…)` and
+    /// `$((…))`, whose bodies count both parentheses of a `$((`; `${…}`,
+    /// which ends at its first `}` outside quotes and in double quotes reads
+    /// `'` as a literal; and `$$`, after which a `(` or `{` opens nothing.
+    /// [`NoReading`] when a command substitution in it holds a `#` that may
+    /// start a comment: Bash reads that comment to the end of its line, so
+    /// its quotes open nothing and its `)` closes nothing.
+    fn quoted_end(&mut self, at: usize, end: usize) -> Result<Option<usize>, NoReading> {
+        let bytes = self.bytes;
+        let mut frames: Vec<(Quoted, usize)> = Vec::new();
+        let mut i = at;
+        while i < end {
+            self.spent += 1;
+            let top = frames.last().map(|frame| frame.0);
+            match quote_opens(bytes, i, top) {
+                Some(QuoteOpen::Skip(past)) => i = past,
+                Some(QuoteOpen::Push(quoted, body)) => {
+                    if let Some(&past) = self.quoted.get(&i) {
+                        i = past;
+                    } else {
+                        frames.push((quoted, i));
+                        i = body;
+                    }
+                }
+                None => {
+                    let closed = match (frames.last_mut(), bytes[i]) {
+                        (None, _) => return Ok(None),
+                        (Some((Quoted::Double, _)), b'"')
+                        | (Some((Quoted::Backquote, _)), b'`')
+                        | (Some((Quoted::Braces { .. }, _)), b'}')
+                        | (Some((Quoted::Parens(0), _)), b')') => true,
+                        (Some((Quoted::Parens(open), _)), b'(') => {
+                            *open += 1;
+                            false
+                        }
+                        (Some((Quoted::Parens(open), _)), b')') => {
+                            *open -= 1;
+                            false
+                        }
+                        (Some((Quoted::Parens(_) | Quoted::Backquote, _)), b'#')
+                            if hash_may_start_comment(bytes, i) =>
+                        {
+                            return Err(NoReading);
+                        }
+                        _ => false,
+                    };
+                    i += 1;
+                    if closed && let Some((quoted, start)) = frames.pop() {
+                        self.remember(quoted, start, i);
+                    }
+                }
+            }
+            if frames.is_empty() {
+                return Ok(Some(i));
+            }
+        }
+        if frames.is_empty() {
+            return Ok(None);
+        }
+        // Unclosed: quoted to the end of the span, and of the input when the
+        // span ends there.
+        if end == bytes.len() {
+            for (quoted, start) in frames {
+                self.remember(quoted, start, end);
+            }
+        }
+        Ok(Some(end))
+    }
+
+    fn remember(&mut self, quoted: Quoted, start: usize, past: usize) {
+        if !matches!(quoted, Quoted::Braces { .. }) {
+            self.quoted.insert(start, past);
         }
     }
 
     /// Index past the `)` that closes the `(` at `open`; `None` when none
-    /// does.
+    /// does. Quoted text counts no parenthesis.
     fn close(&mut self, open: usize) -> Result<Option<usize>, NoReading> {
         if let Some(close) = self.closes.get(&open) {
             return Ok(*close);
@@ -5786,50 +5862,133 @@ impl<'a> ParenMatches<'a> {
         let mut opens: Vec<usize> = Vec::new();
         let mut i = open;
         while i < bytes.len() {
-            i = match bytes[i] {
-                b'(' => {
-                    opens.push(i);
-                    i + 1
-                }
+            if let Some(past) = self.quoted_end(i, bytes.len())? {
+                i = past;
+                continue;
+            }
+            self.spent += 1;
+            match bytes[i] {
+                b'(' => opens.push(i),
                 b')' => {
                     if let Some(at) = opens.pop() {
                         self.closes.insert(at, Some(i + 1));
                     }
                     if opens.is_empty() {
-                        self.spent += i + 1 - open;
-                        if substitution_comment_in(bytes, open, i + 1) {
-                            return Err(NoReading);
-                        }
                         return Ok(Some(i + 1));
                     }
-                    i + 1
                 }
-                b'\\' => i + 2,
-                b'\'' => {
-                    memchr::memchr(b'\'', &bytes[i + 1..]).map_or(bytes.len(), |at| i + at + 2)
-                }
-                b'"' => skip_quoted_text(bytes, i + 1, bytes.len(), b'"'),
-                _ => i + 1,
-            };
-        }
-        self.spent += bytes.len() - open;
-        if substitution_comment_in(bytes, open, bytes.len()) {
-            return Err(NoReading);
+                _ => {}
+            }
+            i += 1;
         }
         self.closes.extend(opens.into_iter().map(|at| (at, None)));
         Ok(None)
     }
 
-    /// Whether the `((` (or `$((`) whose second `(` is at `second` opens
-    /// arithmetic: as Bash decides it (and `context::arithmetic_end`), when
-    /// the `)` closing `second` is followed at once by another `)`;
-    /// otherwise (`((cd x) && ls)`) the parentheses open nested subshells.
-    fn arithmetic(&mut self, second: usize) -> Lookup {
-        match self.close(second) {
-            Ok(Some(close)) if self.bytes.get(close) == Some(&b')') => Lookup::End(close + 1),
-            Ok(_) => Lookup::NotArithmetic,
-            Err(NoReading) => Lookup::NoReading,
+    /// Where the arithmetic that the `((` (or `$((`) whose second `(` is at
+    /// `second` opens ends; `None` when it opens none. Bash (and
+    /// `context::arithmetic_end`) reads arithmetic when the `)` closing
+    /// `second` is followed at once by another `)`; otherwise (`((cd x) &&
+    /// ls)`) the parentheses open nested subshells.
+    fn arithmetic(&mut self, second: usize) -> Result<Option<usize>, NoReading> {
+        Ok(self
+            .close(second)?
+            .filter(|close| self.bytes.get(*close) == Some(&b')'))
+            .map(|close| close + 1))
+    }
+
+    /// End of the `[[` operand word that starts at `start`: the first blank,
+    /// `;`, `&` or `)` outside quoted text and its parentheses, where Bash
+    /// keeps blanks in the word.
+    fn operand_word_end(&mut self, start: usize) -> Result<usize, NoReading> {
+        let bytes = self.bytes;
+        let mut depth = 0usize;
+        let mut i = start;
+        while i < bytes.len() {
+            if let Some(past) = self.quoted_end(i, bytes.len())? {
+                i = past;
+                continue;
+            }
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' if depth > 0 => depth -= 1,
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b')' if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
         }
+        Ok(i.min(bytes.len()))
+    }
+
+    /// Spell `_` each `#` in `start..end` outside quoted text that may start
+    /// a comment; with `in_groups_only`, only those inside parentheses (the
+    /// groups of a pattern word).
+    fn spell_hashes(
+        &mut self,
+        start: usize,
+        end: usize,
+        in_groups_only: bool,
+        spelled: &mut Option<Vec<u8>>,
+    ) -> Result<(), NoReading> {
+        let bytes = self.bytes;
+        let mut depth = 0usize;
+        let mut i = start;
+        while i < end {
+            if let Some(past) = self.quoted_end(i, end)? {
+                i = past;
+                continue;
+            }
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b'#' if (depth > 0 || !in_groups_only) && hash_may_start_comment(bytes, i) => {
+                    spelled.get_or_insert_with(|| bytes.to_vec())[i] = b'_';
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+}
+
+/// What starts at a byte for [`SpanReader::quoted_end`].
+enum QuoteOpen {
+    /// Quoted text read whole, which ends before this index.
+    Skip(usize),
+    /// Quoted text that may nest more, and where its body starts.
+    Push(Quoted, usize),
+}
+
+/// The quoted text that starts at `i` inside `context` (`None`: unquoted
+/// text), if any.
+fn quote_opens(bytes: &[u8], i: usize, context: Option<Quoted>) -> Option<QuoteOpen> {
+    let next = |at: usize| past_line_continuations(bytes, at);
+    let double = context == Some(Quoted::Double);
+    let quoted_braces = context == Some(Quoted::Braces { quoted: true });
+    match bytes[i] {
+        b'\\' => Some(QuoteOpen::Skip(i + 2)),
+        b'$' if bytes.get(next(i + 1)) == Some(&b'$') => Some(QuoteOpen::Skip(next(i + 1) + 1)),
+        b'$' if bytes.get(next(i + 1)) == Some(&b'(') => {
+            Some(QuoteOpen::Push(Quoted::Parens(0), next(i + 1) + 1))
+        }
+        b'$' if bytes.get(next(i + 1)) == Some(&b'{') => Some(QuoteOpen::Push(
+            Quoted::Braces {
+                quoted: double || quoted_braces,
+            },
+            next(i + 1) + 1,
+        )),
+        b'`' if context != Some(Quoted::Backquote) => {
+            Some(QuoteOpen::Push(Quoted::Backquote, i + 1))
+        }
+        b'"' if !double => Some(QuoteOpen::Push(Quoted::Double, i + 1)),
+        b'$' if !double && crate::context::ansi_c_quote_starts_at(bytes, i) => Some(
+            QuoteOpen::Skip(crate::context::skip_ansi_c_quoted(bytes, i + 2)),
+        ),
+        b'\'' if !double && !quoted_braces => Some(QuoteOpen::Skip(
+            memchr::memchr(b'\'', &bytes[i + 1..]).map_or(bytes.len(), |at| i + at + 2),
+        )),
+        _ => None,
     }
 }
 
@@ -5843,8 +6002,6 @@ enum Frame {
     /// A `${…}`, and whether it is in double quotes, where a `'` in it is a
     /// literal.
     Braces { quoted: bool },
-    /// A Bash 5.3 `${ …; }` body, with the `{ …; }` groups open in it.
-    FunctionSubstitution(usize),
 }
 
 /// Index of the first byte at or after `at` that does not start a `\`LF pair
@@ -5854,15 +6011,6 @@ fn past_line_continuations(bytes: &[u8], mut at: usize) -> usize {
         at += 2;
     }
     at
-}
-
-/// Whether the `{` at `open` (after a `$`) opens a Bash 5.3 command
-/// substitution `${ …; }`: a blank, newline or `|` follows it.
-fn function_substitution_at(bytes: &[u8], open: usize) -> bool {
-    matches!(
-        bytes.get(past_line_continuations(bytes, open + 1)),
-        Some(b' ' | b'\t' | b'\n' | b'|')
-    )
 }
 
 /// The byte Bash reads right before index `at` once line continuations are
@@ -5896,19 +6044,6 @@ fn token_starts_at(bytes: &[u8], at: usize, floor: usize) -> bool {
     })
 }
 
-/// Whether the last byte before `at` other than a blank separates commands
-/// (or opens a `${ …; }` or `{ …; }` body), where `{` and `}` are reserved
-/// words.
-fn follows_separator(bytes: &[u8], at: usize) -> bool {
-    matches!(
-        bytes[..at]
-            .iter()
-            .rev()
-            .find(|b| !matches!(b, b' ' | b'\t')),
-        Some(b';' | b'&' | b'|' | b'\n' | b'(' | b'{')
-    )
-}
-
 /// Index of the `(` that follows the `(` at `open` once line continuations
 /// are skipped.
 fn second_open_paren(bytes: &[u8], open: usize) -> Option<usize> {
@@ -5932,179 +6067,6 @@ fn conditional_operator(bytes: &[u8], at: usize) -> Option<(bool, usize)> {
         None | Some(b' ' | b'\t' | b'\n') => Some((regex, after)),
         Some(b'(' | b'|') if regex => Some((regex, after)),
         _ => None,
-    }
-}
-
-/// End of the `[[` operand word that starts at `start`: the first blank,
-/// `;`, `&` or `)` outside quotes, backquotes and its parentheses, where Bash
-/// keeps blanks in the word. [`NoReading`] when the word holds a comment in
-/// a command substitution.
-fn operand_word_end(bytes: &[u8], start: usize) -> Result<usize, NoReading> {
-    let mut depth = 0usize;
-    let mut i = start;
-    while i < bytes.len() {
-        i = match bytes[i] {
-            b'\\' => i + 2,
-            b'\'' => memchr::memchr(b'\'', &bytes[i + 1..]).map_or(bytes.len(), |at| i + at + 2),
-            b'"' => skip_quoted_text(bytes, i + 1, bytes.len(), b'"'),
-            // A backquoted command keeps its blanks in the word.
-            b'`' => skip_quoted_text(bytes, i + 1, bytes.len(), b'`'),
-            b'(' => {
-                depth += 1;
-                i + 1
-            }
-            b')' if depth > 0 => {
-                depth -= 1;
-                i + 1
-            }
-            b' ' | b'\t' | b'\n' | b';' | b'&' | b')' if depth == 0 => break,
-            _ => i + 1,
-        };
-    }
-    let end = i.min(bytes.len());
-    if substitution_comment_in(bytes, start, end) {
-        return Err(NoReading);
-    }
-    Ok(end)
-}
-
-/// Whether `start..end` of `bytes` holds a `#` that may start a comment
-/// inside a command substitution (`$(…)`, backquotes or a Bash 5.3
-/// `${ …; }`), in or out of double quotes.
-///
-/// Bash reads such a comment to the end of its line: its quotes open nothing
-/// and its `)` closes nothing. The span readers of [`bash_hashes_as_data`]
-/// (the paren lookups, the `[[` operand words, the spelling) read quotes and
-/// parentheses without comments, so after such a `#` they may end a span
-/// where Bash does not, and spell text Bash reads as a comment: a quote there
-/// then opens in the spelled text and hides a later command. A comment's `#`
-/// comes before any of its text, so this reading, exact up to that `#`, finds
-/// it in every span that holds it. Such spans are rare, and the reading fails
-/// closed on them.
-fn substitution_comment_in(bytes: &[u8], start: usize, end: usize) -> bool {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Sub {
-        Double,
-        Backquote,
-        /// A `$(…)` body, with the parentheses open in it.
-        Parens(usize),
-        /// A Bash 5.3 `${ …; }` body, read to the end of the span.
-        Braces,
-    }
-    let mut frames: Vec<Sub> = Vec::new();
-    let mut i = start;
-    while i < end {
-        let top = frames.last().copied();
-        i = match bytes[i] {
-            b'\\' => i + 2,
-            b'"' if top == Some(Sub::Double) => {
-                frames.pop();
-                i + 1
-            }
-            b'"' => {
-                frames.push(Sub::Double);
-                i + 1
-            }
-            b'`' if top == Some(Sub::Backquote) => {
-                frames.pop();
-                i + 1
-            }
-            b'`' => {
-                frames.push(Sub::Backquote);
-                i + 1
-            }
-            b'$' if bytes.get(past_line_continuations(bytes, i + 1)) == Some(&b'$') => {
-                past_line_continuations(bytes, i + 1) + 1
-            }
-            b'$' if bytes.get(past_line_continuations(bytes, i + 1)) == Some(&b'{')
-                && function_substitution_at(bytes, past_line_continuations(bytes, i + 1)) =>
-            {
-                frames.push(Sub::Braces);
-                past_line_continuations(bytes, i + 1) + 1
-            }
-            b'$' if bytes.get(past_line_continuations(bytes, i + 1)) == Some(&b'(') => {
-                let open = past_line_continuations(bytes, i + 1);
-                // `$((` is arithmetic, whose parentheses the body counts.
-                if bytes.get(past_line_continuations(bytes, open + 1)) != Some(&b'(') {
-                    frames.push(Sub::Parens(0));
-                }
-                open + 1
-            }
-            _ if top == Some(Sub::Double) => i + 1,
-            b'\'' => memchr::memchr(b'\'', &bytes[i + 1..end]).map_or(end, |at| i + at + 2),
-            b'(' => {
-                if let Some(Sub::Parens(open)) = frames.last_mut() {
-                    *open += 1;
-                }
-                i + 1
-            }
-            b')' => {
-                match frames.last_mut() {
-                    Some(Sub::Parens(0)) => {
-                        frames.pop();
-                    }
-                    Some(Sub::Parens(open)) => *open -= 1,
-                    _ => {}
-                }
-                i + 1
-            }
-            b'#' if top.is_some() && hash_may_start_comment(bytes, i) => return true,
-            _ => i + 1,
-        };
-    }
-    false
-}
-
-/// Index past the `quote` (`"` or a backquote) that closes the text that
-/// starts at `start`, or `end`; a `\` escapes the byte after it.
-fn skip_quoted_text(bytes: &[u8], start: usize, end: usize, quote: u8) -> usize {
-    let mut at = start;
-    while at < end && bytes[at] != quote {
-        at += if bytes[at] == b'\\' { 2 } else { 1 };
-    }
-    at + 1
-}
-
-/// Spell `_` each `#` in `start..end` of `bytes` that is outside quotes and
-/// may start a comment, quoting read as [`ParenMatches`] reads it.
-fn spell_comment_hashes(bytes: &[u8], start: usize, end: usize, spelled: &mut Option<Vec<u8>>) {
-    spell_hashes(bytes, start, end, false, spelled);
-}
-
-/// [`spell_comment_hashes`] for only the `#` inside parentheses: the groups
-/// of a pattern word.
-fn spell_group_hashes(bytes: &[u8], start: usize, end: usize, spelled: &mut Option<Vec<u8>>) {
-    spell_hashes(bytes, start, end, true, spelled);
-}
-
-fn spell_hashes(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    in_groups_only: bool,
-    spelled: &mut Option<Vec<u8>>,
-) {
-    let mut depth = 0usize;
-    let mut i = start;
-    while i < end {
-        i = match bytes[i] {
-            b'\\' => i + 2,
-            b'\'' => memchr::memchr(b'\'', &bytes[i + 1..end]).map_or(end, |at| i + at + 2),
-            b'"' => skip_quoted_text(bytes, i + 1, end, b'"'),
-            b'(' => {
-                depth += 1;
-                i + 1
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                i + 1
-            }
-            b'#' if (depth > 0 || !in_groups_only) && hash_may_start_comment(bytes, i) => {
-                spelled.get_or_insert_with(|| bytes.to_vec())[i] = b'_';
-                i + 1
-            }
-            _ => i + 1,
-        };
     }
 }
 
@@ -6690,6 +6652,27 @@ mod tests {
                 "case x in @( _)) :;; esac; git reset --hard",
             ),
             ("x\\\n#; git reset --hard", "x\\\n_; git reset --hard"),
+            // Every span reader reads `$'…'` and backquotes as quoted text.
+            (
+                "[[ x =~ $'\\'' ]]; (( 1 #)); git reset --hard",
+                "[[ x =~ $'\\'' ]]; (( 1 _)); git reset --hard",
+            ),
+            (
+                "(( 1 $'\\'' #)); git reset --hard",
+                "(( 1 $'\\'' _)); git reset --hard",
+            ),
+            (
+                "(( `echo )` + 1 #)); git reset --hard",
+                "(( `echo )` + 1 _)); git reset --hard",
+            ),
+            (
+                "[[ x == @( `echo )` #) ]]; git reset --hard",
+                "[[ x == @( `echo )` _) ]]; git reset --hard",
+            ),
+            (
+                "(( \"$(echo \")\")\" + 1 #)); git reset --hard",
+                "(( \"$(echo \")\")\" + 1 _)); git reset --hard",
+            ),
             (
                 "echo $\\\n( (( 1 #)); git reset --hard )",
                 "echo $\\\n( (( 1 _)); git reset --hard )",
@@ -6741,8 +6724,8 @@ mod tests {
         }
     }
 
-    /// Bash ends a `${` at its first `}` (only a nested `${` nests), reads
-    /// `$$` as one parameter, and a Bash 5.3 `${ …; }` as command text.
+    /// Bash ends a `${` at its first `}` (only a nested `${` nests) and reads
+    /// `$$` as one parameter.
     #[test]
     fn bash_parameter_expansions_end_where_bash_ends_them() {
         for (command, spelled) in [
@@ -6758,29 +6741,35 @@ mod tests {
                 "echo $${ ; (( 1 #)); git reset --hard",
                 "echo $${ ; (( 1 _)); git reset --hard",
             ),
+            // A Bash 5.3 `${ …; }` is read as the shared readers read it: to
+            // its first `}`.
             (
-                "echo ${ : # \"\n}; (( 1 #)); git reset --hard\n# \"",
-                "echo ${ : # \"\n}; (( 1 _)); git reset --hard\n# \"",
+                "echo \"${ (echo) }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ (echo) }; : # \"; (( 1 _)); git reset --hard",
             ),
             (
-                "echo ${| : # \"\n}; (( 1 #)); git reset --hard\n# \"",
-                "echo ${| : # \"\n}; (( 1 _)); git reset --hard\n# \"",
+                "echo \"${ { :; } }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ { :; } }; : # \"; (( 1 _)); git reset --hard",
             ),
             (
-                "[[ x == ${ : # \"\n} ]]; (( 1 #)); git reset --hard\n# \"",
-                "[[ x == ${ : # \"\n} ]]; (( 1 _)); git reset --hard\n# \"",
+                "echo \"${ if :; then :; fi }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ if :; then :; fi }; : # \"; (( 1 _)); git reset --hard",
             ),
             (
-                "echo \"${ : # \"\n}\"; (( 1 #)); git reset --hard\n# \"",
-                "echo \"${ : # \"\n}\"; (( 1 _)); git reset --hard\n# \"",
+                "echo \"${ for x in 1; do :; done }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ for x in 1; do :; done }; : # \"; (( 1 _)); git reset --hard",
             ),
             (
-                "echo \"${ { : # \"\n}; }\"; (( 1 #)); git reset --hard\n# \"",
-                "echo \"${ { : # \"\n}; }\"; (( 1 _)); git reset --hard\n# \"",
+                "echo \"${ case x in x) ;; esac }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ case x in x) ;; esac }; : # \"; (( 1 _)); git reset --hard",
             ),
             (
-                "echo \"${ echo }; : # \"\n}\"; (( 1 #)); git reset --hard\n# \"",
-                "echo \"${ echo }; : # \"\n}\"; (( 1 _)); git reset --hard\n# \"",
+                "echo \"${ [[ x ]] }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ [[ x ]] }; : # \"; (( 1 _)); git reset --hard",
+            ),
+            (
+                "echo \"${ (( 1 )) }; : # \"; (( 1 #)); git reset --hard",
+                "echo \"${ (( 1 )) }; : # \"; (( 1 _)); git reset --hard",
             ),
             // A quote in a heredoc body opens nothing.
             (
@@ -6818,6 +6807,13 @@ mod tests {
             format!("(( i=$( : # ) )\n) + 1 #)); {tail}"),
             format!("(( `: # \"` + 1 )); {tail}"),
             format!("echo $(( $( : # \"\n) )); {tail}"),
+            // Both `(` of a `$((` count, and `$'…'` is quoted text.
+            format!("(( i = $( echo $(( 1 )) # \"\n) + 1 )); {tail}"),
+            format!("for (( i=$( echo $(( 1 )) # '\n) ; i<1; i++ )); do :; done; {tail}"),
+            format!("for (( i=$( : $((1)) # \"\n) ; i<1; i++ )); do :; done; {tail}"),
+            format!("[[ x == $( echo $(( 1 )) # \"\n) ]]; {tail}"),
+            format!("[[ x == $( : $'\\'' # \"\n) ]]; {tail}"),
+            format!("(( $(cat <( : # \"\n)) )); {tail}"),
             "[[ x == $( : # it's\n) ]]; git status".to_string(),
         ] {
             assert_eq!(
@@ -6907,13 +6903,20 @@ mod tests {
 
     #[test]
     fn bash_hashes_as_data_reads_nothing_past_its_budget() {
-        // Each `$(((` is quoted text to the scan from the `((` before it, so
-        // every lookup scans afresh to the end, until the budget is spent.
-        let command = format!("(({} #)); git reset --hard", "\"$(((".repeat(3_000));
+        let command = "(( 1 #)); (( 2 #)); git reset --hard";
         assert_eq!(
-            bash_hashes_as_data(&command, false),
+            bash_hashes_as_data_within(command, false, 0),
             Some(BashHashReading::Unread)
         );
+        assert_eq!(
+            bash_hashes_as_data_within(command, false, 64),
+            Some(BashHashReading::Spelled(
+                "(( 1 _)); (( 2 _)); git reset --hard".to_string()
+            ))
+        );
+        // Quoted text that each lookup starts inside of is read once.
+        let command = format!("(({} #)); git reset --hard", "\"$(((".repeat(3_000));
+        let _ = bash_spelling(&command);
     }
 
     #[test]

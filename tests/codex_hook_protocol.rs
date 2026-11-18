@@ -893,6 +893,26 @@ fn bash_data_hash_hides_no_later_git_command() {
         "for (( i=$( : # \"\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# \" ) ; i<1; i++ )); do :; done",
         "for (( i=$( : # '\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# ' ) ; i<1; i++ )); do :; done",
         "(( i=$( : # ) )\n) + 1 #)); git reset --hard",
+        // Comments after a `$((…))` or `$'…'` in a command substitution.
+        "(( i = $( echo $(( 1 )) # \"\n) + 1 )); (( 1 #)); git reset --hard\n# \" ) + 1 ))",
+        "for (( i=$( echo $(( 1 )) # \"\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# \"",
+        "for (( i=$( echo $(( 1 )) # '\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# '",
+        "for (( i=$( : $((1)) # \"\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# \"",
+        "[[ x == $( : $'\\'' # \"\n) ]]; (( 1 #)); git reset --hard\n# \"",
+        // `$'…'` and backquotes are quoted text in every span.
+        "[[ x =~ $'\\'' ]]; (( 1 #)); git reset --hard",
+        "(( 1 $'\\'' #)); git reset --hard",
+        "(( `echo )` + 1 #)); git reset --hard",
+        "[[ x == @( `echo )` #) ]]; git reset --hard",
+        "(( \"$(echo \")\")\" + 1 #)); git reset --hard",
+        // A Bash 5.3 `${ …; }` hides nothing after its first `}`.
+        "echo \"${ (echo) }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ { :; } }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ if :; then :; fi }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ for x in 1; do :; done }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ case x in x) ;; esac }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ [[ x ]] }; : # \"; (( 1 #)); git reset --hard",
+        "echo \"${ (( 1 )) }; : # \"; (( 1 #)); git reset --hard",
         // A `${` ends at its first `}`: only a nested `${` nests.
         "echo ${x:-{}; (( 1 #)); git reset --hard",
         "echo ${x:-${y:-{}}; (( 1 #)); git reset --hard",
@@ -947,6 +967,9 @@ fn bash_data_hash_hides_no_later_git_command() {
         "[[ x == $(echo x) ]] && echo ok # git reset --hard",
         "(( $(echo 1) > 0 )) && echo ok # git reset --hard",
         "cat <<'EOF'\ndon't\nEOF\n(( 1 #)); git status",
+        "[[ x =~ ( $'\\'' ) ]] && echo ok # git reset --hard",
+        "(( `echo 1` > 0 )) && echo ok # git reset --hard",
+        "[[ x == $( echo $(( 1 )) ) ]] && echo ok # git reset --hard",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
