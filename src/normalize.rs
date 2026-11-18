@@ -3208,22 +3208,23 @@ fn decode_powershell_pattern_view(command: &str) -> Cow<'_, str> {
 /// only changes the scope a script runs in. Every reader that understands the
 /// call operator can judge the dot form once the `.` byte becomes `&`.
 ///
-/// A command position is the start of a statement, the right side of an
-/// assignment (see [`powershell_assignment_rhs`]) and the operand of
+/// A command position here is the start of a statement and the operand of
 /// `return`, `throw` or `exit`. The readers know a call operator best at the
-/// start of a statement (`$r = & 'git' reset --hard` passed them), so the
-/// text before an operator in any other command position is blanked:
-/// `$r = . 'git' x` reads as `      & 'git' x`. The original line is judged
+/// start of a statement (`return & 'git' reset --hard` passed them), so
+/// `return`, `throw` or `exit` before an operator is blanked:
+/// `return . 'git' x` reads as `       & 'git' x`. The original line is judged
 /// too, so the blanked prefix loses nothing. The view has the same length as
-/// `command`, so spans still address it.
+/// `command`, so spans still address it. An assignment's value is already
+/// read as a statement of its own (see [`powershell_assignment_views`]), and
+/// that statement passes through this view.
 ///
-/// A quote ends the dot operator, so `.'git'` and `$r=.'git'` hold the
-/// operator and its operand in one word. Only a static command word is read.
+/// A quote ends the dot operator, so `.'git'` holds the operator and its
+/// operand in one word. Only a static command word is read.
 /// Dot-sourcing a variable or an expandable string (`. $profile`,
 /// `. "$PSScriptRoot\x.ps1"`) loads a script whose name is not known here,
-/// and keeps the reading it had; so do `& $x` and `& (…)` after an
-/// assignment. A `.` in an argument (`git add .`) is data. Returns `None`
-/// when nothing changes.
+/// and keeps the reading it had; so do `& $x` and `& (…)` after `return`.
+/// A `.` in an argument (`git add .`) is data. Returns `None` when nothing
+/// changes.
 #[must_use]
 pub(crate) fn powershell_invocation_operator_view(command: &str) -> Option<String> {
     if !command.contains(['.', '&']) {
@@ -3253,8 +3254,8 @@ pub(crate) fn powershell_invocation_operator_view(command: &str) -> Option<Strin
         let raw = token.text(command)?;
         let range = &token.byte_range;
         if token.kind == NormalizeTokenKind::Separator {
-            // A call operator after an assignment, `return`, `throw` or
-            // `exit`. At a statement start the readers already know it.
+            // A call operator after `return`, `throw` or `exit`. At a
+            // statement start the readers already know it.
             if raw.trim() == "&"
                 && let Some(start) = statement_start
                 && !command[start..range.start].trim().is_empty()
@@ -3274,22 +3275,16 @@ pub(crate) fn powershell_invocation_operator_view(command: &str) -> Option<Strin
         let Some(start) = statement_start else {
             continue;
         };
-        // `$r=.` and `=.` glue the operator onto the assignment.
-        let quoted = raw
-            .find(".'")
-            .or_else(|| raw.find(".\""))
-            .filter(|&dot| (dot == 0 || raw[..dot].ends_with('=')) && !raw[dot..].contains('$'));
-        let operator = if raw == "." {
+        let quoted = (raw.starts_with(".'") || raw.starts_with(".\"")) && !raw.contains('$');
+        let operator = if raw == "." || quoted {
             Some(range.start)
-        } else if raw.ends_with("=.") {
-            Some(range.end - 1)
         } else {
-            quoted.map(|dot| range.start + dot)
+            None
         };
         let Some(operator) = operator else {
             continue;
         };
-        if (quoted.is_some() || static_operand(iter.peek(), range.end, false))
+        if (quoted || static_operand(iter.peek(), range.end, false))
             && powershell_command_position(&command[start..operator])
         {
             operators.push((start, operator));
@@ -3307,24 +3302,13 @@ pub(crate) fn powershell_invocation_operator_view(command: &str) -> Option<Strin
 }
 
 /// Whether a PowerShell command may follow `prefix`, the text of a statement
-/// so far: nothing, `return`, `throw`, `exit`, or one or more assignment
-/// targets each followed by an assignment operator (`$a = $b +=`).
+/// so far: nothing, `return`, `throw` or `exit`.
 fn powershell_command_position(prefix: &str) -> bool {
-    let mut prefix = prefix.trim();
-    if prefix.is_empty()
+    let prefix = prefix.trim();
+    prefix.is_empty()
         || ["return", "throw", "exit"]
             .iter()
             .any(|keyword| prefix.eq_ignore_ascii_case(keyword))
-    {
-        return true;
-    }
-    while let Some(rest) = powershell_assignment_rhs(prefix) {
-        if rest.is_empty() {
-            return true;
-        }
-        prefix = rest;
-    }
-    false
 }
 
 /// Return the executable right-hand side of a simple PowerShell variable
@@ -3354,11 +3338,17 @@ pub(crate) fn powershell_assignment_rhs(candidate: &str) -> Option<&str> {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
             '=' if !in_single && !in_double => {
-                let lhs = candidate[..idx]
-                    .trim()
-                    .trim_end_matches(['+', '-', '*', '/', '%', '?'])
-                    .trim_end();
-                if powershell_assignment_targets(lhs) {
+                let mut lhs = candidate[..idx].trim();
+                lhs = lhs.trim_end_matches(['+', '-', '*', '/', '%', '?']);
+                lhs = lhs.trim_end();
+
+                if let Some(after_type) = lhs.strip_prefix('[').and_then(|rest| {
+                    let close = rest.find(']')?;
+                    Some(rest[close + 1..].trim_start())
+                }) {
+                    lhs = after_type;
+                }
+                if lhs.starts_with('$') && !lhs.bytes().any(|byte| byte.is_ascii_whitespace()) {
                     return Some(candidate[idx + 1..].trim());
                 }
             }
@@ -3367,45 +3357,6 @@ pub(crate) fn powershell_assignment_rhs(candidate: &str) -> Option<&str> {
     }
 
     None
-}
-
-/// Whether `lhs` is a list of PowerShell assignment targets: comma-separated
-/// variables (`$a`, `$script:a`, `$a.b`, `$a[0]`), each after any number of
-/// type constraints (`[string]$a`, `[int] [string]$a`).
-fn powershell_assignment_targets(lhs: &str) -> bool {
-    let mut depth = 0usize;
-    let mut item_start = 0;
-    let mut items = Vec::new();
-    for (idx, ch) in lhs.char_indices() {
-        match ch {
-            '[' | '{' => depth += 1,
-            ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                items.push(&lhs[item_start..idx]);
-                item_start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    items.push(&lhs[item_start..]);
-    items.into_iter().all(|item| {
-        let mut target = item.trim();
-        while target.starts_with('[') {
-            let mut depth = 0usize;
-            let Some(close) = target.char_indices().find_map(|(idx, ch)| {
-                match ch {
-                    '[' => depth += 1,
-                    ']' => depth -= 1,
-                    _ => {}
-                }
-                (depth == 0).then_some(idx)
-            }) else {
-                return false;
-            };
-            target = target[close + 1..].trim_start();
-        }
-        target.starts_with('$') && !target.chars().any(char::is_whitespace)
-    })
 }
 
 /// Tokenize a command while preserving every raw token's byte span.
@@ -8482,34 +8433,20 @@ mod tests {
             ("a | . git x", "a | & git x"),
             ("a\n. git x", "a\n& git x"),
             ("if ($true) { . git x }", "if ($true) { & git x }"),
-            ("$r = . git x", "     & git x"),
-            ("$r=. git x", "   & git x"),
-            ("$r += . git x", "      & git x"),
-            ("$r ??= . git x", "       & git x"),
-            ("$r =. git x", "    & git x"),
-            ("[string]$r = . git x", "             & git x"),
-            ("[int] [string]$r = . git x", "                   & git x"),
-            ("$a, $b = . git x", "         & git x"),
-            ("$a = $b = . git x", "          & git x"),
-            ("$x[1,2] = . git x", "          & git x"),
             ("return . git x", "       & git x"),
             ("THROW . git x", "      & git x"),
             ("exit . git x", "     & git x"),
-            ("echo a; $r = . git x", "echo a;      & git x"),
             (".\u{a0}git x", "&\u{a0}git x"),
-            ("$r=.\u{a0}git x", "   &\u{a0}git x"),
             (".'git' x", "&'git' x"),
             (".\"git\" x", "&\"git\" x"),
-            ("$r=.'git' x", "   &'git' x"),
-            ("$r =.'git' x", "    &'git' x"),
-            ("$a, $b = .'git' x", "         &'git' x"),
             ("echo a; .'git' x", "echo a; &'git' x"),
             (".'iex' 'git x'", "&'iex' 'git x'"),
             (". ./x.ps1", "& ./x.ps1"),
+            // An assignment's value is its own statement in
+            // `powershell_assignment_views`, which reads the operator there.
+            ("$r;. git x", "$r;& git x"),
+            ("$r;.'git' x", "$r;&'git' x"),
             // The call operator itself, outside a statement start.
-            ("$r = & 'git' x", "     & 'git' x"),
-            ("$r=&'git' x", "   &'git' x"),
-            ("$a, $b = &\"git\" x", "         &\"git\" x"),
             ("return & 'git' x", "       & 'git' x"),
             ("exit & git x", "     & git x"),
         ] {
@@ -8551,6 +8488,10 @@ mod tests {
             "$r = & { git x }",
             "git status & 'git' x",
             "x=1 & git x",
+            // Assignments: see `powershell_assignment_views`.
+            "$r = . git x",
+            "$r=.'git' x",
+            "$r = & 'git' x",
         ] {
             assert_eq!(
                 powershell_invocation_operator_view(command),
