@@ -19,7 +19,7 @@
 use fancy_regex::Regex;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::LazyLock;
 
@@ -3309,26 +3309,43 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
     tokenize_powershell_with_comments(command, false).0
 }
 
-/// `command` with every assignment operator that follows an assignment
-/// target replaced by `;` and blanks, so the value starts a statement of its
-/// own, or `None` when there is none. The text keeps its length and byte
-/// offsets.
+/// Deny-only views of a command's PowerShell assignments: what PowerShell
+/// runs as an assignment's value, read where the readers look for a
+/// command. See [`powershell_assignment_views`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PowerShellAssignmentViews {
+    /// `command` with every operator before a value in command mode replaced
+    /// by `;` and blanks, so the value starts a statement of its own. Same
+    /// length and byte offsets. `None` when there is no such value.
+    pub(crate) separated: Option<String>,
+    /// Each value in expression mode, as its own command `$c = <value>`.
+    pub(crate) values: Vec<String>,
+}
+
+/// The assignment views of `command` (see [`PowerShellAssignmentViews`]).
 ///
 /// PowerShell runs the value of an assignment as a pipeline: `$c=iex '…'`,
-/// `$null = Remove-Item -Recurse -Force x`, `$c[ 0 ]=git reset --hard` and
-/// `@{a=git reset --hard}` run their command (pwsh 7.5, measured in the
-/// sandbox). The readers and packs each find a statement's command by
+/// `$null = Remove-Item -Recurse -Force x`, `$c[ 0 ]=git reset --hard`,
+/// `@{a=git reset --hard}`, `$c=[IO.Directory]::Delete('x', $true)` and
+/// `@{a = 1|%{git reset --hard}}` run what they name (pwsh 7.5, measured in
+/// the sandbox). The readers and packs each find a statement's command by
 /// themselves, and each has its own idea of an assignment: the tokenizer
 /// keeps `$c=iex` as one word, some readers want `$name =` as separate
-/// words, and the filesystem pack skips any statement that starts with
-/// `$name =`. In this view the value stands where a statement's command
-/// stands, so every reader and pack judges it as the command it is.
+/// words, the filesystem pack skips any statement that starts with
+/// `$name =`, and the script-block readers look only at a plain `$c = `
+/// that starts the command.
 ///
-/// Only a value that PowerShell parses in command mode is separated (see
-/// [`powershell_value_is_command`]): `$y=$x*2` and `$t = $(Get-Date)` stay as
-/// written. This pass does not decide whether the assignment stands where
-/// PowerShell runs it. An argument spelled like an assignment (`Write-Output $c = x`,
-/// `git commit -m $c=iex`) is judged as a command too: the view only adds
+/// A value that PowerShell parses in command mode (see
+/// [`powershell_value_is_command`]) is separated in place, so every reader
+/// and pack judges it as the command it is, with the rest of the command
+/// around it. Any other value is copied out as `$c = <value>`, to its
+/// statement's end ([`powershell_value_end`]), so it gets the verdict of
+/// that spelling: `$y=$x*2` and `$t = $(Get-Date)` stay allowed, as their
+/// `$c = ` spellings are.
+///
+/// This pass does not decide whether the assignment stands where PowerShell
+/// runs it. An argument spelled like an assignment (`Write-Output $c = x`,
+/// `git commit -m $c=iex`) is judged as one too: the views only add
 /// denials, and base already denied such spaced spellings with `iex`. A
 /// target starts a word, or follows a block brace or an assignment operator
 /// inside one (`if(1){$c=…`, `$a=$b=…`). A word that holds only a target or
@@ -3340,9 +3357,249 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
 /// `(Get-Item x).p=…`). A bare or quoted name is a target only as a
 /// hashtable key: after `@{`, or after `;` or a line break inside one.
 /// Quoted text, here-strings and escapes are skipped.
-pub(crate) fn separate_powershell_assignment_values(command: &str) -> Option<String> {
+pub(crate) fn powershell_assignment_views(command: &str) -> PowerShellAssignmentViews {
+    let bytes = command.as_bytes();
+    let mut views = PowerShellAssignmentViews::default();
+    let mut separated: Option<Vec<u8>> = None;
+    // Where each value starts, and whether it is an expression.
+    let mut starts: Vec<(usize, bool)> = Vec::new();
+    for (at, len) in powershell_assignment_operators(command) {
+        let rest = &command[at + len..];
+        let expression = !powershell_value_is_command(rest);
+        if !expression {
+            // An operator is ASCII, or a dash character followed by `=`, so
+            // these bytes are whole characters.
+            let bytes = separated.get_or_insert_with(|| bytes.to_vec());
+            bytes[at] = b';';
+            bytes[at + 1..at + len].fill(b' ');
+        }
+        starts.push((command.len() - rest.trim_start().len(), expression));
+    }
+    views.separated = separated.and_then(|bytes| String::from_utf8(bytes).ok());
+    starts.sort_unstable();
+    starts.dedup_by_key(|&mut (start, _)| start);
+    let ends = powershell_value_ends(bytes, starts.iter().map(|&(start, _)| start));
+    // Where each value starts and ends, and whether it is an expression. A
+    // value whose brackets never close is no PowerShell: pwsh runs nothing
+    // of such a script (a POSIX heredoc's `$h={`).
+    let mut values: Vec<(usize, usize, bool)> = starts
+        .into_iter()
+        .zip(ends)
+        .filter_map(|((start, expression), end)| {
+            end.filter(|&end| end > start)
+                .map(|end| (start, end, expression))
+        })
+        .collect();
+    // Copy each expression out. A value inside it reads as `$null` there,
+    // as it is read by itself, so each byte is copied once (`$a=$b=…` and
+    // nested hashtables stay linear).
+    values.sort_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+    let mut open: Vec<(usize, bool, String)> = Vec::new();
+    let mut copied = 0;
+    let mut seen = HashSet::new();
+    let mut close = |open: &mut Vec<(usize, bool, String)>, copied: &mut usize, limit: usize| {
+        while open.last().is_some_and(|&(end, ..)| end <= limit) {
+            let Some((end, expression, mut text)) = open.pop() else {
+                break;
+            };
+            text.push_str(&command[*copied..end]);
+            *copied = end;
+            if let Some((.., parent)) = open.last_mut() {
+                parent.push_str("$null");
+            }
+            let text = text.trim_end();
+            // Assigning a script block runs nothing (pwsh 7.5): its body is
+            // judged where the block is invoked (`& $c`).
+            let block = text.starts_with('{')
+                && powershell_group_end(text.as_bytes(), 0) == Some(text.len());
+            if expression
+                && !block
+                && !powershell_value_is_inert(text)
+                && seen.insert(text.to_owned())
+            {
+                views.values.push(format!("$c = {text}"));
+            }
+        }
+    };
+    for (start, end, expression) in values {
+        close(&mut open, &mut copied, start);
+        if let Some((.., parent)) = open.last_mut() {
+            parent.push_str(&command[copied..start]);
+        }
+        copied = start;
+        open.push((end, expression, String::new()));
+    }
+    close(&mut open, &mut copied, usize::MAX);
+    views
+}
+
+/// Where each assignment value that starts at `starts` (ascending) ends:
+/// its statement ends at a `;` or a line end outside brackets, or at the
+/// bracket that closes the group, block or hashtable the assignment stands
+/// in. A line that ends with `|`, or whose next line starts with one,
+/// continues the pipeline. `None` when a bracket the value opens never
+/// closes. One pass over the text for all values.
+fn powershell_value_ends(
+    bytes: &[u8],
+    starts: impl IntoIterator<Item = usize>,
+) -> Vec<Option<usize>> {
+    let len = bytes.len();
+    let mut starts = starts.into_iter().enumerate().peekable();
+    let mut ends = Vec::new();
+    // Per open bracket, innermost last: the values waiting for their end.
+    let mut frames: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut last_visible = None;
+    // The first non-blank byte at or after a line end, read once per run.
+    let mut next_visible = (0, None);
+    let mut i = 0;
+    loop {
+        while let Some((index, _)) = starts.next_if(|&(_, start)| start <= i) {
+            ends.push(None);
+            if let Some(frame) = frames.last_mut() {
+                frame.push(index);
+            }
+        }
+        if i >= len {
+            break;
+        }
+        let byte = bytes[i];
+        let mut statement_end = false;
+        let next = match byte {
+            b'(' | b'{' | b'[' => {
+                frames.push(Vec::new());
+                i + 1
+            }
+            b')' | b'}' | b']' => {
+                if frames.len() > 1 {
+                    for index in frames.pop().unwrap_or_default() {
+                        ends[index] = Some(i);
+                    }
+                } else {
+                    // A closer with no opener ends the statement.
+                    statement_end = true;
+                }
+                i + 1
+            }
+            b';' => {
+                statement_end = true;
+                i + 1
+            }
+            b'\r' | b'\n' => {
+                if next_visible.0 <= i {
+                    let blank = bytes[i..]
+                        .iter()
+                        .take_while(|byte| byte.is_ascii_whitespace())
+                        .count();
+                    next_visible = (i + blank, bytes.get(i + blank).copied());
+                }
+                statement_end = last_visible != Some(b'|') && next_visible.1 != Some(b'|');
+                i + 1
+            }
+            b'`' => consume_shell_escape(bytes, i, len),
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                braced_variable_end(bytes, i, len).unwrap_or(len)
+            }
+            b'@' => consume_powershell_here_string(bytes, i, len).unwrap_or(i + 1),
+            b'\'' | b'"' => powershell_quoted_end(bytes, i, len),
+            _ => i + 1,
+        };
+        if statement_end && let Some(frame) = frames.last_mut() {
+            for index in frame.drain(..) {
+                ends[index] = Some(i);
+            }
+        }
+        if !byte.is_ascii_whitespace() {
+            last_visible = Some(bytes[next - 1]);
+        }
+        i = next;
+    }
+    // At the end of the text a value ends there unless a bracket it opened
+    // is still open.
+    if let Some(frame) = frames.last() {
+        for &index in frame {
+            ends[index] = Some(len);
+        }
+    }
+    ends
+}
+
+/// Position after the bracket that closes the `(`, `{` or `[` at `i`, with
+/// quoted text, here-strings and escapes skipped, or `None` if it never
+/// closes.
+fn powershell_group_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut depth = 0usize;
+    let mut j = i;
+    while j < len {
+        j = match bytes[j] {
+            b'(' | b'{' | b'[' => {
+                depth += 1;
+                j + 1
+            }
+            b')' | b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+                j + 1
+            }
+            b'`' => consume_shell_escape(bytes, j, len),
+            b'$' if bytes.get(j + 1) == Some(&b'{') => braced_variable_end(bytes, j, len)?,
+            b'@' => consume_powershell_here_string(bytes, j, len).unwrap_or(j + 1),
+            b'\'' | b'"' => powershell_quoted_end(bytes, j, len),
+            _ => j + 1,
+        };
+    }
+    None
+}
+
+/// Whether an expression value can run nothing: it holds only variables,
+/// numbers, strings without a subexpression, blanks and arithmetic or
+/// comparison-free operators (`$x * 2`, `$a + 'b'`, `$h[$i]`, `$a=$null`).
+/// Any word, type, member, block, pipe, call or redirection makes it a
+/// value worth reading.
+fn powershell_value_is_inert(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        i = match bytes[i] {
+            b'$' if bytes.get(i + 1) == Some(&b'{') => match braced_variable_end(bytes, i, len) {
+                Some(end) => end,
+                None => return false,
+            },
+            b'$' => match powershell_variable_end(bytes, i, len, None) {
+                Some(end) => end,
+                None => return false,
+            },
+            b'\'' => powershell_quoted_end(bytes, i, len),
+            b'"' => {
+                let end = powershell_quoted_end(bytes, i, len);
+                if bytes[i..end].windows(2).any(|pair| pair == b"$(")
+                    || bytes[i..end].contains(&b'`')
+                {
+                    return false;
+                }
+                end
+            }
+            b'.' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => i + 1,
+            byte if byte.is_ascii_digit()
+                || byte.is_ascii_whitespace()
+                || b"+-*/%=,()[]!".contains(&byte) =>
+            {
+                i + 1
+            }
+            _ => return false,
+        };
+    }
+    true
+}
+
+/// Where each assignment operator that follows an assignment target starts
+/// in `command`, and its length (see [`powershell_assignment_views`]).
+fn powershell_assignment_operators(command: &str) -> Vec<(usize, usize)> {
     if !command.contains('=') {
-        return None;
+        return Vec::new();
     }
     let bytes = command.as_bytes();
     let tokens = tokenize_powershell_raw(command);
@@ -3391,6 +3648,9 @@ pub(crate) fn separate_powershell_assignment_values(command: &str) -> Option<Str
                 operators.push((j, len));
                 i = j + len;
                 key = false;
+            } else if j == end && j > start {
+                // `(Get-Variable c).Value =iex`: the next word continues it.
+                continued_at.insert(end);
             }
         }
         group_end = None;
@@ -3463,28 +3723,18 @@ pub(crate) fn separate_powershell_assignment_values(command: &str) -> Option<Str
         // `@{` ends the word: the next word is a key.
         key_next = key;
     }
-    operators.retain(|&(at, len)| powershell_value_is_command(&command[at + len..]));
-    if operators.is_empty() {
-        return None;
-    }
-    // An operator is ASCII, or a dash character followed by `=`, so these
-    // bytes are whole characters.
-    let mut separated = bytes.to_vec();
-    for (at, len) in operators {
-        separated[at] = b';';
-        separated[at + 1..at + len].fill(b' ');
-    }
-    String::from_utf8(separated).ok()
+    operators
 }
 
 /// Whether an assignment value that starts `rest` is parsed in command mode,
-/// as PowerShell decides from its first character: a bare word, `&` or `.`
-/// runs a command (`git …`, `& $exe`, `. ./x.ps1`, `.{…}`). A variable,
-/// parenthesis, `@`, type, script block, string, number or unary operator
-/// starts an expression (`$x*2`, `$(Get-Date)`, `'text'`, `-not $x`), whose
-/// commands, if any, sit inside parentheses or subexpressions that dcg
-/// already reads wherever they stand. Splitting such a value off would only
-/// make the expression look like a command with a dynamic name.
+/// judged from its first character: a bare word, `&` or `.` runs a command
+/// (`git …`, `& $exe`, `. ./x.ps1`, `.{…}`). A variable, parenthesis, `@`,
+/// type, script block, string, digit or unary operator starts an
+/// expression (`$x*2`, `$(Get-Date)`, `'text'`, `-not $x`). Separating such
+/// a value would make it look like a command with a dynamic name, so it is
+/// read as `$c = <value>` instead. PowerShell itself reads a word that
+/// starts with a digit but is no number as a command (`$c = 7z a x` runs
+/// `7z`); here it is an expression, judged as its `$c = ` spelling is.
 fn powershell_value_is_command(rest: &str) -> bool {
     let mut chars = rest.trim_start().chars();
     match chars.next() {
@@ -6732,7 +6982,7 @@ mod tests {
 
     #[test]
     fn powershell_assignment_values_start_a_statement_wherever_a_target_starts() {
-        let separated = |command: &str| separate_powershell_assignment_values(command);
+        let separated = |command: &str| powershell_assignment_views(command).separated;
         for (assignment, view) in [
             // Glued or spaced, every operator, every statement start.
             ("$c=iex 'x'", "$c;iex 'x'"),
@@ -6852,6 +7102,89 @@ mod tests {
             "${c d} -eq 'a=b'",
         ] {
             assert_eq!(separated(unchanged), None, "{unchanged:?}");
+        }
+    }
+
+    #[test]
+    fn powershell_expression_values_read_as_their_dollar_c_spelling() {
+        let values = |command: &str| powershell_assignment_views(command).values;
+        for (assignment, expected) in [
+            // Glued or spaced, every target shape, to the statement's end.
+            (
+                "$c=[IO.Directory]::Delete('x', $true)",
+                vec!["$c = [IO.Directory]::Delete('x', $true)"],
+            ),
+            (
+                "$c=@(1,2); $c[ 0 ] = {git x}.Invoke(); Get-Date",
+                vec!["$c = @(1,2)", "$c = {git x}.Invoke()"],
+            ),
+            ("$a, $b = {git x}.Invoke()", vec!["$c = {git x}.Invoke()"]),
+            (
+                "(Get-Variable c).Value = 1|%{git x}",
+                vec!["$c = 1|%{git x}"],
+            ),
+            ("$c.'p q' = 'x' | iex", vec!["$c = 'x' | iex"]),
+            // Hashtable entries end at `;`, a line end or the closing brace.
+            (
+                "@{a = 'git x'|iex; b = 1|%{git y}\nc = $x.y}",
+                vec!["$c = 'git x'|iex", "$c = 1|%{git y}", "$c = $x.y"],
+            ),
+            // A value inside another reads as `$null` there: it is read by
+            // itself.
+            (
+                "$h = @{a = {git x}.Invoke()}",
+                vec!["$c = {git x}.Invoke()", "$c = @{a = $null}"],
+            ),
+            ("$a=$b=$d={git x}.Invoke()", vec!["$c = {git x}.Invoke()"]),
+            (
+                "$c = {git x; $d = $e.f}.Invoke()",
+                vec!["$c = $e.f", "$c = {git x; $d = $null}.Invoke()"],
+            ),
+            (
+                "$c = @{a = git x; b = 1}",
+                vec!["$c = @{a = $null; b = $null}"],
+            ),
+            // Brackets, strings and here-strings hold their `;`, `}` and
+            // line ends.
+            (
+                "$c = 1 | % { a; b\n c }; d",
+                vec!["$c = 1 | % { a; b\n c }"],
+            ),
+            (
+                "$c = 'a;}' + \"b)\" | iex; d",
+                vec!["$c = 'a;}' + \"b)\" | iex"],
+            ),
+            ("$c = @'\n;}\n'@ | iex\nd", vec!["$c = @'\n;}\n'@ | iex"]),
+            ("$c = (1) + $x.y; d", vec!["$c = (1) + $x.y"]),
+            // A pipeline continues across a line end next to `|`.
+            ("$c = 'x' |\n iex\nd", vec!["$c = 'x' |\n iex"]),
+            ("$c = 'x'\n\n | iex\nd", vec!["$c = 'x'\n\n | iex"]),
+            ("$c = 'x' `\n| iex\nd", vec!["$c = 'x' `\n| iex"]),
+            ("if (1) { $c = $x.y } else {}", vec!["$c = $x.y"]),
+            // The same value is read once.
+            ("$a = $x.y; $b = $x.y", vec!["$c = $x.y"]),
+            // A value that can run nothing is not read.
+            (
+                "$y=$x*2; $s = 'git x'; $n = -1.5; $t = \"a $x\"; $h[$i] = !$b",
+                vec![],
+            ),
+            ("$t = \"a $(git x)\"", vec!["$c = \"a $(git x)\""]),
+            ("$t = 1kb", vec!["$c = 1kb"]),
+            // A script block is not run by its assignment.
+            (
+                "$c = {git x}; $h = @{a = { git y }}",
+                vec!["$c = @{a = $null}"],
+            ),
+            ("$c = {git x}.Invoke()", vec!["$c = {git x}.Invoke()"]),
+            ("$c = {git x} | % { $_ }", vec!["$c = {git x} | % { $_ }"]),
+            // A value in command mode is separated, not copied.
+            ("$c = git x", vec![]),
+            ("$c = ", vec![]),
+            // A value whose brackets never close is not read.
+            ("cat <<'EOF'\n$h={\nEOF", vec![]),
+            ("$c = (1; $d = $x.y", vec!["$c = $x.y"]),
+        ] {
+            assert_eq!(values(assignment), expected, "{assignment:?}");
         }
     }
 

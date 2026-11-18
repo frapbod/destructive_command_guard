@@ -1,26 +1,31 @@
 //! PowerShell runs the value of an assignment as a pipeline: `$c=iex 'git
 //! reset --hard'`, `$null = Remove-Item -Recurse -Force .git`, `$c[ 0 ]=git
-//! reset --hard` and `@{a=git reset --hard}` run their command (pwsh 7.5
+//! reset --hard`, `@{a=git reset --hard}`, `$c=[IO.Directory]::Delete('x',
+//! $true)` and `@{a = 1|%{git reset --hard}}` run what they name (pwsh 7.5
 //! measured in the sandbox for every RUNS_IT row; Windows PowerShell 5.1
 //! parses assignments the same way). dcg's readers and packs each found a
 //! statement's command by themselves: the tokenizer kept `$c=iex` as one
 //! word, several readers wanted `$name =` as separate words, the filesystem
-//! pack skipped every statement starting with `$name =`, and none read a
-//! target with a blank inside (`$c[ 0 ]`, `$a, $b`) or a hashtable value.
+//! pack skipped every statement starting with `$name =`, the script-block
+//! readers looked only at a plain `$c = ` starting the command, and none read
+//! a target with a blank inside (`$c[ 0 ]`, `$a, $b`) or a hashtable value.
 //!
-//! A deny-only PowerShell view now ends each assignment's target at its
-//! operator (`$c=iex '…'` reads as `$c;iex '…'`), wherever the target stands,
-//! so every reader and pack judges the value as a command. Only a value that
-//! PowerShell parses in command mode (a bare word, `&` or `.`) is split off;
-//! an expression (`$y=$x*2`, `$x = $(Get-Date)`) stays as written. Targets:
-//! variables (`${c}`, `$env:C`, Unicode names), members (`.p`, `.'p'`, `.$n`,
-//! `.$('p')`), indexes, type constraints, static properties, hashtable keys
-//! and `(expr).p`; brackets and braced names may hold blanks (`$c[$i + 1]`,
-//! `[Dictionary[string, int]]$c`, `${c d}`). A comment glued between target
-//! and operator (`$c<#x#>=`) is not covered yet. An argument spelled like an
-//! assignment has its value judged as a command too: `Write-Output $c=iex
-//! 'git reset --hard'` denies, as `Write-Output $c = iex '…'` already did on
-//! base, although PowerShell only prints it.
+//! Deny-only PowerShell views now read every assignment's value, wherever
+//! the target stands. A value that PowerShell parses in command mode (a
+//! bare word, `&` or `.`) starts its own statement in place (`$c=iex '…'`
+//! reads as `$c;iex '…'`), so every reader and pack judges it as a command.
+//! Any other value is read by itself as `$c = <value>`, to its statement's
+//! end, so it gets that spelling's verdict; values that hold only
+//! variables, numbers, plain strings and arithmetic (`$y=$x*2`), and bare
+//! script blocks (`$c={…}`, which run nothing until invoked), are not read.
+//! Targets: variables (`${c}`, `$env:C`, Unicode names), members (`.p`,
+//! `.'p'`, `.$n`, `.$('p')`), indexes, type constraints, static properties,
+//! hashtable keys and `(expr).p`; brackets and braced names may hold blanks
+//! (`$c[$i + 1]`, `[Dictionary[string, int]]$c`, `${c d}`). A comment glued
+//! between target and operator (`$c<#x#>=`) is not covered yet. An argument
+//! spelled like an assignment has its value judged too: `Write-Output
+//! $c=iex 'git reset --hard'` denies, as `Write-Output $c = iex '…'` already
+//! did on base, although PowerShell only prints it.
 
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
@@ -185,6 +190,36 @@ const RUNS_IT: &[&str] = &[
     "$p = @{a = git reset --hard}; Get-ChildItem @p",
     "$h = @{a = $(git reset --hard)}",
     "$h = @{a = (git reset --hard)}",
+    // A value in expression mode that runs a command: script-block calls,
+    // pipelines, after any target and in hashtable entries.
+    "$c=@(1,2); $c[ 0 ] = {git reset --hard}.Invoke()",
+    "$c=@(1,2); $c[ 0 ]={git reset --hard}.Invoke()",
+    "$c=@(1,2); $c[ 0 ]={git reset --hard}.InvokeReturnAsIs()",
+    "$a, $b = {git reset --hard}.Invoke()",
+    "$c=@{}; $c.'p q' = {git reset --hard}.Invoke()",
+    "$c=1; (Get-Variable c).Value = {git reset --hard}.Invoke()",
+    "@{a = {git reset --hard}.Invoke()}",
+    "@{a={git reset --hard}.Invoke()}",
+    "$h = @{a = { git reset --hard }.Invoke()}",
+    "@{a = 'git reset --hard' | iex}",
+    "@{a='git reset --hard'|iex}",
+    "@{a = 1|%{git reset --hard}}",
+    "@{a=1|%{git reset --hard}}",
+    "$h = @{a = 1,2 | ForEach-Object { git reset --hard }}",
+    "$h = @{a = 'x' | % { git reset --hard }}",
+    "$c=@{}; (Get-Variable c).Value = git reset --hard",
+    "$c=@{}; (Get-Variable c).Value = icm {git reset --hard}",
+    "$h = @{a = 1 | ForEach-Object { Remove-Item -Recurse -Force C:\\Users }}",
+];
+
+/// pwsh 7.5 runs these too (a real directory is deleted). The Unknown
+/// dialect allows the bare .NET call on the base commit (card t_02cc8a24),
+/// so only the PowerShell dialect is held to them here.
+const RUNS_IT_IN_POWERSHELL: &[&str] = &[
+    "$c=[IO.Directory]::Delete('C:\\Users', $true)",
+    "$null=[System.IO.Directory]::Delete('C:\\Users',$true)",
+    "$c=@(1,2); $c[ 0 ]=[IO.Directory]::Delete('C:\\Users', $true)",
+    "@{a=[IO.Directory]::Delete('C:\\Users', $true)}",
 ];
 
 /// pwsh 7.5 runs no `git reset --hard` for any of these (sandboxed).
@@ -241,6 +276,17 @@ const HARMLESS: &[&str] = &[
     "$r = Invoke-Command -ScriptBlock { Get-Date }",
     "$c = Set-Alias x Write-Output; x 'git reset --hard'",
     "$x = 5; sal y iex; y 'git status'",
+    // Expression values that run nothing dangerous, and a Perl heredoc
+    // whose `$h={…}` is data.
+    "$y=$x*2",
+    "$v=[IO.Path]::Combine('a','b')",
+    "$c=@(1,2); $c[ 0 ] = [IO.Path]::Combine('a','b')",
+    "$c = {Get-Date}.Invoke()",
+    "$c=@(1,2); $c[ 0 ] = {Get-Date}.Invoke()",
+    "@{a = 1 | ForEach-Object { git status }}",
+    "@{a = 'git status' | Write-Output}",
+    "$files = Get-ChildItem; foreach($f in $files){ $size = $f.Length * 2 }",
+    "cat > t.pl <<'EOF'\nsub f {\n  my $x=shift;\n  my $h={\n    a=>$x,\n  };\n  return $h;\n}\nEOF",
 ];
 
 /// Data the Unknown dialect already denies on the base commit through its
@@ -255,6 +301,7 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // reason to skip assignments).
     "$text = @'\n[System.IO.Directory]::Delete($path, $true)\n'@; Write-Output $text",
     "$p = @{Path='.'; Recurse=$true}; Get-ChildItem @p",
+    "$a = $b = $x * 2",
 ];
 
 /// Text PowerShell cannot parse (it runs none of it) that the Unknown dialect
@@ -382,7 +429,7 @@ fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
 #[test]
 fn powershell_tool_judges_the_value_of_a_statement_leading_assignment() {
     for protocol in [Protocol::Claude, Protocol::Codex] {
-        for command in RUNS_IT {
+        for command in RUNS_IT.iter().chain(RUNS_IT_IN_POWERSHELL) {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "deny",
@@ -416,6 +463,13 @@ fn powershell_and_unknown_dialects_judge_the_value_of_a_statement_leading_assign
                 "{dialect:?}: {command:?}"
             );
         }
+    }
+    for command in RUNS_IT_IN_POWERSHELL {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Deny,
+            "{command:?}"
+        );
     }
     for command in HARMLESS_IN_POWERSHELL {
         assert_eq!(

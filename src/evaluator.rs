@@ -15887,11 +15887,12 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         };
         adopt_alternate_reading(&mut result, alternate, command);
     }
-    // Two deny-only PowerShell views; each keeps the original tokenizer's
+    // Deny-only PowerShell views; each keeps the original tokenizer's
     // decisions and grants intact. One reads comment and smart-quote syntax.
-    // The other ends each assignment's target at its operator (`$c=iex '…'`
-    // reads as `$c;iex '…'`), so every reader and pack judges the value as
-    // the command PowerShell runs.
+    // The others read what PowerShell runs as an assignment's value: a value
+    // in command mode starts its own statement in place (`$c=iex '…'` reads
+    // as `$c;iex '…'`), and any other value is read as its own command
+    // `$c = <value>` (`@{a = 1|%{…}}`).
     if matches!(
         shell_dialect,
         ShellDialect::PowerShell | ShellDialect::Unknown
@@ -15917,15 +15918,27 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 inherited_automated_stdin,
             )
         };
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum View {
+            Masked,
+            Separated,
+            Value,
+        }
         let masked = crate::normalize::mask_powershell_comments(command);
-        let separated = crate::normalize::separate_powershell_assignment_values(
-            masked.as_deref().unwrap_or(command),
-        );
+        let assignments =
+            crate::normalize::powershell_assignment_views(masked.as_deref().unwrap_or(command));
+        let views = masked
+            .map(|view| (view, View::Masked))
+            .into_iter()
+            .chain(assignments.separated.map(|view| (view, View::Separated)))
+            .chain(
+                assignments
+                    .values
+                    .into_iter()
+                    .map(|view| (view, View::Value)),
+            );
         let mut unseparated_reading = None;
-        for (view, separates) in [(masked, false), (separated, true)] {
-            let Some(view) = view else {
-                continue;
-            };
+        for (view, kind) in views {
             if result.decision != EvaluationDecision::Allow
                 || result.bypass_method == Some(BypassMethod::AllowOnce)
                 || explicitly_allowed_as_written(
@@ -15940,7 +15953,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             // The copy's incomplete analyses count only if its result is used.
             let mut alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
             let mut alternate = read(&view, ShellDialect::PowerShell);
-            if !separates {
+            if kind == View::Masked {
                 unseparated_reading = Some(alternate.decision);
             } else if shell_dialect == ShellDialect::Unknown
                 && alternate.decision == EvaluationDecision::Deny
@@ -15954,9 +15967,13 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 // PowerShell already rejects the text as written, which the
                 // Unknown dialect tolerates (a Node heredoc's `()=>{` is an
                 // unbalanced PowerShell block), so a PowerShell denial of the
-                // view is no news about the assignment. Judge the view as
-                // Unknown judges such text.
+                // view is no news about the assignment. Judge a separated
+                // view as Unknown judges such text; a copied value stays
+                // unread (POSIX reads `$c = $a * 2` as a command).
                 alternate_scope.discard();
+                if kind == View::Value {
+                    continue;
+                }
                 alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
                 alternate = read(&view, ShellDialect::Unknown);
             }
@@ -15977,14 +15994,16 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             drop(alternate_scope);
             result = alternate;
             if let Some(info) = result.pattern_info.as_mut() {
-                if view.len() == command.len()
+                // A value view's offsets are its own.
+                let same_offsets = kind != View::Value && view.len() == command.len();
+                if same_offsets
                     && let Some(span) = info.matched_span.as_ref()
                     && span.end <= command.len()
                     && command.is_char_boundary(span.start)
                     && command.is_char_boundary(span.end)
                 {
                     info.matched_text_preview = Some(extract_match_preview(command, span));
-                } else if view.len() != command.len() {
+                } else if !same_offsets {
                     // Smart-quote spelling changes byte offsets.
                     info.matched_span = None;
                     info.matched_text_preview = None;
