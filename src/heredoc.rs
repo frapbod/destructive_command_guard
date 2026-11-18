@@ -164,8 +164,10 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     r#"(?i)\b(?:powershell|pwsh)(?:\.exe)?["']?(?:\s+-\S+(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-e(?:n(?:c(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?\s+[A-Za-z0-9+/=]"#,
     // cmd.exe inline execution (`cmd /c "..."`, `cmd /k ...`, `cmd /s /c ...`,
     // `cmd.exe /c ...`). The /c (run-then-exit) and /k (run-then-stay) switches run an
-    // arbitrary inner command line that Tier 2 extracts and re-evaluates.
-    r"(?i)\bcmd(?:\.exe)?\b(?:\s+/[A-Za-z]+)*\s+/[ck]\b",
+    // arbitrary inner command line that Tier 2 extracts and re-evaluates. A
+    // possible closing quote of a quoted program name (`"cmd.exe" /c`) is
+    // allowed before the switches, as for PowerShell above.
+    r#"(?i)\bcmd(?:\.exe)?\b["']?(?:\s+/[A-Za-z]+)*\s+/[ck]\b"#,
     // PowerShell Invoke-Expression / its `iex` alias: executes a string as code. Tier 2
     // extracts the quoted argument and re-evaluates it.
     r"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b",
@@ -1764,9 +1766,11 @@ static INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::ne
 /// `bash -c`). Group 1 = double-quoted inner, group 2 = single-quoted inner,
 /// group 3 = unquoted rest-of-line. The inner command line is re-evaluated by the
 /// full pipeline, so `cmd /c "del /s /q C:\src"` is blocked like the bare `del`.
+/// A quoted program name (`"cmd.exe" /c …`, `& 'C:\…\cmd.exe' /c …`) ends in
+/// its closing quote, as in the inline shell patterns above.
 static CMD_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\bcmd(?:\.exe)?\b(?:\s+/[A-Za-z]+)*\s+/[ck]\s+(?:"([^"]*)"|'([^']*)'|([^\n]+))"#,
+        r#"(?i)\bcmd(?:\.exe)?\b['"]?(?:\s+/[A-Za-z]+)*\s+/[ck]\s+(?:"([^"]*)"|'([^']*)'|([^\n]+))"#,
     )
     .expect("cmd inline script regex compiles")
 });
@@ -1781,13 +1785,27 @@ static IEX_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Regex for `Start-Process [-FilePath] <file> -ArgumentList '<args>'` (or
 /// `saps`, `-Args`, `-FilePath:`/`-ArgumentList:` colon forms). Group 1 = the
-/// file, group 2/3 = the double/single-quoted argument string. A comma list
-/// or a variable is not reconstructed (no extraction, no change).
+/// file, group 2 = the argument list: one quoted string, or a comma list of
+/// quoted strings and bare words, optionally in `@( )`, which Start-Process
+/// joins with spaces (see [`START_PROCESS_ARGUMENT`]). A variable is not
+/// reconstructed (no extraction, no change).
+///
+/// The list is one grammar: a first element, then any number of
+/// `<blanks>,<blanks><element>`, so blanks before a comma do not end it. A
+/// lone bare word is not a list. Only the first element is a place where a
+/// new parameter (`-Wait`) can start, so only it may not begin with `-`;
+/// after a comma, `--hard` is an element PowerShell passes on.
 static START_PROCESS_INLINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:"([^"]*)"|'([^']*)')(?:\s|$|[;|&)])"#,
+        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:@\(\s*)?((?:"[^"]*"|'[^']*')(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`][^\s'",;|$()`]*))*|[^\s'",;|$()@{}`-][^\s'",;|$()`]*(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`][^\s'",;|$()`]*))+)\s*\)?(?:\s|$|[;|&)])"#,
     )
     .expect("start-process inline regex compiles")
+});
+
+/// One element of a [`START_PROCESS_INLINE`] argument list. Group 1/2 = the
+/// double/single-quoted text, group 3 = a bare word.
+static START_PROCESS_ARGUMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""([^"]*)"|'([^']*)'|([^\s'",]+)"#).expect("start-process argument regex compiles")
 });
 
 /// Regex for `powershell -EncodedCommand <base64>` (flag abbreviates to any prefix
@@ -3261,6 +3279,46 @@ fn push_windows_inner(
     true
 }
 
+/// A Start-Process target's program name: last path component, lower case,
+/// without `.exe`.
+fn start_process_target_name(file: &str) -> String {
+    let name = file
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(file)
+        .to_ascii_lowercase();
+    if let Some(stem) = name.strip_suffix(".exe") {
+        return stem.to_string();
+    }
+    name
+}
+
+/// Whether a Start-Process target is a shell that reads its joined argument
+/// list as one command line.
+fn start_process_target_is_shell(file: &str) -> bool {
+    matches!(
+        start_process_target_name(file).as_str(),
+        "cmd" | "powershell" | "pwsh" | "bash" | "sh" | "wsl"
+    )
+}
+
+/// The dialect that reads a line rebuilt from `Start-Process`.
+///
+/// The line is an [`ExtractedContent`] with target `start-process`, whose
+/// first word is the file. It is the target's own command line: cmd.exe
+/// reads it as cmd does (its operators, its CR removal, a
+/// `C:\…\cmd.exe` path kept as written), a PowerShell host as
+/// PowerShell, and anything else as POSIX, as before.
+#[must_use]
+pub fn start_process_line_dialect(line: &str) -> crate::normalize::ShellDialect {
+    let file = line.split_ascii_whitespace().next().unwrap_or("");
+    match start_process_target_name(file).as_str() {
+        "cmd" => crate::normalize::ShellDialect::Cmd,
+        "powershell" | "pwsh" => crate::normalize::ShellDialect::PowerShell,
+        _ => crate::normalize::ShellDialect::Posix,
+    }
+}
+
 /// Extract Windows-specific inline scripts that wrap an inner command line:
 /// `cmd /c "..."` / `cmd /k ...`, `iex` / `Invoke-Expression "..."`, and
 /// `powershell -EncodedCommand <base64>` (decoded from base64 UTF-16LE). The inner
@@ -3335,15 +3393,37 @@ fn extract_windows_inline_scripts(
     // <args>`, so `Start-Process cmd -ArgumentList '/c rd /s /q C:\src'` is the
     // same deletion as the denied `cmd /c rd /s /q C:\src`. The reconstructed
     // line is not a substring of the command, so there is no content_range.
-    for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2, 3]) {
+    // A comma list (`-ArgumentList '/c', 'rd /s /q C:\src'`) runs the same
+    // line: Start-Process joins its elements with spaces. Only a shell reads
+    // that line as a command; another program's list is its own argv, which
+    // this POSIX re-reading would misread (`C:\work\f` as host `C`), and
+    // which its pack reads (`powershell_start_process_scp`).
+    for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
-        let (Some(file), Some(args)) = (cap.get(1), cap.get(2).or_else(|| cap.get(3))) else {
+        let (Some(file), Some(args)) = (cap.get(1), cap.get(2)) else {
             continue;
         };
         let full = cap.get(0).expect("group 0 always present");
-        let line = format!("{} {}", text(file), text(args));
+        let elements: Vec<&str> = START_PROCESS_ARGUMENT
+            .captures_iter(text(args))
+            .filter_map(|element| {
+                element
+                    .get(1)
+                    .or_else(|| element.get(2))
+                    .or_else(|| element.get(3))
+                    .map(|value| value.as_str())
+            })
+            .collect();
+        if elements.len() > 1 && !start_process_target_is_shell(text(file)) {
+            continue;
+        }
+        let mut line = text(file).to_string();
+        for element in elements {
+            line.push(' ');
+            line.push_str(element);
+        }
         if !push_windows_inner(
             extracted,
             skip_reasons,
@@ -3381,6 +3461,28 @@ fn extract_windows_inline_scripts(
             return;
         }
     }
+}
+
+/// Where each `cmd /c` / `cmd /k` call that [`extract_windows_inline_scripts`]
+/// reads in `text` starts (the byte of its `cmd` word), in the same views.
+/// Calls may nest or follow one another on a line, so every start is found,
+/// not only the first of a line.
+pub(crate) fn cmd_inline_call_starts(text: &str) -> Vec<usize> {
+    let redirect_view = blank_local_redirects(text);
+    let mut starts = Vec::new();
+    for view in std::iter::once(text).chain(redirect_view.as_deref()) {
+        let mut from = 0;
+        while let Some(found) = CMD_INLINE_SCRIPT.find_at(view, from) {
+            starts.push(found.start());
+            from = found.start() + 1;
+            while !view.is_char_boundary(from) {
+                from += 1;
+            }
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    starts
 }
 
 /// `pattern`'s captures in each of `views` (the command, then its redirect

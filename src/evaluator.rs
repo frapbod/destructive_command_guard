@@ -4787,10 +4787,38 @@ fn cmd_payload_is_dynamic(command: &str) -> bool {
     false
 }
 
+/// How a launcher reading treats a payload that expands variables at run
+/// time (`%CD%`, `!x!`, `$env:X`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LauncherExpansions {
+    /// The payload's commands are not known before it runs: the launcher is
+    /// unverified (the top-level launcher readings fail closed on it).
+    Refuse,
+    /// Read the payload as written. Only for a deny-only extra reading,
+    /// whose allow decides nothing: the variable's value stays unknown, but
+    /// a command spelled out beside it (`git reset --hard & echo %CD%`) is
+    /// still judged.
+    AsWritten,
+}
+
 fn validate_launcher_payload(
     command: String,
     dialect: ShellDialect,
     max_payload_bytes: usize,
+) -> Result<String, String> {
+    validate_launcher_payload_with(
+        command,
+        dialect,
+        max_payload_bytes,
+        LauncherExpansions::Refuse,
+    )
+}
+
+fn validate_launcher_payload_with(
+    command: String,
+    dialect: ShellDialect,
+    max_payload_bytes: usize,
+    expansions: LauncherExpansions,
 ) -> Result<String, String> {
     let command = command.trim().to_string();
     if command.is_empty() {
@@ -4801,11 +4829,12 @@ fn validate_launcher_payload(
             "embedded launcher command exceeds the {max_payload_bytes}-byte analysis limit"
         ));
     }
-    let dynamic = match dialect {
-        ShellDialect::PowerShell => powershell_payload_is_dynamic(&command),
-        ShellDialect::Cmd => cmd_payload_is_dynamic(&command),
-        ShellDialect::Posix | ShellDialect::Unknown => false,
-    };
+    let dynamic = expansions == LauncherExpansions::Refuse
+        && match dialect {
+            ShellDialect::PowerShell => powershell_payload_is_dynamic(&command),
+            ShellDialect::Cmd => cmd_payload_is_dynamic(&command),
+            ShellDialect::Posix | ShellDialect::Unknown => false,
+        };
     if dynamic {
         // A payload that is exactly one variable read with property accesses
         // (`$PSVersionTable.PSVersion`, `$env:PATH`) invokes nothing: there
@@ -5074,6 +5103,7 @@ fn parse_cmd_launcher(
     words: &[&str],
     outer_dialect: ShellDialect,
     argv: NativeArgv,
+    expansions: LauncherExpansions,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let mut index = 1usize;
@@ -5087,7 +5117,12 @@ fn parse_cmd_launcher(
                     "cmd {option} has no statically inspectable payload"
                 ));
             };
-            return match validate_launcher_payload(command, ShellDialect::Cmd, max_payload_bytes) {
+            return match validate_launcher_payload_with(
+                command,
+                ShellDialect::Cmd,
+                max_payload_bytes,
+                expansions,
+            ) {
                 Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
                     command,
                     dialect: ShellDialect::Cmd,
@@ -5821,16 +5856,19 @@ fn parse_windows_launcher_segment(
         segment,
         outer_dialect,
         NativeArgv::Verbatim,
+        LauncherExpansions::Refuse,
         max_payload_bytes,
     )
 }
 
 /// One launcher segment under one reading of the arguments the launched
-/// program receives ([`NativeArgv`]).
+/// program receives ([`NativeArgv`]). `expansions` applies to a `cmd /c` /
+/// `cmd /k` payload.
 fn parse_windows_launcher_segment_as(
     segment: &str,
     outer_dialect: ShellDialect,
     argv: NativeArgv,
+    expansions: LauncherExpansions,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let segment = segment.trim();
@@ -5884,7 +5922,16 @@ fn parse_windows_launcher_segment_as(
         }
     }
     let segment = static_substitution.as_deref().unwrap_or(segment);
-    let tokens = tokenize_for_shell_dialect(segment, outer_dialect);
+    // A POSIX shell keeps a CR inside a word (it is not a metacharacter), so
+    // `cmd.exe /c gi<CR>t reset --hard` hands cmd the argument `gi<CR>t`,
+    // and cmd removes the CR. The shared tokenizer ends a word at a CR. Mark
+    // word boundaries on a spelling with each CR as another word byte (same
+    // length), and take the words from the segment itself, so the launcher
+    // payload keeps the CR its shell reading needs.
+    let cr_as_word_byte = (outer_dialect == ShellDialect::Posix && segment.contains('\r'))
+        .then(|| segment.replace('\r', "\u{1}"));
+    let tokens =
+        tokenize_for_shell_dialect(cr_as_word_byte.as_deref().unwrap_or(segment), outer_dialect);
     if tokens
         .iter()
         .any(|token| token.kind == NormalizeTokenKind::Separator)
@@ -5906,7 +5953,7 @@ fn parse_windows_launcher_segment_as(
         "powershell" | "pwsh" => {
             parse_powershell_launcher(&words, &executable, outer_dialect, argv, max_payload_bytes)
         }
-        "cmd" => parse_cmd_launcher(&words, outer_dialect, argv, max_payload_bytes),
+        "cmd" => parse_cmd_launcher(&words, outer_dialect, argv, expansions, max_payload_bytes),
         "call" if outer_dialect == ShellDialect::Cmd => {
             let Some(command) = decoded_launcher_tail(&words, 1, outer_dialect, argv) else {
                 return WindowsLauncherParse::Unverified(
@@ -5924,6 +5971,180 @@ fn parse_windows_launcher_segment_as(
         }
         _ => WindowsLauncherParse::NotLauncher,
     }
+}
+
+/// The command text one `cmd /c` / `cmd /k` call inside a larger command
+/// hands cmd.exe, under each reading of the outer shell.
+///
+/// `cmd_offset` is a byte of the call's `cmd` word (where the inline-script
+/// scanner found it). The call runs from the start of that word to where the
+/// outer shell ends the command (`;`, `&&`, `|`, `)` or a line break), and its
+/// words are resolved through that shell's quotes and escapes, as for a
+/// launcher that starts a segment. Text after that boundary belongs to the
+/// outer shell, not to cmd. The boundary view keeps a CR inside a word for
+/// POSIX (a CR is not a metacharacter there) and for Cmd (cmd removes it
+/// before it reads its text); PowerShell ends the line at it.
+///
+/// Every call the scanner finds gets a reading; none is dropped because the
+/// launcher reader cannot verify it:
+/// - The payload is read as written, cmd variables included (`git reset
+///   --hard & echo %CD%`): this reading only adds denials.
+/// - When the `cmd` program name ends a larger word, with or without quoting
+///   before it (`--exec=cmd.exe /c …`, `--exec="cmd.exe" /c …`,
+///   `"$WINDIR/System32/cmd.exe" /c …`), the call is that program and the
+///   words after its word.
+/// - When the `cmd` call is inside a larger word, that word is a quoted
+///   argument of another program (`tmux new-session -d 'cmd.exe /c …'`,
+///   `schtasks /tr "cmd /c …"`). The program gets the word's value, so the
+///   calls in that value are read the same way, under every dialect (which
+///   shell the program hands it to is not known).
+fn embedded_cmd_call_envelopes(
+    command: &str,
+    cmd_offset: usize,
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+) -> Vec<WindowsLauncherEnvelope> {
+    let mut envelopes = Vec::new();
+    let mut read_values = HashSet::new();
+    push_embedded_cmd_call_envelopes(
+        command,
+        cmd_offset,
+        outer_dialect,
+        max_payload_bytes,
+        &mut read_values,
+        &mut envelopes,
+    );
+    envelopes
+}
+
+fn push_embedded_cmd_call_envelopes(
+    command: &str,
+    cmd_offset: usize,
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+    read_values: &mut HashSet<String>,
+    envelopes: &mut Vec<WindowsLauncherEnvelope>,
+) {
+    let candidate_dialects: &[ShellDialect] = if outer_dialect == ShellDialect::Unknown {
+        &[
+            ShellDialect::Posix,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ]
+    } else {
+        std::slice::from_ref(&outer_dialect)
+    };
+    for &dialect in candidate_dialects {
+        let cr_as_word_byte = (dialect != ShellDialect::PowerShell && command.contains('\r'))
+            .then(|| command.replace('\r', "\u{1}"));
+        let tokens =
+            tokenize_for_shell_dialect(cr_as_word_byte.as_deref().unwrap_or(command), dialect);
+        let Some(word) = tokens.iter().position(|token| {
+            token.kind == NormalizeTokenKind::Word && token.byte_range.contains(&cmd_offset)
+        }) else {
+            continue;
+        };
+        let start = tokens[word].byte_range.start;
+        let end = tokens[word..]
+            .iter()
+            .find(|token| token.kind == NormalizeTokenKind::Separator)
+            .map_or(command.len(), |token| token.byte_range.start);
+        let (Some(call), Some(raw_word)) = (
+            command.get(start..end),
+            command.get(tokens[word].byte_range.clone()),
+        ) else {
+            continue;
+        };
+        let without_cr = |text: &'_ str| -> String {
+            if dialect == ShellDialect::Cmd {
+                text.replace('\r', "")
+            } else {
+                text.to_string()
+            }
+        };
+        let readings: &[NativeArgv] = if dialect == ShellDialect::Posix {
+            &[NativeArgv::Verbatim, NativeArgv::Msys]
+        } else {
+            &[NativeArgv::Verbatim]
+        };
+        let mut read_call = |call: &str| {
+            let mut launcher = false;
+            for &argv in readings {
+                if let WindowsLauncherParse::Envelope(envelope) = parse_windows_launcher_segment_as(
+                    &without_cr(call),
+                    dialect,
+                    argv,
+                    LauncherExpansions::AsWritten,
+                    max_payload_bytes,
+                ) {
+                    launcher = true;
+                    if !envelopes.contains(&envelope) {
+                        envelopes.push(envelope);
+                    }
+                }
+            }
+            launcher
+        };
+        if read_call(call) {
+            continue;
+        }
+        // The `cmd` program name may end a larger word (`--exec=cmd.exe /c …`,
+        // `--exec="cmd.exe" /c …`, `"$WINDIR/System32/cmd.exe" /c …`): the
+        // call is that program and the words after its word. What comes
+        // before it in the word does not matter.
+        if let Some(from_cmd) =
+            cmd_name_ending_word(command, cmd_offset, tokens[word].byte_range.end)
+                .zip(command.get(tokens[word].byte_range.end..end))
+                .map(|(name, args)| format!("{name}{args}"))
+        {
+            if read_call(&from_cmd) {
+                continue;
+            }
+        }
+        let raw_word = without_cr(raw_word);
+        let Some(value) = shell_word_value(&raw_word, dialect) else {
+            continue;
+        };
+        // A value no shorter than the word removed no quoting layer; each
+        // layer read makes the text shorter, so the reading ends.
+        if value.len() >= raw_word.len() || !read_values.insert(value.clone()) {
+            continue;
+        }
+        for inner_offset in crate::heredoc::cmd_inline_call_starts(&value) {
+            push_embedded_cmd_call_envelopes(
+                &value,
+                inner_offset,
+                ShellDialect::Unknown,
+                max_payload_bytes,
+                read_values,
+                envelopes,
+            );
+        }
+    }
+}
+
+/// The `cmd` / `cmd.exe` program name the inline-script scanner matched at
+/// `cmd_offset`, when the word holding it ends right after that name and any
+/// closing quotes (`word_end`).
+fn cmd_name_ending_word(command: &str, cmd_offset: usize, word_end: usize) -> Option<&str> {
+    let from_cmd = command.get(cmd_offset..word_end)?;
+    let name_len = if from_cmd
+        .get(..7)
+        .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"))
+    {
+        7
+    } else if from_cmd
+        .get(..3)
+        .is_some_and(|name| name.eq_ignore_ascii_case("cmd"))
+    {
+        3
+    } else {
+        return None;
+    };
+    from_cmd[name_len..]
+        .bytes()
+        .all(|byte| matches!(byte, b'\'' | b'"'))
+        .then(|| &from_cmd[..name_len])
 }
 
 fn windows_launcher_envelopes(
@@ -5991,8 +6212,13 @@ fn windows_launcher_envelopes(
             };
             let mut launcher_reading = false;
             for &argv in readings {
-                match parse_windows_launcher_segment_as(segment, candidate, argv, max_payload_bytes)
-                {
+                match parse_windows_launcher_segment_as(
+                    segment,
+                    candidate,
+                    argv,
+                    LauncherExpansions::Refuse,
+                    max_payload_bytes,
+                ) {
                     WindowsLauncherParse::NotLauncher => {}
                     WindowsLauncherParse::Envelope(envelope) => {
                         launcher_reading = true;
@@ -15352,6 +15578,56 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             }
         } else {
             alternate_scope.discard();
+        }
+    }
+    // cmd.exe removes every CR from its command-line text before it reads
+    // it: `cmd /c "gi<CR>t reset --hard"` runs `git reset --hard`. Read a
+    // command that may be Cmd (a Cmd command, a decoded cmd /c or /k
+    // payload, or an unknown shell) again without CR, as Cmd. A proven POSIX
+    // or PowerShell command is not rewritten: CR means something else there,
+    // and the cmd payloads nested in it come back here as Cmd. Deny wins,
+    // what the user authorized as written stays authorized, and the spelling
+    // may spend no allow-once grant, as for the PowerShell reading above.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(shell_dialect, ShellDialect::Cmd | ShellDialect::Unknown)
+        && command.contains('\r')
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let spelled = command.replace('\r', "");
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                &spelled,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                ShellDialect::Cmd,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            result = alternate;
+            // The spelling is shorter: its offsets are not the command's.
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.matched_span = None;
+                info.matched_text_preview = None;
+            }
         }
     }
     // A program name in another case runs the same program on a
@@ -38293,14 +38569,26 @@ fn evaluate_heredoc(
             } else {
                 Vec::new()
             };
+            // A line rebuilt from `Start-Process <file> -ArgumentList …` is
+            // the target's own command line, read in the target's dialect:
+            // cmd.exe's operators, CR removal and `C:\…\cmd.exe` path, not
+            // POSIX's. It is read whole; the POSIX split below would cut it
+            // at cmd's `&` and keep the CR in the second command.
+            let line_dialect = if content.target_command.as_deref() == Some("start-process") {
+                crate::heredoc::start_process_line_dialect(&content.content)
+            } else {
+                crate::normalize::ShellDialect::Posix
+            };
+            let whole_body = !per_command_pass || line_dialect != ShellDialect::Posix;
             let destination_source_context = per_command_pass
+                && line_dialect == ShellDialect::Posix
                 && crate::packs::core::credential_files::shell_destination_context_required(
                     &content.content,
                 )
                 && (literal_shell_source
                     || literal_bash_source_range_with_flags(command, &content, &["-lc", "-cl"])
                         .is_some());
-            let evaluate_source = |source: &str| {
+            let evaluate_source_as = |source: &str, dialect: ShellDialect| {
                 evaluate_command_with_pack_order_deadline_at_path_inner(
                     source,
                     context.enabled_keywords,
@@ -38312,13 +38600,14 @@ fn evaluate_heredoc(
                     context.allow_once_audit,
                     context.project_path,
                     context.deadline,
-                    crate::normalize::ShellDialect::Posix,
+                    dialect,
                     context.nested_command_depth + 1,
                     inline_automated_stdin,
                 )
             };
+            let evaluate_source = |source: &str| evaluate_source_as(source, line_dialect);
             let mut complete_source_result = None;
-            let mut inner_commands = if per_command_pass {
+            let mut inner_commands = if !whole_body {
                 crate::heredoc::extract_shell_commands(&content.content)
             } else {
                 // Without a keyword or trigger the per-command pass has
@@ -38361,10 +38650,50 @@ fn evaluate_heredoc(
                     },
                 );
             }
-            for (index, inner) in inner_commands.into_iter().enumerate() {
+            // A `cmd /c` / `cmd /k` call found inside another command
+            // (`(cmd.exe /c …)`, `xargs cmd.exe /c …`, `wsl cmd.exe /c …`)
+            // hands cmd.exe its own command text. The POSIX reading above
+            // ends a word at a CR, which cmd removes, so `gi<CR>t reset
+            // --hard` is never read as `git`. Read the text that call hands
+            // cmd once more in the call's own dialect, where the Cmd readings
+            // (CR removal, `&`, caret) apply; deny wins. The call ends where
+            // the outer shell ends it, not at the end of the line the scanner
+            // captured: `cmd /c ver; echo 'a & b'` hands cmd only `ver`.
+            let cmd_readings = if content.target_command.as_deref() == Some("cmd")
+                && line_dialect == ShellDialect::Posix
+            {
+                embedded_cmd_call_envelopes(
+                    command,
+                    content.byte_range.start,
+                    context.shell_dialect,
+                    context
+                        .heredoc_settings
+                        .limits
+                        .max_body_bytes
+                        .min(MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES),
+                )
+            } else {
+                Vec::new()
+            };
+            let readings = inner_commands
+                .into_iter()
+                .map(|inner| (line_dialect, inner))
+                .chain(cmd_readings.into_iter().map(|envelope| {
+                    (
+                        envelope.dialect,
+                        crate::heredoc::ExtractedShellCommand {
+                            text: envelope.command,
+                            start: 0,
+                            end: content.content.len(),
+                            line_number: 1,
+                        },
+                    )
+                }));
+            for (index, (reading_dialect, inner)) in readings.enumerate() {
                 if deadline_exceeded(context.deadline) {
                     return Some(EvaluationResult::indeterminate_due_to_budget());
                 }
+                let alternate_reading = reading_dialect != line_dialect;
 
                 // A leaf such as `echo > "/tmp/run-$i"` loses the `for`
                 // header or assignment that proves its target (#526).
@@ -38375,13 +38704,18 @@ fn evaluate_heredoc(
                 // whole-body command of a body without a per-command pass
                 // takes the same route, so a denial in it is mapped and
                 // line-numbered from its span.
-                let needs_source_context = !per_command_pass
-                    || (destination_source_context && index == 0)
-                    || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
-                        .is_some_and(|operator| {
-                            contextual_redirects.contains(&(inner.start + operator))
-                        });
-                let mut result = if needs_source_context {
+                // A cmd call's own text (below) is derived, not a span of
+                // the body: it is read alone and maps to no body offset.
+                let needs_source_context = !alternate_reading
+                    && (whole_body
+                        || (destination_source_context && index == 0)
+                        || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
+                            .is_some_and(|operator| {
+                                contextual_redirects.contains(&(inner.start + operator))
+                            }));
+                let mut result = if alternate_reading {
+                    evaluate_source_as(&inner.text, reading_dialect)
+                } else if needs_source_context {
                     complete_source_result
                         .get_or_insert_with(|| evaluate_source(&content.content))
                         .clone()
@@ -38426,6 +38760,10 @@ fn evaluate_heredoc(
                         // policy modes and allow-once --force depend on it.
                         if info.source != MatchSource::ConfigOverride {
                             info.source = MatchSource::HeredocAst;
+                        }
+                        if alternate_reading {
+                            info.matched_span = None;
+                            info.matched_text_preview = None;
                         }
                         if let Some(span) = info.matched_span {
                             if let Some(mapped_inner) =
@@ -50979,6 +51317,15 @@ mod tests {
             r#"Start-Process -FilePath pwsh -ArgumentList:'-c "Remove-Item -Recurse C:\src"' -Wait"#,
             r"Start-Process cmd -ArgumentList '/c rd /s /q C:\src'",
             r#"saps bash -Args "-c 'rm -rf /'""#,
+            // Start-Process joins a comma list with spaces.
+            r"Start-Process cmd -ArgumentList '/c', 'rd /s /q C:\src'",
+            r#"Start-Process -FilePath cmd.exe -ArgumentList @("/c", "rd /s /q C:\src") -Wait"#,
+            r"Start-Process cmd -ArgumentList /c, 'rd /s /q C:\src'",
+            // Blanks before a comma do not end the list.
+            r"Start-Process cmd -ArgumentList '/c dir' , '&rd /s /q C:\src'",
+            // The line is cmd's: its `&`, and a full path to cmd.exe.
+            r"Start-Process cmd -ArgumentList '/c dir&rd /s /q C:\src'",
+            r"Start-Process C:\Windows\System32\cmd.exe -ArgumentList '/c rd /s /q C:\src'",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -50990,6 +51337,10 @@ mod tests {
         for command in [
             "Start-Process notepad -ArgumentList 'README.md'",
             "Start-Process cmd -ArgumentList '/c dir C:\\src'",
+            "Start-Process cmd -ArgumentList '/c', 'dir C:\\src'",
+            "Start-Process cmd -ArgumentList '/c' , 'dir'",
+            "Start-Process cmd -ArgumentList @('/c' , 'echo SAFE')",
+            "Start-Process C:\\Windows\\System32\\cmd.exe -ArgumentList '/c dir'",
             "Start-Process https://example.com",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
@@ -57730,6 +58081,101 @@ mod tests {
             assert!(evaluate(cr).is_denied(), "{dialect:?}: single use");
         }
         println!("{CHILD_COMPLETION}");
+    }
+
+    #[test]
+    fn cmd_cr_reading_does_not_spend_another_requests_grant() {
+        use crate::pending_exceptions::{
+            AllowOnceEntry, AllowOnceScopeKind, ENV_ALLOW_ONCE_PATH, PendingExceptionRecord,
+        };
+        const CHILD: &str = "DCG_TEST_CMD_CR_ALLOW_ONCE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "evaluator::tests::cmd_cr_reading_does_not_spend_another_requests_grant",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(ENV_ALLOW_ONCE_PATH, dir.path().join("allow_once.jsonl"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("cmd-cr-grant-child-complete")
+            );
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_text = cwd.to_string_lossy();
+        let store = AllowOnceStore::new(PathBuf::from(
+            std::env::var_os(ENV_ALLOW_ONCE_PATH).unwrap(),
+        ));
+        let redaction = crate::logging::RedactionConfig::default();
+        for dialect in [ShellDialect::Cmd, ShellDialect::Unknown] {
+            let now = Utc::now();
+            let granted = "git reset --hard";
+            let pending = PendingExceptionRecord::new(
+                now, &cwd_text, granted, "test", &redaction, true, None,
+            );
+            let entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                &cwd_text,
+                true,
+                false,
+                &redaction,
+            );
+            store.add_entry(&entry, now).unwrap();
+            let evaluate =
+                |command| evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+            let result = evaluate("gi\rt reset --hard");
+            assert!(result.is_denied(), "{dialect:?}: {result:?}");
+            assert_eq!(store.preview_active(Utc::now()).unwrap().0.len(), 1);
+            let result = evaluate(granted);
+            assert_eq!(
+                result.bypass_method,
+                Some(BypassMethod::AllowOnce),
+                "{dialect:?}: {result:?}"
+            );
+            assert!(store.preview_active(Utc::now()).unwrap().0.is_empty());
+
+            let now = Utc::now();
+            let pending = PendingExceptionRecord::new(
+                now,
+                &cwd_text,
+                "gi\rt reset --hard",
+                "test",
+                &redaction,
+                true,
+                None,
+            );
+            let entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                &cwd_text,
+                true,
+                false,
+                &redaction,
+            );
+            store.add_entry(&entry, now).unwrap();
+            let result = evaluate("gi\rt reset --hard");
+            assert_eq!(
+                result.bypass_method,
+                Some(BypassMethod::AllowOnce),
+                "{dialect:?}: {result:?}"
+            );
+            assert!(store.preview_active(Utc::now()).unwrap().0.is_empty());
+        }
+        println!("cmd-cr-grant-child-complete");
     }
 
     #[test]
