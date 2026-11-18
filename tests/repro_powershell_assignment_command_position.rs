@@ -7,7 +7,7 @@
 //! its command (aliases, functions, script-block consumers, `iex`) skipped
 //! even the spaced `$c = icm {…}`.
 //!
-//! The deny-only PowerShell view now puts blanks around every glued
+//! A deny-only PowerShell view now puts blanks around every glued
 //! assignment operator after a target, wherever the word stands, so a glued
 //! spelling gets the verdict of its spaced twin. The readers judge the
 //! position, as they already did for the spaced spelling. That includes the
@@ -175,6 +175,12 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$msg='git reset --hard is dangerous'; Write-Output $msg",
 ];
 
+/// Text PowerShell cannot parse (it runs none of it) that the Unknown dialect
+/// allows on the base commit. The blanks must not turn PowerShell's parse
+/// failure into an Unknown denial: the first row is a Node heredoc from real
+/// Codex history, reduced (`()=>{…` in JavaScript).
+const HARMLESS_IN_UNKNOWN: &[&str] = &["node <<'JS'\n)={\nJS", "x)={"];
+
 fn dcg_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
@@ -332,6 +338,13 @@ fn powershell_and_unknown_dialects_judge_the_value_of_a_statement_leading_assign
     for command in HARMLESS_IN_POWERSHELL {
         assert_eq!(
             decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Allow,
+            "{command:?}"
+        );
+    }
+    for command in HARMLESS_IN_UNKNOWN {
+        assert_eq!(
+            decision_in(command, ShellDialect::Unknown),
             EvaluationDecision::Allow,
             "{command:?}"
         );

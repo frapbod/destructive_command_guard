@@ -3308,18 +3308,6 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
     tokenize_powershell_with_comments(command, false).0
 }
 
-/// Read PowerShell comments, smart quotes and glued assignments in a
-/// separate deny-only view, or `None` when the command has none of them.
-/// Masked comments preserve line ends; block-comment line ends are spaces.
-/// Smart quotes use their ASCII spelling so the existing readers see them.
-/// A statement-leading assignment gets blanks around its operator
-/// ([`space_powershell_assignments`]).
-pub(crate) fn powershell_deny_only_view(command: &str) -> Option<String> {
-    let masked = mask_powershell_comments(command);
-    let text = masked.as_deref().unwrap_or(command);
-    space_powershell_assignments(text).or(masked)
-}
-
 /// `command` with a blank on each side of every assignment operator that is
 /// glued to an assignment target or to the value after it, or `None` when
 /// there is none.
@@ -3652,7 +3640,10 @@ fn powershell_quoted_end(bytes: &[u8], i: usize, end: usize) -> usize {
     end
 }
 
-fn mask_powershell_comments(command: &str) -> Option<String> {
+/// Read PowerShell comments and smart quotes in a separate deny-only view.
+/// Masked comments preserve line ends; block-comment line ends are spaces.
+/// Smart quotes use their ASCII spelling so the existing readers see them.
+pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
     let has_smart_quotes = command
         .chars()
         .any(|c| matches!(c, '\u{2018}'..='\u{201e}'));
@@ -6662,19 +6653,6 @@ mod tests {
         ] {
             assert_eq!(spaced(unchanged), None, "{unchanged:?}");
         }
-    }
-
-    #[test]
-    fn powershell_deny_only_view_spaces_assignments_after_masking_comments() {
-        assert_eq!(
-            powershell_deny_only_view("<#x#>$c=iex 'git reset --hard'").as_deref(),
-            Some("     $c = iex 'git reset --hard'")
-        );
-        assert_eq!(
-            powershell_deny_only_view("$c=iex 'x' # note").as_deref(),
-            Some("$c = iex 'x'       ")
-        );
-        assert_eq!(powershell_deny_only_view("$c = iex 'x'"), None);
     }
 
     #[test]
