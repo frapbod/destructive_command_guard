@@ -324,6 +324,81 @@ fn powershell_comments_do_not_hide_following_commands() {
     }
 }
 
+/// A `#` or `<#` glued to the token before it starts a comment in expression
+/// mode (`$c#x`, `$c=1#x`) and after a member access or a leading string in
+/// argument mode (`echo $c.p#x`, `echo 'a'#x`), but stays text in other
+/// argument words (`echo a#x`, `echo $c#x`). Every row was measured with
+/// sandboxed pwsh 7.5: each dangerous row ran `git reset --hard`, no harmless
+/// row did.
+#[test]
+fn powershell_glued_comments_follow_the_parse_mode() {
+    let dangerous = [
+        "$c#'\ngit reset --hard\n#'",
+        "${c}#'\ngit reset --hard\n#'",
+        "$c=1#'\ngit reset --hard\n#'",
+        "$c=$d#'\ngit reset --hard\n#'",
+        "$c = $d#'\ngit reset --hard\n#'",
+        "$c=@{}; $c.p#'\ngit reset --hard\n#'",
+        "$c='a'#'\ngit reset --hard\n#'",
+        "$c=[int]::MaxValue#'\ngit reset --hard\n#'",
+        "$c = $d -eq $e#'\ngit reset --hard\n#'",
+        "$h=@{a=1#'\n}; git reset --hard\n#'",
+        "$c<#x#> = iex 'git reset --hard'",
+        "if(1){$c<#x#> = iex 'git reset --hard'}",
+        "$c=@{p='V'}; Write-Output $c.p#'\ngit reset --hard\n#'",
+        "$c=@{p='V'}; Write-Output $c.p<#'#>; git reset --hard",
+        "Write-Output ($c).p#'\ngit reset --hard\n#'",
+        "Write-Output a,$c.p#'\ngit reset --hard\n#'",
+        "Write-Output 'a'#'\ngit reset --hard\n#'",
+    ];
+    let harmless = [
+        "Write-Output $c#'\ngit reset --hard\n#'",
+        "Write-Output a#'\ngit reset --hard\n'",
+        "Write-Output a<#'\ngit reset --hard\n#>'",
+        "Write-Output $global:c#'\ngit reset --hard\n#'",
+        "Write-Output x$c.p#'\ngit reset --hard\n'",
+        "Write-Output -x:$c#'\ngit reset --hard\n'",
+        "Write-Output a,$c#'\ngit reset --hard\n'",
+        "git commit -m fix#1",
+        "$c=1#note",
+        "$c=@{p='V'}; $c.p#x",
+        "$c<#x#> = git status",
+        "[int]$c<#x#> = 1; git status",
+    ];
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        for command in dangerous {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for command in harmless {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in dangerous {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+        for command in harmless {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn powershell_comment_codex_bash_label() {
