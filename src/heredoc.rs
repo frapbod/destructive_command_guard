@@ -3463,11 +3463,6 @@ fn extract_windows_inline_scripts(
     }
 }
 
-/// `pattern`'s captures in each of `views` (the command, then its redirect
-/// view), dropping a capture whose payload (the first of `payload_groups`
-/// that matched) was already captured at the same range: the views are the
-/// same length, so that is the same payload read twice. Lazy, so a caller
-/// that stops at the extraction limit stops the scan too.
 /// Where each `cmd /c` / `cmd /k` call that [`extract_windows_inline_scripts`]
 /// reads in `text` starts (the byte of its `cmd` word), in the same views.
 /// Calls may nest or follow one another on a line, so every start is found,
@@ -3490,6 +3485,11 @@ pub(crate) fn cmd_inline_call_starts(text: &str) -> Vec<usize> {
     starts
 }
 
+/// `pattern`'s captures in each of `views` (the command, then its redirect
+/// view), dropping a capture whose payload (the first of `payload_groups`
+/// that matched) was already captured at the same range: the views are the
+/// same length, so that is the same payload read twice. Lazy, so a caller
+/// that stops at the extraction limit stops the scan too.
 fn windows_view_captures<'a>(
     pattern: &'a Regex,
     views: &'a [&'a str],
