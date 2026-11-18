@@ -453,6 +453,8 @@ const HARMLESS: &[&str] = &[
     "[System.Management.Automation.Runspaces.Command]$c = New-Object System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
     "$c ??= New-Object System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
     "$c = $d = New-Object System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c, $d = New-Object System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c=New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
     "$r=$ExecutionContext.InvokeCommand | % InvokeScript 'git status'",
     "& { $ExecutionContext.InvokeCommand | % InvokeScript 'git status' }",
     "Get-ChildItem | ForEach-Object { $_ | % Name }",
