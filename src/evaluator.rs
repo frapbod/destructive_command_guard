@@ -4314,6 +4314,50 @@ fn decoded_launcher_tail(
     (!decoded.is_empty()).then(|| decoded.join(" "))
 }
 
+/// The cmd variable that stands for a value a POSIX shell substitutes while
+/// it builds a cmd.exe payload ([`decoded_cmd_launcher_tail`]).
+const POSIX_VALUE_AS_CMD_VARIABLE: &str = "%DCG_POSIX_VALUE%";
+
+/// The payload words of a `cmd /c` / `cmd /k` launcher, as cmd.exe receives
+/// them ([`decoded_launcher_tail`]).
+///
+/// A POSIX shell (WSL, Git Bash) substitutes every `$x`, `${x}`, `$(…)` and
+/// backquote outside single quotes before cmd.exe starts, so
+/// `cmd.exe /c "gi${X}t reset --hard"` hands cmd `git reset --hard` when `X`
+/// is empty (measured with bash 5). Read as written, cmd's reading kept
+/// `${X}` as literal text. The value is not known here: each one becomes a
+/// cmd variable, cmd's own spelling of unknown text, so cmd's rules for
+/// `%VAR%` decide (a top-level launcher fails closed, as for
+/// `cmd /c "echo %USERNAME%"`; a deny-only reading judges the text around
+/// it). `Unknown` includes the POSIX reading.
+fn decoded_cmd_launcher_tail(
+    words: &[&str],
+    start: usize,
+    outer_dialect: ShellDialect,
+    argv: NativeArgv,
+) -> Option<String> {
+    if !matches!(outer_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return decoded_launcher_tail(words, start, outer_dialect, argv);
+    }
+    let rendered: Vec<Cow<'_, str>> = words
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            (index >= start)
+                .then(|| {
+                    crate::normalize::posix_word_with_values_replaced(
+                        raw,
+                        POSIX_VALUE_AS_CMD_VARIABLE,
+                    )
+                })
+                .flatten()
+                .map_or(Cow::Borrowed(*raw), Cow::Owned)
+        })
+        .collect();
+    let rendered: Vec<&str> = rendered.iter().map(AsRef::as_ref).collect();
+    decoded_launcher_tail(&rendered, start, outer_dialect, argv)
+}
+
 /// `CharExtensions.IsDash` / `SpecialCharacters.IsDash` in PowerShell's
 /// console host: hyphen-minus, en dash, em dash and horizontal bar.
 fn is_powershell_dash(c: char) -> bool {
@@ -5112,7 +5156,8 @@ fn parse_cmd_launcher(
             return WindowsLauncherParse::NotLauncher;
         };
         if matches!(option.as_str(), "/c" | "/k") {
-            let Some(command) = decoded_launcher_tail(words, index + 1, outer_dialect, argv) else {
+            let Some(command) = decoded_cmd_launcher_tail(words, index + 1, outer_dialect, argv)
+            else {
                 return WindowsLauncherParse::Unverified(format!(
                     "cmd {option} has no statically inspectable payload"
                 ));
@@ -38647,25 +38692,59 @@ fn evaluate_heredoc(
             } else {
                 Vec::new()
             };
+            // A value the parent shell substituted into this source is
+            // spelled `${DCG_POSIX_VALUE}`, inside the child's single quotes
+            // `'"${DCG_POSIX_VALUE}"'`
+            // (`heredoc::posix_shell_source_with_outer_values`). The
+            // evaluator reads an unknown variable in a quoted command name
+            // (`"${…}" reset --hard`) only in the command as sent
+            // (`posix_proven_variable_view`), so read this source's view
+            // here, and the source with every such value empty
+            // (`$'gi'"${…}"$'t'` is `git` then). Both are deny-only readings,
+            // only for a source that holds such a value.
+            let has_outer_value = line_dialect == ShellDialect::Posix
+                && content.content.contains(crate::heredoc::POSIX_OUTER_VALUE);
+            let unknown_name_view = if has_outer_value {
+                match posix_proven_variable_view(&content.content, context.deadline, true) {
+                    Ok(view) => view,
+                    Err(ProvenViewIncomplete::Budget) => {
+                        return Some(EvaluationResult::indeterminate_due_to_budget());
+                    }
+                }
+            } else {
+                None
+            };
+            let empty_outer_values = has_outer_value.then(|| {
+                content
+                    .content
+                    .replace(crate::heredoc::POSIX_OUTER_VALUE, "")
+            });
+            let whole_reading = |dialect: ShellDialect, text: String| {
+                (
+                    dialect,
+                    crate::heredoc::ExtractedShellCommand {
+                        text,
+                        start: 0,
+                        end: content.content.len(),
+                        line_number: 1,
+                    },
+                    true,
+                )
+            };
             let readings = inner_commands
                 .into_iter()
-                .map(|inner| (line_dialect, inner))
-                .chain(cmd_readings.into_iter().map(|envelope| {
-                    (
-                        envelope.dialect,
-                        crate::heredoc::ExtractedShellCommand {
-                            text: envelope.command,
-                            start: 0,
-                            end: content.content.len(),
-                            line_number: 1,
-                        },
-                    )
-                }));
-            for (index, (reading_dialect, inner)) in readings.enumerate() {
+                .map(|inner| (line_dialect, inner, false))
+                .chain(
+                    cmd_readings
+                        .into_iter()
+                        .map(|envelope| whole_reading(envelope.dialect, envelope.command)),
+                )
+                .chain(unknown_name_view.map(|view| whole_reading(ShellDialect::Posix, view)))
+                .chain(empty_outer_values.map(|text| whole_reading(ShellDialect::Posix, text)));
+            for (index, (reading_dialect, inner, alternate_reading)) in readings.enumerate() {
                 if deadline_exceeded(context.deadline) {
                     return Some(EvaluationResult::indeterminate_due_to_budget());
                 }
-                let alternate_reading = reading_dialect != line_dialect;
 
                 // A leaf such as `echo > "/tmp/run-$i"` loses the `for`
                 // header or assignment that proves its target (#526).
