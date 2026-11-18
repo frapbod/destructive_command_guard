@@ -139,6 +139,14 @@ fn checkout_paths_after_options_are_denied() {
             "git checkout other --pathspec-from-file=list",
             "git checkout --pathspec-from-file=list other",
             "git checkout -q other --pathspec-from-file list",
+            // `-m` is `--merge` here, not a commit message flag.
+            "git checkout -m -- f",
+            "git checkout -m other f",
+            "git checkout -qm other f",
+            "git checkout -q -m other f",
+            "git checkout other -m f",
+            "git restore -m f",
+            "git restore -ms other f",
             // Already denied; kept as controls.
             "git checkout other -- f",
             "git checkout -- f",
@@ -165,6 +173,10 @@ fn branch_switches_and_creation_stay_allowed() {
             "git checkout --conflict merge main",
             "git checkout main 2>/dev/null",
             "git checkout -",
+            "git checkout -m main",
+            "git switch -m main",
+            "git commit -m \"fix checkout other f\"",
+            "git commit -m \"git checkout other -- f\"",
         ],
     );
 }

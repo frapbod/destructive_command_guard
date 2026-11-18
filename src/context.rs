@@ -1742,7 +1742,8 @@ fn token_mask_ranges(
         };
 
         let mut is_git_subcommand_token = false;
-        if cmd == "git" && git_subcommand.is_none() {
+        let cmd_is_git = cmd.rsplit('/').next().unwrap_or(cmd) == "git";
+        if cmd_is_git && git_subcommand.is_none() {
             if git_waiting_for_value {
                 git_waiting_for_value = false;
             } else if token_text == "--" {
@@ -1853,6 +1854,14 @@ fn token_mask_ranges(
             (token_text, token.byte_range.start)
         };
 
+        // `git checkout`, `git switch` and `git restore` read `-m` as
+        // `--merge`, a flag without a value, so the next word is a ref, a
+        // path or `--`, never a commit message (and `--message` is not one of
+        // their options). Masking it hid `git checkout -m <ref> <path>`.
+        let git_m_is_merge =
+            cmd_is_git && matches!(git_subcommand, Some("checkout" | "switch" | "restore"));
+        let is_git_message_flag = |flag: &str| git_m_is_merge && matches!(flag, "-m" | "--message");
+
         if let Some(pending) = pending_safe_flag {
             let is_flag_token = flag_text.starts_with('-') && flag_text != "-";
             if pending.multi_value {
@@ -1884,6 +1893,7 @@ fn token_mask_ranges(
         // Handle --flag=value (and similar) forms.
         if let Some((flag, value_range)) = split_flag_assignment(flag_text, flag_start) {
             if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag)
+                && !is_git_message_flag(flag)
                 && !token.has_inline_code
                 && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
             {
@@ -1906,6 +1916,7 @@ fn token_mask_ranges(
             split_short_flag_attached_value(cmd, flag_text, flag_start)
         {
             if !token.has_inline_code
+                && !is_git_message_flag(flag)
                 && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
             {
                 mask_ranges.push(value_range);
@@ -1917,14 +1928,16 @@ fn token_mask_ranges(
         }
 
         // Handle separate flag + value forms.
-        if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag_text) {
+        if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag_text) && !is_git_message_flag(flag_text) {
             pending_safe_flag = Some(PendingSafeFlag {
                 flag: flag_text,
                 multi_value: SAFE_STRING_REGISTRY.is_flag_data_multivalue(cmd, flag_text),
             });
             continue;
         }
-        if let Some(data_flag) = combined_short_data_flag_value(cmd, flag_text) {
+        if let Some(data_flag) = combined_short_data_flag_value(cmd, flag_text)
+            && !is_git_message_flag(data_flag)
+        {
             pending_safe_flag = Some(PendingSafeFlag {
                 flag: data_flag,
                 multi_value: SAFE_STRING_REGISTRY.is_flag_data_multivalue(cmd, data_flag),
@@ -6107,6 +6120,42 @@ mod tests {
         let sanitized = sanitize_for_pattern_matching(command);
         assert!(!sanitized.contains("git reset --hard"));
         assert!(sanitized.ends_with(" '--priority' 2"));
+    }
+
+    #[test]
+    fn sanitize_leaves_operands_after_merge_flag_visible_in_checkout_switch_restore() {
+        // `-m` is `--merge` (no value) in these subcommands, so the next word
+        // is a ref, a path or `--`. Git 2.39.5 restored `f` from `other` for
+        // each checkout and restore spelling below.
+        for command in [
+            "git checkout -m -- f",
+            "git checkout -m other f",
+            "git checkout -qm other f",
+            "git checkout -q -m other f",
+            "git checkout other -m f",
+            "git checkout -mq other f",
+            "/usr/bin/git checkout -m other f",
+            "git -C repo checkout -m other f",
+            "git restore -m f",
+            "git restore -ms other f",
+            "git switch -m other",
+        ] {
+            assert_eq!(sanitize_for_pattern_matching(command), command);
+        }
+        // Every other subcommand keeps `-m` as message data.
+        for command in [
+            "git commit -m 'fix checkout other f'",
+            "git commit -am 'git checkout other -- f'",
+            "git tag -a v1 -m 'git checkout other -- f'",
+            "git merge -m 'git checkout other -- f' topic",
+            "git stash push -m 'git checkout other -- f'",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert!(
+                !sanitized.contains("other -- f") && !sanitized.contains("other f"),
+                "{command}: {sanitized}"
+            );
+        }
     }
 
     #[test]
