@@ -6714,7 +6714,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // it instead.
         destructive_pattern!(
             "show-redirect-overwrite-source",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+(?:[^\s;&|<>()]+\s+)*?[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
             "git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'.",
             High,
             "Redirecting `git show <ref>:<path>` back onto `<path>` replaces the working-tree \
@@ -9054,6 +9054,13 @@ git x",
             "git show origin/main:README.md >| README.md",
             "git show HEAD:a.txt > ./a.txt",
             "git show HEAD:a.txt > a.txt && cargo build",
+            // Options before `<ref>:<path>`. Git 2.39.5 wrote the other
+            // version over the edit for `--quiet` and `-m`.
+            "git show --quiet other:f > f",
+            "git show -m other:f > f",
+            "git show -q --no-patch other:f > f",
+            "git show --format=%s other:f > f",
+            "git --git-dir=.git show -m other:f > f",
         ] {
             assert_blocks_with_pattern(&pack, cmd, "show-redirect-overwrite-source");
             assert_blocks_with_severity(&pack, cmd, Severity::High);
@@ -9068,6 +9075,10 @@ git x",
             "git show HEAD:a.txt > b.txt",
             "git show HEAD:a.txt | less",
             "git show HEAD:a.txt | grep TODO",
+            "git show other:f > g",
+            "git show -m HEAD",
+            "git show -m other:f > g",
+            "git show --quiet other:f | less",
         ] {
             assert!(
                 pack.check(cmd)

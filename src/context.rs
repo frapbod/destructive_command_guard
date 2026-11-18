@@ -1741,16 +1741,31 @@ fn token_mask_ranges(
             continue;
         };
 
+        // Quoting a complete flag token does not change its argv spelling.
+        // Semantic command views can quote the whole `--message=value` word,
+        // including its flag. Unwrap one literal fragment for flag and git
+        // subcommand recognition (`git '--git-dir=.git' checkout`)
+        // while retaining the original value offsets. Leave concatenated or
+        // escaped quote fragments unrecognized rather than guessing their argv.
+        let unquoted_flag = strip_matching_quotes(token_text);
+        let (flag_text, flag_start) = if unquoted_flag.len() < token_text.len()
+            && !unquoted_flag.contains(char::from(token_text.as_bytes()[0]))
+        {
+            (unquoted_flag, token.byte_range.start + 1)
+        } else {
+            (token_text, token.byte_range.start)
+        };
+
         let mut is_git_subcommand_token = false;
         let cmd_is_git = cmd.rsplit('/').next().unwrap_or(cmd) == "git";
         if cmd_is_git && git_subcommand.is_none() {
             if git_waiting_for_value {
                 git_waiting_for_value = false;
-            } else if token_text == "--" {
+            } else if flag_text == "--" {
                 git_options_ended = true;
-            } else if !git_options_ended && token_text.starts_with('-') && token_text != "-" {
+            } else if !git_options_ended && flag_text.starts_with('-') && flag_text != "-" {
                 let takes_value = matches!(
-                    token_text,
+                    flag_text,
                     "-C" | "-c"
                         | "--git-dir"
                         | "--work-tree"
@@ -1758,20 +1773,20 @@ fn token_mask_ranges(
                         | "--exec-path"
                         | "--pager"
                         | "--config-env"
-                ) || token_text.starts_with("-C")
-                    || token_text.starts_with("-c")
-                    || token_text.starts_with("--git-dir=")
-                    || token_text.starts_with("--work-tree=")
-                    || token_text.starts_with("--namespace=")
-                    || token_text.starts_with("--exec-path=")
-                    || token_text.starts_with("--pager=")
-                    || token_text.starts_with("--config-env=");
-                if takes_value && !token_text.contains('=') {
+                ) || flag_text.starts_with("-C")
+                    || flag_text.starts_with("-c")
+                    || flag_text.starts_with("--git-dir=")
+                    || flag_text.starts_with("--work-tree=")
+                    || flag_text.starts_with("--namespace=")
+                    || flag_text.starts_with("--exec-path=")
+                    || flag_text.starts_with("--pager=")
+                    || flag_text.starts_with("--config-env=");
+                if takes_value && !flag_text.contains('=') {
                     git_waiting_for_value = true;
                 }
             } else {
-                git_subcommand = Some(token_text);
-                if token_text == "grep" {
+                git_subcommand = Some(flag_text);
+                if flag_text == "grep" {
                     search_cmd_override = Some("grep");
                     is_git_subcommand_token = true;
                 }
@@ -1840,26 +1855,14 @@ fn token_mask_ranges(
             continue;
         }
 
-        // Quoting a complete flag token does not change its argv spelling.
-        // Semantic command views can quote the whole `--message=value` word,
-        // including its flag. Unwrap one literal fragment for flag recognition
-        // while retaining the original value offsets. Leave concatenated or
-        // escaped quote fragments unrecognized rather than guessing their argv.
-        let unquoted_flag = strip_matching_quotes(token_text);
-        let (flag_text, flag_start) = if unquoted_flag.len() < token_text.len()
-            && !unquoted_flag.contains(char::from(token_text.as_bytes()[0]))
-        {
-            (unquoted_flag, token.byte_range.start + 1)
-        } else {
-            (token_text, token.byte_range.start)
-        };
-
         // `git checkout`, `git switch` and `git restore` read `-m` as
-        // `--merge`, a flag without a value, so the next word is a ref, a
-        // path or `--`, never a commit message (and `--message` is not one of
-        // their options). Masking it hid `git checkout -m <ref> <path>`.
+        // `--merge`, and `git show` reads it as "diff merges"; both are flags
+        // without a value, so the next word is a ref, a path or `--`, never a
+        // commit message (and `--message` is not one of their options).
+        // Masking it hid `git checkout -m <ref> <path>` and
+        // `git show -m <ref>:<path> > <path>`.
         let git_m_is_merge =
-            cmd_is_git && matches!(git_subcommand, Some("checkout" | "switch" | "restore"));
+            cmd_is_git && matches!(git_subcommand, Some("checkout" | "switch" | "restore" | "show"));
         let is_git_message_flag = |flag: &str| git_m_is_merge && matches!(flag, "-m" | "--message");
 
         if let Some(pending) = pending_safe_flag {
@@ -6136,6 +6139,16 @@ mod tests {
             "git checkout -mq other f",
             "/usr/bin/git checkout -m other f",
             "git -C repo checkout -m other f",
+            // Global options written as `--name=value`, or quoted, are not
+            // the subcommand (semantic views quote whole `--x=value` words).
+            "git --git-dir=.git checkout -m other f",
+            "git '--git-dir=.git' checkout -m other f",
+            "git \"--git-dir=.git\" checkout -m other f",
+            "git --work-tree=. checkout -qm other f",
+            "git --bogus=x checkout -m -- f",
+            "git -C . '--git-dir=.git' checkout other -m f",
+            "git 'checkout' -m other f",
+            "git show -m other:f > f",
             "git restore -m f",
             "git restore -ms other f",
             "git switch -m other",
@@ -6149,6 +6162,8 @@ mod tests {
             "git tag -a v1 -m 'git checkout other -- f'",
             "git merge -m 'git checkout other -- f' topic",
             "git stash push -m 'git checkout other -- f'",
+            "git --git-dir=.git commit -m 'git checkout other -- f'",
+            "git '--git-dir=.git' commit -m 'git checkout other -- f'",
         ] {
             let sanitized = sanitize_for_pattern_matching(command);
             assert!(

@@ -147,6 +147,21 @@ fn checkout_paths_after_options_are_denied() {
             "git checkout other -m f",
             "git restore -m f",
             "git restore -ms other f",
+            // Global options written as `--name=value` or quoted.
+            "git --git-dir=.git checkout -m other f",
+            "git --work-tree=. checkout -m other f",
+            "git --git-dir=.git checkout -qm other f",
+            "git --git-dir=.git checkout -m -- f",
+            "git --git-dir=.git checkout other -m f",
+            "git --namespace=x checkout -m other f",
+            "git --exec-path=/x checkout -m other f",
+            "git --config-env=a=B checkout -m other f",
+            "git --bogus=x checkout -m other f",
+            "git -C . --git-dir=.git checkout -m other f",
+            "git \"--git-dir=.git\" checkout -m other f",
+            // `git show <ref>:<path>` redirected onto `<path>`, options first.
+            "git show --quiet other:f > f",
+            "git show -m other:f > f",
             // Already denied; kept as controls.
             "git checkout other -- f",
             "git checkout -- f",
@@ -177,6 +192,10 @@ fn branch_switches_and_creation_stay_allowed() {
             "git switch -m main",
             "git commit -m \"fix checkout other f\"",
             "git commit -m \"git checkout other -- f\"",
+            "git --git-dir=.git checkout -m main",
+            "git --git-dir=.git commit -m \"git checkout other -- f\"",
+            "git show other:f > g",
+            "git show -m HEAD",
         ],
     );
 }
