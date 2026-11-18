@@ -12405,11 +12405,12 @@ fn powershell_method_arguments(command: &str) -> PowerShellMethodArguments {
         Brace,
     }
     fn in_arguments(frames: &[Frame]) -> bool {
-        frames
-            .iter()
-            .rev()
-            .find(|frame| !matches!(frame, Frame::Paren | Frame::Subexpression(_) | Frame::Bracket))
-            == Some(&Frame::Method)
+        frames.iter().rev().find(|frame| {
+            !matches!(
+                frame,
+                Frame::Paren | Frame::Subexpression(_) | Frame::Bracket
+            )
+        }) == Some(&Frame::Method)
     }
 
     let bytes = command.as_bytes();
@@ -12511,7 +12512,10 @@ fn powershell_method_arguments(command: &str) -> PowerShellMethodArguments {
                 // Close the innermost frame of the matching kind, and any
                 // unclosed frames inside it.
                 if let Some(position) = frames.iter().rposition(|frame| match closer {
-                    b')' => matches!(frame, Frame::Method | Frame::Paren | Frame::Subexpression(_)),
+                    b')' => matches!(
+                        frame,
+                        Frame::Method | Frame::Paren | Frame::Subexpression(_)
+                    ),
                     b']' => *frame == Frame::Bracket,
                     _ => *frame == Frame::Brace,
                 }) {
@@ -12551,25 +12555,26 @@ fn powershell_member_name_ends_at(
     }
     let bytes = command.as_bytes();
     let before = &command[..open];
-    let name_start = if let Some(start) =
-        ending_at(strings, open).or_else(|| ending_at(subexpressions, open))
-    {
-        start
-    } else {
-        let start = before
-            .trim_end_matches(|character: char| character.is_alphanumeric() || character == '_')
-            .len();
-        if start == open {
-            return false;
-        }
-        // `.$m(`: the name is a variable.
-        powershell_variable_prefix_start(before, start).unwrap_or(start)
-    };
+    let name_start =
+        if let Some(start) = ending_at(strings, open).or_else(|| ending_at(subexpressions, open)) {
+            start
+        } else {
+            let start = before
+                .trim_end_matches(|character: char| character.is_alphanumeric() || character == '_')
+                .len();
+            if start == open {
+                return false;
+            }
+            // `.$m(`: the name is a variable.
+            powershell_variable_prefix_start(before, start).unwrap_or(start)
+        };
 
     // Blank space, comments and line continuations between `.` and the name.
     let mut end = name_start;
     loop {
-        let trimmed = command[..end].trim_end_matches([' ', '\t', '\r', '\n']).len();
+        let trimmed = command[..end]
+            .trim_end_matches([' ', '\t', '\r', '\n'])
+            .len();
         if trimmed < end {
             end = trimmed;
             continue;
@@ -12601,7 +12606,9 @@ fn powershell_member_name_ends_at(
 /// (`$m` or `$scope:m`), when there is one.
 fn powershell_variable_prefix_start(before: &str, name_start: usize) -> Option<usize> {
     let dollar = before[..name_start]
-        .trim_end_matches(|character: char| character.is_alphanumeric() || matches!(character, '_' | ':'))
+        .trim_end_matches(|character: char| {
+            character.is_alphanumeric() || matches!(character, '_' | ':')
+        })
         .len()
         .checked_sub(1)?;
     (before.as_bytes()[dollar] == b'$').then_some(dollar)
