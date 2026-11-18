@@ -22684,7 +22684,14 @@ fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource>
             "heredoc producer is not a plain cat stdin copy; file operands, transforms or redirections may change its output".to_string(),
         ));
     }
-    if !content.quoted && contains_dynamic_shell_output(&content.content) {
+    // The parent shell expands the body before `cat` copies it, and the
+    // body's quotes are data to it: `'gi${x}t' reset --hard` reaches the
+    // consumer as `'git' reset --hard` when `x` is empty (measured with Linux
+    // bash). `contains_dynamic_shell_output` reads those quotes as quotes.
+    if !content.quoted
+        && (contains_dynamic_shell_output(&content.content)
+            || crate::heredoc::heredoc_body_expands(&content.content))
+    {
         return Some(IndirectInputSource::Unverified(
             "unquoted heredoc input contains shell expansion or globbing".to_string(),
         ));
@@ -38376,7 +38383,36 @@ fn evaluate_heredoc(
                 shell_view.language = crate::heredoc::ScriptLanguage::Bash;
                 shell_view
             });
-        shell_view.into_iter().chain(std::iter::once(content))
+        // A POSIX shell reads an unquoted-delimiter heredoc body after its
+        // parent shell expanded it: `bash <<EOF` + `'gi${x}t' reset --hard`
+        // hands bash `'git' reset --hard` when `x` is empty (measured with
+        // Linux bash), so read that source too, each value spelled where the
+        // child reads it (`heredoc::posix_shell_source_from_heredoc_body`).
+        // It is added beside the body, not put in its place: the body's
+        // range carries other proofs. Here-strings are read this way at
+        // extraction, like `-c` words.
+        let expanded_view = (matches!(
+            content.heredoc_type,
+            Some(
+                crate::heredoc::HeredocType::Standard
+                    | crate::heredoc::HeredocType::TabStripped
+                    | crate::heredoc::HeredocType::IndentStripped
+            )
+        ) && !content.quoted
+            && crate::heredoc::stdin_feeds_posix_shell(content.target_command.as_deref()))
+        .then(|| crate::heredoc::posix_shell_source_from_heredoc_body(&content.content))
+        .flatten()
+        .map(|source| {
+            let mut view = content.clone();
+            view.content = source;
+            view.content_range = None;
+            view.language = crate::heredoc::ScriptLanguage::Bash;
+            view
+        });
+        shell_view
+            .into_iter()
+            .chain(std::iter::once(content))
+            .chain(expanded_view)
     });
     let mut ast_left_body_unanalysed = false;
     for mut content in content_views {

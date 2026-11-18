@@ -230,6 +230,66 @@ fn text_the_parent_does_not_expand_stays_as_written() {
     assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
 }
 
+/// The parent shell expands a here-string operand and an unquoted-delimiter
+/// heredoc body before the shell on its stdin reads them, and the body's
+/// quotes are data to the parent. Measured with Linux bash (fake `git`):
+/// `/bin/bash <<< "'gi${x}t' reset --hard"`, and `/bin/bash <<EOF`, `<<-EOF`
+/// with `'gi${x}t' reset --hard` as the body, run `git reset --hard`.
+#[test]
+fn outer_values_in_shell_stdin_are_unknown_child_text() {
+    let body = "'gi${x}t' reset --hard";
+    let heredocs = [
+        "bash <<EOF",
+        "sh <<EOF",
+        "bash -s <<EOF",
+        "/bin/bash <<EOF",
+        "ssh host <<EOF",
+        "ssh host bash <<EOF",
+        "cat <<EOF | bash",
+        "cat <<EOF | sh -s",
+    ]
+    .map(|head| format!("{head}\n{body}\nEOF"));
+    let mut commands: Vec<String> = vec![
+        r#"bash <<< "'gi${x}t' reset --hard""#.into(),
+        r#"sh <<< "'gi${x}t' reset --hard""#.into(),
+        r#"bash <<< "'g${x}' reset --hard""#.into(),
+        r#"bash <<< "'gi$(true)t' reset --hard""#.into(),
+        r#"ssh host <<< "'gi${x}t' reset --hard""#.into(),
+        r#"ssh host bash <<< "'gi${x}t' reset --hard""#.into(),
+        "bash <<-EOF\n\t'gi${x}t' reset --hard\n\tEOF".into(),
+        "bash <<EOF\n'g${x}' reset --hard\nEOF".into(),
+        "bash <<EOF\n'gi`true`t' reset --hard\nEOF".into(),
+        "bash <<EOF\necho ok\n\"gi${x}t\" reset --hard\nEOF".into(),
+    ];
+    commands.extend(heredocs);
+    let commands: Vec<&str> = commands.iter().map(String::as_str).collect();
+    let misses = misses(&commands, &POSIX, EvaluationDecision::Deny);
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
+/// A quoted heredoc delimiter keeps the body as written, and a value the
+/// parent substitutes as data stays data, as in a `-c` word.
+#[test]
+fn shell_stdin_the_parent_does_not_expand_stays_as_written() {
+    let misses = misses(
+        &[
+            "bash <<'EOF'\n'gi${x}t' reset --hard\nEOF",
+            "bash <<\"EOF\"\n'gi${x}t' reset --hard\nEOF",
+            "bash <<\\EOF\n'gi${x}t' reset --hard\nEOF",
+            "bash <<EOF\n'gi\\${x}t' reset --hard\nEOF",
+            "bash <<EOF\necho '$HOME'\nEOF",
+            "bash <<EOF\ncd $HOME && ls\nEOF",
+            "ssh host bash <<EOF\ncd $DIR && git pull\nEOF",
+            r#"bash <<< "echo '$HOME'""#,
+            r#"bash <<< "git status $x""#,
+            r"bash <<< 'echo ${x}'",
+        ],
+        &POSIX,
+        EvaluationDecision::Allow,
+    );
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
 /// A value the parent shell substitutes into a cmd payload is unknown cmd
 /// text: a top-level `cmd /c` fails closed on it, as on `%X%`.
 #[test]

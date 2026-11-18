@@ -2580,6 +2580,60 @@ fn is_posix_shell_interpreter(name: &str) -> bool {
             .is_some_and(|version| version.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// Whether the program that receives a heredoc or here-string reads it as
+/// POSIX shell source: a POSIX shell (`bash`, `bash -s`), or `ssh`, whose
+/// remote shell does (`ssh host`, `ssh host bash`).
+pub(crate) fn stdin_feeds_posix_shell(target: Option<&str>) -> bool {
+    target.is_some_and(|name| {
+        is_posix_shell_interpreter(name) || name.strip_suffix(".exe").unwrap_or(name) == "ssh"
+    })
+}
+
+/// An unquoted-delimiter heredoc body spelled as one double-quoted POSIX
+/// word with the same expansions. In such a body the parent shell expands
+/// `$x`, `${x}`, `$(…)` and backquotes, and a backslash escapes only `$`,
+/// `` ` ``, `\` and a newline, as inside double quotes; unlike there, `"` is
+/// literal, so it and a backslash before it are escaped here.
+fn heredoc_body_as_double_quoted_word(body: &str) -> String {
+    let mut word = String::with_capacity(body.len() + 8);
+    word.push('"');
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('"') => word.push_str(r#"\\\""#),
+                Some(next) => {
+                    word.push('\\');
+                    word.push(next);
+                }
+                None => word.push_str(r"\\"),
+            },
+            '"' => word.push_str(r#"\""#),
+            _ => word.push(ch),
+        }
+    }
+    word.push('"');
+    word
+}
+
+/// Whether the parent shell substitutes any value into an unquoted-delimiter
+/// heredoc body. Its quotes are data to the parent, so `'$x'` in the body
+/// still expands. `true` when the body cannot be read.
+pub(crate) fn heredoc_body_expands(body: &str) -> bool {
+    crate::normalize::posix_word_value_ranges(&heredoc_body_as_double_quoted_word(body))
+        .is_none_or(|values| !values.is_empty())
+}
+
+/// The source a POSIX shell reads from an unquoted-delimiter heredoc body
+/// after its parent shell expanded the body
+/// ([`posix_shell_source_with_outer_values`]):
+/// `bash <<EOF` + `'gi${x}t' reset --hard` hands bash `'git' reset --hard`
+/// when `x` is empty (measured with Linux bash). `None` when the body holds
+/// no value or cannot be read.
+pub(crate) fn posix_shell_source_from_heredoc_body(body: &str) -> Option<String> {
+    posix_shell_source_with_outer_values([heredoc_body_as_double_quoted_word(body).as_str()])
+}
+
 /// Recover the original word around an existing payload locator's inner span.
 /// The locators retain their option/consumer grammar; quote removal happens
 /// once, here, rather than independently in every interpreter extractor.
@@ -8017,11 +8071,20 @@ fn extract_herestrings(
                 });
                 continue;
             }
-            let content_range = (command.get(raw_content_range.clone()) == Some(content.as_str()))
-                .then_some(raw_content_range);
-
             // Extract the command that receives the here-string
             let target_cmd = extract_heredoc_target_command(command, full_match.start());
+            // A shell reads the operand after the parent shell expanded it,
+            // as it reads a `-c` word ([`with_posix_outer_values`]):
+            // `bash <<< "'gi${x}t' reset --hard"` hands bash
+            // `'git' reset --hard` when `x` is empty (measured with Linux
+            // bash).
+            let content = if stdin_feeds_posix_shell(target_cmd.as_deref()) {
+                posix_shell_source_with_outer_values([raw]).unwrap_or(content)
+            } else {
+                content
+            };
+            let content_range = (command.get(raw_content_range.clone()) == Some(content.as_str()))
+                .then_some(raw_content_range);
             let language = target_cmd
                 .as_deref()
                 .map_or(ScriptLanguage::Unknown, ScriptLanguage::from_command);
@@ -17305,6 +17368,31 @@ mod tests {
                 None,
                 "{word:?}"
             );
+        }
+        // An unquoted-delimiter heredoc body: its quotes are data to the
+        // parent, and only `\$`, `` \` ``, `\\` and backslash-newline escape.
+        for (body, want) in [
+            (
+                "'gi${x}t' reset --hard",
+                Some(r#"'gi'"${DCG_POSIX_VALUE}"'t' reset --hard"#),
+            ),
+            (
+                "echo \"a\" \\\"$x\\\"\nls",
+                Some(
+                    r#"echo "a" \"${DCG_POSIX_VALUE}\"
+ls"#,
+                ),
+            ),
+            ("a \\\nb $x", Some("a b ${DCG_POSIX_VALUE}")),
+            ("'gi\\${x}t' reset", None),
+            ("echo '$ x' \\n", None),
+        ] {
+            assert_eq!(
+                posix_shell_source_from_heredoc_body(body).as_deref(),
+                want,
+                "{body:?}"
+            );
+            assert_eq!(heredoc_body_expands(body), want.is_some(), "{body:?}");
         }
     }
 
