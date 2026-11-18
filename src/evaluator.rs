@@ -3881,6 +3881,29 @@ fn visible_powershell_scriptblock_assignment(
         return None;
     }
     let rhs = rhs.trim_start();
+    // A script block literal, bare, cast or in parentheses: `$b = { … }`,
+    // `$b = [scriptblock]{ … }`, `$b = ({ … })`. Its body is the source.
+    let mut literal = rhs.trim_end();
+    loop {
+        if let Some((type_start, type_end)) = find_powershell_scriptblock_type_literal(literal, 0)
+            && type_start == 0
+        {
+            literal = literal[type_end..].trim_start();
+        } else if literal.starts_with('(')
+            && find_powershell_subexpression_close(literal, 1) == Ok(literal.len() - 1)
+        {
+            literal = literal[1..literal.len() - 1].trim();
+        } else {
+            break;
+        }
+    }
+    if is_static_powershell_script_block_expression(literal) {
+        let body = &literal[1..literal.len() - 1];
+        return Some((
+            name,
+            VisiblePowerShellScriptBlockSource::Static(body.to_string()),
+        ));
+    }
     let Some((marker_start, marker_end)) = find_powershell_scriptblock_create(rhs, 0) else {
         return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
     };
@@ -4088,36 +4111,56 @@ fn evaluate_visible_powershell_scriptblock_invocations(
     deadline: Option<&Deadline>,
     inherited_automated_stdin: bool,
 ) -> Option<EvaluationResult> {
-    find_powershell_scriptblock_create(command, 0)?;
+    // `[scriptblock]::Create(…)` assignments make every visible variable a
+    // possible ScriptBlock, so an invoked variable whose value dcg cannot
+    // read is denied. Without one, only script block literals (`$b = { … }`)
+    // are followed; other variables are ordinary values.
+    let creates_scriptblocks = find_powershell_scriptblock_create(command, 0).is_some();
+    if !creates_scriptblocks && find_powershell_code_marker(command, "{", 0).is_none() {
+        return None;
+    }
     let statements = match split_top_level_powershell_statements(command) {
         Ok(statements) => statements,
-        Err(()) => {
+        Err(()) if creates_scriptblocks => {
             return Some(EvaluationResult::denied_by_legacy(
                 "A visible PowerShell ScriptBlock flow has syntax that dcg cannot safely segment",
             ));
         }
+        // The executable-block pass reads unsegmentable literal blocks.
+        Err(()) => return None,
     };
     let mut scriptblocks = HashMap::<String, VisiblePowerShellScriptBlockSource>::new();
     if statements.len() >= 2 {
         for statement in statements {
-            if let Some((name, source)) = visible_powershell_scriptblock_assignment(statement) {
-                if scriptblocks.len() >= MAX_POWERSHELL_VISIBLE_ALIASES
-                    && !scriptblocks.contains_key(&name)
-                {
-                    return Some(EvaluationResult::denied_by_legacy(
-                        "PowerShell script creates too many visible ScriptBlock variables for bounded analysis",
-                    ));
+            // A call can sit on an assignment's right-hand side
+            // (`$r = $b.Invoke()`), so read the calls before the assignment
+            // rebinds its variable.
+            let mut invoked = Vec::<(String, bool)>::new();
+            if !scriptblocks.is_empty() {
+                invoked.extend(
+                    visible_powershell_scriptblock_invocations(statement)
+                        .into_iter()
+                        .map(|name| (name, false)),
+                );
+                // A ScriptBlock passed to a method can be run by it
+                // (`.ForEach($b)`, `.Where($b)`, `[regex]::Replace(…, $b)`).
+                for name in powershell_method_arguments(statement).variables {
+                    if scriptblocks.contains_key(&name)
+                        && !invoked.iter().any(|(invoked, _)| *invoked == name)
+                    {
+                        invoked.push((name, true));
+                    }
                 }
-                scriptblocks.insert(name, source);
-                continue;
             }
-
-            for name in visible_powershell_scriptblock_invocations(statement) {
+            for (name, method_argument) in invoked {
                 let Some(source) = scriptblocks.get(&name) else {
                     continue;
                 };
                 let source = match source {
                     VisiblePowerShellScriptBlockSource::Static(source) => source,
+                    // Any value can be a method argument; only a ScriptBlock
+                    // that dcg can read is judged there.
+                    VisiblePowerShellScriptBlockSource::Dynamic if method_argument => continue,
                     VisiblePowerShellScriptBlockSource::Dynamic => {
                         return Some(EvaluationResult::denied_by_legacy(
                             "An invoked PowerShell ScriptBlock receives source that dcg cannot statically verify",
@@ -4160,6 +4203,23 @@ fn evaluate_visible_powershell_scriptblock_invocations(
                     }
                     return Some(result);
                 }
+            }
+
+            if let Some((name, source)) = visible_powershell_scriptblock_assignment(statement) {
+                if !creates_scriptblocks
+                    && matches!(source, VisiblePowerShellScriptBlockSource::Dynamic)
+                {
+                    scriptblocks.remove(&name);
+                    continue;
+                }
+                if scriptblocks.len() >= MAX_POWERSHELL_VISIBLE_ALIASES
+                    && !scriptblocks.contains_key(&name)
+                {
+                    return Some(EvaluationResult::denied_by_legacy(
+                        "PowerShell script creates too many visible ScriptBlock variables for bounded analysis",
+                    ));
+                }
+                scriptblocks.insert(name, source);
             }
         }
     }
@@ -12252,6 +12312,8 @@ fn powershell_block_bodies(command: &str, with_function_bodies: bool) -> Result<
         Ok(())
     }
     let mut bodies = Vec::new();
+    // Read once, on the first block the prefix does not show running.
+    let mut method_blocks: Option<Vec<usize>> = None;
     let mut search_start = 0usize;
     while search_start < command.len() {
         let Some(open) = find_powershell_code_marker(command, "{", search_start) else {
@@ -12263,6 +12325,10 @@ fn powershell_block_bodies(command: &str, with_function_bodies: bool) -> Result<
         let prefix = &command[..open];
         let keyword = powershell_block_statement_keyword(prefix);
         if powershell_prefix_opens_executable_block(prefix)
+            || method_blocks
+                .get_or_insert_with(|| powershell_method_arguments(command).blocks)
+                .binary_search(&open)
+                .is_ok()
             || (with_function_bodies
                 && keyword
                     .as_deref()
@@ -12302,6 +12368,243 @@ fn powershell_prefix_dot_sources_block(local: &str) -> bool {
     local.strip_suffix('.').is_some_and(|before| {
         before.is_empty() || before.ends_with(|c: char| c.is_ascii_whitespace() || c == '(')
     })
+}
+
+/// What a method call receives in `command`: script blocks and variables
+/// written in its argument list.
+///
+/// A method can run a ScriptBlock it receives: the intrinsic `.ForEach(…)`
+/// and `.Where(…)` run it once per element, and a .NET method that takes a
+/// delegate (`[regex]::Replace(…, { … })`, `List.Sort({ … })`) runs the
+/// block it converts. dcg cannot tell which method a call reaches (the member
+/// name can be quoted or a variable, and the object's type is unknown), so
+/// every method argument is read as one that may run.
+#[derive(Debug, Default)]
+struct PowerShellMethodArguments {
+    /// Offsets of the `{` of each script block passed to a method, in order.
+    /// Both `.M({ … })` and the bare form `.M{ … }` count.
+    blocks: Vec<usize>,
+    /// Lowercase names of variables written inside a method's argument list,
+    /// once per occurrence.
+    variables: Vec<String>,
+}
+
+/// One forward pass over `command` with PowerShell's grouping: strings,
+/// here-strings and comments are skipped as `find_powershell_code_marker`
+/// skips them, so block offsets agree with that function. An argument stays
+/// a method argument inside `( )`, `$( )`, `@( )` and `[ ]` (the value they
+/// produce is still passed), but not inside a nested script block or `@{ }`
+/// hashtable, which hold their own code or data.
+fn powershell_method_arguments(command: &str) -> PowerShellMethodArguments {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Frame {
+        Method,
+        Paren,
+        Subexpression(usize),
+        Bracket,
+        Brace,
+    }
+    fn in_arguments(frames: &[Frame]) -> bool {
+        frames
+            .iter()
+            .rev()
+            .find(|frame| !matches!(frame, Frame::Paren | Frame::Subexpression(_) | Frame::Bracket))
+            == Some(&Frame::Method)
+    }
+
+    let bytes = command.as_bytes();
+    let mut found = PowerShellMethodArguments::default();
+    let mut frames = Vec::<Frame>::new();
+    // Spans a member name may end with or be separated from its `.` by.
+    let mut strings = Vec::<Range<usize>>::new();
+    let mut comments = Vec::<Range<usize>>::new();
+    let mut subexpressions = Vec::<Range<usize>>::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let start = index;
+        match bytes[index] {
+            b'`' => index = escape_sequence_end(command, index),
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(command, index);
+                comments.push(start..index);
+            }
+            b'\'' => {
+                index = skip_powershell_single_quote(command, index);
+                strings.push(start..index);
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'`' {
+                        index = escape_sequence_end(command, index);
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+                strings.push(start..index);
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                index =
+                    powershell_here_string_end(command, index).map_or(index + 1, |(_, _, end)| end);
+            }
+            b'$' | b'@' if bytes.get(index + 1) == Some(&b'(') => {
+                frames.push(Frame::Subexpression(index));
+                index += 2;
+            }
+            b'@' if bytes.get(index + 1) == Some(&b'{') => {
+                frames.push(Frame::Brace);
+                index += 2;
+            }
+            b'$' => match powershell_variable_prefix(&command[index..]) {
+                Some((name, end)) => {
+                    if in_arguments(&frames) {
+                        found.variables.push(name);
+                    }
+                    index += end;
+                }
+                None => index += 1,
+            },
+            b'(' => {
+                frames.push(
+                    if powershell_member_name_ends_at(
+                        command,
+                        index,
+                        &strings,
+                        &comments,
+                        &subexpressions,
+                    ) {
+                        Frame::Method
+                    } else {
+                        Frame::Paren
+                    },
+                );
+                index += 1;
+            }
+            b'{' => {
+                if in_arguments(&frames)
+                    || powershell_member_name_ends_at(
+                        command,
+                        index,
+                        &strings,
+                        &comments,
+                        &subexpressions,
+                    )
+                {
+                    found.blocks.push(index);
+                }
+                frames.push(Frame::Brace);
+                index += 1;
+            }
+            b'[' => {
+                frames.push(Frame::Bracket);
+                index += 1;
+            }
+            closer @ (b')' | b']' | b'}') => {
+                // Close the innermost frame of the matching kind, and any
+                // unclosed frames inside it.
+                if let Some(position) = frames.iter().rposition(|frame| match closer {
+                    b')' => matches!(frame, Frame::Method | Frame::Paren | Frame::Subexpression(_)),
+                    b']' => *frame == Frame::Bracket,
+                    _ => *frame == Frame::Brace,
+                }) {
+                    if let Frame::Subexpression(open) = frames[position] {
+                        subexpressions.push(open..index + 1);
+                    }
+                    frames.truncate(position);
+                }
+                index += 1;
+            }
+            _ => index += command[index..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    found
+}
+
+/// Whether the text right before `open` (a `(` or `{`) is a member name
+/// after a member operator, making `open` the start of a method call's
+/// arguments: `$x.ForEach(`, `[regex]::Replace(`, `$x?.Where{`, and the
+/// spellings PowerShell also accepts: a quoted (`.'ForEach'(`), variable
+/// (`.$m(`) or subexpression (`.$('ForEach')(`) name, and blank space,
+/// comments or a line continuation between the `.` and the name. A space
+/// before `(` or `{` is a parse error there, so none is allowed. The spans
+/// are those `powershell_method_arguments` has passed, sorted.
+fn powershell_member_name_ends_at(
+    command: &str,
+    open: usize,
+    strings: &[Range<usize>],
+    comments: &[Range<usize>],
+    subexpressions: &[Range<usize>],
+) -> bool {
+    fn ending_at(spans: &[Range<usize>], end: usize) -> Option<usize> {
+        spans
+            .binary_search_by_key(&end, |span| span.end)
+            .ok()
+            .map(|found| spans[found].start)
+    }
+    let bytes = command.as_bytes();
+    let before = &command[..open];
+    let name_start = if let Some(start) =
+        ending_at(strings, open).or_else(|| ending_at(subexpressions, open))
+    {
+        start
+    } else {
+        let start = before
+            .trim_end_matches(|character: char| character.is_alphanumeric() || character == '_')
+            .len();
+        if start == open {
+            return false;
+        }
+        // `.$m(`: the name is a variable.
+        powershell_variable_prefix_start(before, start).unwrap_or(start)
+    };
+
+    // Blank space, comments and line continuations between `.` and the name.
+    let mut end = name_start;
+    loop {
+        let trimmed = command[..end].trim_end_matches([' ', '\t', '\r', '\n']).len();
+        if trimmed < end {
+            end = trimmed;
+            continue;
+        }
+        if let Some(start) = ending_at(comments, end) {
+            end = start;
+            continue;
+        }
+        if end > 0 && bytes[end - 1] == b'`' {
+            end -= 1;
+            continue;
+        }
+        break;
+    }
+    if end < 2 {
+        return false;
+    }
+    match bytes[end - 1] {
+        // `::` of a static member, after the type literal.
+        b':' => bytes[end - 2] == b':',
+        // The object is written right before the `.`: a dot after blank space
+        // is the dot-source operator.
+        b'.' => !bytes[end - 2].is_ascii_whitespace(),
+        _ => false,
+    }
+}
+
+/// The start of the variable whose unbraced name begins at `name_start`
+/// (`$m` or `$scope:m`), when there is one.
+fn powershell_variable_prefix_start(before: &str, name_start: usize) -> Option<usize> {
+    let dollar = before[..name_start]
+        .trim_end_matches(|character: char| character.is_alphanumeric() || matches!(character, '_' | ':'))
+        .len()
+        .checked_sub(1)?;
+    (before.as_bytes()[dollar] == b'$').then_some(dollar)
 }
 
 fn powershell_prefix_ends_with_execution_operator(prefix: &str) -> bool {
