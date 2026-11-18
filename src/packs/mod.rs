@@ -725,6 +725,9 @@ impl Pack {
                 )
                 .map(|command| command.safe)
             }
+            // A safe pattern's flag evidence must be what Git's parse-options
+            // reads (`-SW` is `-S -W`, `--wor` is `--worktree`).
+            "core.git" => crate::packs::core::git::safe_premise_refuted(cmd).then_some(false),
             "system.permissions" => {
                 crate::packs::system::permissions::posix_chmod_is_safe(cmd).then_some(true)
             }

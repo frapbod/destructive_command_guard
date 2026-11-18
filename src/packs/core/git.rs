@@ -265,6 +265,17 @@ const BRANCH_LONG_OPTIONS: &[BranchLongOptionSpec] = &[
 ];
 
 fn resolve_branch_long_option(token: &str) -> Option<ResolvedBranchLongOption> {
+    resolve_long_option(token, BRANCH_LONG_OPTIONS)
+}
+
+/// Resolve `--name[=value]` against one builtin's long options the way Git's
+/// parse-options does: an exact name (or `no-` plus an exact negatable name)
+/// first, else the one option the word abbreviates. `None` for an unknown or
+/// ambiguous word, which Git rejects.
+fn resolve_long_option(
+    token: &str,
+    options: &'static [BranchLongOptionSpec],
+) -> Option<ResolvedBranchLongOption> {
     let option = token.strip_prefix("--")?;
     let (option, inline_value) = option
         .split_once('=')
@@ -283,11 +294,11 @@ fn resolve_branch_long_option(token: &str) -> Option<ResolvedBranchLongOption> {
     // Git gives exact long names precedence over abbreviations. This matters
     // for hidden `--set-upstream`, which is also a prefix of
     // `--set-upstream-to`.
-    if let Some(spec) = BRANCH_LONG_OPTIONS.iter().find(|spec| spec.name == option) {
+    if let Some(spec) = options.iter().find(|spec| spec.name == option) {
         return Some(candidate(spec, false));
     }
     if let Some(base) = option.strip_prefix("no-") {
-        if let Some(spec) = BRANCH_LONG_OPTIONS
+        if let Some(spec) = options
             .iter()
             .find(|spec| spec.negatable && spec.name == base)
         {
@@ -295,7 +306,7 @@ fn resolve_branch_long_option(token: &str) -> Option<ResolvedBranchLongOption> {
         }
     }
 
-    let mut matches = BRANCH_LONG_OPTIONS.iter().filter_map(|spec| {
+    let mut matches = options.iter().filter_map(|spec| {
         if spec.name.starts_with(option) {
             return Some(candidate(spec, false));
         }
@@ -5954,6 +5965,253 @@ pub(crate) fn branch_command_decision_in_dialect(
     mutation.decision()
 }
 
+/// The options of one Git builtin as its parse-options table declares them
+/// (git/git master e1ec09b2, `builtin/checkout.c` and `builtin/clean.c`).
+/// A short-only option is named by its letter.
+struct GitOptionTable {
+    short: &'static [(char, &'static str, BranchLongOptionArity)],
+    long: &'static [BranchLongOptionSpec],
+}
+
+const fn long_opt(
+    name: &'static str,
+    arity: BranchLongOptionArity,
+    negatable: bool,
+) -> BranchLongOptionSpec {
+    BranchLongOptionSpec {
+        name,
+        arity,
+        negatable,
+    }
+}
+
+use BranchLongOptionArity::{None as Flag, OptionalAttached, Required};
+
+/// `add_common_options` and `add_checkout_path_options`, which `restore` and
+/// `checkout` share.
+macro_rules! checkout_family_long_options {
+    ($($extra:expr),* $(,)?) => {
+        &[
+            $($extra,)*
+            long_opt("quiet", Flag, true),
+            long_opt("recurse-submodules", OptionalAttached, true),
+            long_opt("progress", Flag, true),
+            long_opt("merge", Flag, true),
+            long_opt("conflict", Required, true),
+            long_opt("ours", Flag, false),
+            long_opt("theirs", Flag, false),
+            long_opt("patch", Flag, true),
+            long_opt("unified", Required, false),
+            long_opt("inter-hunk-context", Required, false),
+            long_opt("ignore-skip-worktree-bits", Flag, true),
+            long_opt("pathspec-from-file", Required, true),
+            long_opt("pathspec-file-nul", Flag, true),
+        ]
+    };
+}
+
+const GIT_RESTORE_OPTIONS: GitOptionTable = GitOptionTable {
+    short: &[
+        ('s', "source", Required),
+        ('S', "staged", Flag),
+        ('W', "worktree", Flag),
+        ('q', "quiet", Flag),
+        ('m', "merge", Flag),
+        ('2', "ours", Flag),
+        ('3', "theirs", Flag),
+        ('p', "patch", Flag),
+        ('U', "unified", Required),
+    ],
+    long: checkout_family_long_options![
+        long_opt("source", Required, true),
+        long_opt("staged", Flag, true),
+        long_opt("worktree", Flag, true),
+        long_opt("ignore-unmerged", Flag, true),
+        long_opt("overlay", Flag, true),
+    ],
+};
+
+const GIT_CHECKOUT_OPTIONS: GitOptionTable = GitOptionTable {
+    short: &[
+        ('b', "b", Required),
+        ('B', "B", Required),
+        ('l', "l", Flag),
+        ('q', "quiet", Flag),
+        ('m', "merge", Flag),
+        ('d', "detach", Flag),
+        ('t', "track", OptionalAttached),
+        ('f', "force", Flag),
+        ('2', "ours", Flag),
+        ('3', "theirs", Flag),
+        ('p', "patch", Flag),
+        ('U', "unified", Required),
+    ],
+    long: checkout_family_long_options![
+        long_opt("guess", Flag, true),
+        long_opt("overlay", Flag, true),
+        long_opt("auto-advance", Flag, true),
+        long_opt("detach", Flag, true),
+        long_opt("track", OptionalAttached, true),
+        long_opt("force", Flag, true),
+        long_opt("orphan", Required, true),
+        long_opt("overwrite-ignore", Flag, true),
+        long_opt("ignore-other-worktrees", Flag, true),
+    ],
+};
+
+const GIT_CLEAN_OPTIONS: GitOptionTable = GitOptionTable {
+    short: &[
+        ('q', "quiet", Flag),
+        ('n', "dry-run", Flag),
+        ('f', "force", Flag),
+        ('i', "interactive", Flag),
+        ('d', "d", Flag),
+        ('e', "exclude", Required),
+        ('x', "x", Flag),
+        ('X', "X", Flag),
+    ],
+    long: &[
+        long_opt("quiet", Flag, true),
+        long_opt("dry-run", Flag, true),
+        long_opt("force", Flag, true),
+        long_opt("interactive", Flag, true),
+        long_opt("exclude", Required, false),
+    ],
+};
+
+/// The setting Git's parse-options leaves each option at after reading `args`,
+/// the words after the subcommand: `(name, set)` in reading order, so the last
+/// entry for a name wins, as it does in Git.
+///
+/// This is how Git reads them (gitcli(7)): options and operands may mix, and
+/// `--` or `--end-of-options` ends the options; `-SW` is `-S -W`, and a letter
+/// that takes a value takes the rest of its cluster (`-sW` is `--source=W`)
+/// or else the next word; `--wor` is the long option it abbreviates, and
+/// `--no-<name>` turns `<name>` off. `None` when a word is an option the
+/// table does not know or an ambiguous abbreviation: Git rejects it, and a
+/// reader that guessed past it could misread every word after it.
+fn git_option_settings(args: &[&str], table: &GitOptionTable) -> Option<Vec<(&'static str, bool)>> {
+    let mut settings = Vec::new();
+    let mut index = 0;
+    while let Some(&word) = args.get(index) {
+        index += 1;
+        if matches!(word, "--" | "--end-of-options") {
+            break;
+        }
+        if word.starts_with("--") {
+            let resolved = resolve_long_option(word, table.long)?;
+            if !resolved.negated
+                && !resolved.inline_value
+                && matches!(resolved.arity, BranchLongOptionArity::Required)
+            {
+                index += 1;
+            }
+            settings.push((resolved.name, !resolved.negated));
+        } else if let Some(cluster) = word.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+            for (at, letter) in cluster.char_indices() {
+                let &(_, name, arity) = table.short.iter().find(|(short, ..)| *short == letter)?;
+                settings.push((name, true));
+                match arity {
+                    BranchLongOptionArity::Required => {
+                        if at + letter.len_utf8() == cluster.len() {
+                            index += 1;
+                        }
+                        break;
+                    }
+                    // `-tdirect`: an optional value is only ever attached.
+                    BranchLongOptionArity::OptionalAttached => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(settings)
+}
+
+fn git_option_setting(settings: &[(&'static str, bool)], name: &str) -> Option<bool> {
+    settings
+        .iter()
+        .rev()
+        .find(|(option, _)| *option == name)
+        .map(|(_, set)| *set)
+}
+
+/// Whether Git's own reading of `args` keeps the premise of the `core.git`
+/// safe patterns for `subcommand`: `restore-staged-*` (only the index is
+/// restored), `checkout-new-branch` and `checkout-orphan` (no forced
+/// switch), and `clean-dry-run-*` (a dry run).
+///
+/// The safe patterns find their evidence by spelling: `--staged` with no
+/// `--worktree` or `-W` word, `-b` with any other words, `-n` somewhere in a
+/// cluster. Git reads more spellings than that, so `git restore --staged .
+/// -SW`, `git restore --staged --wor .`, `git checkout -b x -f`, `git clean
+/// -f -ein` (`-e in`) and `git clean -n --no-dry-run -f` all destroy work
+/// while the spelling still matched. Settling this in the regexes means
+/// spelling every cluster, abbreviation and later negation in each one; one
+/// reader of Git's option table settles it for all of them.
+fn git_safe_premise_holds(subcommand: &str, args: &[&str]) -> bool {
+    let table = match subcommand {
+        "restore" => &GIT_RESTORE_OPTIONS,
+        "checkout" => &GIT_CHECKOUT_OPTIONS,
+        "clean" => &GIT_CLEAN_OPTIONS,
+        _ => return true,
+    };
+    let Some(settings) = git_option_settings(args, table) else {
+        return false;
+    };
+    let setting = |name| git_option_setting(&settings, name);
+    match subcommand {
+        "restore" => setting("staged") == Some(true) && setting("worktree") != Some(true),
+        "checkout" => setting("force") != Some(true),
+        _ => setting("dry-run") == Some(true),
+    }
+}
+
+/// `true` when some `git restore`, `git checkout` or `git clean` in `command`
+/// does not keep its safe pattern's premise under Git's reading
+/// ([`git_safe_premise_holds`]). The pack then grants no safe exemption for
+/// `command`, and its destructive patterns decide.
+///
+/// `command` is a matching view (decoded words joined by blanks) or raw
+/// source. Every `git` word is read as a possible invocation, as the safe
+/// patterns do; a refusal only ever withdraws an exemption.
+pub(crate) fn safe_premise_refuted(command: &str) -> bool {
+    crate::packs::split_command_segments(command)
+        .into_iter()
+        .any(|segment| {
+            let words: Vec<String> = shell_words::split(segment).unwrap_or_else(|_| {
+                segment
+                    .split_whitespace()
+                    .map(|word| word.trim_matches(['\'', '"']).to_string())
+                    .collect()
+            });
+            let semantic: Vec<GitSemanticWord> = words
+                .iter()
+                .map(|word| GitSemanticWord {
+                    decoded: word.clone(),
+                    dynamic: false,
+                    may_split: false,
+                })
+                .collect();
+            words.iter().enumerate().any(|(index, word)| {
+                let base = word.rsplit(['/', '\\']).next().unwrap_or(word).to_ascii_lowercase();
+                let base = base.strip_suffix(".exe").unwrap_or(&base);
+                let (subcommand, args_from) = if base == "git" {
+                    let Some(at) = static_git_subcommand_index(&semantic, index + 1) else {
+                        return false;
+                    };
+                    (words[at].as_str(), at + 1)
+                } else if let Some(subcommand) = base.strip_prefix("git-") {
+                    (subcommand, index + 1)
+                } else {
+                    return false;
+                };
+                let args: Vec<&str> = words[args_from..].iter().map(String::as_str).collect();
+                !git_safe_premise_holds(subcommand, &args)
+            })
+        })
+}
+
 /// Create the core git pack.
 #[must_use]
 pub fn create_pack() -> Pack {
@@ -6059,6 +6317,11 @@ pub fn create_pack() -> Pack {
 /// allowed, and git treats the extra tokens as pathspecs. Quote removal cannot
 /// manufacture a string start, and safe matching is per segment, so a dashed
 /// builtin in real command position is the segment's first word.
+///
+/// A match is evidence by spelling only. Whether Git reads the flags that way
+/// (`-SW` is `-S -W`, `--wor` is `--worktree`, `-ein` is `-e in`, a later
+/// `--no-dry-run` wins) is settled by [`safe_premise_refuted`], which
+/// withdraws the exemption when Git's reading breaks the pattern's premise.
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // Branch creation is safe
@@ -6335,10 +6598,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // carry uncommitted modifications — the up-to-date check `-f` exists
         // to override. `git rm -rf .` was only denied by accident, by the
         // filesystem `rm -rf` text rule, and `git rm -f <file>` was allowed.
-        // `--cached` (index only, worktree kept) and dry runs stay allowed.
+        // `--cached` (index only, worktree kept) and dry runs stay allowed,
+        // unless a later `--no-cached`/`--no-dry-run` (or an abbreviation,
+        // `--no-c`, `--no-d`) turns them back off.
         destructive_pattern!(
             "rm-force",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)rm\b(?![^;&|\n]*\s(?:--cached|--dry-run|-[A-Za-z]*n[A-Za-z]*)(?:\s|$))[^;&|\n<>()]*?\s(?:--f(?:o(?:r(?:ce?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)rm\b(?!(?![^;&|\n]*\s--no-[cd])[^;&|\n]*\s(?:--cached|--dry-run|-[A-Za-z]*n[A-Za-z]*)(?:\s|$))[^;&|\n<>()]*?\s(?:--f(?:o(?:r(?:ce?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
             "git rm -f deletes files even when they have uncommitted modifications. Commit or stash them first.",
             High,
             "git rm --force removes the named files from the index AND the working tree, \
@@ -6353,9 +6618,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `git update-ref -d <ref>` deletes a branch or any other ref outright
         // — the plumbing spelling of `git branch -D`, which already requires
         // approval (README FAQ: every branch deletion is an approval boundary).
+        // `-d` may share a cluster with `-z` or lead `-m<reason>` (`-dmwhy`).
         destructive_pattern!(
             "update-ref-delete",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)update-ref\b[^;&|\n<>()]*?\s(?:-d|--delete)(?:\s|$)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)update-ref\b[^;&|\n<>()]*?\s(?:-z*d[^\s;&|<>()]*|--delete)(?:\s|$)",
             "git update-ref -d deletes a ref (e.g. a branch) outright, like git branch -D.",
             High,
             "git update-ref -d is the plumbing form of deleting a ref. Pointed at \
@@ -6475,9 +6741,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
+        // Git reads `-W` inside a short cluster (`-SW`, `-qW`; not after the
+        // value letter `-s`) and any abbreviation down to `--w`.
         destructive_pattern!(
             "restore-worktree-explicit",
-            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\s+.*(?:--worktree|-W\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\s+(?:.*(?:--worktree|-W\b)|(?:.*\s)?(?:--w(?:o(?:r(?:k(?:t(?:r(?:ee?)?)?)?)?)?)?(?:\s|$|[;&|)])|-[0-9A-TV-Za-rt-z]*W))",
             "git restore --worktree/-W discards uncommitted changes permanently.",
             High,
             "git restore --worktree (or -W) explicitly targets your working directory, \
@@ -9574,5 +9842,84 @@ git x",
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Git's parse-options readings, each measured with Git 2.39.5 in a
+    /// throwaway repository: which options end up set.
+    #[test]
+    fn git_option_settings_read_argv_as_git_does() {
+        let read = |args: &str, table| {
+            let args: Vec<&str> = args.split_whitespace().collect();
+            git_option_settings(&args, table)
+                .map(|settings| {
+                    ["staged", "worktree", "source", "force", "dry-run", "exclude"]
+                        .into_iter()
+                        .filter_map(|name| {
+                            git_option_setting(&settings, name).map(|set| (name, set))
+                        })
+                        .collect::<Vec<_>>()
+                })
+        };
+        let restore = &GIT_RESTORE_OPTIONS;
+        assert_eq!(read("--staged . -SW", restore), Some(vec![("staged", true), ("worktree", true)]));
+        assert_eq!(read("--staged --wor .", restore), Some(vec![("staged", true), ("worktree", true)]));
+        assert_eq!(read("-W --no-w -S .", restore), Some(vec![("staged", true), ("worktree", false)]));
+        // A value letter takes the rest of its cluster, or else the next word.
+        assert_eq!(read("--staged -sWIP .", restore), Some(vec![("staged", true), ("source", true)]));
+        assert_eq!(read("-Ss -W .", restore), Some(vec![("staged", true), ("source", true)]));
+        assert_eq!(read("--source -W --staged .", restore), Some(vec![("staged", true), ("source", true)]));
+        // Options end at `--`; an unknown or ambiguous option is unreadable.
+        assert_eq!(read("--staged -- -W", restore), Some(vec![("staged", true)]));
+        assert_eq!(read("--staged --end-of-options -W", restore), Some(vec![("staged", true)]));
+        assert_eq!(read("--staged --bogus .", restore), None);
+        assert_eq!(read("--staged -Z .", restore), None);
+        assert_eq!(read("--staged --p .", restore), None);
+
+        let checkout = &GIT_CHECKOUT_OPTIONS;
+        assert_eq!(read("-b x -f", checkout), Some(vec![("force", true)]));
+        assert_eq!(read("-b x --forc", checkout), Some(vec![("force", true)]));
+        assert_eq!(read("-bf x", checkout), Some(vec![]));
+        assert_eq!(read("-tf -b x", checkout), Some(vec![]));
+        assert_eq!(read("-b x -f --no-force", checkout), Some(vec![("force", false)]));
+
+        let clean = &GIT_CLEAN_OPTIONS;
+        assert_eq!(read("-f -ein", clean), Some(vec![("force", true), ("exclude", true)]));
+        assert_eq!(read("-f -e -n", clean), Some(vec![("force", true), ("exclude", true)]));
+        assert_eq!(
+            read("-n --no-dry-run -f", clean),
+            Some(vec![("force", true), ("dry-run", false)])
+        );
+        assert_eq!(read("-fn --no-d", clean), Some(vec![("force", true), ("dry-run", false)]));
+        assert_eq!(read("-f -e foo -n", clean), Some(vec![("force", true), ("dry-run", true), ("exclude", true)]));
+    }
+
+    #[test]
+    fn safe_premise_refuted_finds_the_git_invocation() {
+        for command in [
+            "git restore --staged . -SW",
+            "git -C repo restore --staged --wor .",
+            "/usr/bin/git restore -S -qW src",
+            "git-restore --staged --wor .",
+            "GIT.EXE checkout -b x -f",
+            "git checkout --orphan x --fo",
+            "git clean -f -ein",
+            "git status && git clean -n --no-dry-run -f",
+            "git restore --staged --bogus .",
+        ] {
+            assert!(safe_premise_refuted(command), "{command}");
+        }
+        for command in [
+            "git restore --staged .",
+            "git restore -S src",
+            "git checkout -b feature origin/main",
+            "git checkout --orphan gh-pages",
+            "git clean -nd",
+            "git clean -f -e foo -n",
+            "git status",
+            "git stash drop",
+            "echo restore -SW",
+        ] {
+            assert!(!safe_premise_refuted(command), "{command}");
+        }
     }
 }
