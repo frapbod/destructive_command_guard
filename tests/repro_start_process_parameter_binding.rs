@@ -449,3 +449,51 @@ fn values_in_a_cmd_argument_list_are_unknown_cmd_text() {
         EvaluationDecision::Allow,
     );
 }
+
+/// From review round 2. Each ran `git reset --hard` (or `rm -rf`) in
+/// PowerShell 7.5 in the shell-truth sandbox.
+#[test]
+fn review_round_2_spellings_bind() {
+    assert_everywhere(
+        &[
+            // A known program whose list holds no literal element is read
+            // as the program called directly (`& git $a` is judged).
+            "$a = 'reset','--hard'; Start-Process git -ArgumentList $a -Wait -NoNewWindow",
+            "Start-Process git -ArgumentList $('reset','--hard')",
+            "Start-Process git -ArgumentList $(\"reset --hard\")",
+            "Start-Process git -ArgumentList {reset --hard}",
+            "Start-Process git {reset --hard}",
+            "Start-Process git -ArgumentList ('reset --hard'.ToString())",
+            "Start-Process git -ArgumentList (\"{0} --hard\" -f 'reset')",
+            "Start-Process git -ArgumentList ('reset','--hard' -join ' ')",
+            "Start-Process git -ArgumentList (,'reset --hard')",
+            "Start-Process git -ArgumentList @{a='reset --hard'}.a",
+            // A quoted name after the call or dot-source operator.
+            "& 'Start-Process' git 'reset','--hard'",
+            "&'Start-Process' git reset,--hard",
+            "& \"Start-Process\" git reset,--hard",
+            ". 'Start-Process' git reset,--hard",
+            "& 'saps' git reset,--hard",
+            "& 'Microsoft.PowerShell.Management\\Start-Process' git reset,--hard",
+            "& 'Start-Process' cmd '/c git reset --hard'",
+            "& 'Start-Process'git reset,--hard -Wait -NoNewWindow",
+            // A group ends its argument: `-Wait` after it is a parameter.
+            "Start-Process git ('reset','--hard')-Wait -NoNewWindow",
+            "Start-Process git ('reset','--hard')-NoNewWindow -Wait",
+            "Start-Process rm ('-rf','/')-Wait -NoNewWindow",
+        ],
+        EvaluationDecision::Deny,
+    );
+    assert_everywhere(
+        &[
+            "Start-Process notepad $file",
+            "Start-Process msedge $url",
+            "Start-Process git {status}",
+            "Start-Process git -ArgumentList $('log','--oneline')",
+            "& 'Start-Process' notepad 'C:\\x\\notes.txt'",
+            "Start-Process git ('status')-Wait",
+            "Write-Output 'Start-Process' git reset,--hard",
+        ],
+        EvaluationDecision::Allow,
+    );
+}

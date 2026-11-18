@@ -175,8 +175,9 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     // <args>`; Tier 2 binds its parameters as PowerShell does (any order,
     // prefixes, aliases, positions) and re-evaluates that line. PowerShell
     // ends the command name at a blank, a continuation, or a `(` or `{`
-    // that starts the first argument (`Start-Process('git')`).
-    r"(?i)(?:^|[\s;|&({=\\])(?:start-process|saps|start)(?:[^\S\r\n]|`\r?\n|[({])",
+    // that starts the first argument (`Start-Process('git')`). After the
+    // call or dot-source operator the name may be quoted (`& 'saps'`).
+    r#"(?i)(?:^|[\s;|&({=\\])(?:start-process|saps|start)(?:[^\S\r\n]|`\r?\n|[({])|[&.][^\S\r\n]*\(?[^\S\r\n]*['"\x{2018}-\x{201E}](?:microsoft\.powershell\.management\\)?(?:start-process|saps|start)['"\x{2018}-\x{201E}]"#,
     // Piped execution to interpreters (versioned, with optional .exe)
     r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)

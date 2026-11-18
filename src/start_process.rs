@@ -291,6 +291,75 @@ fn here_string_end(text: &str, at: usize) -> Option<usize> {
     Some(index + offset + 3)
 }
 
+/// End of a `[...]` index whose `[` is at `at`, past nested brackets,
+/// groups and quoted strings; the end of the text when unclosed.
+fn index_end(bytes: &[u8], at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = at;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            b'(' | b'{' => index = group_end(bytes, index),
+            b'\'' | b'"' => index = quoted_end(bytes, index),
+            b'`' => index += 2,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The end of what follows a group that ends at `at` and still belongs to
+/// its element: member access (`.Name`, `::Name`, a quoted or `$` name),
+/// a method call right after a member (`.Trim()`), and an index (`[1]`).
+/// Anything else starts the next argument: PowerShell 7.5 binds
+/// `('reset')x` and `('reset','--hard')-Wait` as two arguments.
+fn group_postfix_end(text: &str, mut at: usize) -> usize {
+    let bytes = text.as_bytes();
+    loop {
+        let name_start = match bytes.get(at) {
+            Some(b'[') => {
+                at = index_end(bytes, at);
+                continue;
+            }
+            Some(b'.') if bytes.get(at + 1) != Some(&b'.') => at + 1,
+            Some(b':') if bytes.get(at + 1) == Some(&b':') => at + 2,
+            _ => return at,
+        };
+        let name_end = match bytes.get(name_start) {
+            Some(b'\'' | b'"') => quoted_end(bytes, name_start),
+            Some(b'(' | b'{') => group_end(bytes, name_start),
+            Some(_) => {
+                let start = name_start + usize::from(bytes[name_start] == b'$');
+                start
+                    + bytes[start..]
+                        .iter()
+                        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                        .count()
+            }
+            None => name_start,
+        };
+        if name_end == name_start {
+            // `(x).` with no member: PowerShell stops with a parse error;
+            // keep the dot with the element.
+            return name_end;
+        }
+        at = name_end;
+        if bytes.get(at) == Some(&b'(') {
+            at = group_end(bytes, at);
+        }
+    }
+}
+
 /// End of one element (a word, string, group or here-string) at `at`.
 fn element_end(text: &str, at: usize) -> usize {
     let bytes = text.as_bytes();
@@ -300,14 +369,20 @@ fn element_end(text: &str, at: usize) -> usize {
     let mut index = match bytes.get(at) {
         // A string that starts a word ends the word (`'a'b` is two).
         Some(b'\'' | b'"') => return quoted_end(bytes, at),
-        Some(b'(' | b'{') => group_end(bytes, at),
-        Some(b'@' | b'$') if matches!(bytes.get(at + 1), Some(b'(' | b'{')) => {
-            group_end(bytes, at + 1)
+        // A group (`( )`, `{ }`, `@( )`, `@{ }`, `$( )`) ends its element
+        // unless member access or an index follows.
+        Some(b'(' | b'{') => return group_postfix_end(text, group_end(bytes, at)),
+        Some(b'@') if matches!(bytes.get(at + 1), Some(b'(' | b'{')) => {
+            return group_postfix_end(text, group_end(bytes, at + 1));
         }
+        Some(b'$') if bytes.get(at + 1) == Some(&b'(') => {
+            return group_postfix_end(text, group_end(bytes, at + 1));
+        }
+        // `${name}` is a variable: the word goes on (`${a}x` is one word).
+        Some(b'$') if bytes.get(at + 1) == Some(&b'{') => group_end(bytes, at + 1),
         _ => at,
     };
-    // A bare word, or what follows a group (`(Get-Command git).Source`):
-    // quoted parts and escapes belong to it.
+    // A bare word: quoted parts and escapes belong to it.
     while index < bytes.len() {
         if horizontal_space_len(text, index).is_some()
             || ends_statement(bytes, index)
@@ -318,6 +393,10 @@ fn element_end(text: &str, at: usize) -> usize {
         index = match bytes[index] {
             b'\'' | b'"' => quoted_end(bytes, index),
             b'`' => index + 2,
+            // `$( )` and `${ }` inside a word belong to it (`gi$('')t`).
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                group_end(bytes, index + 1)
+            }
             _ => index + 1,
         };
     }
@@ -673,8 +752,20 @@ fn element_strings_within(raw: &str, depth: usize) -> Option<Vec<String>> {
     if raw.starts_with("@'") || raw.starts_with("@\"") {
         return here_string_text(raw).map(|text| vec![text]);
     }
+    if raw.starts_with('{') && group_end(raw.as_bytes(), 0) == raw.len() {
+        // A script block given where a string belongs is its text as
+        // written, between the braces (PowerShell 7.5: `{reset --hard}`
+        // runs `git reset --hard`).
+        return raw
+            .get(1..raw.len() - 1)
+            .map(|inner| vec![inner.to_string()]);
+    }
+    // `@( )` and `$( )` both give their statements' output: here, the
+    // strings of literal statements (`$('reset','--hard')`).
     if let Some(inner) = raw
         .strip_prefix("@(")
+        .or_else(|| raw.strip_prefix("$("))
+        .filter(|_| group_end(raw.as_bytes(), 1) == raw.len())
         .and_then(|tail| tail.strip_suffix(')'))
     {
         let mut strings = Vec::new();
@@ -687,6 +778,7 @@ fn element_strings_within(raw: &str, depth: usize) -> Option<Vec<String>> {
     }
     if let Some(inner) = raw
         .strip_prefix('(')
+        .filter(|_| group_end(raw.as_bytes(), 0) == raw.len())
         .and_then(|tail| tail.strip_suffix(')'))
     {
         let parts = split_top_level(inner, b",");
@@ -903,7 +995,9 @@ fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
         };
         return vec![format!("{word} {joined}")];
     }
-    let Some(joined) = joined_arguments(text, arguments, DYNAMIC_ARGUMENT, true) else {
+    // A known program reads its line even when none of the list is known,
+    // as the same program called directly does (`& git $x` is judged).
+    let Some(joined) = joined_arguments(text, arguments, DYNAMIC_ARGUMENT, false) else {
         return Vec::new();
     };
     // Another program reads the line as argv by Windows' rules. That argv
@@ -936,9 +1030,16 @@ fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
 
 /// The PowerShell names of `Start-Process` at a command start: `start` and
 /// `saps` are its aliases, and a module-qualified name is the same command.
+/// Group 1 is a bare name. Group 3 is a name quoted after the call or
+/// dot-source operator (`& 'Start-Process'`, `.'saps'`, `& ("…")`, any of
+/// PowerShell's quote characters), with group 2 and 4 the optional
+/// parentheses around it. `start` is an alias on Windows only (Microsoft's
+/// Start-Process documentation), where `& 'start'` resolves it too.
 static START_PROCESS_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)(?:^|[\s;|&({=\\])(start-process|saps|start)")
-        .expect("start-process name regex compiles")
+    regex::Regex::new(
+        r#"(?i)(?:^|[\s;|&({=\\])(start-process|saps|start)|(?:^|[\s;|&({=])[&.][^\S\r\n]*(\([^\S\r\n]*)?['"\x{2018}-\x{201E}](?:microsoft\.powershell\.management\\)?(start-process|saps|start)['"\x{2018}-\x{201E}]([^\S\r\n]*\))?"#,
+    )
+    .expect("start-process name regex compiles")
 });
 
 /// At most this many units bind: each parameter once, as its name and a
@@ -952,20 +1053,37 @@ const UNIT_LIMIT: usize = 2 * PARAMETERS.len() + 3;
 pub(crate) fn start_process_lines(text: &str) -> Vec<(Range<usize>, Vec<String>)> {
     let mut calls = Vec::new();
     for found in START_PROCESS_NAME.captures_iter(text) {
-        let name = found.get(1).expect("group 1 always present");
-        // The name is a whole word: blanks, a line continuation, or a `(`
-        // or `{` that starts the first argument (`Start-Process('git')`)
-        // follow. Any other character continues the command name.
-        let after = name.end();
-        let tail = text.get(after..).unwrap_or_default();
-        if horizontal_space_len(text, after).is_none()
-            && !tail.starts_with("`\n")
-            && !tail.starts_with("`\r\n")
-            && !tail.starts_with(['(', '{'])
-        {
-            continue;
-        }
-        let (units, end) = units(text, name.end(), UNIT_LIMIT + 1);
+        let (name, after) = if let Some(name) = found.get(1) {
+            // A bare name is a whole word: blanks, a line continuation, or
+            // a `(` or `{` that starts the first argument
+            // (`Start-Process('git')`) follow. Any other character
+            // continues the command name.
+            let after = name.end();
+            let tail = text.get(after..).unwrap_or_default();
+            if horizontal_space_len(text, after).is_none()
+                && !tail.starts_with("`\n")
+                && !tail.starts_with("`\r\n")
+                && !tail.starts_with(['(', '{'])
+            {
+                continue;
+            }
+            (name, after)
+        } else {
+            // A quoted name ends at its closing quote: the arguments may
+            // follow at once (`& 'Start-Process'git reset,--hard`).
+            let name = found.get(3).expect("one name group is present");
+            let quote_end = name.end()
+                + text
+                    .get(name.end()..)
+                    .and_then(|tail| tail.chars().next())
+                    .map_or(0, char::len_utf8);
+            match (found.get(2), found.get(4)) {
+                (Some(_), Some(close)) => (name, close.end()),
+                (Some(_), None) => continue,
+                (None, _) => (name, quote_end),
+            }
+        };
+        let (units, end) = units(text, after, UNIT_LIMIT + 1);
         let mut lines: Vec<String> = Vec::new();
         for version_7 in [true, false] {
             if let Some(bound) = bind(text, &units, version_7) {
@@ -1134,8 +1252,144 @@ mod tests {
                 "sh /c git reset --hard".to_string(),
             ]
         );
-        assert!(lines("Start-Process git -ArgumentList $rest").is_empty());
         assert!(lines("Start-Process $tool -ArgumentList $rest").is_empty());
+    }
+
+    /// A known program reads its line even when none of the list is known,
+    /// as the program called directly does (`& git $a`).
+    #[test]
+    fn known_programs_read_unknown_lists() {
+        for spelling in [
+            "$a = 'reset','--hard'; Start-Process git -ArgumentList $a -Wait -NoNewWindow",
+            "Start-Process git -ArgumentList $rest",
+            "Start-Process git -ArgumentList ('reset --hard'.ToString())",
+            "Start-Process git -ArgumentList (\"{0} --hard\" -f 'reset')",
+            "Start-Process git -ArgumentList ('reset','--hard' -join ' ')",
+            "Start-Process git -ArgumentList @{a='reset --hard'}.a",
+            "Start-Process git ('a','reset --hard')[1] -Wait",
+            "Start-Process git (' reset --hard ').Trim() -Wait",
+            "Start-Process git {reset --hard}.ToString() -Wait",
+        ] {
+            assert_eq!(
+                lines(spelling),
+                program("git DCG_START_PROCESS_ARGUMENT"),
+                "{spelling:?}"
+            );
+        }
+        assert_eq!(
+            lines("Start-Process notepad $file"),
+            program("notepad DCG_START_PROCESS_ARGUMENT")
+        );
+    }
+
+    /// Measured with PowerShell 7.5: a script block where a string belongs
+    /// is its text between the braces, and `$( )` gives its statements'
+    /// strings as `@( )` does.
+    #[test]
+    fn script_blocks_and_subexpressions_are_their_strings() {
+        for spelling in [
+            "Start-Process git {reset --hard} -Wait -NoNewWindow",
+            "Start-Process git -ArgumentList { reset   --hard } -Wait",
+            "Start-Process git -ArgumentList $('reset','--hard')",
+            "Start-Process git -ArgumentList $('reset';'--hard')",
+            "Start-Process git -ArgumentList $(\"reset --hard\")",
+        ] {
+            assert_eq!(lines(spelling), program("git reset --hard"), "{spelling:?}");
+        }
+        assert_eq!(
+            lines("Start-Process git {reset \"a b\" 'c d'}"),
+            vec![
+                "& git reset 'a b' '''c' 'd'''".to_string(),
+                "git reset 'a b' ''\\''c' 'd'\\'''".to_string(),
+            ]
+        );
+        assert_eq!(
+            lines("Start-Process git {status},{log}"),
+            program("git status log")
+        );
+        assert_eq!(
+            lines("Start-Process cmd {/c git reset --hard}"),
+            vec!["cmd /c git reset --hard".to_string()]
+        );
+    }
+
+    /// Measured with PowerShell 7.5: after `&` or `.` the name may be
+    /// quoted (any PowerShell quote), parenthesized, or followed at once
+    /// by the arguments.
+    #[test]
+    fn quoted_names_after_the_call_operator() {
+        for spelling in [
+            "& 'Start-Process' git 'reset','--hard'",
+            "&'Start-Process' git reset,--hard",
+            "& 'Start-Process'git reset,--hard",
+            "& \"Start-Process\" git reset,--hard",
+            ". 'Start-Process' git reset,--hard",
+            ".'Start-Process' git reset,--hard",
+            "& 'saps' git reset,--hard",
+            "& 'start' git reset,--hard",
+            "& 'Microsoft.PowerShell.Management\\Start-Process' git reset,--hard",
+            "& \u{2018}Start-Process\u{2019} git reset,--hard",
+            "& \u{201C}Start-Process\u{201D} git reset,--hard",
+            "& ('Start-Process') git reset,--hard",
+            "& 'Start-Process'('git') reset,--hard",
+            "$p = & 'Start-Process' git reset,--hard -PassThru",
+        ] {
+            assert_eq!(lines(spelling), program("git reset --hard"), "{spelling:?}");
+        }
+        assert_eq!(
+            lines("& 'Start-Process' cmd '/c x'"),
+            vec!["cmd /c x".to_string()]
+        );
+        for spelling in [
+            "& ('Start-Process' git reset,--hard",
+            "$o.'Start-Process' git reset,--hard",
+            "Write-Output 'Start-Process' git reset,--hard",
+        ] {
+            assert!(lines(spelling).is_empty(), "{spelling:?}");
+        }
+    }
+
+    /// Measured with PowerShell 7.5: a group ends its argument unless
+    /// member access, a method call or an index follows it.
+    #[test]
+    fn a_group_ends_its_argument() {
+        for spelling in [
+            "Start-Process git ('reset','--hard')-Wait -NoNewWindow",
+            "Start-Process git ('reset','--hard')-NoNewWindow -Wait",
+            "Start-Process git @('reset','--hard')-Wait",
+            "Start-Process git $('reset','--hard')-Wait",
+            "Start-Process git {reset --hard}-Wait",
+        ] {
+            assert_eq!(lines(spelling), program("git reset --hard"), "{spelling:?}");
+        }
+        assert_eq!(
+            lines("Start-Process rm ('-rf','/')-Wait -NoNewWindow"),
+            program("rm -rf /")
+        );
+        for spelling in [
+            "Start-Process git -ArgumentList ('reset')x",
+            "Start-Process git -ArgumentList ('reset')'--hard'",
+            "Start-Process git $('reset')x",
+            "Start-Process git @('reset')x",
+            "Start-Process git {reset}x",
+            "Start-Process git @{a='reset'}x",
+            "Start-Process git ('reset --hard').Trim()x",
+        ] {
+            assert!(
+                lines(spelling).is_empty(),
+                "{spelling:?}: {:?}",
+                lines(spelling)
+            );
+        }
+        // `${a}` is a variable: the word goes on.
+        assert_eq!(
+            lines("Start-Process git ${a}x -Wait"),
+            program("git DCG_START_PROCESS_ARGUMENT")
+        );
+        assert_eq!(
+            lines("Start-Process git re$('s')et,--hard"),
+            program("git DCG_START_PROCESS_ARGUMENT --hard")
+        );
     }
 
     /// An element that is not a literal stands for one word; the literal
