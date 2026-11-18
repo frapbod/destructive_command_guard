@@ -12676,24 +12676,87 @@ fn powershell_group_name(
     (name, Some(close))
 }
 
-/// The first of `separators` (sorted, all at or after `start`) that is
-/// outside every `( )`, `@( )`, `$( )` and `{ }` group opened from `start`:
-/// a line break inside `-ArgumentList (<LF>'…'<LF>)` does not end the
-/// statement. A group that does not close runs to the end of the command, so
-/// the reader of that group fails closed.
+/// The name a [`PowerShellMemberCmdlet`] name value gives, and where the
+/// value ends. `after` ends the word before the value, `value_start` starts
+/// it, and `word` is its decoded word, if static. A group or quoted string
+/// is static only when nothing is glued after it
+/// ([`powershell_argument_value_end`]): `('NotIt').Replace('NotIt',
+/// 'InvokeScript')` and `('Trim', 'InvokeScript')[1]` may name any member.
+/// `None` is a name that is not static.
+fn powershell_cmdlet_name_value(
+    cmdlet: PowerShellMemberCmdlet,
+    segment: &str,
+    after: usize,
+    value_start: usize,
+    word: Option<&str>,
+) -> (Option<String>, usize) {
+    if let Some(group) = powershell_group_value(segment, after, value_start) {
+        let (group_name, close) = powershell_group_name(cmdlet, segment, group);
+        let Some(close) = close else {
+            return (None, segment.len());
+        };
+        let end = powershell_argument_value_end(segment, close + 1);
+        return ((end == close + 1).then_some(group_name).flatten(), end);
+    }
+    if matches!(segment.as_bytes().get(value_start), Some(b'\'' | b'"')) {
+        let end = powershell_argument_value_end(segment, value_start);
+        return (
+            parse_static_powershell_source(&segment[value_start..end]).ok(),
+            end,
+        );
+    }
+    (word.map(str::to_string), value_start)
+}
+
+/// The end of the double-quoted string that opens at `start`: past its
+/// closing quote, its escapes and its `$( … )` subexpressions. A string or
+/// subexpression that does not close runs to the end of `command`.
+fn skip_powershell_double_quote(command: &str, start: usize) -> usize {
+    let bytes = command.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = escape_sequence_end(command, index),
+            b'"' => return index + 1,
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                match find_powershell_subexpression_close(command, index + 2) {
+                    Ok(close) => index = close + 1,
+                    Err(()) => return bytes.len(),
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The first of `separators` (sorted, all at or after `start`) that ends the
+/// statement begun at `start`. A separator inside a `( )`, `@( )`, `$( )` or
+/// `{ }` group opened from `start` does not (`-ArgumentList (<LF>'…'<LF>)`),
+/// and neither does a line break whose last token, past blanks and
+/// comments, is `,`: the array goes on to the next line
+/// (`-ArgumentList 'git …',<LF>$true`). A group that does not close runs to
+/// the end of the command, so the reader of that group fails closed.
 fn powershell_separator_outside_groups(command: &str, start: usize, separators: &[usize]) -> usize {
     let bytes = command.as_bytes();
     let mut next = 0usize;
     let mut index = start;
+    // The last code byte read outside comments and blank space.
+    let mut last = None;
     loop {
         let Some(&separator) = separators.get(next) else {
             return command.len();
         };
         if separator <= index || index >= bytes.len() {
+            if last == Some(b',') && matches!(bytes.get(separator), Some(b'\n' | b'\r')) {
+                next += 1;
+                continue;
+            }
             return separator;
         }
         let group_close = match bytes[index] {
             b'`' => {
+                last = Some(b'`');
                 index = escape_sequence_end(command, index);
                 continue;
             }
@@ -12708,37 +12771,27 @@ fn powershell_separator_outside_groups(command: &str, start: usize, separators: 
                 continue;
             }
             b'\'' => {
+                last = Some(b'\'');
                 index = skip_powershell_single_quote(command, index);
                 continue;
             }
             b'"' => {
-                index += 1;
-                while index < bytes.len() {
-                    match bytes[index] {
-                        b'`' => index = escape_sequence_end(command, index),
-                        b'"' => {
-                            index += 1;
-                            break;
-                        }
-                        b'$' if bytes.get(index + 1) == Some(&b'(') => {
-                            match find_powershell_subexpression_close(command, index + 2) {
-                                Ok(close) => index = close + 1,
-                                Err(()) => return command.len(),
-                            }
-                        }
-                        _ => index += 1,
-                    }
-                }
+                last = Some(b'"');
+                index = skip_powershell_double_quote(command, index);
                 continue;
             }
             b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                last = Some(b'@');
                 index =
                     powershell_here_string_end(command, index).map_or(index + 1, |(_, _, end)| end);
                 continue;
             }
             b'(' => find_powershell_subexpression_close(command, index + 1).ok(),
             b'{' => find_powershell_script_block_close(command, index + 1),
-            _ => {
+            byte => {
+                if !byte.is_ascii_whitespace() {
+                    last = Some(byte);
+                }
                 index += 1;
                 continue;
             }
@@ -12746,6 +12799,7 @@ fn powershell_separator_outside_groups(command: &str, start: usize, separators: 
         let Some(close) = group_close else {
             return command.len();
         };
+        last = Some(bytes[close]);
         index = close + 1;
         while separators
             .get(next)
@@ -12754,6 +12808,44 @@ fn powershell_separator_outside_groups(command: &str, start: usize, separators: 
             next += 1;
         }
     }
+}
+
+/// Where the argument-mode value that starts at `start` ends: at the first
+/// blank, `,`, `;`, `|`, `&` or line continuation outside quotes and
+/// brackets, or at a `)` or `}` that closes an outer group. A literal and the
+/// text glued after it (`('…')[1]`, `'…'.Replace(…)`) are one expression,
+/// which PowerShell evaluates whole, so the value is static only when this
+/// end is the literal's own end.
+fn powershell_argument_value_end(segment: &str, start: usize) -> usize {
+    let bytes = segment.as_bytes();
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' if depth == 0 && matches!(bytes.get(index + 1), Some(b'\n' | b'\r')) => break,
+            b'`' => {
+                index = escape_sequence_end(segment, index);
+                continue;
+            }
+            b'\'' => {
+                index = skip_powershell_single_quote(segment, index);
+                continue;
+            }
+            b'"' => {
+                index = skip_powershell_double_quote(segment, index);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => break,
+            b')' | b']' | b'}' => depth -= 1,
+            byte if depth == 0 && (byte.is_ascii_whitespace() || b",;|&".contains(&byte)) => {
+                break;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    index
 }
 
 /// Engine members reached through [`PowerShellMemberCmdlet`]. The name is
@@ -12853,22 +12945,21 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                         break;
                     }
                     let after = words[index - 2].2.end.max(group_end);
-                    match powershell_group_value(segment, after, range.start) {
-                        Some(group) => {
-                            let (group_name, close) = powershell_group_name(cmdlet, segment, group);
-                            name = Some(group_name);
-                            group_end = close.map_or(segment.len(), |close| close + 1);
-                            argument_start.get_or_insert(group_end);
-                            while words.get(index).is_some_and(|(_, _, word)| {
-                                close.is_none_or(|close| word.start < close)
-                            }) {
-                                index += 1;
-                            }
-                        }
-                        None => {
-                            name = Some((!*dynamic).then(|| value.clone()));
-                            argument_start.get_or_insert(range.end);
-                        }
+                    let (value_name, value_end) = powershell_cmdlet_name_value(
+                        cmdlet,
+                        segment,
+                        after,
+                        range.start,
+                        (!*dynamic).then_some(value.as_str()),
+                    );
+                    name = Some(value_name);
+                    group_end = group_end.max(value_end).max(range.end);
+                    argument_start.get_or_insert(group_end);
+                    while words
+                        .get(index)
+                        .is_some_and(|(_, _, word)| word.start < group_end)
+                    {
+                        index += 1;
                     }
                 } else {
                     // Once the name is bound, the next positional word starts
@@ -12902,26 +12993,36 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                     (word.clone(), *word_dynamic, word_range.start)
                 }
             };
+            // The value follows the parameter word, or its `:`.
+            let after = if attached.is_none_or(str::is_empty) {
+                range.end
+            } else {
+                value_start
+            };
             if member {
-                let group = attached
-                    .is_none_or(str::is_empty)
-                    .then(|| powershell_group_value(segment, range.end, value_start))
-                    .flatten();
-                name = Some(match group {
-                    Some(group) => {
-                        let (group_name, close) = powershell_group_name(cmdlet, segment, group);
-                        group_end = close.map_or(segment.len(), |close| close + 1);
-                        while words.get(index).is_some_and(|(_, _, word)| {
-                            close.is_none_or(|close| word.start < close)
-                        }) {
-                            index += 1;
-                        }
-                        group_name
-                    }
-                    None => (!value_dynamic).then_some(value),
-                });
+                let (value_name, value_end) = powershell_cmdlet_name_value(
+                    cmdlet,
+                    segment,
+                    after,
+                    value_start,
+                    (!value_dynamic).then_some(value.as_str()),
+                );
+                name = Some(value_name);
+                group_end = group_end.max(value_end);
+                while words
+                    .get(index)
+                    .is_some_and(|(_, _, word)| word.start < group_end)
+                {
+                    index += 1;
+                }
             } else if arguments {
-                argument_start = Some(value_start);
+                // A `(` read as its own token opens the argument value
+                // (`-ArgumentList ('…', '…')[1]`), so the value starts there.
+                let between = segment.get(after..value_start).unwrap_or_default();
+                argument_start = Some(match between.find('(') {
+                    Some(open) if between.trim() == "(" => after + open,
+                    _ => value_start,
+                });
             }
         }
         let (Some(name), Some(argument_start)) = (name, argument_start) else {
@@ -12953,17 +13054,35 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         } else if let Some(group) = text.strip_prefix('(').or_else(|| text.strip_prefix("@(")) {
             match find_powershell_subexpression_close(group, 0) {
                 Ok(close) => {
+                    let after = text.len() - group.len() + close + 1;
                     let (first, second) = powershell_first_method_argument(&group[..close]);
-                    (parse_static_powershell_source(first), second.is_some())
+                    if powershell_argument_value_end(text, after) != after {
+                        // Text glued to the group (`(…)[1]`, `(…).Replace(…)`)
+                        // makes another value.
+                        (Err(()), true)
+                    } else if text[after..]
+                        .trim_start_matches([' ', '\t'])
+                        .starts_with(',')
+                    {
+                        // `('…'), $true`: the group is the first of several
+                        // arguments, so it is one value only with one element.
+                        let first = if second.is_none() {
+                            parse_static_powershell_source(first)
+                        } else {
+                            Err(())
+                        };
+                        (first, true)
+                    } else {
+                        (parse_static_powershell_source(first), second.is_some())
+                    }
                 }
                 Err(()) => (Err(()), true),
             }
         } else {
             let more = powershell_first_method_argument(text).1.is_some();
             let argument = if text.starts_with(['\'', '"']) {
-                word_text.ok_or(()).and_then(|raw| {
-                    parse_static_powershell_source(powershell_first_method_argument(raw).0)
-                })
+                // A quoted value is static only when the quote ends it.
+                parse_static_powershell_source(&text[..powershell_argument_value_end(text, 0)])
             } else {
                 // A bare word is its own text; a variable, array, type or
                 // block is not static.
@@ -66570,20 +66689,85 @@ mod tests {
                 "New-Object -TypeName (\n[a.Command]\n) 'a', $true",
                 vec!["a"],
             ),
+            // A comment inside the source fails closed, as in a method call
+            // (`.InvokeScript(<#c#>'…')`).
             (
                 "New-Object a.Command -ArgumentList ('a' # c\n, $true)",
-                vec!["a"],
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
             ),
-            // An unclosed group is a parse error; its text is still judged.
+            // An unclosed group is a parse error; it fails closed.
             (
                 "New-Object a.Command -ArgumentList (\n'a',\n$true",
-                vec!["a"],
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
             ),
             ("% InvokeScript (\n$x", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
             ("New-Object a.Command 'a'\n$true", vec![]),
             (
                 "New-Object PSObject -Property @{\na = 1\n}\n% InvokeScript",
                 vec![],
+            ),
+            // A line ending in `,` goes on, past blank and comment lines.
+            (
+                "New-Object -ArgumentList 'a',\n  $true -TypeName a.Command",
+                vec!["a"],
+            ),
+            (
+                "New-Object -ArgumentList 'a', # c\n\n  # d\n  $true -TypeName a.Command",
+                vec!["a"],
+            ),
+            (
+                "$x | % -ArgumentList 'a',\r\n  'b' -MemberName InvokeScript",
+                vec!["a"],
+            ),
+            ("New-Object a.Command 'a'\n,$true", vec![]),
+            // Text glued after a literal makes another value.
+            ("New-Object a.Command ('a'), $true", vec!["a"]),
+            (
+                "New-Object a.Command ('a' , 'b') , $true",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("New-Object a.Command ('a')", vec![]),
+            (
+                "% InvokeScript ('b', 'a')[1]",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% InvokeScript ('b').Replace('b', 'a')",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% InvokeScript 'b'.Replace('b', 'a')",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("% InvokeScript ('a')", vec!["a"]),
+            (
+                "% -MemberName InvokeScript -ArgumentList ('b', 'a')[-1]",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "New-Object a.Command -ArgumentList ('b', 'a', $true)[1,2]",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("New-Object a.Command -ArgumentList ('a', $true)", vec!["a"]),
+            (
+                "% -MemberName ('X').Replace('X', 'InvokeScript') 'a'",
+                vec!["a"],
+            ),
+            (
+                "% -MemberName:('X').Replace('X', 'InvokeScript') 'a'",
+                vec!["a"],
+            ),
+            ("% 'X'.Replace('X', 'InvokeScript') 'a'", vec!["a"]),
+            ("% ('Trim', 'InvokeScript')[1] 'a'", vec!["a"]),
+            ("% -MemberName:('Invoke' + 'Script') 'a'", vec!["a"]),
+            ("% 'Trim' 'a'", vec![]),
+            (
+                "New-Object -TypeName 'a.B'.Replace('B', 'Command') -ArgumentList 'a', $true",
+                vec!["a"],
+            ),
+            (
+                "New-Object -TypeName ('a.B').Trim() -ArgumentList 'a', 1",
+                vec!["a"],
             ),
         ] {
             assert_eq!(sources(command), expected, "{command:?}");
