@@ -178,6 +178,43 @@ const RUNS_IT: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % -MemberName 'NotIt'.Replace('NotIt', 'InvokeScript') -ArgumentList 'git reset --hard'",
     "$ExecutionContext.InvokeCommand | % InvokeScript ('git reset --hard') , 'x'",
     "$ExecutionContext.InvokeCommand | % InvokeScript \u{2018}git reset --hard\u{2019}",
+    // A parameter placed before the name takes its value (review round 5,
+    // runner rv6/truth.out and r5/truth*.out).
+    "$ExecutionContext.InvokeCommand | % -ErrorAction Stop InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | ForEach-Object -PipelineVariable p InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -OutVariable o InvokeScript 'git reset --hard'",
+    "$c = New-Object -ErrorAction Stop System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = New-Object -OutVariable o System.Management.Automation.Runspaces.Command -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | % -Verbose InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -ErrorAction:Stop InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -Verbose: $false InvokeScript 'git reset --hard'",
+    "ForEach-Object -InputObject $ExecutionContext.InvokeCommand -ErrorAction Stop InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -ea Stop -ov o InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -WarningAction SilentlyContinue, Stop InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -PipelineVariable (\n'p') InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % –MemberName InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ErrorAction Stop 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' -ErrorAction Stop",
+    "$ExecutionContext.InvokeCommand | % -OutBuffer (0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0) InvokeScript 'git reset --hard'",
+    // ForEach-Object member names are wildcard patterns.
+    "$ExecutionContext.InvokeCommand | % InvokeScr* 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % -MemberName Invoke?cript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | ForEach-Object -MemberName 'Invoke[S]cript' -ArgumentList 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % *eScript 'git reset --hard'",
+    "[powershell]::Create() | % AddScr* 'git reset --hard' | % Invoke",
+    "$ExecutionContext.InvokeCommand | % [I]nvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % 'I*Script' 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | % Invoke[R-T]cript 'git reset --hard'",
+    // A quoted or bare cmdlet name after the call or dot-source operator.
+    "$c = & 'New-Object' System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$ExecutionContext.InvokeCommand | & 'ForEach-Object' InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | & \"ForEach-Object\" -MemberName InvokeScript -ArgumentList 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | . 'ForEach-Object' InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | . ForEach-Object InvokeScript 'git reset --hard'",
+    "$c = . 'New-Object' System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // A line continuation between an argument group and its comma.
+    "$c = New-Object System.Management.Automation.Runspaces.Command ('git reset --hard') `\n, $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = New-Object System.Management.Automation.Runspaces.Command ('git reset --hard')`\n, $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -217,10 +254,29 @@ const HARMLESS: &[&str] = &[
     "$c = New-Object System.Management.Automation.Runspaces.Command -ArgumentList ('git status'), $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
     // A line that starts with `,` begins a new statement.
     "$c = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard'\n,$true\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    // A parameter before the name, a call operator, a wildcard that matches
+    // no engine method, and ordinary ForEach-Object and foreach forms.
+    "$ExecutionContext.InvokeCommand | % -ErrorAction Stop InvokeScript 'git status'",
+    "Get-ChildItem | % -ErrorAction Stop Name",
+    "$ExecutionContext.InvokeCommand | & 'ForEach-Object' InvokeScript 'git status'",
+    "$ExecutionContext.InvokeCommand | % InvokeScr* 'git status'",
+    "Get-ChildItem | % Na* ",
+    "$ExecutionContext.InvokeCommand | % 'I*Script' 'git status'",
+    "$ExecutionContext.InvokeCommand | % 'Invoke`*' 'git reset --hard'",
+    "Get-ChildItem | % -Verbose Name",
+    "1..3 | ForEach-Object -Parallel { $_ } -ThrottleLimit 2",
+    "foreach ($x in 1, 2) { Write-Output $x -NoEnumerate }",
+    "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' -ErrorAction Stop",
+    "$ExecutionContext.InvokeCommand | % –MemberName InvokeScript 'git status'",
+    "$ExecutionContext.InvokeCommand | . ForEach-Object InvokeScript 'git status'",
+    "$c = New-Object -ErrorAction Stop System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "1, 2 | ForEach-Object -Begin { $s = 0 } -Process { $s += $_ } -End { $s }",
+    "$ExecutionContext.InvokeCommand | % -Verbose: $false InvokeScript 'git status'",
+    "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ErrorAction Stop 'git status'",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
-/// 9a712556 and e94e3692 as well (its POSIX reading takes the quoted text as a command),
+/// 9a712556, e94e3692 and 7c5f7a8c as well (its POSIX reading takes the quoted text as a command),
 /// so they are checked in the PowerShell dialect only.
 const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // The second argument is data for the script's `$args`.
@@ -249,6 +305,12 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % -MemberName ('Invoke' + 'Script') 'git status'",
     "$c = New-Object ([System.Text.StringBuilder]) 'git reset --hard', 100; $c.ToString()",
     "$c = New-Object -TypeName System.Management.Automation.Runspaces.Command `\n    -ArgumentList 'git status', $true\n$ps=[powershell]::Create()\n[void]$ps.Commands.AddCommand($c)\n[void]$ps.Invoke()",
+    // Unknown denies these on base 7c5f7a8c as well.
+    "$c = New-Object System.Management.Automation.Runspaces.Command ('git status') `\n, $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$o = New-Object -TypeName PSObject -Property @{ a = 1; b = '-x' }; $o.b",
+    // PowerShell wildcards have no `[!…]` negation, so this runs nothing. In
+    // Unknown the windows.filesystem pack reads `!x` as unresolved syntax.
+    "$ExecutionContext.InvokeCommand | % 'Invoke[!x]cript' 'git reset --hard'",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {

@@ -12848,10 +12848,261 @@ fn powershell_argument_value_end(segment: &str, start: usize) -> usize {
     index
 }
 
-/// Engine members reached through [`PowerShellMemberCmdlet`]. The name is
-/// the named parameter's value or the first positional word; the first
-/// argument starts after `-ArgumentList` (`-Args`) or at the next positional
-/// word, which PowerShell binds to the argument list.
+/// How a [`PowerShellMemberCmdlet`] parameter is bound.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellParameterRole {
+    /// The member or type name (`-MemberName`, `-TypeName`).
+    Name,
+    /// The argument list (`-ArgumentList`, `-Args`).
+    Arguments,
+    /// Any other parameter that takes the next value.
+    Value,
+    /// A switch: it takes a value only when attached with `:`.
+    Switch,
+}
+
+/// Common parameters, with their aliases (PowerShell 7.5 `Get-Command`
+/// metadata).
+const POWERSHELL_COMMON_PARAMETERS: &[(&str, PowerShellParameterRole)] = &[
+    ("verbose", PowerShellParameterRole::Switch),
+    ("vb", PowerShellParameterRole::Switch),
+    ("debug", PowerShellParameterRole::Switch),
+    ("db", PowerShellParameterRole::Switch),
+    ("erroraction", PowerShellParameterRole::Value),
+    ("ea", PowerShellParameterRole::Value),
+    ("warningaction", PowerShellParameterRole::Value),
+    ("wa", PowerShellParameterRole::Value),
+    ("informationaction", PowerShellParameterRole::Value),
+    ("infa", PowerShellParameterRole::Value),
+    ("progressaction", PowerShellParameterRole::Value),
+    ("proga", PowerShellParameterRole::Value),
+    ("errorvariable", PowerShellParameterRole::Value),
+    ("ev", PowerShellParameterRole::Value),
+    ("warningvariable", PowerShellParameterRole::Value),
+    ("wv", PowerShellParameterRole::Value),
+    ("informationvariable", PowerShellParameterRole::Value),
+    ("iv", PowerShellParameterRole::Value),
+    ("outvariable", PowerShellParameterRole::Value),
+    ("ov", PowerShellParameterRole::Value),
+    ("outbuffer", PowerShellParameterRole::Value),
+    ("ob", PowerShellParameterRole::Value),
+    ("pipelinevariable", PowerShellParameterRole::Value),
+    ("pv", PowerShellParameterRole::Value),
+];
+
+/// `ForEach-Object` parameters, with their aliases (PowerShell 7.5).
+const POWERSHELL_FOREACH_OBJECT_PARAMETERS: &[(&str, PowerShellParameterRole)] = &[
+    ("inputobject", PowerShellParameterRole::Value),
+    ("begin", PowerShellParameterRole::Value),
+    ("process", PowerShellParameterRole::Value),
+    ("end", PowerShellParameterRole::Value),
+    ("remainingscripts", PowerShellParameterRole::Value),
+    ("membername", PowerShellParameterRole::Name),
+    ("argumentlist", PowerShellParameterRole::Arguments),
+    ("args", PowerShellParameterRole::Arguments),
+    ("parallel", PowerShellParameterRole::Value),
+    ("throttlelimit", PowerShellParameterRole::Value),
+    ("timeoutseconds", PowerShellParameterRole::Value),
+    ("asjob", PowerShellParameterRole::Switch),
+    ("usenewrunspace", PowerShellParameterRole::Switch),
+    ("whatif", PowerShellParameterRole::Switch),
+    ("wi", PowerShellParameterRole::Switch),
+    ("confirm", PowerShellParameterRole::Switch),
+    ("cf", PowerShellParameterRole::Switch),
+];
+
+/// `New-Object` parameters, with their aliases (PowerShell 7.5, and
+/// `-ComObject` on Windows).
+const POWERSHELL_NEW_OBJECT_PARAMETERS: &[(&str, PowerShellParameterRole)] = &[
+    ("typename", PowerShellParameterRole::Name),
+    ("comobject", PowerShellParameterRole::Value),
+    ("argumentlist", PowerShellParameterRole::Arguments),
+    ("args", PowerShellParameterRole::Arguments),
+    ("property", PowerShellParameterRole::Value),
+    ("strict", PowerShellParameterRole::Switch),
+];
+
+/// Whether an argument-mode word is a parameter name: a dash, then not a
+/// number (`-1` and `-.5` are values).
+fn powershell_parameter_word(word: &str) -> bool {
+    let mut characters = word.chars();
+    characters.next().is_some_and(is_powershell_dash)
+        && characters
+            .next()
+            .is_some_and(|next| !(next.is_ascii_digit() || next == '.' || next.is_whitespace()))
+}
+
+/// How `parameter` (with its dash, without an attached value) binds among
+/// `parameters` and the common parameters. PowerShell takes an exact name or
+/// alias, or else a prefix of one. `None` is a name that matches none, or
+/// prefixes that bind in different ways: dcg cannot place its value.
+fn powershell_cmdlet_parameter_role(
+    parameters: &[(&str, PowerShellParameterRole)],
+    parameter: &str,
+) -> Option<PowerShellParameterRole> {
+    let mut characters = parameter.chars();
+    characters.next();
+    let name = characters.as_str().to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    let known = || parameters.iter().chain(POWERSHELL_COMMON_PARAMETERS);
+    if let Some((_, role)) = known().find(|(candidate, _)| *candidate == name) {
+        return Some(*role);
+    }
+    let mut roles = known()
+        .filter(|(candidate, _)| candidate.starts_with(&name))
+        .map(|(_, role)| *role);
+    let first = roles.next()?;
+    roles.all(|role| role == first).then_some(first)
+}
+
+/// The index past blank space, line breaks, line continuations and comments
+/// from `start`.
+fn skip_powershell_blank_and_comments(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    while let Some(character) = text.get(index..).and_then(|rest| rest.chars().next()) {
+        match character {
+            '`' if matches!(bytes.get(index + 1), Some(b'\n' | b'\r')) => index += 2,
+            '<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(text, index);
+            }
+            '#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = text[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline);
+            }
+            character if character.is_whitespace() => index += character.len_utf8(),
+            _ => break,
+        }
+    }
+    index
+}
+
+/// Where a parameter value that starts at `value_start` ends. `after` ends
+/// the word before it. A group is read to its close; text glued to a value
+/// and further elements after a `,` (`-InputObject 1, 2`) are part of it.
+fn powershell_cmdlet_value_end(segment: &str, after: usize, value_start: usize) -> usize {
+    let element_end = |from: usize, start: usize| match powershell_group_value(segment, from, start)
+    {
+        Some(Ok((_, close))) => powershell_argument_value_end(segment, close + 1),
+        Some(Err(())) => segment.len(),
+        None => powershell_argument_value_end(segment, start),
+    };
+    let mut end = element_end(after, value_start);
+    // Each pass moves past one `,`, so the loop ends.
+    loop {
+        let comma = skip_powershell_blank_and_comments(segment, end);
+        if segment.as_bytes().get(comma) != Some(&b',') {
+            return end;
+        }
+        let element = skip_powershell_blank_and_comments(segment, comma + 1);
+        end = element_end(element, element).max(element);
+    }
+}
+
+/// Whether a PowerShell wildcard pattern (`*`, `?`, `[…]` sets and ranges,
+/// backtick escapes) matches `text`, ignoring ASCII case. `None` is a
+/// pattern with a set that does not close.
+fn powershell_wildcard_matches(pattern: &str, text: &str) -> Option<bool> {
+    enum Element {
+        Star,
+        Any,
+        Set(Vec<(char, char)>),
+    }
+    let mut elements = Vec::new();
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        let element = match character {
+            '*' => Element::Star,
+            '?' => Element::Any,
+            '[' => {
+                let mut set = Vec::new();
+                loop {
+                    let low = match characters.next()? {
+                        ']' => break,
+                        '`' => characters.next()?,
+                        low => low,
+                    };
+                    let mut lookahead = characters.clone();
+                    let high = if lookahead.next() == Some('-')
+                        && lookahead.clone().next().is_some_and(|high| high != ']')
+                    {
+                        characters.next();
+                        match characters.next()? {
+                            '`' => characters.next()?,
+                            high => high,
+                        }
+                    } else {
+                        low
+                    };
+                    set.push((low.to_ascii_lowercase(), high.to_ascii_lowercase()));
+                }
+                Element::Set(set)
+            }
+            '`' => {
+                let literal = characters.next().unwrap_or('`').to_ascii_lowercase();
+                Element::Set(vec![(literal, literal)])
+            }
+            literal => {
+                let literal = literal.to_ascii_lowercase();
+                Element::Set(vec![(literal, literal)])
+            }
+        };
+        elements.push(element);
+    }
+    let text: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    // matched[j]: the elements read so far match the first j characters.
+    let mut matched = vec![false; text.len() + 1];
+    matched[0] = true;
+    for element in &elements {
+        let mut next = vec![false; text.len() + 1];
+        for j in 0..=text.len() {
+            next[j] = match element {
+                Element::Star => matched[j] || (j > 0 && next[j - 1]),
+                Element::Any => j > 0 && matched[j - 1],
+                Element::Set(set) => {
+                    j > 0
+                        && matched[j - 1]
+                        && set
+                            .iter()
+                            .any(|&(low, high)| low <= text[j - 1] && text[j - 1] <= high)
+                }
+            };
+        }
+        matched = next;
+    }
+    Some(matched[text.len()])
+}
+
+/// The sink a `ForEach-Object` member name selects. The name is a wildcard
+/// pattern (`InvokeScr*`, `Invoke?cript`, `[I]nvokeScript`), which PowerShell
+/// resolves when it matches one member; a pattern that can match an engine
+/// method, or does not parse, is that sink.
+fn powershell_member_pattern_sink(name: Option<&str>) -> Option<PowerShellEngineSink> {
+    let Some(pattern) = name.filter(|name| name.contains(['*', '?', '['])) else {
+        return powershell_engine_sink_for_name(name);
+    };
+    let matches =
+        |candidate: &&str| powershell_wildcard_matches(pattern, candidate).unwrap_or(true);
+    if POWERSHELL_ENGINE_SCRIPT_METHODS.iter().any(matches) {
+        Some(PowerShellEngineSink::Script)
+    } else if matches(&POWERSHELL_EXPAND_STRING_METHOD) {
+        Some(PowerShellEngineSink::Expand)
+    } else {
+        None
+    }
+}
+
+/// Engine members reached through [`PowerShellMemberCmdlet`], called by a
+/// bare or module-qualified name, or a quoted one after `&` or `.`. The name
+/// is the named parameter's value or the first positional word (for
+/// `ForEach-Object` a wildcard pattern); the first argument starts after
+/// `-ArgumentList` (`-Args`) or at the next positional word, which
+/// PowerShell binds to the argument list. Every other parameter must be one
+/// the cmdlet has ([`powershell_cmdlet_parameter_role`]), with its value read
+/// whole; a parameter dcg cannot place fails closed.
 fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
     // Where statements may end, in order; a `(` or `)` token opens or closes
@@ -12884,19 +13135,31 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             continue;
         };
         // `$c = New-Object …` runs the cmdlet on the right of the assignment.
-        let after_assignment = token_index >= 2
-            && tokens[token_index - 1]
-                .text(command)
-                .is_some_and(|operator| {
-                    matches!(operator.trim(), "=" | "+=" | "-=" | "*=" | "/=" | "%=")
-                })
-            && tokens[token_index - 2]
-                .text(command)
-                .is_some_and(|target| target.starts_with('$'))
-            && powershell_token_at_command_boundary(&tokens, token_index - 2, command);
-        if raw_command.starts_with(['\'', '"'])
-            || !(after_assignment
-                || powershell_token_at_command_boundary(&tokens, token_index, command))
+        let command_position = |at: usize| {
+            powershell_token_at_command_boundary(&tokens, at, command)
+                || (at >= 2
+                    && tokens[at - 1].text(command).is_some_and(|operator| {
+                        matches!(operator.trim(), "=" | "+=" | "-=" | "*=" | "/=" | "%=")
+                    })
+                    && tokens[at - 2]
+                        .text(command)
+                        .is_some_and(|target| target.starts_with('$'))
+                    && powershell_token_at_command_boundary(&tokens, at - 2, command))
+        };
+        // `& 'ForEach-Object' …` and `. 'New-Object' …` call a quoted name;
+        // a quoted word elsewhere is a string.
+        let call_operator = token_index >= 1 && {
+            let previous = &tokens[token_index - 1];
+            match previous.text(command) {
+                Some(operator) if previous.kind == NormalizeTokenKind::Separator => {
+                    operator.trim() == "&"
+                }
+                Some(".") => command_position(token_index - 1),
+                _ => false,
+            }
+        };
+        if !(call_operator
+            || (!raw_command.starts_with(['\'', '"']) && command_position(token_index)))
         {
             continue;
         }
@@ -12926,71 +13189,80 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         let Some(words) = decoded_powershell_segment_words(segment) else {
             continue;
         };
-        let (name_parameter, value_parameter) = match cmdlet {
-            PowerShellMemberCmdlet::ForEachObject => ("membername", "inputobject"),
-            PowerShellMemberCmdlet::NewObject => ("typename", "property"),
+        let parameters = match cmdlet {
+            PowerShellMemberCmdlet::ForEachObject => POWERSHELL_FOREACH_OBJECT_PARAMETERS,
+            PowerShellMemberCmdlet::NewObject => POWERSHELL_NEW_OBJECT_PARAMETERS,
         };
+        // Every word is placed: the name, the argument list, a known
+        // parameter with its value. A parameter dcg does not know may take
+        // the next word as its value, so the name and the arguments after it
+        // cannot be placed, and the statement is not verified.
         let mut name: Option<Option<String>> = None;
         let mut argument_start: Option<usize> = None;
-        let mut other_parameter = false;
-        // Where the last group read as one value closes.
-        let mut group_end = 0usize;
+        let mut unplaced = false;
+        // Where the last value read ends; the words before it are part of it.
+        let mut value_end = 0usize;
         let mut index = 1usize;
         while let Some((value, dynamic, range)) = words.get(index) {
             index += 1;
-            if *dynamic || value.len() < 2 || !value.starts_with('-') {
+            if range.start < value_end {
+                continue;
+            }
+            let previous_end = words[index - 2].2.end.max(value_end);
+            if *dynamic || !powershell_parameter_word(value) {
                 if name.is_none() {
                     // `% { … }` is the script-block form.
                     if cmdlet == PowerShellMemberCmdlet::ForEachObject && value.starts_with('{') {
                         break;
                     }
-                    let after = words[index - 2].2.end.max(group_end);
-                    let (value_name, value_end) = powershell_cmdlet_name_value(
+                    let (value_name, end) = powershell_cmdlet_name_value(
                         cmdlet,
                         segment,
-                        after,
+                        previous_end,
                         range.start,
                         (!*dynamic).then_some(value.as_str()),
                     );
                     name = Some(value_name);
-                    group_end = group_end.max(value_end).max(range.end);
-                    argument_start.get_or_insert(group_end);
-                    while words
-                        .get(index)
-                        .is_some_and(|(_, _, word)| word.start < group_end)
-                    {
-                        index += 1;
-                    }
+                    value_end = end.max(range.end);
+                    argument_start.get_or_insert(value_end);
                 } else {
                     // Once the name is bound, the next positional word starts
                     // the argument list (with any `(` before it).
-                    argument_start.get_or_insert_with(|| words[index - 2].2.end.max(group_end));
+                    argument_start.get_or_insert(previous_end);
+                    value_end = powershell_cmdlet_value_end(segment, previous_end, range.start)
+                        .max(range.end);
                 }
                 continue;
             }
             let (parameter, attached) = value
                 .split_once(':')
                 .map_or((value.as_str(), None), |(head, tail)| (head, Some(tail)));
-            let is = |candidate: &str| powershell_alias_parameter(parameter, candidate);
-            let member = is(name_parameter);
-            let arguments = is("argumentlist") || parameter.eq_ignore_ascii_case("-args");
-            if !(member || arguments || is(value_parameter)) {
-                other_parameter = true;
+            let Some(role) = powershell_cmdlet_parameter_role(parameters, parameter) else {
+                unplaced = true;
+                break;
+            };
+            // A switch takes a value only when attached with `:`.
+            if role == PowerShellParameterRole::Switch && attached.is_none() {
                 continue;
             }
-            let (value, value_dynamic, value_start) = match attached {
+            let (value, value_dynamic, value_start, word_end) = match attached {
                 Some(tail) if !tail.is_empty() => {
                     let colon = segment[range.clone()]
                         .find(':')
                         .map_or(range.end, |at| range.start + at + 1);
-                    (tail.to_string(), *dynamic, colon)
+                    (tail.to_string(), *dynamic, colon, range.end)
                 }
                 _ => {
                     let Some((word, word_dynamic, word_range)) = words.get(index) else {
                         break;
                     };
                     index += 1;
-                    (word.clone(), *word_dynamic, word_range.start)
+                    (
+                        word.clone(),
+                        *word_dynamic,
+                        word_range.start,
+                        word_range.end,
+                    )
                 }
             };
             // The value follows the parameter word, or its `:`.
@@ -12999,38 +13271,60 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             } else {
                 value_start
             };
-            if member {
-                let (value_name, value_end) = powershell_cmdlet_name_value(
-                    cmdlet,
-                    segment,
-                    after,
-                    value_start,
-                    (!value_dynamic).then_some(value.as_str()),
-                );
-                name = Some(value_name);
-                group_end = group_end.max(value_end);
-                while words
-                    .get(index)
-                    .is_some_and(|(_, _, word)| word.start < group_end)
-                {
-                    index += 1;
+            match role {
+                PowerShellParameterRole::Name => {
+                    let (value_name, end) = powershell_cmdlet_name_value(
+                        cmdlet,
+                        segment,
+                        after,
+                        value_start,
+                        (!value_dynamic).then_some(value.as_str()),
+                    );
+                    name = Some(value_name);
+                    value_end = end.max(word_end);
                 }
-            } else if arguments {
-                // A `(` read as its own token opens the argument value
-                // (`-ArgumentList ('…', '…')[1]`), so the value starts there.
-                let between = segment.get(after..value_start).unwrap_or_default();
-                argument_start = Some(match between.find('(') {
-                    Some(open) if between.trim() == "(" => after + open,
-                    _ => value_start,
-                });
+                PowerShellParameterRole::Arguments => {
+                    // A `(` read as its own token opens the argument value
+                    // (`-ArgumentList ('…', '…')[1]`), so the value starts there.
+                    let between = segment.get(after..value_start).unwrap_or_default();
+                    argument_start = Some(match between.find('(') {
+                        Some(open) if between.trim() == "(" => after + open,
+                        _ => value_start,
+                    });
+                    value_end =
+                        powershell_cmdlet_value_end(segment, after, value_start).max(word_end);
+                }
+                PowerShellParameterRole::Value | PowerShellParameterRole::Switch => {
+                    value_end =
+                        powershell_cmdlet_value_end(segment, after, value_start).max(word_end);
+                }
             }
+        }
+        // The word list stops at its bound; a name or argument list after it
+        // is not read.
+        if words.len() > MAX_POWERSHELL_VISIBLE_ALIAS_WORDS
+            && index >= words.len()
+            && (name.is_none() || argument_start.is_none())
+        {
+            sinks.push(ExecutableTextSink::Unverified {
+                rule: SINK_ANALYSIS_BOUNDS_RULE,
+                reason: "command contains too many words for bounded analysis of a PowerShell cmdlet",
+            });
+            continue;
+        }
+        if unplaced {
+            sinks.push(ExecutableTextSink::Unverified {
+                rule: POWERSHELL_ENGINE_SCRIPT_RULE,
+                reason: "a PowerShell cmdlet that calls a member or constructor by name has a parameter dcg cannot place",
+            });
+            continue;
         }
         let (Some(name), Some(argument_start)) = (name, argument_start) else {
             continue;
         };
         let sink = match cmdlet {
             PowerShellMemberCmdlet::ForEachObject => {
-                powershell_engine_sink_for_name(name.as_deref())
+                powershell_member_pattern_sink(name.as_deref())
             }
             // A type name that is not static may be that type.
             PowerShellMemberCmdlet::NewObject => powershell_constructed_type_sink(name.as_deref()),
@@ -13049,7 +13343,7 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         // The first argument, and whether a second follows it.
         let (argument, more) = if text.is_empty() {
             continue;
-        } else if other_parameter || text.starts_with('-') {
+        } else if powershell_parameter_word(text) {
             (Err(()), true)
         } else if let Some(group) = text.strip_prefix('(').or_else(|| text.strip_prefix("@(")) {
             match find_powershell_subexpression_close(group, 0) {
@@ -13060,9 +13354,10 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                         // Text glued to the group (`(…)[1]`, `(…).Replace(…)`)
                         // makes another value.
                         (Err(()), true)
-                    } else if text[after..]
-                        .trim_start_matches([' ', '\t'])
-                        .starts_with(',')
+                    } else if text
+                        .as_bytes()
+                        .get(skip_powershell_blank_and_comments(text, after))
+                        == Some(&b',')
                     {
                         // `('…'), $true`: the group is the first of several
                         // arguments, so it is one value only with one element.
@@ -66777,6 +67072,107 @@ mod tests {
             "% (\n".repeat(20_000),
             format!("% {}a{}", "(\n".repeat(50_000), "\n)".repeat(50_000)),
             "New-Object a.Command {\n".repeat(20_000),
+        ] {
+            let _ = sources(&command);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn member_cmdlet_words_are_placed_or_fail_closed() {
+        let sources = |command: &str| {
+            let mut sinks = Vec::new();
+            collect_powershell_member_cmdlet_sinks(command, &mut sinks);
+            sinks
+                .into_iter()
+                .map(|sink| match sink {
+                    ExecutableTextSink::Payload { source, .. } => source,
+                    ExecutableTextSink::Unverified { rule, .. } => rule.to_string(),
+                    _ => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        for (command, expected) in [
+            // A parameter takes its value; a switch takes none.
+            ("% -ErrorAction Stop InvokeScript 'a'", vec!["a"]),
+            ("% -ea:Stop -ov o -Verbose InvokeScript 'a'", vec!["a"]),
+            ("% -Verbose: $false InvokeScript 'a'", vec!["a"]),
+            ("% -WarningAction x, y InvokeScript 'a'", vec!["a"]),
+            ("% -PipelineVariable (\n'p') InvokeScript 'a'", vec!["a"]),
+            ("% \u{2013}MemberName InvokeScript 'a'", vec!["a"]),
+            (
+                "% -MemberName InvokeScript -ErrorAction Stop 'a'",
+                vec!["a"],
+            ),
+            ("% InvokeScript 'a' -ErrorAction Stop", vec!["a"]),
+            (
+                "New-Object -OutVariable o a.Command -ArgumentList 'a', $true",
+                vec!["a"],
+            ),
+            (
+                "New-Object -Property @{ x = '-y' } a.Command 'a', $true",
+                vec!["a"],
+            ),
+            ("% -ErrorAction Stop Name", vec![]),
+            ("% -Begin { -x } -Process { $_ } -End { -y }", vec![]),
+            (
+                "foreach ($x in $y) { Write-Output $x -NoEnumerate }",
+                vec![],
+            ),
+            // A parameter the cmdlet does not have, or a prefix of parameters
+            // that bind in different ways (`-A`: -ArgumentList or -AsJob).
+            (
+                "% -Foo x InvokeScript 'a'",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "% -A x InvokeScript 'a'",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("% -- InvokeScript 'a'", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            // A prefix of parameters that all take a value (`-In`).
+            ("% -In $x InvokeScript 'a'", vec!["a"]),
+            // A negative number is a value.
+            ("New-Object a.Point -1, 2", vec![]),
+            // Member names are wildcard patterns.
+            ("% InvokeScr* 'a'", vec!["a"]),
+            ("% Invoke?cript 'a'", vec!["a"]),
+            ("% 'Invoke[S]cript' 'a'", vec!["a"]),
+            ("% [I]nvokeScript 'a'", vec!["a"]),
+            ("% Invoke[R-T]cript 'a'", vec!["a"]),
+            ("% *eScript 'a'", vec!["a"]),
+            ("% Expand* '$(a)'", vec!["@\"\n$(a)\n\"@"]),
+            ("% 'Invoke`*' 'a'", vec![]),
+            ("% Invoke[!x]cript 'a'", vec![]),
+            ("% Na* 'a'", vec![]),
+            ("% Invoke[Script 'a'", vec!["a"]),
+            // A quoted name runs only after a call operator.
+            ("& 'ForEach-Object' InvokeScript 'a'", vec!["a"]),
+            (". 'ForEach-Object' InvokeScript 'a'", vec!["a"]),
+            ("$c = . 'New-Object' a.Command 'a', $true", vec!["a"]),
+            ("'ForEach-Object' InvokeScript 'a'", vec![]),
+            // A line continuation or comment before the comma after a group.
+            ("New-Object a.Command ('a') `\n, $true", vec!["a"]),
+            ("New-Object a.Command ('a') <# c #> , $true", vec!["a"]),
+        ] {
+            assert_eq!(sources(command), expected, "{command:?}");
+        }
+        // Words past the reader's bound leave the name unread.
+        let long = format!(
+            "% -OutBuffer ({}) InvokeScript 'a'",
+            vec!["0"; 300].join(" + ")
+        );
+        assert_eq!(sources(&long), vec![SINK_ANALYSIS_BOUNDS_RULE]);
+        let started = std::time::Instant::now();
+        for command in [
+            format!("% {} 'a'", "*?".repeat(50_000)),
+            format!("% {} 'a'", "[a-z]".repeat(50_000)),
+            "% -ea Stop ".repeat(20_000),
+            format!("% -InputObject {} InvokeScript 'a'", "1, ".repeat(50_000)),
         ] {
             let _ = sources(&command);
         }
