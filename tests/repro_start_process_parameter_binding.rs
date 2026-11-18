@@ -104,31 +104,21 @@ fn hook_decision(protocol: Protocol, tool_name: &str, command: &str) -> String {
         .to_string()
 }
 
-fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
-    let enabled: std::collections::HashSet<String> =
-        ["core.git", "core.filesystem", "windows.filesystem"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-    let ordered = REGISTRY.expand_enabled_ordered(&enabled);
-    let keywords = REGISTRY.collect_enabled_keywords(&enabled);
-    let index = REGISTRY.build_enabled_keyword_index(&ordered);
-    let config = Config::default();
-    let overrides = config.overrides.compile();
-    let heredoc = config.heredoc_settings();
-    evaluate_command_with_pack_order_at_path_in_dialect(
-        command,
-        &keywords,
-        &ordered,
-        index.as_ref(),
-        &overrides,
-        &LayeredAllowlist::default(),
-        &heredoc,
-        None,
-        dialect,
-    )
-    .decision
-}
+const PACKS: [&str; 3] = ["core.git", "core.filesystem", "windows.filesystem"];
+
+/// The packs of the review's base-versus-head probe: a program's argv must
+/// reach every reader that judged it before.
+const WIDE_PACKS: [&str; 9] = [
+    "core.git",
+    "core.filesystem",
+    "windows.filesystem",
+    "windows.system",
+    "windows.misc",
+    "windows.powershell",
+    "system.permissions",
+    "system.disk",
+    "system.services",
+];
 
 fn decision_with(command: &str, dialect: ShellDialect, packs: &[&str]) -> EvaluationDecision {
     let enabled: std::collections::HashSet<String> =
@@ -156,19 +146,29 @@ fn decision_with(command: &str, dialect: ShellDialect, packs: &[&str]) -> Evalua
 /// Each command must get `expected` in the PowerShell and Unknown dialects
 /// and from both hook protocols with the PowerShell and Bash tools.
 fn assert_everywhere(commands: &[&str], expected: EvaluationDecision) {
+    assert_everywhere_with(commands, expected, &PACKS);
+}
+
+fn assert_dialects(commands: &[&str], expected: EvaluationDecision, packs: &[&str]) {
+    for command in commands {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_with(command, dialect, packs),
+                expected,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+}
+
+fn assert_everywhere_with(commands: &[&str], expected: EvaluationDecision, packs: &[&str]) {
     let hook_expected = if expected == EvaluationDecision::Deny {
         "deny"
     } else {
         "allow"
     };
+    assert_dialects(commands, expected, packs);
     for command in commands {
-        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
-            assert_eq!(
-                decision_in(command, dialect),
-                expected,
-                "{dialect:?}: {command:?}"
-            );
-        }
         for protocol in [Protocol::Claude, Protocol::Codex] {
             for tool in ["PowerShell", "Bash"] {
                 assert_eq!(
@@ -313,5 +313,139 @@ fn scp_argv_keeps_windows_paths() {
         decision_with(upload, ShellDialect::PowerShell, &packs),
         EvaluationDecision::Deny,
         "{upload:?}"
+    );
+}
+
+/// From the review of this change: a program's argument list, one string
+/// or a comma list, reaches every reader that judged the single string
+/// before (Windows tools, `sudo`, `busybox`, `xargs`, `env`, `timeout`).
+#[test]
+fn other_programs_keep_every_reading() {
+    // Denied in both dialects and from every hook with default packs.
+    assert_everywhere_with(
+        &[
+            "Start-Process cipher -ArgumentList '/w:C:\\'",
+            "Start-Process cipher -ArgumentList '/w:C:\\' -Wait",
+            "Start-Process sudo -ArgumentList 'rm -rf /'",
+            "Start-Process sudo -ArgumentList 'rm','-rf','/'",
+            "Start-Process busybox -ArgumentList 'rm -rf /'",
+            "Start-Process xargs -ArgumentList 'rm -rf'",
+            "Start-Process env -ArgumentList 'git reset --hard'",
+            "Start-Process env -ArgumentList 'git','reset','--hard'",
+            "Start-Process timeout -ArgumentList '5 git reset --hard'",
+            "Start-Process timeout -ArgumentList '5','git','reset','--hard'",
+        ],
+        EvaluationDecision::Deny,
+        &WIDE_PACKS,
+    );
+    // Windows tools whose packs judge them in both dialects.
+    assert_dialects(
+        &[
+            "Start-Process takeown -ArgumentList '/f C:\\Windows /r /d y'",
+            "Start-Process takeown -ArgumentList '/f','C:\\Windows','/r','/d','y'",
+            "Start-Process icacls -ArgumentList 'C:\\ /grant Everyone:F /T'",
+            "Start-Process icacls -ArgumentList 'C:\\','/grant','Everyone:F','/T'",
+            "Start-Process net -ArgumentList 'user admin /delete'",
+            "Start-Process net -ArgumentList 'user','admin','/delete'",
+        ],
+        EvaluationDecision::Deny,
+        &WIDE_PACKS,
+    );
+    assert_dialects(
+        &[
+            "Start-Process cipher -ArgumentList '/c C:\\work'",
+            "Start-Process net -ArgumentList 'user'",
+            "Start-Process icacls -ArgumentList 'C:\\work\\f.txt'",
+            "Start-Process env -ArgumentList 'git status'",
+            "Start-Process timeout -ArgumentList '/t 5'",
+            "Start-Process python -ArgumentList '-m','http.server','8000'",
+        ],
+        EvaluationDecision::Allow,
+        &WIDE_PACKS,
+    );
+}
+
+/// From the review: spellings PowerShell 7.5 runs that the binder must
+/// read. Each ran `git reset --hard` (or cmd's) in the shell-truth sandbox.
+#[test]
+fn review_spellings_bind() {
+    let all = "-ErrorAction Continue -WarningAction Continue -InformationAction Continue \
+               -ProgressAction Continue -ErrorVariable e1 -WarningVariable w1 \
+               -InformationVariable i1 -OutVariable o1 -OutBuffer 1 -PipelineVariable p1 \
+               -WorkingDirectory . -RedirectStandardError e.txt -RedirectStandardOutput o.txt \
+               -Environment @{A='1'} -Wait -NoNewWindow -PassThru -Verbose";
+    let long_git = format!("Start-Process {all} git reset,--hard");
+    let long_cmd = format!("Start-Process {all} cmd '/c git reset --hard'");
+    let long_named =
+        format!("Start-Process {all} -FilePath cmd -ArgumentList '/c git reset --hard'");
+    assert_everywhere(
+        &[
+            "Start-Process('git') -ArgumentList 'reset','--hard'",
+            "Start-Process(\"git\") 'reset','--hard'",
+            "saps('git') reset,--hard",
+            "Start-Process git \u{2013}ArgumentList 'reset','--hard' \u{2013}Wait \u{2013}NoNewWindow",
+            "Start-Process git \u{2014}ArgumentList 'reset','--hard' -Wait -NoNewWindow",
+            "Start-Process git 'reset','--hard' \u{2013}Wait -NoNewWindow",
+            "Start-Process \u{2013}FilePath git 'reset','--hard' -Wait -NoNewWindow",
+            &long_git,
+            &long_cmd,
+            &long_named,
+            "Start-Process git *>&1 -ArgumentList 'reset','--hard'",
+            "Start-Process git -Wait -NoNewWindow *>$null 'reset','--hard'",
+            "Start-Process -FilePath git -ArgumentList ([string[]]('reset','--hard')) -Wait -NoNewWindow",
+        ],
+        EvaluationDecision::Deny,
+    );
+    // `Start-Process('cmd')` is judged where PowerShell reads it.
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        assert_eq!(
+            decision_with(
+                "Start-Process('cmd') '/c git reset --hard'",
+                dialect,
+                &PACKS
+            ),
+            EvaluationDecision::Deny,
+            "{dialect:?}"
+        );
+    }
+    assert_everywhere(
+        &[
+            "Start-Process('notepad') 'C:\\x\\notes.txt'",
+            "Start-Process git \u{2013}ArgumentList 'status' \u{2013}Wait",
+            "Start-Process git *>&1 -ArgumentList 'log','--oneline'",
+            "Start-Process git -ArgumentList ([string[]]('reset','--soft'))",
+        ],
+        EvaluationDecision::Allow,
+    );
+}
+
+/// From the review of PR #37: a cmd target whose argument list holds a
+/// PowerShell value. cmd runs that value as part of its command text, so
+/// it is read as unknown cmd text, which fails closed, as `cmd /c %X%` does.
+#[test]
+fn values_in_a_cmd_argument_list_are_unknown_cmd_text() {
+    assert_everywhere(
+        &[
+            "$x = 'git reset --hard'; Start-Process cmd -ArgumentList '/c',$x",
+            "Start-Process cmd -ArgumentList $x",
+            "Start-Process cmd -ArgumentList \"/c gi$(\"\")t reset --hard\"",
+            "start cmd -ArgumentList \"/c git reset --hard\"",
+            "start cmd -ArgumentList \"/c gi$('')t reset --hard\"",
+            "Start-Process cmd \"/c gi$('')t reset --hard\"",
+            "Start-Process -FilePath $env:ComSpec -ArgumentList '/c',$x",
+            // The same unknown switch, written directly.
+            "cmd %X%",
+        ],
+        EvaluationDecision::Deny,
+    );
+    assert_everywhere(
+        &[
+            "Start-Process cmd -ArgumentList '/c dir'",
+            "Start-Process cmd -ArgumentList '/d','/c','dir'",
+            "start cmd -ArgumentList \"/c dir\"",
+            "Start-Process notepad -ArgumentList $file",
+            "cmd /d /c dir",
+        ],
+        EvaluationDecision::Allow,
     );
 }

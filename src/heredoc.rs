@@ -173,9 +173,10 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     r"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b",
     // PowerShell Start-Process (aliases `saps`, `start`) runs `<file>
     // <args>`; Tier 2 binds its parameters as PowerShell does (any order,
-    // prefixes, aliases, positions) and re-evaluates that line. Any
-    // spelling has the command name followed by a blank or a continuation.
-    r"(?i)(?:^|[\s;|&({=\\])(?:start-process|saps|start)(?:[^\S\r\n]|`\r?\n)",
+    // prefixes, aliases, positions) and re-evaluates that line. PowerShell
+    // ends the command name at a blank, a continuation, or a `(` or `{`
+    // that starts the first argument (`Start-Process('git')`).
+    r"(?i)(?:^|[\s;|&({=\\])(?:start-process|saps|start)(?:[^\S\r\n]|`\r?\n|[({])",
     // Piped execution to interpreters (versioned, with optional .exe)
     r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)
@@ -3286,8 +3287,9 @@ pub(crate) fn start_process_target_is_shell(file: &str) -> bool {
 /// reads it as cmd does (its operators, its CR removal, a
 /// `C:\…\cmd.exe` path kept as written), a PowerShell host as
 /// PowerShell, and the other shells as POSIX. Another program's argv is
-/// spelled as a PowerShell call of literal words (`& 'git' 'reset'
-/// '--hard'`), which reads exactly that argv, with Windows paths as paths.
+/// spelled as a PowerShell call (`& git reset --hard`), which reads exactly
+/// that argv, with Windows paths as paths, and, when it has no Windows path
+/// syntax, also as the POSIX command (`git reset --hard`).
 #[must_use]
 pub fn start_process_line_dialect(line: &str) -> crate::normalize::ShellDialect {
     let file = line.split_ascii_whitespace().next().unwrap_or("");
@@ -20409,7 +20411,7 @@ mod tests {
             assert!(
                 contents
                     .iter()
-                    .any(|content| content.content == "& 'iexplore.exe' 'https://example.com'"),
+                    .any(|content| content.content == "& iexplore.exe https://example.com"),
                 "{contents:?}"
             );
         }

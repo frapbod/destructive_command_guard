@@ -150,8 +150,10 @@ fn resolve(name: &str, version_7: bool) -> Resolved {
 /// One syntactic unit of a command's arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Unit {
-    /// `-Name`, or `-Name:<elements>` with its value attached.
+    /// `-Name`, or `-Name:<elements>` with its value attached. `start` is
+    /// where its dash is (one byte for `-`, three for `–`, `—` or `―`).
     Parameter {
+        start: usize,
         name: Range<usize>,
         attached: Option<Vec<Range<usize>>>,
     },
@@ -342,11 +344,61 @@ fn element_list(text: &str, at: usize) -> (Vec<Range<usize>>, usize) {
     }
 }
 
-fn is_parameter_start(bytes: &[u8], at: usize) -> bool {
-    bytes.get(at) == Some(&b'-')
-        && bytes
-            .get(at + 1)
+/// The width of a dash at `at`: PowerShell takes `-` and the en dash, em
+/// dash and horizontal bar (U+2013, U+2014, U+2015) alike before a
+/// parameter name and in `--` (measured with PowerShell 7.5; U+2012 and
+/// U+2212 are not dashes to it).
+fn dash_len(text: &str, at: usize) -> Option<usize> {
+    match text.get(at..)?.chars().next()? {
+        '-' => Some(1),
+        '\u{2013}' | '\u{2014}' | '\u{2015}' => Some(3),
+        _ => None,
+    }
+}
+
+fn is_parameter_start(text: &str, at: usize) -> bool {
+    dash_len(text, at).is_some_and(|width| {
+        text.as_bytes()
+            .get(at + width)
             .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'?'))
+    })
+}
+
+/// The end of `--` (any two dashes) at `at` when it stands alone.
+fn end_of_parameters(text: &str, at: usize) -> Option<usize> {
+    let first = dash_len(text, at)?;
+    let end = at + first + dash_len(text, at + first)?;
+    (end >= text.len()
+        || horizontal_space_len(text, end).is_some()
+        || ends_statement(text.as_bytes(), end))
+    .then_some(end)
+}
+
+/// The end of a redirection at `at` (`>`, `>>`, `2>`, `*>>`, `3>&1`, with
+/// its target), which PowerShell takes out of the arguments wherever it
+/// stands: `Start-Process git *>&1 reset,--hard` binds `reset,--hard`.
+/// A redirection starts a word: `>` inside a bare word is part of it.
+fn redirection_end(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = at;
+    if matches!(bytes.get(index), Some(b'*' | b'1'..=b'6')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'>') {
+        return None;
+    }
+    index += 1;
+    if bytes.get(index) == Some(&b'>') {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b'&') && bytes.get(index + 1).is_some_and(u8::is_ascii_digit) {
+        return Some(index + 2);
+    }
+    let target = skip_blanks(text, index, false);
+    if target >= bytes.len() || ends_statement(bytes, target) {
+        return Some(target);
+    }
+    Some(element_end(text, target).max(target + 1).min(text.len()))
 }
 
 /// The argument units of the command whose arguments start at `at`, up to
@@ -358,21 +410,23 @@ fn units(text: &str, mut at: usize, limit: usize) -> (Vec<Unit>, usize) {
     let mut end = at;
     while units.len() < limit {
         at = skip_blanks(text, at, false);
-        if at >= bytes.len() || ends_statement(bytes, at) {
-            break;
-        }
-        if bytes.get(at..at + 2) == Some(b"--")
-            && (at + 2 >= bytes.len()
-                || horizontal_space_len(text, at + 2).is_some()
-                || ends_statement(bytes, at + 2))
-        {
-            units.push(Unit::EndOfParameters);
-            at += 2;
+        if let Some(after) = redirection_end(text, at) {
+            at = after;
             end = at;
             continue;
         }
-        if is_parameter_start(bytes, at) {
-            let name_start = at + 1;
+        if at >= bytes.len() || ends_statement(bytes, at) {
+            break;
+        }
+        if let Some(after) = end_of_parameters(text, at) {
+            units.push(Unit::EndOfParameters);
+            at = after;
+            end = at;
+            continue;
+        }
+        if is_parameter_start(text, at) {
+            let start = at;
+            let name_start = at + dash_len(text, at).unwrap_or(1);
             let mut name_end = name_start;
             while bytes
                 .get(name_end)
@@ -385,6 +439,7 @@ fn units(text: &str, mut at: usize, limit: usize) -> (Vec<Unit>, usize) {
                 if value_start >= bytes.len() || ends_statement(bytes, value_start) {
                     // `-Wait:` with nothing after it: PowerShell stops.
                     units.push(Unit::Parameter {
+                        start,
                         name: name_start..name_end,
                         attached: Some(Vec::new()),
                     });
@@ -399,6 +454,7 @@ fn units(text: &str, mut at: usize, limit: usize) -> (Vec<Unit>, usize) {
                 None
             };
             units.push(Unit::Parameter {
+                start,
                 name: name_start..name_end,
                 attached,
             });
@@ -431,6 +487,10 @@ fn bind(text: &str, units: &[Unit], version_7: bool) -> Option<Bound> {
     let mut positionals: Vec<Value> = Vec::new();
     let mut pending: Option<&'static Parameter> = None;
     let mut parameters_ended = false;
+    if units.len() > UNIT_LIMIT {
+        // More units than any binding uses: PowerShell stops.
+        return None;
+    }
     let mut assign = |parameter: &'static Parameter, value: Option<Value>| -> Option<()> {
         if bound.contains(&parameter.name) {
             return None;
@@ -458,30 +518,43 @@ fn bind(text: &str, units: &[Unit], version_7: bool) -> Option<Bound> {
             (Unit::Argument(elements), None) => {
                 positionals.push(Value::Elements(elements.clone()));
             }
-            (Unit::Parameter { name, attached }, _) if parameters_ended => {
+            (
+                Unit::Parameter {
+                    start,
+                    name,
+                    attached,
+                },
+                _,
+            ) if parameters_ended => {
                 // After `--` a parameter-like word is a plain argument.
-                let start = name.start.saturating_sub(1);
                 let end = attached
                     .as_ref()
                     .and_then(|elements| elements.last())
                     .map_or(name.end, |last| last.end);
-                let word = Value::Literal(text.get(start..end)?.to_string());
+                let word = Value::Literal(text.get(*start..end)?.to_string());
                 match pending.take() {
                     Some(parameter) => assign(parameter, Some(word))?,
                     None => positionals.push(word),
                 }
             }
-            (Unit::Parameter { name, attached }, Some(parameter)) => {
+            (
+                Unit::Parameter {
+                    start,
+                    name,
+                    attached,
+                },
+                Some(parameter),
+            ) => {
                 let raw = text.get(name.clone())?;
                 if !matches!(resolve(raw, version_7), Resolved::Unknown) || attached.is_some() {
                     // A parameter where a value belongs: MissingArgument.
                     return None;
                 }
-                let word = text.get(name.start.saturating_sub(1)..name.end)?;
+                let word = text.get(*start..name.end)?;
                 assign(parameter, Some(Value::Literal(word.to_string())))?;
                 pending = None;
             }
-            (Unit::Parameter { name, attached }, None) => {
+            (Unit::Parameter { name, attached, .. }, None) => {
                 let Resolved::Found(parameter) = resolve(text.get(name.clone())?, version_7) else {
                     return None;
                 };
@@ -552,6 +625,32 @@ fn split_top_level<'a>(inner: &'a str, separators: &[u8]) -> Vec<&'a str> {
     parts
 }
 
+/// `value` without a leading cast that keeps strings as they are
+/// (`[string]`, `[string[]]`, `[object[]]`, `[array]`, with or without
+/// `System.`), as in `-ArgumentList ([string[]]('reset','--hard'))`. Only
+/// an expression has casts: in argument mode `[string]'x'` is the word
+/// `[string]x`.
+fn strip_string_cast(value: &str) -> Option<&str> {
+    let value = value.trim_start();
+    let close = value.strip_prefix('[')?.find(']')? + 1;
+    let mut name = value[1..close].to_ascii_lowercase();
+    let rest = &value[close + 1..];
+    let rest = if let Some(tail) = rest.strip_prefix(']') {
+        // `[string[]]`: the first `]` closed the `[]`; this one the cast.
+        name.push(']');
+        tail
+    } else {
+        rest
+    };
+    let name = name.strip_prefix("system.").unwrap_or(&name);
+    matches!(
+        name,
+        "string" | "string[]" | "object" | "object[]" | "array"
+    )
+    .then(|| rest.trim_start())
+    .filter(|rest| !rest.is_empty())
+}
+
 /// Literal groups nested deeper than this are not reduced (read as not a
 /// literal), which bounds the recursion below.
 const GROUP_DEPTH: usize = 8;
@@ -600,6 +699,9 @@ fn element_strings_within(raw: &str, depth: usize) -> Option<Vec<String>> {
         }
         if let Some(text) = decode_powershell_literal_expression(raw) {
             return Some(vec![text]);
+        }
+        if let Some(cast) = strip_string_cast(inner) {
+            return element_strings_within(cast, depth);
         }
         return element_strings_within(inner, depth);
     }
@@ -673,9 +775,46 @@ pub(crate) fn windows_argv(line: &str) -> Vec<String> {
     }
 }
 
-/// A PowerShell single-quoted literal of `text`.
-fn powershell_literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
+/// `text` as one PowerShell argument-mode word: bare when PowerShell reads
+/// it as itself (so rules that match bare words see it as written), else a
+/// single-quoted literal.
+fn powershell_word(text: &str) -> String {
+    let bare = !text.is_empty()
+        && text != "--%"
+        && text != "--"
+        && !text.starts_with(['@', '#', '~'])
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./\\:=+%^*?!-".contains(&byte));
+    if bare {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "''"))
+    }
+}
+
+/// `text` as one POSIX shell word: bare when the shell reads it as itself
+/// (globs and a leading `~` keep their shell meaning, as the program's own
+/// runtime may give them), else a single-quoted literal. A program name
+/// with `=` is quoted, or the shell would read an assignment.
+fn posix_word(text: &str, program: bool) -> String {
+    let bare = !text.is_empty()
+        && (!program || !text.contains('='))
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:=+%^*?,@~-".contains(&byte));
+    if bare {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// Whether a word has Windows path syntax (a backslash, or a drive letter
+/// and colon), which a POSIX reading misreads (`C:\\work\\f` as host `C`).
+fn has_windows_path_syntax(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    word.contains('\\') || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 /// The shells whose command line is read as a whole (see
@@ -689,11 +828,30 @@ const SHELL_READERS: [&str; 3] = ["cmd", "powershell", "sh"];
 /// literal (`'reset','--hard',$rest` still runs a hard reset).
 const DYNAMIC_ARGUMENT: &str = "DCG_START_PROCESS_ARGUMENT";
 
-/// The argument list's strings, each element that is not a literal as one
-/// [`DYNAMIC_ARGUMENT`]; `None` when no element is a literal.
-fn argument_strings(text: &str, value: &Value) -> Option<Vec<String>> {
+/// How a program's reader spells an element that is not a literal: a
+/// shell reads it as its own variable, unknown text it fails closed on
+/// (`cmd /c %DCG_START_PROCESS_ARGUMENT%`); another program gets one argv
+/// word.
+fn dynamic_argument(program: &str) -> String {
+    match crate::heredoc::start_process_target_name(program).as_str() {
+        "cmd" => format!("%{DYNAMIC_ARGUMENT}%"),
+        "powershell" | "pwsh" => format!("${DYNAMIC_ARGUMENT}"),
+        "bash" | "sh" | "wsl" => format!("\"${DYNAMIC_ARGUMENT}\""),
+        _ => DYNAMIC_ARGUMENT.to_string(),
+    }
+}
+
+/// The argument list joined as Start-Process joins it, each element that
+/// is not a literal as `dynamic`; `None` when no element is a literal and
+/// `need_literal` is set (nothing about the line is known).
+fn joined_arguments(
+    text: &str,
+    value: &Value,
+    dynamic: &str,
+    need_literal: bool,
+) -> Option<String> {
     let Value::Elements(elements) = value else {
-        return value_strings(text, value);
+        return value_strings(text, value).map(|strings| strings.join(" "));
     };
     let mut strings = Vec::new();
     let mut literal = false;
@@ -703,36 +861,41 @@ fn argument_strings(text: &str, value: &Value) -> Option<Vec<String>> {
                 literal = true;
                 strings.extend(decoded);
             }
-            None => strings.push(DYNAMIC_ARGUMENT.to_string()),
+            None => strings.push(dynamic.to_string()),
         }
     }
-    literal.then_some(strings)
+    (literal || !need_literal).then(|| strings.join(" "))
 }
 
 fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
     let Some(arguments) = bound.arguments.as_ref() else {
         return Vec::new();
     };
-    let Some(arguments) = argument_strings(text, arguments) else {
-        return Vec::new();
-    };
-    let joined = arguments.join(" ");
     let file = match value_strings(text, &bound.file) {
         Some(strings) if strings.len() == 1 => strings.into_iter().next(),
         Some(_) => return Vec::new(),
         None => None,
     };
     let Some(file) = file else {
-        // Any program: read the line as each shell would.
+        // Any program: read the line as each shell would, when some of it
+        // is known.
         return SHELL_READERS
             .iter()
-            .map(|shell| format!("{shell} {joined}"))
+            .filter_map(|shell| {
+                joined_arguments(text, arguments, &dynamic_argument(shell), true)
+                    .map(|joined| format!("{shell} {joined}"))
+            })
             .collect();
     };
     if file.is_empty() {
         return Vec::new();
     }
     if crate::heredoc::start_process_target_is_shell(&file) {
+        // A shell runs its line as code even when none of it is known.
+        let Some(joined) = joined_arguments(text, arguments, &dynamic_argument(&file), false)
+        else {
+            return Vec::new();
+        };
         let word = if file.chars().any(char::is_whitespace) {
             crate::heredoc::start_process_target_name(&file)
         } else {
@@ -740,12 +903,35 @@ fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
         };
         return vec![format!("{word} {joined}")];
     }
-    let mut line = format!("& {}", powershell_literal(&file));
-    for word in windows_argv(&joined) {
+    let Some(joined) = joined_arguments(text, arguments, DYNAMIC_ARGUMENT, true) else {
+        return Vec::new();
+    };
+    // Another program reads the line as argv by Windows' rules. That argv
+    // is read as a PowerShell call, where the packs know Windows paths;
+    // when no word has Windows path syntax it is also read as a POSIX
+    // command, which is exact then and keeps the POSIX-only readings
+    // (`env`, `timeout` and other wrappers) that a single string always had.
+    let argv = windows_argv(&joined);
+    let mut line = format!("& {}", powershell_word(&file));
+    for word in &argv {
         line.push(' ');
-        line.push_str(&powershell_literal(&word));
+        line.push_str(&powershell_word(word));
     }
-    vec![line]
+    let mut lines = vec![line];
+    if !std::iter::once(&file)
+        .chain(&argv)
+        .any(|word| has_windows_path_syntax(word))
+        && crate::heredoc::start_process_line_dialect(&file)
+            == crate::normalize::ShellDialect::Posix
+    {
+        let mut posix = posix_word(&file, true);
+        for word in &argv {
+            posix.push(' ');
+            posix.push_str(&posix_word(word, false));
+        }
+        lines.push(posix);
+    }
+    lines
 }
 
 /// The PowerShell names of `Start-Process` at a command start: `start` and
@@ -755,8 +941,10 @@ static START_PROCESS_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
         .expect("start-process name regex compiles")
 });
 
-/// At most this many units bind: each parameter once, two positions.
-const UNIT_LIMIT: usize = PARAMETERS.len() + 3;
+/// At most this many units bind: each parameter once, as its name and a
+/// value, two positions and one `--`. A call with more stops with a binding
+/// error, so the scan reads one more unit to tell.
+const UNIT_LIMIT: usize = 2 * PARAMETERS.len() + 3;
 
 /// Every `Start-Process` call in `text` that binds, as (the call's range,
 /// the command lines its program runs).
@@ -765,16 +953,19 @@ pub(crate) fn start_process_lines(text: &str) -> Vec<(Range<usize>, Vec<String>)
     let mut calls = Vec::new();
     for found in START_PROCESS_NAME.captures_iter(text) {
         let name = found.get(1).expect("group 1 always present");
-        // The name is a whole word: blanks or a line continuation follow.
+        // The name is a whole word: blanks, a line continuation, or a `(`
+        // or `{` that starts the first argument (`Start-Process('git')`)
+        // follow. Any other character continues the command name.
         let after = name.end();
         let tail = text.get(after..).unwrap_or_default();
         if horizontal_space_len(text, after).is_none()
             && !tail.starts_with("`\n")
             && !tail.starts_with("`\r\n")
+            && !tail.starts_with(['(', '{'])
         {
             continue;
         }
-        let (units, end) = units(text, name.end(), UNIT_LIMIT);
+        let (units, end) = units(text, name.end(), UNIT_LIMIT + 1);
         let mut lines: Vec<String> = Vec::new();
         for version_7 in [true, false] {
             if let Some(bound) = bind(text, &units, version_7) {
@@ -801,6 +992,21 @@ mod tests {
             .into_iter()
             .flat_map(|(_, lines)| lines)
             .collect()
+    }
+
+    /// The readings of a program that is not a shell, whose argv has no
+    /// Windows path syntax: a PowerShell call and the POSIX command.
+    fn program(argv: &str) -> Vec<String> {
+        vec![format!("& {argv}"), argv.to_string()]
+    }
+
+    /// The expected readings: a shell's own line, or another program's.
+    fn expected(line: &str) -> Vec<String> {
+        if line.starts_with("cmd ") {
+            vec![line.to_string()]
+        } else {
+            program(line)
+        }
     }
 
     /// Bindings measured with PowerShell 7.5 (proxy of Start-Process's own
@@ -846,43 +1052,35 @@ mod tests {
                 "Microsoft.PowerShell.Management\\Start-Process cmd '/c x'",
                 "cmd /c x",
             ),
-            ("Start-Process git reset,--hard", "& 'git' 'reset' '--hard'"),
+            ("Start-Process git reset,--hard", "git reset --hard"),
             (
                 "Start-Process git -ArgumentList 'reset','--hard'",
-                "& 'git' 'reset' '--hard'",
+                "git reset --hard",
             ),
             (
                 "Start-Process git 'reset', '--hard' -Wait",
-                "& 'git' 'reset' '--hard'",
+                "git reset --hard",
             ),
-            (
-                "Start-Process git reset ,--hard",
-                "& 'git' 'reset' '--hard'",
-            ),
-            (
-                "Start-Process git reset,\n--hard",
-                "& 'git' 'reset' '--hard'",
-            ),
-            (
-                "Start-Process git @('reset'; '--hard')",
-                "& 'git' 'reset' '--hard'",
-            ),
-            (
-                "Start-Process git ('reset','--hard')",
-                "& 'git' 'reset' '--hard'",
-            ),
+            ("Start-Process git reset ,--hard", "git reset --hard"),
+            ("Start-Process git reset,\n--hard", "git reset --hard"),
+            ("Start-Process git @('reset'; '--hard')", "git reset --hard"),
+            ("Start-Process git ('reset','--hard')", "git reset --hard"),
             (
                 "Start-Process git -ArgumentList @'\nreset --hard\n'@",
-                "& 'git' 'reset' '--hard'",
+                "git reset --hard",
             ),
             (
                 "Start-Process git -ArgumentList ('re'+'set'),'--hard'",
-                "& 'git' 'reset' '--hard'",
+                "git reset --hard",
             ),
-            ("Start-Process git -ArgumentList -x", "& 'git' '-x'"),
-            ("Start-Process git -ArgumentList a'b c'", "& 'git' 'ab' 'c'"),
+            ("Start-Process git -ArgumentList -x", "git -x"),
+            ("Start-Process git -ArgumentList a'b c'", "git ab c"),
         ] {
-            assert_eq!(lines(spelling), vec![expected.to_string()], "{spelling:?}");
+            assert_eq!(
+                lines(spelling),
+                super::tests::expected(expected),
+                "{spelling:?}"
+            );
         }
     }
 
@@ -915,11 +1113,11 @@ mod tests {
     fn binds_under_both_parameter_tables() {
         assert_eq!(
             lines("Start-Process -C x git reset,--hard"),
-            vec!["& 'git' 'reset' '--hard'".to_string()]
+            program("git reset --hard")
         );
         assert_eq!(
             lines("Start-Process -E @{} git reset,--hard"),
-            vec!["& 'git' 'reset' '--hard'".to_string()]
+            program("git reset --hard")
         );
         assert!(matches!(resolve("E", false), Resolved::Ambiguous));
         assert!(matches!(resolve("Co", false), Resolved::Unknown));
@@ -946,12 +1144,42 @@ mod tests {
     fn dynamic_elements_keep_the_literal_ones() {
         assert_eq!(
             lines("Start-Process git -ArgumentList 'reset','--hard',$rest"),
-            vec!["& 'git' 'reset' '--hard' 'DCG_START_PROCESS_ARGUMENT'".to_string()]
+            program("git reset --hard DCG_START_PROCESS_ARGUMENT")
         );
         assert_eq!(
             lines("Start-Process git -ArgumentList 'push',$remote,'--force'"),
-            vec!["& 'git' 'push' 'DCG_START_PROCESS_ARGUMENT' '--force'".to_string()]
+            program("git push DCG_START_PROCESS_ARGUMENT --force")
         );
+    }
+
+    /// A shell reads an element that is not a literal as its own variable,
+    /// also when no element is a literal: it runs that text as code.
+    #[test]
+    fn shells_read_dynamic_elements_as_variables() {
+        for (spelling, line) in [
+            (
+                "$x = 'git reset --hard'; Start-Process cmd -ArgumentList '/c',$x",
+                "cmd /c %DCG_START_PROCESS_ARGUMENT%",
+            ),
+            (
+                "Start-Process cmd -ArgumentList $x",
+                "cmd %DCG_START_PROCESS_ARGUMENT%",
+            ),
+            (
+                "Start-Process cmd \"/c gi$('')t reset --hard\"",
+                "cmd %DCG_START_PROCESS_ARGUMENT%",
+            ),
+            (
+                "Start-Process pwsh -ArgumentList '-c',$x",
+                "pwsh -c $DCG_START_PROCESS_ARGUMENT",
+            ),
+            (
+                "Start-Process bash -ArgumentList '-c',$x",
+                "bash -c \"$DCG_START_PROCESS_ARGUMENT\"",
+            ),
+        ] {
+            assert_eq!(lines(spelling), vec![line.to_string()], "{spelling:?}");
+        }
     }
 
     /// Deeply nested groups are not reduced, and do not exhaust the stack.
@@ -963,7 +1191,151 @@ mod tests {
         let deep = format!("git -ArgumentList {deep},'--hard'");
         assert_eq!(
             lines(&format!("Start-Process {deep}")),
-            vec!["& 'git' 'DCG_START_PROCESS_ARGUMENT' '--hard'".to_string()]
+            program("git DCG_START_PROCESS_ARGUMENT --hard")
+        );
+    }
+
+    /// Measured with PowerShell 7.5: a `(` or `{` right after the name
+    /// starts the first argument; a quote, `$`, `@`, `#` or `<#` there
+    /// continues the command name (`Start-Process'git'` is another command).
+    #[test]
+    fn a_group_right_after_the_name_is_the_first_argument() {
+        for spelling in [
+            "Start-Process('git') -ArgumentList 'reset','--hard'",
+            "Start-Process(\"git\") 'reset','--hard'",
+            "saps('git') reset,--hard",
+        ] {
+            assert_eq!(lines(spelling), program("git reset --hard"), "{spelling:?}");
+        }
+        assert_eq!(
+            lines("Start-Process('cmd') '/c x'"),
+            vec!["cmd /c x".to_string()]
+        );
+        for spelling in [
+            "Start-Process'git' reset,--hard",
+            "Start-Process$x reset,--hard",
+            "Start-Process<#c#> git reset,--hard",
+        ] {
+            assert!(lines(spelling).is_empty(), "{spelling:?}");
+        }
+    }
+
+    /// PowerShell takes U+2013, U+2014 and U+2015 as a parameter dash and in
+    /// `--`; U+2012 is not one. A dash in a value is passed as written.
+    #[test]
+    fn unicode_dashes_start_parameters() {
+        for spelling in [
+            "Start-Process git \u{2013}ArgumentList 'reset','--hard' \u{2013}Wait \u{2013}NoNewWindow",
+            "Start-Process git \u{2014}ArgumentList 'reset','--hard' -Wait -NoNewWindow",
+            "Start-Process git \u{2015}ArgumentList 'reset','--hard'",
+            "Start-Process git 'reset','--hard' \u{2013}Wait -NoNewWindow",
+            "Start-Process \u{2013}FilePath git 'reset','--hard' -Wait -NoNewWindow",
+            "Start-Process git \u{2013}ArgumentList:reset,--hard",
+            "Start-Process \u{2013}\u{2013} git reset,--hard",
+            "Start-Process -\u{2013} git reset,--hard",
+        ] {
+            assert_eq!(lines(spelling), program("git reset --hard"), "{spelling:?}");
+        }
+        assert!(lines("Start-Process git \u{2012}ArgumentList reset").is_empty());
+        assert_eq!(
+            lines("Start-Process git -ArgumentList \u{2013}x"),
+            vec![
+                "& git '\u{2013}x'".to_string(),
+                "git '\u{2013}x'".to_string()
+            ]
+        );
+    }
+
+    /// Every parameter may be bound before the program, each as a name and
+    /// a value: the scan reads them all.
+    #[test]
+    fn every_parameter_may_come_before_the_program() {
+        let all = "-ErrorAction Continue -WarningAction Continue -InformationAction Continue \
+                   -ProgressAction Continue -ErrorVariable e1 -WarningVariable w1 \
+                   -InformationVariable i1 -OutVariable o1 -OutBuffer 1 -PipelineVariable p1 \
+                   -WorkingDirectory . -RedirectStandardError e.txt -RedirectStandardOutput o.txt \
+                   -RedirectStandardInput i.txt -Credential c -Verb RunAs -WindowStyle Hidden \
+                   -Environment @{A='1'} -Wait -NoNewWindow -PassThru -Verbose -Debug \
+                   -LoadUserProfile -UseNewEnvironment";
+        assert_eq!(
+            lines(&format!("Start-Process {all} git reset,--hard")),
+            program("git reset --hard")
+        );
+        assert_eq!(
+            lines(&format!("Start-Process {all} -- cmd '/c x'")),
+            vec!["cmd /c x".to_string()]
+        );
+        // One unit more than any binding uses: PowerShell stops.
+        assert!(lines(&format!("Start-Process {all} -- cmd '/c x' extra")).is_empty());
+    }
+
+    /// Measured with PowerShell 7.5: a redirection anywhere in the
+    /// arguments is taken out of them.
+    #[test]
+    fn redirections_are_not_arguments() {
+        for spelling in [
+            "Start-Process git *>&1 -ArgumentList 'reset','--hard'",
+            "Start-Process git -Wait -NoNewWindow *>$null 'reset','--hard'",
+            "Start-Process git 2>&1 reset,--hard",
+            "Start-Process git 2> e.txt reset,--hard",
+            "Start-Process git > o.txt reset,--hard",
+            "Start-Process git *>> o.txt reset,--hard",
+            "Start-Process git 2>&1 3>&1 6>&1 reset,--hard",
+            "Start-Process git reset,--hard 2>&1 | Out-Null",
+        ] {
+            assert_eq!(lines(spelling), program("git reset --hard"), "{spelling:?}");
+        }
+        assert_eq!(lines("Start-Process git 2>&1reset"), program("git reset"));
+        // `reset` is the redirection's target; no argument list.
+        assert!(lines("Start-Process git > reset").is_empty());
+    }
+
+    /// A string cast in an expression keeps its strings.
+    #[test]
+    fn string_casts_keep_their_strings() {
+        for spelling in [
+            "Start-Process git -ArgumentList ([string[]]('reset','--hard'))",
+            "Start-Process git -ArgumentList ([System.String[]] ('reset','--hard'))",
+            "Start-Process git -ArgumentList ([object[]]('reset','--hard'))",
+            "Start-Process git -ArgumentList ([array]('reset','--hard'))",
+            "Start-Process git -ArgumentList ([string] 'reset'),'--hard'",
+        ] {
+            assert_eq!(lines(spelling), program("git reset --hard"), "{spelling:?}");
+        }
+        assert_eq!(
+            lines("Start-Process git -ArgumentList ([string]$rest),'--hard'"),
+            program("git DCG_START_PROCESS_ARGUMENT --hard")
+        );
+    }
+
+    /// Words are bare where the reader takes them as written, else quoted;
+    /// an argv with Windows path syntax is read only as PowerShell, where
+    /// `C:\\work` is a path.
+    #[test]
+    fn argv_spelling() {
+        assert_eq!(
+            lines("Start-Process git -ArgumentList 'commit','-m','\"a b\"',\"it's\""),
+            vec![
+                "& git commit -m 'a b' 'it''s'".to_string(),
+                "git commit -m 'a b' 'it'\\''s'".to_string()
+            ]
+        );
+        assert_eq!(
+            lines("Start-Process cipher -ArgumentList '/w:C:\\'"),
+            vec!["& cipher /w:C:\\".to_string()]
+        );
+        assert_eq!(
+            lines(
+                "Start-Process scp.exe -ArgumentList 'outside.example:/in/r.csv','C:\\work\\r.csv'"
+            ),
+            vec!["& scp.exe outside.example:/in/r.csv C:\\work\\r.csv".to_string()]
+        );
+        assert_eq!(
+            lines("Start-Process env -ArgumentList 'FOO=1 git reset --hard'"),
+            vec![
+                "& env FOO=1 git reset --hard".to_string(),
+                "env FOO=1 git reset --hard".to_string()
+            ]
         );
     }
 

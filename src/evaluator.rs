@@ -5087,6 +5087,22 @@ fn cmd_host_switch(raw: &str, outer_dialect: ShellDialect) -> Option<String> {
     Some(option)
 }
 
+/// Whether a cmd word holds a `%NAME%` variable reference.
+fn cmd_word_has_variable(word: &str) -> bool {
+    let mut parts = word.split('%');
+    parts.next();
+    let mut inner = parts.collect::<Vec<_>>();
+    // `a%b%c` splits into ["a", "b", "c"]: a name sits between two `%`.
+    inner.pop();
+    inner.iter().any(|name| {
+        !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'-' | b'.' | b':' | b'~' | b',' | b'=')
+            })
+    })
+}
+
 fn cmd_switch_is_non_executing(option: &str) -> bool {
     matches!(option, "/d" | "/q" | "/a" | "/u" | "/s" | "/?")
         || ["/e:", "/f:", "/v:"]
@@ -5130,6 +5146,14 @@ fn parse_cmd_launcher(
                 }),
                 Err(reason) => WindowsLauncherParse::Unverified(reason),
             };
+        }
+        if cmd_word_has_variable(&option) {
+            // cmd expands `%NAME%` before it reads its switches: the value
+            // may be `/c` and a command (`Start-Process cmd -ArgumentList
+            // $x` runs `cmd <x>`).
+            return WindowsLauncherParse::Unverified(format!(
+                "cmd host switch {raw:?} holds a variable"
+            ));
         }
         if !cmd_switch_is_non_executing(&option) {
             if option.starts_with('/') {
