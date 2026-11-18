@@ -190,6 +190,14 @@ const RUNS_IT: &[&str] = &[
     "$b = { git reset --hard }; . $b",
     "@(1).ForEach({ git reset --hard })",
     "@(1).Where({ git reset --hard })",
+    // Nested blocks and hashtables, and a body that is only a block.
+    "$b={ {git reset --hard} }; & (& $b)",
+    "& { {git reset --hard} } | % { & $_ }",
+    "$b={ if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { git reset --hard } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } } }; & $b",
+    "& { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { if (1) { git reset --hard } } } } } } } } } } } } }",
+    "$h=@{a=@{b=@{c={git reset --hard}}}}; & $h.a.b.c",
+    "$b={ {git reset --hard} }; $b.Invoke().Invoke()",
+    "$h=@{a={ { {git reset --hard} } }}; $h.a.Invoke().Invoke().Invoke()",
 ];
 
 /// PowerShell 7.5 runs none of these: each builds a destructive block and
@@ -232,6 +240,8 @@ const BUILT_NOT_RUN: &[&str] = &[
     "$l = [System.Collections.Generic.List[object]]::new(); $l.Add({ git reset --hard }); $l.Count",
     "$l = [System.Collections.Generic.List[object]]::new(); $l.Add{ git reset --hard }; $l.Count",
     "'x'.Replace('x', { git reset --hard })",
+    // A block whose body is only a block builds that block.
+    "$b={ {git reset --hard} }",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -298,6 +308,8 @@ const HARMLESS: &[&str] = &[
     "$b = { git status }; (1).ForEach($b)",
     "$b = { git status }; $b.Invoke()",
     "Write-Output '(1).ForEach({ git reset --hard })'",
+    // A block whose body is only a harmless block.
+    "{ {git status} }.Invoke().Invoke()",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
