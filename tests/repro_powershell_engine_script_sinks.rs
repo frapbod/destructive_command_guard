@@ -311,6 +311,23 @@ const RUNS_IT: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % -MemberName:'InvokeScript' 'git reset --hard'",
     "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' '-ArgumentList' 'x'",
     "$ExecutionContext.InvokeCommand | % -MemberName InvokeScript 'git reset --hard' --% x",
+    // Review round 9 (runner rv10/truth*.out): a statement inside a group that
+    // an operator follows, and PR #33's assignment shapes (t_279cc772).
+    "($ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard') -join ','",
+    "$c=New-Object System.Management.Automation.Runspaces.Command('git reset --hard', $true); $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "[System.Management.Automation.Runspaces.Command]$c = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c, $d = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c ??= New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = $d = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c=New-Object -TypeName System.Management.Automation.Runspaces.Command -ArgumentList 'git reset --hard', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$r=$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard'",
+    "[object]$r = $ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ArgumentList 'git reset --hard'",
+    "& { $ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' }",
+    "\"x $($ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard') y\"",
+    "($ExecutionContext.InvokeCommand | % InvokeScript (\n'git reset --hard'\n)) -join ','",
+    "if (($ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard') -eq $null) { 'n' }",
+    "@($ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ArgumentList 'git reset --hard') -match 'x'",
+    "($c = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', $true) -ne $null; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -413,6 +430,34 @@ const HARMLESS: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % -MemberName:'InvokeScript' 'git status'",
     "'a.b' | % Split '.' -ErrorAction:$ErrorActionPreference",
     "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' -‘MemberName’ x",
+    // A ForEach-Object or New-Object statement inside a group ends at the
+    // group's close; the operator after it is the outer expression's (review
+    // round 9), and the git status twins of PR #33's assignment shapes.
+    "(Get-ChildItem | ForEach-Object Name) -join ','",
+    "(1..3 | % ToString) -join ','",
+    "if ((Get-ChildItem | % Name) -contains 'README.md') { 'yes' }",
+    "$ids = (Get-Process | % Id) -join ','",
+    "@(Get-ChildItem | % Name) -match 'x'",
+    "(New-Object System.Text.StringBuilder).Append('a').ToString() -eq 'a'",
+    "(Get-ChildItem | % Name) -replace 'a', 'b'",
+    "(New-Object System.Random).Next(1, 10) -gt 5",
+    "if ((New-Object System.IO.FileInfo 'a.txt').Exists -eq $false) { 'missing' }",
+    "Get-ChildItem | Where-Object { ($_ | % Name) -like 'a*' }",
+    "if ((New-Object System.IO.DirectoryInfo '.').Exists -and $true) { 'ok' }",
+    "Write-Output ((1..3 | % ToString) -join '+')",
+    "(1..3 | ForEach-Object -MemberName ToString) -join ','",
+    "[int](New-Object System.Random 42).Next(10) -lt 11",
+    "foreach ($f in (Get-ChildItem | % FullName)) { Write-Output -InputObject $f }",
+    "$names = (Get-ChildItem | % Name); $names -join ','",
+    "(1..3 | % { $_ * 2 }) -join ','",
+    "[System.Management.Automation.Runspaces.Command]$c = New-Object System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c ??= New-Object System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$c = $d = New-Object System.Management.Automation.Runspaces.Command 'git status', $true; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    "$r=$ExecutionContext.InvokeCommand | % InvokeScript 'git status'",
+    "& { $ExecutionContext.InvokeCommand | % InvokeScript 'git status' }",
+    "Get-ChildItem | ForEach-Object { $_ | % Name }",
+    "if (($ExecutionContext.InvokeCommand | % InvokeScript 'git status') -eq $null) { 'n' }",
+    "$h = @{ n = (Get-ChildItem | % Name) -join ',' }; $h.n",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -463,6 +508,10 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' `-MemberName 'x'",
     "$r = New-Object System.Text.RegularExpressions.Regex '-\\d+'; $r.Match('a-12').Value",
     "Get-ChildItem | % { cmd /c --% echo hi }",
+    // A group in a string's subexpression, and PR #33's no-blank assignment
+    // twin (review round 9): Unknown denies these on base 53c84977 too.
+    "\"Files: $((Get-ChildItem | % Name) -join ', ')\"",
+    "$c=New-Object System.Management.Automation.Runspaces.Command('git status', $true); $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {

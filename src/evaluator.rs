@@ -12735,8 +12735,11 @@ fn skip_powershell_double_quote(command: &str, start: usize) -> usize {
 /// `{ }` group opened from `start` does not (`-ArgumentList (<LF>'…'<LF>)`),
 /// and neither does a line break whose last token, past blanks and
 /// comments, is `,`: the array goes on to the next line
-/// (`-ArgumentList 'git …',<LF>$true`). A group that does not close runs to
-/// the end of the command, so the reader of that group fails closed.
+/// (`-ArgumentList 'git …',<LF>$true`). A `)` or `}` that no group opened
+/// from `start` closes ends the statement too: it closes a group opened
+/// before the statement (`(Get-ChildItem | % Name) -join ','`), and what
+/// follows belongs to the outer expression. A group that does not close runs
+/// to the end of the command, so the reader of that group fails closed.
 fn powershell_separator_outside_groups(command: &str, start: usize, separators: &[usize]) -> usize {
     let bytes = command.as_bytes();
     let mut next = 0usize;
@@ -12744,9 +12747,9 @@ fn powershell_separator_outside_groups(command: &str, start: usize, separators: 
     // The last code byte read outside comments and blank space.
     let mut last = None;
     loop {
-        let Some(&separator) = separators.get(next) else {
-            return command.len();
-        };
+        // Past the last separator, the statement runs to an outer close or
+        // to the end of the command.
+        let separator = separators.get(next).copied().unwrap_or(bytes.len());
         if separator <= index || index >= bytes.len() {
             if last == Some(b',') && matches!(bytes.get(separator), Some(b'\n' | b'\r')) {
                 next += 1;
@@ -12788,6 +12791,9 @@ fn powershell_separator_outside_groups(command: &str, start: usize, separators: 
             }
             b'(' => find_powershell_subexpression_close(command, index + 1).ok(),
             b'{' => find_powershell_script_block_close(command, index + 1),
+            // Groups opened from `start` are skipped whole, so this closes
+            // an outer one.
+            b')' | b'}' => return index,
             byte => {
                 if !byte.is_ascii_whitespace() {
                     last = Some(byte);
@@ -13168,6 +13174,9 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         .collect();
     separators.sort_unstable();
     let mut spanning_groups = 0usize;
+    // The furthest end of a statement read so far. A statement that starts
+    // before it is nested in that one, whose read covered it already.
+    let mut reach = 0usize;
     for (token_index, command_token) in tokens.iter().enumerate() {
         if command_token.kind != NormalizeTokenKind::Word {
             continue;
@@ -13224,9 +13233,12 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         let start = command_token.byte_range.end;
         let separators = &separators[separators.partition_point(|&at| at < start)..];
         let segment_end = powershell_separator_outside_groups(command, start, separators);
-        // Each group read across a line break may rescan the rest of the
-        // command; the bound keeps nested or unclosed groups from repeating it.
-        if separators.first().is_some_and(|&first| segment_end > first) {
+        let nested = command_token.byte_range.start < reach;
+        reach = reach.max(segment_end);
+        // Each group read across a line break, and each statement nested in
+        // one already read, may rescan the rest of the command; the bound
+        // keeps nested or unclosed groups from repeating it.
+        if nested || separators.first().is_some_and(|&first| segment_end > first) {
             spanning_groups += 1;
             if spanning_groups > MAX_POWERSHELL_ENGINE_SCRIPT_CALLS {
                 sinks.push(ExecutableTextSink::Unverified {
@@ -67184,6 +67196,17 @@ mod tests {
         for (command, expected) in [
             ("$x | % InvokeScript (\n'a'\n)\nb", vec!["a"]),
             ("$x | % -MemberName (\n'InvokeScript'\n) 'a'", vec!["a"]),
+            // A `)` or `}` that closes a group opened before the statement
+            // ends it; the operator after it is the outer expression's.
+            ("($x | % Name) -join ','", vec![]),
+            ("($x | % InvokeScript 'a') -join ','", vec!["a"]),
+            (
+                "if ((New-Object a.FileInfo 'f').Exists -eq $false) { 1 }",
+                vec![],
+            ),
+            ("$x | ? { ($_ | % Name) -like 'a*' }", vec![]),
+            ("\"$(($x | % Name) -join ', ')\"", vec![]),
+            ("($x | % InvokeScript (\n'a'\n)) -join ','", vec!["a"]),
             (
                 "New-Object a.Command -ArgumentList @(\n'a',\n$true\n)\nb",
                 vec!["a"],
@@ -67280,6 +67303,10 @@ mod tests {
             "% (\n".repeat(20_000),
             format!("% {}a{}", "(\n".repeat(50_000), "\n)".repeat(50_000)),
             "New-Object a.Command {\n".repeat(20_000),
+            // Nested statements with no separator between them.
+            format!("{}{}", "(% a ".repeat(20_000), ")".repeat(20_000)),
+            format!("{}{}", "& { % a ".repeat(20_000), "}".repeat(20_000)),
+            "(% a ".repeat(20_000),
         ] {
             let _ = sources(&command);
         }
