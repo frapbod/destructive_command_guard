@@ -896,6 +896,10 @@ fn bash_data_hash_hides_no_later_git_command() {
         // A `${` ends at its first `}`: only a nested `${` nests.
         "echo ${x:-{}; (( 1 #)); git reset --hard",
         "echo ${x:-${y:-{}}; (( 1 #)); git reset --hard",
+        // A quote in a heredoc body opens nothing.
+        "cat <<'EOF'\ndon't\nEOF\n(( 1 #)); git reset --hard",
+        "cat <<'EOF'\na\\\ndon't\nEOF\n(( 1 #)); git reset --hard",
+        "cat <<EOF\nsay \"hi\nEOF\n(( 1 #)); git reset --hard",
         // dash's reading: the comment ends at the line end and the quote in
         // it opens nothing; Bash reads one arithmetic command to the end.
         "(( 1 #'\ngit reset --hard))\n'))",
@@ -942,6 +946,7 @@ fn bash_data_hash_hides_no_later_git_command() {
         "if !(true); then :; fi # git reset --hard",
         "[[ x == $(echo x) ]] && echo ok # git reset --hard",
         "(( $(echo 1) > 0 )) && echo ok # git reset --hard",
+        "cat <<'EOF'\ndon't\nEOF\n(( 1 #)); git status",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

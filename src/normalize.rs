@@ -5479,6 +5479,10 @@ pub(crate) enum BashHashReading {
 /// quotes that follows a blank or an operator byte is spelled: one after a
 /// word byte (`2#101`, `$#`, `${#x}`) starts no comment to any reader.
 ///
+/// A heredoc body is raw text, and passed over: a quote in it (`don't`)
+/// opens nothing. Only text that every shell reads as a body is (see
+/// [`crate::context::undisputed_heredoc_body_ranges`]).
+///
 /// A command substitution inside such a span (`[[ x == $( : # "` LF
 /// `) ]]`) holds command text, where Bash reads a comment whose quotes open
 /// nothing. The span readers do not read those comments, so such a span is
@@ -5511,8 +5515,22 @@ pub(crate) fn bash_hashes_as_data(command: &str, extglob: bool) -> Option<BashHa
     // Where the last comment ended: the `\`LF pair that ends a comment is no
     // line continuation.
     let mut floor = 0usize;
+    // Heredoc bodies are raw text: a quote in one opens nothing.
+    let mut bodies = crate::context::undisputed_heredoc_body_ranges(command)
+        .into_iter()
+        .peekable();
     let mut i = 0;
     while i < len {
+        if let Some(body) = bodies.peek() {
+            if i >= body.end {
+                bodies.next();
+                continue;
+            }
+            if i >= body.start {
+                i = body.end;
+                continue;
+            }
+        }
         let top = frames.last().copied();
         let in_double = top == Some(Frame::Double);
         let in_braces = matches!(top, Some(Frame::Braces { .. }));
@@ -6763,6 +6781,15 @@ mod tests {
             (
                 "echo \"${ echo }; : # \"\n}\"; (( 1 #)); git reset --hard\n# \"",
                 "echo \"${ echo }; : # \"\n}\"; (( 1 _)); git reset --hard\n# \"",
+            ),
+            // A quote in a heredoc body opens nothing.
+            (
+                "cat <<'EOF'\ndon't\nEOF\n(( 1 #)); git reset --hard",
+                "cat <<'EOF'\ndon't\nEOF\n(( 1 _)); git reset --hard",
+            ),
+            (
+                "cat <<EOF\nsay \"hi\nEOF\n(( 1 #)); git reset --hard",
+                "cat <<EOF\nsay \"hi\nEOF\n(( 1 _)); git reset --hard",
             ),
         ] {
             assert_eq!(
