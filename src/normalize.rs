@@ -3791,6 +3791,18 @@ pub(crate) fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHash
 
 /// Classify the byte before a possible line or block comment.
 fn powershell_comment_predecessor_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
+    // The `#` of a `<#` glued to a word (`a<#`) is text, like the `<`.
+    if index >= 2
+        && bytes[index - 1] == b'<'
+        && bytes.get(index) == Some(&b'#')
+        && powershell_byte_before_role(bytes, index - 1) == PowerShellHashRole::Literal
+    {
+        return PowerShellHashRole::Literal;
+    }
+    powershell_byte_before_role(bytes, index)
+}
+
+fn powershell_byte_before_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
     if powershell_braced_variable_ends_at(bytes, index) {
         // `${c}` ends a name, not a group: `${c}#x` is text like `$c#x`.
         return PowerShellHashRole::Literal;
