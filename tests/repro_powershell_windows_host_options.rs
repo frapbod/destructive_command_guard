@@ -267,6 +267,18 @@ const GIT_BASH_RUNS_IT: &[&str] = &[
     // Piped input reaches the host's -Command - or -File -.
     "echo \"git reset --hard\" | powershell //c -",
     "echo \"git reset --hard\" | pwsh //File -",
+    // Payload words are converted too: the nested host gets `/c`.
+    "cmd //c powershell //c \"git reset --hard\"",
+    "cmd //c pwsh //c \"git reset --hard\"",
+    "cmd //c powershell -NoProfile //Command \"git reset --hard\"",
+    "cmd //c powershell //c git reset --hard",
+    "powershell -c powershell //c \"git reset --hard\"",
+    "pwsh -c powershell //c \"git reset --hard\"",
+    "powershell //c powershell //c \"git reset --hard\"",
+    // Git Bash makes cmd's `/c` a path, whose reading by cmd.exe dcg does
+    // not model; it keeps the switch reading, so the converted payload is
+    // judged as well.
+    "cmd /c powershell //c \"git reset --hard\"",
 ];
 
 /// Ordinary Git Bash launches stay allowed.
@@ -276,6 +288,17 @@ const GIT_BASH_HARMLESS: &[&str] = &[
     "pwsh -NoProfile -File ./b.ps1",
     "powershell -File /c/Users/x/b.ps1",
     "powershell //c \"git status\"",
+];
+
+/// Nested launches that stay allowed under the Bash label and the POSIX
+/// dialect. The Unknown dialect already denies `cmd //c` (an unknown cmd
+/// switch in its Cmd reading), before and after this change.
+const GIT_BASH_NESTED_HARMLESS: &[&str] = &[
+    "cmd //c powershell //c Get-Date",
+    "cmd //c powershell -c Get-Date",
+    // One word: Git Bash converts only a word that starts with `/`, so the
+    // inner powershell gets `//c`, the start of a harmless command string.
+    "cmd //c \"powershell //c git reset --hard\"",
 ];
 
 /// The Bash tool label in both hook formats: Claude Code on Windows runs it
@@ -290,7 +313,7 @@ fn bash_tool_reads_git_bash_powershell_arguments() {
                 "{protocol:?}: {command:?}"
             );
         }
-        for command in GIT_BASH_HARMLESS {
+        for command in GIT_BASH_HARMLESS.iter().chain(GIT_BASH_NESTED_HARMLESS) {
             assert_eq!(
                 hook_decision(protocol, "Bash", command),
                 "allow",
@@ -318,6 +341,32 @@ fn posix_and_unknown_dialects_read_git_bash_powershell_arguments() {
             );
         }
     }
+    for command in GIT_BASH_NESTED_HARMLESS {
+        assert_eq!(
+            decision_in(command, ShellDialect::Posix),
+            EvaluationDecision::Allow,
+            "{command:?}"
+        );
+    }
+}
+
+/// Real PowerShell passes `//c` to a nested host unchanged, which starts a
+/// harmless command string there: the PowerShell label and dialect do not
+/// apply Git Bash's conversion to payload words.
+#[test]
+fn powershell_outer_shell_keeps_nested_double_slash_words() {
+    let command = "powershell -c powershell //c \"git reset --hard\"";
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        assert_eq!(
+            hook_decision(protocol, "PowerShell", command),
+            "allow",
+            "{protocol:?}"
+        );
+    }
+    assert_eq!(
+        decision_in(command, ShellDialect::PowerShell),
+        EvaluationDecision::Allow
+    );
 }
 
 /// Git Bash or WSL starting powershell.exe: the outer shell is POSIX.

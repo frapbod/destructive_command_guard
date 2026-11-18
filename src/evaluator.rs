@@ -4592,6 +4592,42 @@ fn msys_native_argument(decoded: &str) -> Option<&str> {
     }
 }
 
+/// The payload words of a launcher (after cmd's `/c` or PowerShell's
+/// `-Command`), joined with spaces as the host joins them, under one
+/// reading of the arguments it receives.
+///
+/// Git Bash converts every word it hands a native program, payload words
+/// included, so under [`NativeArgv::Msys`] a decoded word that starts with
+/// `//` (after leading blanks) loses one `/`: `cmd //c powershell //c ...`
+/// reaches powershell.exe as `/c`. A word with a single leading `/` stays as
+/// written. Git Bash makes it a path, which the verbatim reading of the same
+/// word covers as well or better (a host that reads `/x` as a switch is
+/// judged on that switch either way). A single word that holds the whole
+/// nested command (`cmd //c "powershell //c ..."`) starts with no `/`, so
+/// Git Bash and this reading leave its inner `//c` alone.
+fn decoded_launcher_tail(
+    words: &[&str],
+    start: usize,
+    dialect: ShellDialect,
+    argv: NativeArgv,
+) -> Option<String> {
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let mut decoded = Vec::with_capacity(words.len().saturating_sub(start));
+    for raw in words.iter().skip(start) {
+        if let Some(word) = decoder.decode(raw, ShellTokenRole::Syntax) {
+            let mut word = word.into_owned();
+            if argv == NativeArgv::Msys {
+                let blanks = word.len() - word.trim_start().len();
+                if word[blanks..].starts_with("//") {
+                    word.remove(blanks);
+                }
+            }
+            decoded.push(word);
+        }
+    }
+    (!decoded.is_empty()).then(|| decoded.join(" "))
+}
+
 /// `CharExtensions.IsDash` / `SpecialCharacters.IsDash` in PowerShell's
 /// console host: hyphen-minus, en dash, em dash and horizontal bar.
 fn is_powershell_dash(c: char) -> bool {
@@ -4923,17 +4959,6 @@ fn unresolved_posix_segment_may_launch_windows_shell(command: &str) -> bool {
         .any(|candidate| candidate.starts_with(&prefix))
 }
 
-fn decoded_shell_tail(words: &[&str], start: usize, dialect: ShellDialect) -> Option<String> {
-    let mut decoder = ShellTokenDecoder::new(dialect);
-    let mut decoded = Vec::with_capacity(words.len().saturating_sub(start));
-    for raw in words.iter().skip(start) {
-        if let Some(word) = decoder.decode(raw, ShellTokenRole::Syntax) {
-            decoded.push(word.into_owned());
-        }
-    }
-    (!decoded.is_empty()).then(|| decoded.join(" "))
-}
-
 fn trim_powershell_script_block(command: &str) -> &str {
     let command = command.trim();
     command
@@ -5186,6 +5211,7 @@ fn powershell_command_payload(
     words: &[&str],
     start: usize,
     outer_dialect: ShellDialect,
+    argv: NativeArgv,
     max_payload_bytes: usize,
     launcher: &'static str,
 ) -> WindowsLauncherParse {
@@ -5198,7 +5224,7 @@ fn powershell_command_payload(
             "PowerShell -Command - executes commands read dynamically from stdin".to_string(),
         );
     }
-    let Some(command) = decoded_shell_tail(words, start, outer_dialect) else {
+    let Some(command) = decoded_launcher_tail(words, start, outer_dialect, argv) else {
         return WindowsLauncherParse::Unverified(
             "PowerShell -Command has no statically inspectable payload".to_string(),
         );
@@ -5236,6 +5262,7 @@ fn parse_powershell_launcher(
                     words,
                     index + 1,
                     outer_dialect,
+                    argv,
                     max_payload_bytes,
                     "PowerShell -Command",
                 );
@@ -5320,6 +5347,7 @@ fn parse_powershell_launcher(
                         words,
                         index,
                         outer_dialect,
+                        argv,
                         max_payload_bytes,
                         "PowerShell positional command",
                     );
@@ -5351,9 +5379,15 @@ fn cmd_switch_is_non_executing(option: &str) -> bool {
             .any(|prefix| option.starts_with(prefix))
 }
 
+/// Under [`NativeArgv::Msys`] the switches read as `cmd_host_switch` reads
+/// them for a POSIX outer shell (`//x` is `/x`; a single `/x`, which Git
+/// Bash makes a path, keeps its switch reading because cmd.exe's reading of
+/// that path is not modeled and the switch reading is the stricter one);
+/// only the payload words change.
 fn parse_cmd_launcher(
     words: &[&str],
     outer_dialect: ShellDialect,
+    argv: NativeArgv,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let mut index = 1usize;
@@ -5362,7 +5396,7 @@ fn parse_cmd_launcher(
             return WindowsLauncherParse::NotLauncher;
         };
         if matches!(option.as_str(), "/c" | "/k") {
-            let Some(command) = decoded_shell_tail(words, index + 1, outer_dialect) else {
+            let Some(command) = decoded_launcher_tail(words, index + 1, outer_dialect, argv) else {
                 return WindowsLauncherParse::Unverified(format!(
                     "cmd {option} has no statically inspectable payload"
                 ));
@@ -6106,9 +6140,7 @@ fn parse_windows_launcher_segment(
 }
 
 /// One launcher segment under one reading of the arguments the launched
-/// program receives. Under [`NativeArgv::Msys`] only PowerShell hosts are
-/// read: `cmd_host_switch` already gives cmd Git Bash's `//x` rule in the
-/// verbatim reading.
+/// program receives ([`NativeArgv`]).
 fn parse_windows_launcher_segment_as(
     segment: &str,
     outer_dialect: ShellDialect,
@@ -6188,10 +6220,9 @@ fn parse_windows_launcher_segment_as(
         "powershell" | "pwsh" => {
             parse_powershell_launcher(&words, &executable, outer_dialect, argv, max_payload_bytes)
         }
-        _ if argv == NativeArgv::Msys => WindowsLauncherParse::NotLauncher,
-        "cmd" => parse_cmd_launcher(&words, outer_dialect, max_payload_bytes),
+        "cmd" => parse_cmd_launcher(&words, outer_dialect, argv, max_payload_bytes),
         "call" if outer_dialect == ShellDialect::Cmd => {
-            let Some(command) = decoded_shell_tail(&words, 1, outer_dialect) else {
+            let Some(command) = decoded_launcher_tail(&words, 1, outer_dialect, argv) else {
                 return WindowsLauncherParse::Unverified(
                     "cmd call has no statically inspectable payload".to_string(),
                 );
@@ -59119,6 +59150,17 @@ mod tests {
         assert_eq!(msys_native_argument("/"), None);
         assert_eq!(msys_native_argument("-c"), Some("-c"));
         assert_eq!(msys_native_argument("x//c"), Some("x//c"));
+
+        let words = ["cmd", "//c", "powershell", "' //c'", "/x", "\"a //c\""];
+        assert_eq!(
+            decoded_launcher_tail(&words, 2, ShellDialect::Posix, NativeArgv::Msys).as_deref(),
+            Some("powershell  /c /x a //c"),
+            "only a word that starts with `//` loses one `/`"
+        );
+        assert_eq!(
+            decoded_launcher_tail(&words, 2, ShellDialect::Posix, NativeArgv::Verbatim).as_deref(),
+            Some("powershell  //c /x a //c")
+        );
 
         for host in [PowerShellHost::Windows, PowerShellHost::Core] {
             for (raw, verbatim, msys) in [
