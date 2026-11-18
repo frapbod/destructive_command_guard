@@ -8407,6 +8407,7 @@ mod tests {
             ("if ($true) { . git x }", "if ($true) { & git x }"),
             ("$r = . git x", "$r = & git x"),
             ("$r=. git x", "$r=& git x"),
+            (".\u{a0}git x", "&\u{a0}git x"),
             (". ./x.ps1", "& ./x.ps1"),
         ] {
             assert_eq!(
@@ -8423,6 +8424,7 @@ mod tests {
             "git add .",
             "echo . git x",
             ".git x",
+            ".\u{200b}git x",
             "(Get-Item x) . git",
             "Write-Output '. git x'",
         ] {

@@ -23,6 +23,13 @@ const POWERSHELL_RUNS_IT: &[&str] = &[
     ". 'git' reset --hard",
     ". \"git\" reset --hard",
     ".  git reset --hard",
+    // PowerShell 7.5 splits words on every Unicode space except line breaks
+    // (shell-truth pwsh, Nov 18 2026: each of these ran `git reset --hard`).
+    ".\tgit reset --hard",
+    ".\u{b}git reset --hard",
+    ".\u{a0}git reset --hard",
+    ".\u{3000}git reset --hard",
+    "$r=.\u{a0}git reset --hard",
     ". GIT reset --hard",
     ". git.exe reset --hard",
     ". 'C:\\Program Files\\Git\\cmd\\git.exe' reset --hard",
@@ -229,13 +236,17 @@ fn powershell_and_unknown_dialects_judge_the_dot_source_operator() {
 }
 
 /// `.git` is one command name, not the operator: PowerShell 7.5 reported
-/// that no command `.git` exists.
+/// that no command `.git` exists. U+200B is not a PowerShell space, so
+/// `.<U+200B>git` is one name too (PowerShell 7.5: not recognized).
 #[test]
 fn a_dot_joined_to_the_word_is_not_the_operator() {
-    assert_eq!(
-        decision_in(".git reset --hard", ShellDialect::PowerShell),
-        EvaluationDecision::Allow
-    );
+    for command in [".git reset --hard", ".\u{200b}git reset --hard"] {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Allow,
+            "{command:?}"
+        );
+    }
 }
 
 /// In a POSIX shell `. git` sources a file named git; it never runs git.
