@@ -884,6 +884,18 @@ fn bash_data_hash_hides_no_later_git_command() {
         "bash -O extglob -c ': !( #); git reset --hard'",
         "x\\\n#; git reset --hard",
         "echo $\\\n( (( 1 #)); git reset --hard )",
+        // A comment in a command substitution inside a `[[` operand or an
+        // arithmetic command: its quote and `)` are comment text to Bash.
+        "[[ x == $( : # \"\n) ]]; (( 1 #)); git reset --hard\n# \" ) ]]",
+        "[[ x == $( : # '\n) ]]; (( 1 #)); git reset --hard\n# ' ) ]]",
+        "[[ x != $( : # \"\n) ]] || (( 1 #)); git reset --hard\n# \" ) ]]",
+        "[[ x =~ $( : # \"\n) ]]; (( 1 #)); git reset --hard\n# \" ) ]]",
+        "for (( i=$( : # \"\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# \" ) ; i<1; i++ )); do :; done",
+        "for (( i=$( : # '\n) ; i<1; i++ )); do :; done; (( 1 #)); git reset --hard\n# ' ) ; i<1; i++ )); do :; done",
+        "(( i=$( : # ) )\n) + 1 #)); git reset --hard",
+        // A `${` ends at its first `}`: only a nested `${` nests.
+        "echo ${x:-{}; (( 1 #)); git reset --hard",
+        "echo ${x:-${y:-{}}; (( 1 #)); git reset --hard",
         // dash's reading: the comment ends at the line end and the quote in
         // it opens nothing; Bash reads one arithmetic command to the end.
         "(( 1 #'\ngit reset --hard))\n'))",
@@ -928,6 +940,8 @@ fn bash_data_hash_hides_no_later_git_command() {
         "[[ x == @(a|b) ]] && echo ok # git reset --hard",
         ": # it's \\\n# (( 1 #)); git reset --hard",
         "if !(true); then :; fi # git reset --hard",
+        "[[ x == $(echo x) ]] && echo ok # git reset --hard",
+        "(( $(echo 1) > 0 )) && echo ok # git reset --hard",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
