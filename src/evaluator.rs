@@ -11693,14 +11693,15 @@ fn powershell_script_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
     let mut bodies = Vec::new();
     let mut search_start = 0usize;
     while let Some(open) = find_powershell_code_marker(command, "{", search_start) {
-        if command[..open].ends_with('$') {
+        let opener = powershell_brace_opener(command, open);
+        if opener == PowerShellBraceOpener::BracedVariable {
             search_start = command[open..]
                 .find('}')
                 .map_or(command.len(), |close| open + close + 1);
             continue;
         }
         let close = find_powershell_script_block_close(command, open + 1).ok_or(())?;
-        if command[..open].ends_with('@') {
+        if opener == PowerShellBraceOpener::Hashtable {
             search_start = open + 1;
             continue;
         }
@@ -11718,6 +11719,102 @@ fn powershell_script_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
         search_start = close + 1;
     }
     Ok(bodies)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PowerShellBraceOpener {
+    Block,
+    BracedVariable,
+    Hashtable,
+}
+
+/// What the code `{` at `open` opens. PowerShell decides by where the token
+/// before it starts, not by the byte before it (measured in pwsh 7.5):
+/// `$${` is the variable `$$` and then a block, `` `${ `` is a literal `$`
+/// and then a block, and in a command argument `a@{`, `$x=@{` or
+/// `[ordered]@{` is one bareword that ends in a block. Anything that is not
+/// shown to be a braced variable or a hashtable is read as a block, so its
+/// body is judged.
+fn powershell_brace_opener(command: &str, open: usize) -> PowerShellBraceOpener {
+    let bytes = command.as_bytes();
+    let escaped = |at: usize| {
+        bytes[..at]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'`')
+            .count()
+            % 2
+            == 1
+    };
+    let dollars = bytes[..open]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'$')
+        .count();
+    if dollars > 0 {
+        // Each unescaped `$$` is a whole variable; an odd run leaves the
+        // `$` that starts `${…}`.
+        let unescaped = dollars - usize::from(escaped(open - dollars));
+        return if unescaped % 2 == 1 {
+            PowerShellBraceOpener::BracedVariable
+        } else {
+            PowerShellBraceOpener::Block
+        };
+    }
+    if open == 0 || bytes[open - 1] != b'@' || escaped(open - 1) {
+        return PowerShellBraceOpener::Block;
+    }
+    let at = open - 1;
+    let separates = |byte: u8| {
+        byte.is_ascii_whitespace()
+            || matches!(byte, b'(' | b')' | b',' | b';' | b'|' | b'{' | b'}' | b'&')
+    };
+    // `@` starts its own token: always a hashtable.
+    if at == 0 || separates(bytes[at - 1]) {
+        return PowerShellBraceOpener::Hashtable;
+    }
+    let token_start = bytes[..at]
+        .iter()
+        .rposition(|byte| separates(*byte))
+        .map_or(0, |index| index + 1);
+    let token = &command[token_start..at];
+    // `-Name:@{…}` gives a parameter a hashtable.
+    if token
+        .strip_prefix('-')
+        .and_then(|rest| rest.strip_suffix(':'))
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    {
+        return PowerShellBraceOpener::Hashtable;
+    }
+    // At the start of a statement or an assignment value, a token such as
+    // `$x=`, `$h.a+=` or `[ordered]` is an expression and ends before the
+    // `@`. A token that starts with a letter is a command name there, and in
+    // a command argument any token runs on through `@{`: both open a block.
+    let before = command[..token_start]
+        .trim_end_matches([' ', '\t'])
+        .as_bytes();
+    let expression_position = match before {
+        [] => true,
+        [.., b'&', b'&'] => true,
+        [.., last] => matches!(
+            last,
+            b'\n' | b'\r' | b';' | b'(' | b'{' | b'}' | b'=' | b'|'
+        ),
+    };
+    let first = token.as_bytes()[0];
+    if expression_position
+        && !(first.is_ascii_alphabetic() || matches!(first, b'_' | b'\'' | b'"' | b'`'))
+        && first.is_ascii()
+    {
+        PowerShellBraceOpener::Hashtable
+    } else {
+        PowerShellBraceOpener::Block
+    }
 }
 
 /// `[scriptblock]::Create(…)` builds a block from a string. Like a literal
@@ -62365,6 +62462,41 @@ mod tests {
     // =========================================================================
     // Issue #255: escape scanning must advance by whole UTF-8 characters
     // =========================================================================
+
+    #[test]
+    fn powershell_brace_opener_reads_the_token_before_the_brace() {
+        use PowerShellBraceOpener::{Block, BracedVariable, Hashtable};
+        // Each shape is measured in pwsh 7.5 with `f` = Write-Output
+        // (t_a68ca4ed, review round 1).
+        for (command, expected) in [
+            ("${x}", BracedVariable),
+            ("$${x}", Block),
+            ("$$${x}", BracedVariable),
+            ("`${x}", Block),
+            ("``${x}", BracedVariable),
+            ("a$${x}", Block),
+            ("$h=@{x}", Hashtable),
+            ("$h = [ordered]@{x}", Hashtable),
+            ("[pscustomobject]@{x}", Hashtable),
+            ("f -x:@{x}", Hashtable),
+            ("f (1,@{x})", Hashtable),
+            ("f a@{x}", Block),
+            ("f 1@{x}", Block),
+            ("f $x=@{x}", Block),
+            ("f [ordered]@{x}", Block),
+            ("f a`@{x}", Block),
+            ("f `@{x}", Block),
+            ("f @'\nx\n'@{x}", Block),
+            ("a=@{x}", Block),
+        ] {
+            let open = command.rfind('{').unwrap();
+            assert_eq!(
+                powershell_brace_opener(command, open),
+                expected,
+                "{command:?}"
+            );
+        }
+    }
 
     #[test]
     fn escape_sequence_end_advances_past_ascii_escaped_char() {

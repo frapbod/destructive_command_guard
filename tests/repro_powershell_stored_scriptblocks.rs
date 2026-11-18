@@ -198,6 +198,43 @@ const RUNS_IT: &[&str] = &[
     "$h=@{a=@{b=@{c={git reset --hard}}}}; & $h.a.b.c",
     "$b={ {git reset --hard} }; $b.Invoke().Invoke()",
     "$h=@{a={ { {git reset --hard} } }}; $h.a.Invoke().Invoke().Invoke()",
+    // PowerShell decides what a `{` opens by where the token before it
+    // starts: `$$` is a whole variable, a `@` or `$` inside a bareword or
+    // after a here-string end is text, and an escaped `$` or `@` is text.
+    // Each `{` below opens a block (rows from t_8fdd187f too).
+    "$l = Write-Output $${git reset --hard}; & $l[1]",
+    "$l = Write-Output a@{git reset --hard}; & $l[1]",
+    "$l = Write-Output @'\nx\n'@{git reset --hard}; & $l[1]",
+    "$l = Write-Output a$${git reset --hard}; & $l[1]",
+    "$l = Write-Output 1@{git reset --hard}; & $l[1]",
+    "$l = Write-Output a`@{git reset --hard}; & $l[1]",
+    "$l = Write-Output `@{git reset --hard}; & $l[1]",
+    "$l = Write-Output `${git reset --hard}; & $l[1]",
+    "$null = 1; Write-Output $${git reset --hard} | Select-Object -Last 1 | ForEach-Object Invoke",
+    "Write-Output a@{git reset --hard} | Select-Object -Last 1 | ForEach-Object Invoke",
+    "$h = @{s = (Write-Output $${git reset --hard})[1]}; & $h.s",
+    "$l = Write-Output $$$${git reset --hard}; & $l[-1]",
+    "$l = Write-Output ``$${git reset --hard}; & $l[-1]",
+    "$l = Write-Output a=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a[@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a]@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a!@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a:@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a.@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output aa@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a1@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a'x'@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a\"x\"@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a$@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output ax#@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output $x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output [x]@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output [ordered]@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output -x=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output $a=$b=@{git reset --hard}; & $l[-1]",
+    "$l = Write-Output a{git reset --hard}; & $l[1]",
+    "$l = Write-Output a<x{git reset --hard}; & $l[1]",
+    "$l = Write-Output a#{git reset --hard}; & $l[1]",
 ];
 
 /// PowerShell 7.5 runs none of these: each builds a destructive block and
@@ -310,6 +347,21 @@ const HARMLESS: &[&str] = &[
     "Write-Output '(1).ForEach({ git reset --hard })'",
     // A block whose body is only a harmless block.
     "{ {git status} }.Invoke().Invoke()",
+    // Hashtables and braced variables, read as PowerShell does.
+    "$h = [ordered]@{a=1}; $h.a",
+    "[pscustomobject]@{Name='x'} | Format-List",
+    "${x} = 1; ${x}",
+    "Write-Output $$",
+    "git rev-parse main@{upstream}",
+    "Get-Process | Select-Object -Property @{n='x';e={$_.Name}}",
+    "Write-Output -x:@{a=1}",
+    "New-Object PSObject -Property ([ordered]@{a=1})",
+    "$x = @{a='git reset --hard'}; $x.a",
+    "$x = @{a=1},@{b=2}; $x.Count",
+    "$p = @{Path='.'}; Get-ChildItem @p",
+    "$h=@{}; $h['k']=@{a=1}; $h.k.a",
+    "$h=@{}; $h.k=[ordered]@{a=1}; $h.k.a",
+    "function f { return @{a=1} }; (f).a",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -321,6 +373,11 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$x = @{ a = 1; b = 'git reset --hard' }",
     "$sw = Measure-Command { Get-ChildItem -Recurse | Out-Null }; $sw.TotalSeconds",
     "$p = @{ Path = '.'; Recurse = $true }; Get-ChildItem @p",
+    // `$$$` is `$$` and then the braced variable `${…}`; `${…}` and an
+    // escaped backtick before it are a variable too.
+    "$l = Write-Output $$${git reset --hard}; & $l[1]",
+    "$l = Write-Output ${git reset --hard}; & $l[-1]",
+    "$l = Write-Output ``${git reset --hard}; & $l[-1]",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
