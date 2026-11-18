@@ -69,13 +69,7 @@ const RUNS_IT: &[&str] = &[
     "$b = { git reset --hard }; Invoke-Command -ScriptBlock $b",
     "$b = { git reset --hard }; 1 | % $b",
     "$b = { git reset --hard }; . $b",
-];
-
-/// Each ran `git reset --hard` in PowerShell 7.5 too. Under the Unknown
-/// dialect a leading `@(` is read as cmd.exe's `@` prefix and the PowerShell
-/// passes are skipped; PR #32 fixes that. Until it merges they are checked
-/// with the PowerShell dialect and label only.
-const RUNS_IT_AT_PREFIX: &[&str] = &[
+    // A leading `@(` (read under the Unknown dialect since PR #32).
     "@(1).ForEach({ git reset --hard })",
     "@(1).Where({ git reset --hard })",
     "@(1).ForEach{ git reset --hard }",
@@ -95,7 +89,7 @@ const HARMLESS: &[&str] = &[
 ];
 
 /// Harmless in PowerShell 7.5 and Bash as well. The Unknown dialect denies
-/// them on base 9a712556 too (its POSIX reading takes `{ git reset --hard }`
+/// them on base e94e3692 too (its POSIX reading takes `{ git reset --hard }`
 /// for a brace group), so they are checked in the PowerShell dialect only.
 /// The last three are PowerShell parse errors that run nothing.
 const HARMLESS_IN_POWERSHELL: &[&str] = &[
@@ -262,7 +256,6 @@ fn hook_judges_script_blocks_passed_to_methods() {
             assert_hook(protocol, tool_name, RUNS_IT, "deny");
             assert_hook(protocol, tool_name, HARMLESS, "allow");
         }
-        assert_hook(protocol, "PowerShell", RUNS_IT_AT_PREFIX, "deny");
         assert_hook(protocol, "PowerShell", HARMLESS_IN_POWERSHELL, "allow");
         assert_hook(protocol, "PowerShell", DENIED_THOUGH_NOT_RUN, "deny");
     }
@@ -283,11 +276,6 @@ fn powershell_and_unknown_dialects_judge_script_blocks_passed_to_methods() {
         assert_dialect(dialect, RUNS_IT, EvaluationDecision::Deny);
         assert_dialect(dialect, HARMLESS, EvaluationDecision::Allow);
     }
-    assert_dialect(
-        ShellDialect::PowerShell,
-        RUNS_IT_AT_PREFIX,
-        EvaluationDecision::Deny,
-    );
     assert_dialect(
         ShellDialect::PowerShell,
         HARMLESS_IN_POWERSHELL,
