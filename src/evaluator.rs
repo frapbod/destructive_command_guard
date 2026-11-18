@@ -12108,15 +12108,83 @@ const POWERSHELL_ENGINE_SCRIPT_METHODS: [&str; 6] = [
 /// matched by its last name segment, since `using namespace` can shorten it.
 const POWERSHELL_SCRIPT_COMMAND_TYPE: &str = "command";
 
-/// Whether a type name (`System.Management.Automation.Runspaces.Command`,
-/// `Command`) names [`POWERSHELL_SCRIPT_COMMAND_TYPE`].
-fn powershell_type_is_script_command(type_name: &str) -> bool {
-    type_name
-        .trim()
-        .rsplit('.')
+/// The sink a constructed type selects: [`POWERSHELL_SCRIPT_COMMAND_TYPE`]
+/// runs script, another named type does not, and a type that is not a static
+/// name (`$t`, `([type]$n)`, or no visible name) may be that type. A type
+/// literal or parenthesized type (`([…Command])`) names the type inside it,
+/// and an assembly qualification (`…Command, System.Management.Automation`,
+/// from the first `,` outside brackets) is not part of the name.
+fn powershell_constructed_type_sink(type_name: Option<&str>) -> Option<PowerShellEngineSink> {
+    let Some(mut name) = type_name.map(str::trim) else {
+        return Some(PowerShellEngineSink::AnyMethod);
+    };
+    while let Some(inner) = name
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .or_else(|| {
+            name.strip_prefix('[')
+                .and_then(|inner| inner.strip_suffix(']'))
+        })
+    {
+        name = inner.trim();
+    }
+    let mut depth = 0usize;
+    let end = name
+        .bytes()
+        .position(|byte| match byte {
+            b'[' => {
+                depth += 1;
+                false
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            b',' => depth == 0,
+            _ => false,
+        })
+        .unwrap_or(name.len());
+    let name = name[..end].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_alphanumeric() || "_.+`[], =-".contains(character))
+    {
+        return Some(PowerShellEngineSink::AnyMethod);
+    }
+    name.rsplit('.')
         .next()
         .is_some_and(|last| last.eq_ignore_ascii_case(POWERSHELL_SCRIPT_COMMAND_TYPE))
+        .then_some(PowerShellEngineSink::Script)
 }
+
+/// The first constructor argument that one argument value supplies when the
+/// call spreads an array into the argument list (`New-Object … -ArgumentList
+/// $a`, `[T]::new.Invoke($a)`). `Ok(None)` is one static value, which fills
+/// only the first parameter; `Ok(Some(first))` is the first element of an
+/// array literal with more than one element (`@('…', $true)`, `('…', $true)`);
+/// `Err(())` is a value whose length is not visible (`$a`, `$(…)`).
+fn powershell_spread_constructor_argument(argument: &str) -> Result<Option<&str>, ()> {
+    let mut text = argument.trim();
+    // Each pass removes one group; the bound keeps deep nesting linear.
+    for _ in 0..MAX_POWERSHELL_SPREAD_GROUPS {
+        let Some(group) = text.strip_prefix("@(").or_else(|| text.strip_prefix('(')) else {
+            return parse_static_powershell_source(text).map(|_| None);
+        };
+        let close = find_powershell_subexpression_close(group, 0)?;
+        if !group[close + 1..].trim().is_empty() {
+            return Err(());
+        }
+        match powershell_first_method_argument(&group[..close]) {
+            (first, Some(_)) => return Ok(Some(first)),
+            (single, None) => text = single.trim(),
+        }
+    }
+    Err(())
+}
+
+/// The most nested groups read around one spread constructor argument.
+const MAX_POWERSHELL_SPREAD_GROUPS: usize = 8;
 
 /// The name inside a type literal that ends at `end` (`[a.b]` before `::`),
 /// or `None` when no bounded type literal ends there.
@@ -12454,11 +12522,7 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
                 .as_deref()
                 .is_some_and(|name| name.eq_ignore_ascii_case("new"));
         let sink = if constructor {
-            match powershell_type_literal_before(command, dot) {
-                Some(type_name) => powershell_type_is_script_command(type_name)
-                    .then_some(PowerShellEngineSink::Script),
-                None => Some(PowerShellEngineSink::AnyMethod),
-            }
+            powershell_constructed_type_sink(powershell_type_literal_before(command, dot))
         } else {
             powershell_engine_sink_for_name(name.as_deref())
                 .or_else(|| intrinsic_foreach.then_some(PowerShellEngineSink::AnyMethod))
@@ -12467,7 +12531,9 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
             continue;
         };
         // `$ic.InvokeScript.Invoke('…')` calls the method object directly.
-        if !intrinsic_foreach && powershell_method_invocation(&command[after_name..], ".invoke") {
+        let via_invoke =
+            !intrinsic_foreach && powershell_method_invocation(&command[after_name..], ".invoke");
+        if via_invoke {
             after_name += ".invoke".len();
         }
         let called = command.as_bytes().get(after_name) == Some(&b'(');
@@ -12507,10 +12573,26 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
         };
         let (mut argument, rest) =
             powershell_first_method_argument(&command[after_name + 1..close]);
-        // A call with no argument (`$r.CreatePipeline()`) runs no script, and
-        // a `Command` built without `isScript` holds a command name.
-        if rest.is_none() && (constructor || argument.trim().is_empty()) {
+        // A call with no argument (`$r.CreatePipeline()`) runs no script.
+        if rest.is_none() && argument.trim().is_empty() {
             continue;
+        }
+        // A `Command` built from one argument holds a command name. A direct
+        // call passes an array as that one argument, but `.Invoke` spreads it
+        // into the argument list (`[…Command]::new.Invoke($a)`), so a value
+        // whose length is not visible may carry `isScript`.
+        if constructor && rest.is_none() {
+            if !via_invoke {
+                continue;
+            }
+            match powershell_spread_constructor_argument(argument) {
+                Ok(None) => continue,
+                Ok(Some(first)) => argument = first,
+                Err(()) => {
+                    push_powershell_engine_sink(sinks, sink, Err(()));
+                    continue;
+                }
+            }
         }
         if intrinsic_foreach {
             // `.ForEach('InvokeScript', 'git …')` calls the named method on
@@ -12547,6 +12629,51 @@ enum PowerShellMemberCmdlet {
     /// `New-Object System.Management.Automation.Runspaces.Command('git …', $true)`
     /// ([`POWERSHELL_SCRIPT_COMMAND_TYPE`]).
     NewObject,
+}
+
+/// The group that a parameter value is written as (`-TypeName ([…Command,
+/// …])`, `-MemberName ('Invoke' + 'Script')`), as its `(` and its matching
+/// `)` (`Err` when unbalanced). `after` ends the word before the value and
+/// `value_start` starts the value's first word; the `(` may be its own token
+/// or begin that word. `None` when the value is not a group.
+fn powershell_group_value(
+    segment: &str,
+    after: usize,
+    value_start: usize,
+) -> Option<Result<(usize, usize), ()>> {
+    let between = segment.get(after..value_start)?;
+    let open = if between.trim() == "(" {
+        after + between.find('(')?
+    } else if between.trim().is_empty() && segment.as_bytes().get(value_start) == Some(&b'(') {
+        value_start
+    } else {
+        return None;
+    };
+    Some(find_powershell_subexpression_close(segment, open + 1).map(|close| (open, close)))
+}
+
+/// The name a grouped value gives, and where its group closes. A group may
+/// hold blanks and commas, so its words are not read one by one: a member
+/// name is the group's static string value, and a type is that value or the
+/// type expression itself (`[…Command, System.Management.Automation]`), which
+/// [`powershell_constructed_type_sink`] reads. `None` is a name that is not
+/// static.
+fn powershell_group_name(
+    cmdlet: PowerShellMemberCmdlet,
+    segment: &str,
+    group: Result<(usize, usize), ()>,
+) -> (Option<String>, Option<usize>) {
+    let Ok((open, close)) = group else {
+        return (None, None);
+    };
+    let inner = &segment[open + 1..close];
+    let name = match cmdlet {
+        PowerShellMemberCmdlet::ForEachObject => parse_static_powershell_source(inner).ok(),
+        PowerShellMemberCmdlet::NewObject => Some(
+            parse_static_powershell_source(inner).unwrap_or_else(|()| inner.trim().to_string()),
+        ),
+    };
+    (name, Some(close))
 }
 
 /// Engine members reached through [`PowerShellMemberCmdlet`]. The name is
@@ -12619,6 +12746,8 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         let mut name: Option<Option<String>> = None;
         let mut argument_start: Option<usize> = None;
         let mut other_parameter = false;
+        // Where the last group read as one value closes.
+        let mut group_end = 0usize;
         let mut index = 1usize;
         while let Some((value, dynamic, range)) = words.get(index) {
             index += 1;
@@ -12628,12 +12757,28 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                     if cmdlet == PowerShellMemberCmdlet::ForEachObject && value.starts_with('{') {
                         break;
                     }
-                    name = Some((!*dynamic).then(|| value.clone()));
-                    argument_start.get_or_insert(range.end);
+                    let after = words[index - 2].2.end.max(group_end);
+                    match powershell_group_value(segment, after, range.start) {
+                        Some(group) => {
+                            let (group_name, close) = powershell_group_name(cmdlet, segment, group);
+                            name = Some(group_name);
+                            group_end = close.map_or(segment.len(), |close| close + 1);
+                            argument_start.get_or_insert(group_end);
+                            while words.get(index).is_some_and(|(_, _, word)| {
+                                close.is_none_or(|close| word.start < close)
+                            }) {
+                                index += 1;
+                            }
+                        }
+                        None => {
+                            name = Some((!*dynamic).then(|| value.clone()));
+                            argument_start.get_or_insert(range.end);
+                        }
+                    }
                 } else {
                     // Once the name is bound, the next positional word starts
                     // the argument list (with any `(` before it).
-                    argument_start.get_or_insert(words[index - 2].2.end);
+                    argument_start.get_or_insert_with(|| words[index - 2].2.end.max(group_end));
                 }
                 continue;
             }
@@ -12663,7 +12808,23 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                 }
             };
             if member {
-                name = Some((!value_dynamic).then_some(value));
+                let group = attached
+                    .is_none_or(str::is_empty)
+                    .then(|| powershell_group_value(segment, range.end, value_start))
+                    .flatten();
+                name = Some(match group {
+                    Some(group) => {
+                        let (group_name, close) = powershell_group_name(cmdlet, segment, group);
+                        group_end = close.map_or(segment.len(), |close| close + 1);
+                        while words.get(index).is_some_and(|(_, _, word)| {
+                            close.is_none_or(|close| word.start < close)
+                        }) {
+                            index += 1;
+                        }
+                        group_name
+                    }
+                    None => (!value_dynamic).then_some(value),
+                });
             } else if arguments {
                 argument_start = Some(value_start);
             }
@@ -12676,11 +12837,7 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                 powershell_engine_sink_for_name(name.as_deref())
             }
             // A type name that is not static may be that type.
-            PowerShellMemberCmdlet::NewObject => match name.as_deref() {
-                Some(type_name) => powershell_type_is_script_command(type_name)
-                    .then_some(PowerShellEngineSink::Script),
-                None => Some(PowerShellEngineSink::AnyMethod),
-            },
+            PowerShellMemberCmdlet::NewObject => powershell_constructed_type_sink(name.as_deref()),
         };
         let Some(sink) = sink else {
             continue;
@@ -12722,8 +12879,10 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             };
             (argument, more)
         };
-        // A `Command` built without `isScript` holds a command name.
-        if cmdlet == PowerShellMemberCmdlet::NewObject && !more {
+        // A `Command` built from one static value holds a command name. New-Object
+        // spreads one array value into the argument list (`-ArgumentList $a`),
+        // so a single value whose length is not visible may carry `isScript`.
+        if cmdlet == PowerShellMemberCmdlet::NewObject && !more && argument.is_ok() {
             continue;
         }
         push_powershell_engine_sink(sinks, sink, argument);
@@ -66236,6 +66395,23 @@ mod tests {
             ("[Text.StringBuilder]::new('a', 1)", vec![]),
             ("$t::new('a', 1)", vec!["a"]),
             ("$t::new($a, 1)", vec![]),
+            ("[a.Command, a.b]::new('a', $true)", vec!["a"]),
+            ("[Command]::new.Invoke(@('a', $true))", vec!["a"]),
+            ("[Command]::new.Invoke(('a', $true))", vec!["a"]),
+            (
+                "[Command]::new.Invoke($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "[Command]::new.Invoke(@($a))",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("[Command]::new.Invoke(('a'))", vec![]),
+            ("[Command]::new.Invoke('a')", vec![]),
+            ("[Command]::new($a)", vec![]),
+            ("[Command]::new(@('a', $true))", vec![]),
+            ("$t::new.Invoke($a)", vec![]),
+            ("[Text.StringBuilder]::new.Invoke($a)", vec![]),
             (
                 "[a.Parser]::ParseInput('a', [ref]$null, [ref]$null)",
                 vec!["a"],
@@ -66259,6 +66435,11 @@ mod tests {
             format!("{}]::new('a', 1)", "[".repeat(200_000)),
             "]::new('a', 1)".repeat(20_000),
             ".`\n".repeat(100_000),
+            format!(
+                "[Command]::new.Invoke({}a{})",
+                "(".repeat(100_000),
+                ")".repeat(100_000)
+            ),
         ] {
             let _ = sources(&command);
         }
