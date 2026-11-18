@@ -53,8 +53,14 @@ const HARMLESS: &[&str] = &[
     "[IO.Path]::Combine('a','b')",
     r"1 | ForEach-Object { Get-Item C:\Users }",
     r"{ Get-ChildItem C:\Users }.Invoke()",
-    r"1 | ForEach-Object { Remove-Item -Recurse -Force C:\Users -WhatIf }",
 ];
+
+/// Harmless in PowerShell (measured: pwsh 7.5 only previewed). The Unknown
+/// reading denies it on base too once the `windows.*` packs are on (the
+/// Windows host): that reading's `remove-item-recurse-force` regex does not
+/// see `-WhatIf` after `1 |`.
+const HARMLESS_IN_POWERSHELL: &[&str] =
+    &[r"1 | ForEach-Object { Remove-Item -Recurse -Force C:\Users -WhatIf }"];
 
 /// One file each (measured). dcg allows `Remove-Item <file>`, so their .NET
 /// spellings are allowed too.
@@ -211,6 +217,13 @@ fn hooks_judge_dotnet_and_block_deletes() {
                     "{protocol:?} {tool}: {command:?}"
                 );
             }
+        }
+        for command in HARMLESS_IN_POWERSHELL {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?} PowerShell: {command:?}"
+            );
         }
         for command in POSIX_HARMLESS {
             assert_eq!(

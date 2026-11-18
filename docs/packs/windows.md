@@ -54,8 +54,6 @@ Commands containing these keywords are checked against this pack:
 - `.delete(`
 - `.DELETE(`
 - `DeleteDirectory`
-- `deletedirectory`
-- `DELETEDIRECTORY`
 
 ### Safe Patterns (Allowed)
 

@@ -5303,12 +5303,14 @@ mod tests {
         let input: HookInput = serde_json::from_str(json).unwrap();
         let extracted = extract_command_with_context(&input).expect("shell command");
         assert_eq!(extracted.protocol, HookProtocol::Codex);
+        // Off Windows its `[IO.File]::` type-literal access is PowerShell
+        // shape, so the mislabeled `Bash` payload widens to the union (#322).
         assert_eq!(
             extracted.dialect,
             if cfg!(windows) {
                 ShellDialect::PowerShell
             } else {
-                ShellDialect::Posix
+                ShellDialect::Unknown
             }
         );
         // A POSIX-parseable Codex payload takes the union on Windows.
@@ -5325,12 +5327,14 @@ mod tests {
             }
         );
         // Without `turn_id` the payload is Claude Code's, whose Windows
-        // `Bash` tool is Git Bash: the POSIX label stands on every host.
+        // `Bash` tool is Git Bash: it is never re-mapped to PowerShell. Its
+        // PowerShell shape still widens it to the union on every host, as
+        // `Remove-Item` does (#322).
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"$a=[IO.File]::ReadAllLines('x'); [string]::Join(\"`n\",$a[239..($a.Length-1)])"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         let extracted = extract_command_with_context(&input).expect("shell command");
         assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
-        assert_eq!(extracted.dialect, ShellDialect::Posix);
+        assert_eq!(extracted.dialect, ShellDialect::Unknown);
     }
 
     #[test]

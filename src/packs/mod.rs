@@ -2653,6 +2653,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             ".Delete(",
             ".delete(",
             ".DELETE(",
+            "DeleteDirectory",
         ],
         windows::filesystem::create_pack,
     ),

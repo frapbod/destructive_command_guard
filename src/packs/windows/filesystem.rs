@@ -2255,10 +2255,9 @@ pub fn create_pack() -> Pack {
             ".Delete(",
             ".delete(",
             ".DELETE(",
-            // Visual Basic's FileSystem.DeleteDirectory.
+            // Visual Basic's FileSystem.DeleteDirectory (the automaton is
+            // case-insensitive).
             "DeleteDirectory",
-            "deletedirectory",
-            "DELETEDIRECTORY",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
