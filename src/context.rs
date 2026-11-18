@@ -1861,8 +1861,11 @@ fn token_mask_ranges(
         // commit message (and `--message` is not one of their options).
         // Masking it hid `git checkout -m <ref> <path>` and
         // `git show -m <ref>:<path> > <path>`.
-        let git_m_is_merge =
-            cmd_is_git && matches!(git_subcommand, Some("checkout" | "switch" | "restore" | "show"));
+        let git_m_is_merge = cmd_is_git
+            && matches!(
+                git_subcommand,
+                Some("checkout" | "switch" | "restore" | "show")
+            );
         let is_git_message_flag = |flag: &str| git_m_is_merge && matches!(flag, "-m" | "--message");
 
         if let Some(pending) = pending_safe_flag {
