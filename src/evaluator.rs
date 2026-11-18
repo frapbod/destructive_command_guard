@@ -4555,6 +4555,79 @@ impl PowerShellHost {
     }
 }
 
+/// The arguments a native Windows program receives from a POSIX outer shell.
+///
+/// Linux, macOS and WSL pass each word through unchanged. Git Bash (MSYS2)
+/// rewrites words that look like POSIX paths before it starts a native
+/// program, so the program can read a different switch than the word shows.
+/// dcg cannot tell Git Bash from WSL by the POSIX dialect, so callers judge
+/// a POSIX launcher under both readings and the deny wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeArgv {
+    /// Each word reaches the program unchanged.
+    Verbatim,
+    /// Git Bash path conversion (`msys2_path_conv.cc` in msys2-runtime).
+    Msys,
+}
+
+/// What Git Bash hands a native program for one decoded word, as far as a
+/// PowerShell host's switch reading goes. `None` means the word reaches the
+/// program as a Windows path, which no host reads as a switch.
+///
+/// msys2-runtime's `find_path_start_and_type` reads a word that starts with
+/// `//` as an escaped Windows switch and drops one `/` (`//c` reaches
+/// powershell.exe as `/c`, which is -Command), and rewrites a word that
+/// starts with a single `/` as a path (`/c` becomes
+/// `C:/Program Files/Git/c`). Its other cases (a UNC path `//host/share`, a
+/// word with `*`, `?` or a quote, which it leaves alone) are not modeled:
+/// this reading only adds a switch or a positional word, and the verbatim
+/// reading of the same word is always judged too. The word is trimmed first
+/// because the host trims it, and Git Bash skips leading blanks before it
+/// looks for a path.
+fn msys_native_argument(decoded: &str) -> Option<&str> {
+    match decoded.trim_start().strip_prefix('/') {
+        Some(rest) if rest.starts_with('/') => Some(rest),
+        Some(_) => None,
+        None => Some(decoded),
+    }
+}
+
+/// The payload words of a launcher (after cmd's `/c` or PowerShell's
+/// `-Command`), joined with spaces as the host joins them, under one
+/// reading of the arguments it receives.
+///
+/// Git Bash converts every word it hands a native program, payload words
+/// included, so under [`NativeArgv::Msys`] a decoded word that starts with
+/// `//` (after leading blanks) loses one `/`: `cmd //c powershell //c ...`
+/// reaches powershell.exe as `/c`. A word with a single leading `/` stays as
+/// written. Git Bash makes it a path, which the verbatim reading of the same
+/// word covers as well or better (a host that reads `/x` as a switch is
+/// judged on that switch either way). A single word that holds the whole
+/// nested command (`cmd //c "powershell //c ..."`) starts with no `/`, so
+/// Git Bash and this reading leave its inner `//c` alone.
+fn decoded_launcher_tail(
+    words: &[&str],
+    start: usize,
+    dialect: ShellDialect,
+    argv: NativeArgv,
+) -> Option<String> {
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let mut decoded = Vec::with_capacity(words.len().saturating_sub(start));
+    for raw in words.iter().skip(start) {
+        if let Some(word) = decoder.decode(raw, ShellTokenRole::Syntax) {
+            let mut word = word.into_owned();
+            if argv == NativeArgv::Msys {
+                let blanks = word.len() - word.trim_start().len();
+                if word[blanks..].starts_with("//") {
+                    word.remove(blanks);
+                }
+            }
+            decoded.push(word);
+        }
+    }
+    (!decoded.is_empty()).then(|| decoded.join(" "))
+}
+
 /// `CharExtensions.IsDash` / `SpecialCharacters.IsDash` in PowerShell's
 /// console host: hyphen-minus, en dash, em dash and horizontal bar.
 fn is_powershell_dash(c: char) -> bool {
@@ -4651,11 +4724,19 @@ fn powershell_host_option(
     raw: &str,
     host: PowerShellHost,
     outer_dialect: ShellDialect,
+    argv: NativeArgv,
 ) -> PowerShellHostOption {
     let Some(decoded) = powershell_host_option_value(raw, outer_dialect) else {
         return PowerShellHostOption::Unknown;
     };
-    let Some((prefix, name)) = powershell_switch_prefix(&decoded) else {
+    let decoded = match argv {
+        NativeArgv::Verbatim => decoded.as_str(),
+        NativeArgv::Msys => match msys_native_argument(&decoded) {
+            Some(argument) => argument,
+            None => return PowerShellHostOption::Unknown,
+        },
+    };
+    let Some((prefix, name)) = powershell_switch_prefix(decoded) else {
         // Windows PowerShell 5.1 skips an argument that is empty after
         // trimming (`CommandLineParameterParser.ParseHelper`, PowerShell
         // v6.0.0-alpha.9 lines 338-342, the 5.1-lineage parser), so
@@ -4876,17 +4957,6 @@ fn unresolved_posix_segment_may_launch_windows_shell(command: &str) -> bool {
     ["powershell", "pwsh", "cmd"]
         .iter()
         .any(|candidate| candidate.starts_with(&prefix))
-}
-
-fn decoded_shell_tail(words: &[&str], start: usize, dialect: ShellDialect) -> Option<String> {
-    let mut decoder = ShellTokenDecoder::new(dialect);
-    let mut decoded = Vec::with_capacity(words.len().saturating_sub(start));
-    for raw in words.iter().skip(start) {
-        if let Some(word) = decoder.decode(raw, ShellTokenRole::Syntax) {
-            decoded.push(word.into_owned());
-        }
-    }
-    (!decoded.is_empty()).then(|| decoded.join(" "))
 }
 
 fn trim_powershell_script_block(command: &str) -> &str {
@@ -5141,6 +5211,7 @@ fn powershell_command_payload(
     words: &[&str],
     start: usize,
     outer_dialect: ShellDialect,
+    argv: NativeArgv,
     max_payload_bytes: usize,
     launcher: &'static str,
 ) -> WindowsLauncherParse {
@@ -5153,7 +5224,7 @@ fn powershell_command_payload(
             "PowerShell -Command - executes commands read dynamically from stdin".to_string(),
         );
     }
-    let Some(command) = decoded_shell_tail(words, start, outer_dialect) else {
+    let Some(command) = decoded_launcher_tail(words, start, outer_dialect, argv) else {
         return WindowsLauncherParse::Unverified(
             "PowerShell -Command has no statically inspectable payload".to_string(),
         );
@@ -5179,17 +5250,19 @@ fn parse_powershell_launcher(
     words: &[&str],
     executable: &str,
     outer_dialect: ShellDialect,
+    argv: NativeArgv,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let host = PowerShellHost::from_executable(executable);
     let mut index = 1usize;
     while let Some(raw) = words.get(index) {
-        match powershell_host_option(raw, host, outer_dialect) {
+        match powershell_host_option(raw, host, outer_dialect, argv) {
             PowerShellHostOption::Command => {
                 return powershell_command_payload(
                     words,
                     index + 1,
                     outer_dialect,
+                    argv,
                     max_payload_bytes,
                     "PowerShell -Command",
                 );
@@ -5274,6 +5347,7 @@ fn parse_powershell_launcher(
                         words,
                         index,
                         outer_dialect,
+                        argv,
                         max_payload_bytes,
                         "PowerShell positional command",
                     );
@@ -5305,9 +5379,15 @@ fn cmd_switch_is_non_executing(option: &str) -> bool {
             .any(|prefix| option.starts_with(prefix))
 }
 
+/// Under [`NativeArgv::Msys`] the switches read as `cmd_host_switch` reads
+/// them for a POSIX outer shell (`//x` is `/x`; a single `/x`, which Git
+/// Bash makes a path, keeps its switch reading because cmd.exe's reading of
+/// that path is not modeled and the switch reading is the stricter one);
+/// only the payload words change.
 fn parse_cmd_launcher(
     words: &[&str],
     outer_dialect: ShellDialect,
+    argv: NativeArgv,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let mut index = 1usize;
@@ -5316,7 +5396,7 @@ fn parse_cmd_launcher(
             return WindowsLauncherParse::NotLauncher;
         };
         if matches!(option.as_str(), "/c" | "/k") {
-            let Some(command) = decoded_shell_tail(words, index + 1, outer_dialect) else {
+            let Some(command) = decoded_launcher_tail(words, index + 1, outer_dialect, argv) else {
                 return WindowsLauncherParse::Unverified(format!(
                     "cmd {option} has no statically inspectable payload"
                 ));
@@ -6045,9 +6125,26 @@ fn parse_cmd_control_command_at_depth(
     }))
 }
 
+#[cfg(test)]
 fn parse_windows_launcher_segment(
     segment: &str,
     outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+) -> WindowsLauncherParse {
+    parse_windows_launcher_segment_as(
+        segment,
+        outer_dialect,
+        NativeArgv::Verbatim,
+        max_payload_bytes,
+    )
+}
+
+/// One launcher segment under one reading of the arguments the launched
+/// program receives ([`NativeArgv`]).
+fn parse_windows_launcher_segment_as(
+    segment: &str,
+    outer_dialect: ShellDialect,
+    argv: NativeArgv,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let segment = segment.trim();
@@ -6121,11 +6218,11 @@ fn parse_windows_launcher_segment(
     };
     match executable.as_str() {
         "powershell" | "pwsh" => {
-            parse_powershell_launcher(&words, &executable, outer_dialect, max_payload_bytes)
+            parse_powershell_launcher(&words, &executable, outer_dialect, argv, max_payload_bytes)
         }
-        "cmd" => parse_cmd_launcher(&words, outer_dialect, max_payload_bytes),
+        "cmd" => parse_cmd_launcher(&words, outer_dialect, argv, max_payload_bytes),
         "call" if outer_dialect == ShellDialect::Cmd => {
-            let Some(command) = decoded_shell_tail(&words, 1, outer_dialect) else {
+            let Some(command) = decoded_launcher_tail(&words, 1, outer_dialect, argv) else {
                 return WindowsLauncherParse::Unverified(
                     "cmd call has no statically inspectable payload".to_string(),
                 );
@@ -6193,14 +6290,24 @@ fn windows_launcher_envelopes(
         let mut segment_envelopes = Vec::new();
         let mut unverified = None;
         for &candidate in candidate_dialects {
-            match parse_windows_launcher_segment(segment, candidate, max_payload_bytes) {
-                WindowsLauncherParse::NotLauncher => {}
-                WindowsLauncherParse::Envelope(envelope) => {
-                    if !segment_envelopes.contains(&envelope) {
-                        segment_envelopes.push(envelope);
+            // A POSIX outer shell may be Git Bash, which rewrites the
+            // launched program's arguments, or not: read both.
+            let readings: &[NativeArgv] = if candidate == ShellDialect::Posix {
+                &[NativeArgv::Verbatim, NativeArgv::Msys]
+            } else {
+                &[NativeArgv::Verbatim]
+            };
+            for &argv in readings {
+                match parse_windows_launcher_segment_as(segment, candidate, argv, max_payload_bytes)
+                {
+                    WindowsLauncherParse::NotLauncher => {}
+                    WindowsLauncherParse::Envelope(envelope) => {
+                        if !segment_envelopes.contains(&envelope) {
+                            segment_envelopes.push(envelope);
+                        }
                     }
+                    WindowsLauncherParse::Unverified(reason) => unverified = Some(reason),
                 }
-                WindowsLauncherParse::Unverified(reason) => unverified = Some(reason),
             }
         }
         // Unknown-mode parsing is a conservative union of viable shell
@@ -8341,6 +8448,88 @@ fn powershell_source_references_appended_input(source: &str) -> bool {
         || source.contains("@input")
 }
 
+/// `appended_code_input_mode` for a PowerShell host under one reading of
+/// its arguments ([`NativeArgv`]).
+fn appended_powershell_input_mode(
+    args: &[String],
+    host: PowerShellHost,
+    argv: NativeArgv,
+    replacement: PipelineReplacement<'_>,
+    delimiter: PipelineRecordDelimiter,
+    join_windows_argv: bool,
+) -> PipelineShellInputMode {
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index) {
+        match powershell_host_option(argument, host, ShellDialect::Posix, argv) {
+            PowerShellHostOption::Command => {
+                let Some(source) = args.get(index + 1) else {
+                    let kind = if join_windows_argv {
+                        PipelineSourceKind::PowerShell.joined_records(delimiter)
+                    } else {
+                        PipelineSourceKind::PowerShell.records(delimiter)
+                    };
+                    return PipelineShellInputMode::ReadsStdin(kind);
+                };
+                if replacement.occurs_in(source)
+                    || powershell_source_references_appended_input(source)
+                {
+                    return PipelineShellInputMode::Unverified;
+                }
+                return PipelineShellInputMode::DoesNotReadStdin;
+            }
+            PowerShellHostOption::EncodedCommand => {
+                return PipelineShellInputMode::Unverified;
+            }
+            PowerShellHostOption::File => {
+                // A script FILE is the source; the pipeline is not. Only
+                // `-File -` takes the script itself from stdin. A missing
+                // path is a pwsh usage error, so refuse to guess.
+                let Some(path) = args.get(index + 1) else {
+                    return PipelineShellInputMode::Unverified;
+                };
+                return if path == "-" {
+                    let kind = if join_windows_argv {
+                        PipelineSourceKind::PowerShell.joined_records(delimiter)
+                    } else {
+                        PipelineSourceKind::PowerShell.records(delimiter)
+                    };
+                    PipelineShellInputMode::ReadsStdin(kind)
+                } else {
+                    PipelineShellInputMode::DoesNotReadStdin
+                };
+            }
+            PowerShellHostOption::NoValue => index += 1,
+            PowerShellHostOption::OptionalValue => index += 2,
+            PowerShellHostOption::Value => {
+                if args.get(index + 1).is_none() {
+                    return PipelineShellInputMode::Unverified;
+                }
+                index += 2;
+            }
+            PowerShellHostOption::Unmodeled => {
+                return PipelineShellInputMode::Unverified;
+            }
+            PowerShellHostOption::Unknown => {
+                if powershell_argument_is_dashed(argument) {
+                    return PipelineShellInputMode::Unverified;
+                }
+                let kind = if join_windows_argv {
+                    PipelineSourceKind::PowerShell.joined_records(delimiter)
+                } else {
+                    PipelineSourceKind::PowerShell.records(delimiter)
+                };
+                return PipelineShellInputMode::ReadsStdin(kind);
+            }
+        }
+    }
+    let kind = if join_windows_argv {
+        PipelineSourceKind::PowerShell.joined_records(delimiter)
+    } else {
+        PipelineSourceKind::PowerShell.records(delimiter)
+    };
+    PipelineShellInputMode::ReadsStdin(kind)
+}
+
 fn appended_code_input_mode(
     command: &[String],
     replacement: PipelineReplacement<'_>,
@@ -8370,76 +8559,17 @@ fn appended_code_input_mode(
             return PipelineShellInputMode::Unverified;
         }
         let host = PowerShellHost::from_executable(&executable);
-        let mut index = 0usize;
-        while let Some(argument) = args.get(index) {
-            match powershell_host_option(argument, host, ShellDialect::Posix) {
-                PowerShellHostOption::Command => {
-                    let Some(source) = args.get(index + 1) else {
-                        let kind = if join_windows_argv {
-                            PipelineSourceKind::PowerShell.joined_records(delimiter)
-                        } else {
-                            PipelineSourceKind::PowerShell.records(delimiter)
-                        };
-                        return PipelineShellInputMode::ReadsStdin(kind);
-                    };
-                    if replacement.occurs_in(source)
-                        || powershell_source_references_appended_input(source)
-                    {
-                        return PipelineShellInputMode::Unverified;
-                    }
-                    return PipelineShellInputMode::DoesNotReadStdin;
-                }
-                PowerShellHostOption::EncodedCommand => {
-                    return PipelineShellInputMode::Unverified;
-                }
-                PowerShellHostOption::File => {
-                    // A script FILE is the source; the pipeline is not. Only
-                    // `-File -` takes the script itself from stdin. A missing
-                    // path is a pwsh usage error, so refuse to guess.
-                    let Some(path) = args.get(index + 1) else {
-                        return PipelineShellInputMode::Unverified;
-                    };
-                    return if path == "-" {
-                        let kind = if join_windows_argv {
-                            PipelineSourceKind::PowerShell.joined_records(delimiter)
-                        } else {
-                            PipelineSourceKind::PowerShell.records(delimiter)
-                        };
-                        PipelineShellInputMode::ReadsStdin(kind)
-                    } else {
-                        PipelineShellInputMode::DoesNotReadStdin
-                    };
-                }
-                PowerShellHostOption::NoValue => index += 1,
-                PowerShellHostOption::OptionalValue => index += 2,
-                PowerShellHostOption::Value => {
-                    if args.get(index + 1).is_none() {
-                        return PipelineShellInputMode::Unverified;
-                    }
-                    index += 2;
-                }
-                PowerShellHostOption::Unmodeled => {
-                    return PipelineShellInputMode::Unverified;
-                }
-                PowerShellHostOption::Unknown => {
-                    if powershell_argument_is_dashed(argument) {
-                        return PipelineShellInputMode::Unverified;
-                    }
-                    let kind = if join_windows_argv {
-                        PipelineSourceKind::PowerShell.joined_records(delimiter)
-                    } else {
-                        PipelineSourceKind::PowerShell.records(delimiter)
-                    };
-                    return PipelineShellInputMode::ReadsStdin(kind);
-                }
-            }
-        }
-        let kind = if join_windows_argv {
-            PipelineSourceKind::PowerShell.joined_records(delimiter)
-        } else {
-            PipelineSourceKind::PowerShell.records(delimiter)
+        let reading = |argv| {
+            appended_powershell_input_mode(
+                &args,
+                host,
+                argv,
+                replacement,
+                delimiter,
+                join_windows_argv,
+            )
         };
-        return PipelineShellInputMode::ReadsStdin(kind);
+        return either_pipeline_reading(reading(NativeArgv::Verbatim), reading(NativeArgv::Msys));
     }
     if executable == "cmd" {
         if args.iter().any(|argument| replacement.occurs_in(argument)) {
@@ -9314,10 +9444,41 @@ fn python_pipeline_input_mode(
     PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
 }
 
+/// The deny-wins union of two readings of one pipeline consumer: input that
+/// either reading runs is judged, and readings that disagree otherwise fail
+/// closed.
+fn either_pipeline_reading(
+    first: PipelineShellInputMode,
+    second: PipelineShellInputMode,
+) -> PipelineShellInputMode {
+    use PipelineShellInputMode::{DoesNotReadStdin, ReadsStdin, Unverified};
+    match (first, second) {
+        (first, second) if first == second => first,
+        (ReadsStdin(kind), DoesNotReadStdin) | (DoesNotReadStdin, ReadsStdin(kind)) => {
+            ReadsStdin(kind)
+        }
+        _ => Unverified,
+    }
+}
+
+/// Whether a PowerShell host started in a pipeline runs its stdin, under
+/// both readings of its arguments ([`NativeArgv`]): the argv comes from a
+/// POSIX-shaped view and the outer shell may be Git Bash.
 fn powershell_pipeline_input_mode(args: &[String], host: PowerShellHost) -> PipelineShellInputMode {
+    either_pipeline_reading(
+        powershell_pipeline_input_mode_as(args, host, NativeArgv::Verbatim),
+        powershell_pipeline_input_mode_as(args, host, NativeArgv::Msys),
+    )
+}
+
+fn powershell_pipeline_input_mode_as(
+    args: &[String],
+    host: PowerShellHost,
+    argv: NativeArgv,
+) -> PipelineShellInputMode {
     let mut index = 0usize;
     while let Some(argument) = args.get(index) {
-        match powershell_host_option(argument, host, ShellDialect::Posix) {
+        match powershell_host_option(argument, host, ShellDialect::Posix, argv) {
             // Resolved through the shared option table rather than an exact
             // `-file` string match, so abbreviations such as `pwsh -f -` are
             // recognized as reading a script from stdin.
@@ -59386,6 +59547,66 @@ mod tests {
     }
 
     #[test]
+    fn git_bash_hands_powershell_double_slash_words_as_switches() {
+        use crate::normalize::ShellDialect;
+
+        assert_eq!(msys_native_argument("//c"), Some("/c"));
+        assert_eq!(msys_native_argument(" //Command"), Some("/Command"));
+        assert_eq!(msys_native_argument("///c"), Some("//c"));
+        assert_eq!(msys_native_argument("/c"), None, "a path, not a switch");
+        assert_eq!(msys_native_argument("/"), None);
+        assert_eq!(msys_native_argument("-c"), Some("-c"));
+        assert_eq!(msys_native_argument("x//c"), Some("x//c"));
+
+        let words = ["cmd", "//c", "powershell", "' //c'", "/x", "\"a //c\""];
+        assert_eq!(
+            decoded_launcher_tail(&words, 2, ShellDialect::Posix, NativeArgv::Msys).as_deref(),
+            Some("powershell  /c /x a //c"),
+            "only a word that starts with `//` loses one `/`"
+        );
+        assert_eq!(
+            decoded_launcher_tail(&words, 2, ShellDialect::Posix, NativeArgv::Verbatim).as_deref(),
+            Some("powershell  //c /x a //c")
+        );
+
+        for host in [PowerShellHost::Windows, PowerShellHost::Core] {
+            for (raw, verbatim, msys) in [
+                (
+                    "//c",
+                    PowerShellHostOption::Unknown,
+                    PowerShellHostOption::Command,
+                ),
+                (
+                    "'//Command'",
+                    PowerShellHostOption::Unknown,
+                    PowerShellHostOption::Command,
+                ),
+                (
+                    "/c",
+                    PowerShellHostOption::Command,
+                    PowerShellHostOption::Unknown,
+                ),
+                (
+                    "-c",
+                    PowerShellHostOption::Command,
+                    PowerShellHostOption::Command,
+                ),
+            ] {
+                assert_eq!(
+                    powershell_host_option(raw, host, ShellDialect::Posix, NativeArgv::Verbatim),
+                    verbatim,
+                    "{host:?} verbatim {raw}"
+                );
+                assert_eq!(
+                    powershell_host_option(raw, host, ShellDialect::Posix, NativeArgv::Msys),
+                    msys,
+                    "{host:?} Git Bash {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn windows_launcher_host_tokens_are_decoded_strictly() {
         use crate::normalize::ShellDialect;
 
@@ -59399,51 +59620,106 @@ mod tests {
             Some("powershell")
         );
         assert_eq!(
-            powershell_host_option("-Co", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-Co",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::Command
         );
         assert_eq!(
-            powershell_host_option("-En", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-En",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::EncodedCommand
         );
         assert_eq!(
-            powershell_host_option("-NoL", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-NoL",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::NoValue
         );
         assert_eq!(
-            powershell_host_option("-Work", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-Work",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::Value
         );
         assert_eq!(
-            powershell_host_option("-File", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-File",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::File
         );
         assert_eq!(
-            powershell_host_option("-file", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-file",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::File,
             "host options are case-insensitive"
         );
         assert_eq!(
-            powershell_host_option("-Fi", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-Fi",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::File
         );
         assert_eq!(
-            powershell_host_option("-f", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-f",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::File,
             "no other host option starts with f, so -f resolves to -File"
         );
         assert_eq!(
-            powershell_host_option("-NoP", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-NoP",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::Unknown,
             "NoProfile and NoProfileLoadTime make -NoP ambiguous"
         );
         assert_eq!(
-            powershell_host_option("-W", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-W",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::Unknown,
             "WindowStyle and WorkingDirectory make -W ambiguous"
         );
         assert_eq!(
-            powershell_host_option("-Com`mand", PowerShellHost::Core, ShellDialect::PowerShell),
+            powershell_host_option(
+                "-Com`mand",
+                PowerShellHost::Core,
+                ShellDialect::PowerShell,
+                NativeArgv::Verbatim
+            ),
             PowerShellHostOption::Unknown,
             "a mid-token bare backtick is passed literally to the native host"
         );
@@ -59657,12 +59933,22 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                powershell_host_option(raw, PowerShellHost::Windows, ShellDialect::PowerShell),
+                powershell_host_option(
+                    raw,
+                    PowerShellHost::Windows,
+                    ShellDialect::PowerShell,
+                    NativeArgv::Verbatim
+                ),
                 windows,
                 "powershell {raw:?}"
             );
             assert_eq!(
-                powershell_host_option(raw, PowerShellHost::Core, ShellDialect::PowerShell),
+                powershell_host_option(
+                    raw,
+                    PowerShellHost::Core,
+                    ShellDialect::PowerShell,
+                    NativeArgv::Verbatim
+                ),
                 core,
                 "pwsh {raw:?}"
             );
