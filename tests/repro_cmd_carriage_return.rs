@@ -515,3 +515,76 @@ fn powershell_backtick_r_in_a_cmd_payload() {
         );
     }
 }
+
+/// A `cmd /c` call inside another command hands cmd only its own words: they
+/// end where the outer shell ends the command (`;`, `&&`, `|`, `)`), and the
+/// outer shell resolves their quotes and escapes first. A later quoted `&`
+/// is the outer shell's data, not cmd's separator, and a later `cmd /c` is
+/// not nested inside the first.
+#[test]
+fn cmd_call_inside_another_command_ends_where_its_shell_ends_it() {
+    // Bash joins the escaped words into one argument; cmd gets
+    // `gi<CR>t reset --hard` (or `git reset --hard`) and runs it.
+    for command in [
+        "(cmd.exe /c gi\rt\\ reset\\ --hard)",
+        "(cmd.exe /c git\\ reset\\ --hard)",
+    ] {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    let nine_ps = (0..9)
+        .map(|n| format!("$v{n} = (cmd /c echo {n})"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    for command in [
+        "cmd /c ver; Write-Output 'a & git reset --hard'",
+        "(cmd /c ver); Write-Output 'a & git reset --hard'",
+        nine_ps.as_str(),
+    ] {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Allow,
+            "PowerShell: {command:?}"
+        );
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    let nine_posix = (0..9)
+        .map(|n| format!("(cmd.exe /c echo {n})"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    for command in [
+        "cmd.exe /c ver; echo 'a & git reset --hard'",
+        nine_posix.as_str(),
+    ] {
+        assert_eq!(
+            decision_in(command, ShellDialect::Posix),
+            EvaluationDecision::Allow,
+            "Posix: {command:?}"
+        );
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "Bash", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}

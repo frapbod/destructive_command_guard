@@ -6249,6 +6249,74 @@ fn parse_windows_launcher_segment_as(
     }
 }
 
+/// The command text one `cmd /c` / `cmd /k` call inside a larger command
+/// hands cmd.exe, under each reading of the outer shell.
+///
+/// `cmd_offset` is a byte of the call's `cmd` word (where the inline-script
+/// scanner found it). The call runs from the start of that word to where the
+/// outer shell ends the command (`;`, `&&`, `|`, `)` or a line break), and its
+/// words are resolved through that shell's quotes and escapes, as for a
+/// launcher that starts a segment. Text after that boundary belongs to the
+/// outer shell, not to cmd. The boundary view keeps a CR inside a word for
+/// POSIX (a CR is not a metacharacter there) and for Cmd (cmd removes it
+/// before it reads its text); PowerShell ends the line at it.
+fn embedded_cmd_call_envelopes(
+    command: &str,
+    cmd_offset: usize,
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+) -> Vec<WindowsLauncherEnvelope> {
+    let candidate_dialects: &[ShellDialect] = if outer_dialect == ShellDialect::Unknown {
+        &[
+            ShellDialect::Posix,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ]
+    } else {
+        std::slice::from_ref(&outer_dialect)
+    };
+    let mut envelopes = Vec::new();
+    for &dialect in candidate_dialects {
+        let cr_as_word_byte = (dialect != ShellDialect::PowerShell && command.contains('\r'))
+            .then(|| command.replace('\r', "\u{1}"));
+        let tokens =
+            tokenize_for_shell_dialect(cr_as_word_byte.as_deref().unwrap_or(command), dialect);
+        let Some(word) = tokens.iter().position(|token| {
+            token.kind == NormalizeTokenKind::Word && token.byte_range.contains(&cmd_offset)
+        }) else {
+            continue;
+        };
+        let start = tokens[word].byte_range.start;
+        let end = tokens[word..]
+            .iter()
+            .find(|token| token.kind == NormalizeTokenKind::Separator)
+            .map_or(command.len(), |token| token.byte_range.start);
+        let Some(call) = command.get(start..end) else {
+            continue;
+        };
+        let call = if dialect == ShellDialect::Cmd {
+            Cow::Owned(call.replace('\r', ""))
+        } else {
+            Cow::Borrowed(call)
+        };
+        let readings: &[NativeArgv] = if dialect == ShellDialect::Posix {
+            &[NativeArgv::Verbatim, NativeArgv::Msys]
+        } else {
+            &[NativeArgv::Verbatim]
+        };
+        for &argv in readings {
+            if let WindowsLauncherParse::Envelope(envelope) =
+                parse_windows_launcher_segment_as(&call, dialect, argv, max_payload_bytes)
+            {
+                if !envelopes.contains(&envelope) {
+                    envelopes.push(envelope);
+                }
+            }
+        }
+    }
+    envelopes
+}
+
 fn windows_launcher_envelopes(
     command: &str,
     outer_dialect: ShellDialect,
@@ -39055,24 +39123,45 @@ fn evaluate_heredoc(
                     },
                 );
             }
-            // A `cmd /c` / `cmd /k` payload is cmd.exe's own command text,
-            // whatever shell found it (`(cmd.exe /c …)`, `xargs cmd.exe /c …`,
-            // `wsl cmd.exe /c …`). The POSIX reading above ends a word at a
-            // CR, which cmd removes, so `gi<CR>t reset --hard` is never read
-            // as `git`. Read the whole payload once more as Cmd, where the
-            // Cmd readings (CR removal, `&`, caret) apply; deny wins.
-            let cmd_reading = (content.target_command.as_deref() == Some("cmd")
-                && line_dialect == ShellDialect::Posix)
-                .then(|| crate::heredoc::ExtractedShellCommand {
-                    text: content.content.clone(),
-                    start: 0,
-                    end: content.content.len(),
-                    line_number: 1,
-                });
+            // A `cmd /c` / `cmd /k` call found inside another command
+            // (`(cmd.exe /c …)`, `xargs cmd.exe /c …`, `wsl cmd.exe /c …`)
+            // hands cmd.exe its own command text. The POSIX reading above
+            // ends a word at a CR, which cmd removes, so `gi<CR>t reset
+            // --hard` is never read as `git`. Read the text that call hands
+            // cmd once more in the call's own dialect, where the Cmd readings
+            // (CR removal, `&`, caret) apply; deny wins. The call ends where
+            // the outer shell ends it, not at the end of the line the scanner
+            // captured: `cmd /c ver; echo 'a & b'` hands cmd only `ver`.
+            let cmd_readings = if content.target_command.as_deref() == Some("cmd")
+                && line_dialect == ShellDialect::Posix
+            {
+                embedded_cmd_call_envelopes(
+                    command,
+                    content.byte_range.start,
+                    context.shell_dialect,
+                    context
+                        .heredoc_settings
+                        .limits
+                        .max_body_bytes
+                        .min(MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES),
+                )
+            } else {
+                Vec::new()
+            };
             let readings = inner_commands
                 .into_iter()
                 .map(|inner| (line_dialect, inner))
-                .chain(cmd_reading.map(|inner| (ShellDialect::Cmd, inner)));
+                .chain(cmd_readings.into_iter().map(|envelope| {
+                    (
+                        envelope.dialect,
+                        crate::heredoc::ExtractedShellCommand {
+                            text: envelope.command,
+                            start: 0,
+                            end: content.content.len(),
+                            line_number: 1,
+                        },
+                    )
+                }));
             for (index, (reading_dialect, inner)) in readings.enumerate() {
                 if deadline_exceeded(context.deadline) {
                     return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -39088,15 +39177,17 @@ fn evaluate_heredoc(
                 // whole-body command of a body without a per-command pass
                 // takes the same route, so a denial in it is mapped and
                 // line-numbered from its span.
-                let needs_source_context = alternate_reading
-                    || whole_body
-                    || (destination_source_context && index == 0)
-                    || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
-                        .is_some_and(|operator| {
-                            contextual_redirects.contains(&(inner.start + operator))
-                        });
+                // A cmd call's own text (below) is derived, not a span of
+                // the body: it is read alone and maps to no body offset.
+                let needs_source_context = !alternate_reading
+                    && (whole_body
+                        || (destination_source_context && index == 0)
+                        || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
+                            .is_some_and(|operator| {
+                                contextual_redirects.contains(&(inner.start + operator))
+                            }));
                 let mut result = if alternate_reading {
-                    evaluate_source_as(&content.content, reading_dialect)
+                    evaluate_source_as(&inner.text, reading_dialect)
                 } else if needs_source_context {
                     complete_source_result
                         .get_or_insert_with(|| evaluate_source(&content.content))
@@ -39142,6 +39233,10 @@ fn evaluate_heredoc(
                         // policy modes and allow-once --force depend on it.
                         if info.source != MatchSource::ConfigOverride {
                             info.source = MatchSource::HeredocAst;
+                        }
+                        if alternate_reading {
+                            info.matched_span = None;
+                            info.matched_text_preview = None;
                         }
                         if let Some(span) = info.matched_span {
                             if let Some(mapped_inner) =
