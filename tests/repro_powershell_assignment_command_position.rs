@@ -276,8 +276,7 @@ const HARMLESS: &[&str] = &[
     "$r = Invoke-Command -ScriptBlock { Get-Date }",
     "$c = Set-Alias x Write-Output; x 'git reset --hard'",
     "$x = 5; sal y iex; y 'git status'",
-    // Expression values that run nothing dangerous, and a Perl heredoc
-    // whose `$h={…}` is data.
+    // Expression values that run nothing dangerous.
     "$y=$x*2",
     "$v=[IO.Path]::Combine('a','b')",
     "$c=@(1,2); $c[ 0 ] = [IO.Path]::Combine('a','b')",
@@ -286,16 +285,16 @@ const HARMLESS: &[&str] = &[
     "@{a = 1 | ForEach-Object { git status }}",
     "@{a = 'git status' | Write-Output}",
     "$files = Get-ChildItem; foreach($f in $files){ $size = $f.Length * 2 }",
-    "cat > t.pl <<'EOF'\nsub f {\n  my $x=shift;\n  my $h={\n    a=>$x,\n  };\n  return $h;\n}\nEOF",
 ];
 
 /// Data the Unknown dialect already denies on the base commit through its
-/// POSIX reading (unchanged here); PowerShell itself runs nothing.
+/// POSIX reading (unchanged here); PowerShell itself runs nothing. A stored
+/// block such as `$c={git reset --hard}` is not listed: the base commit
+/// judges a script block where it is built and denies it in both dialects.
 const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$c='git reset --hard'",
     "$c=\"git reset --hard\"",
     "$c=@'\ngit reset --hard\n'@",
-    "$c={git reset --hard}",
     "$msg='git reset --hard is dangerous'; Write-Output $msg",
     // A here-string value is data, not a command (the filesystem pack's
     // reason to skip assignments).
@@ -307,8 +306,14 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
 /// Text PowerShell cannot parse (it runs none of it) that the Unknown dialect
 /// allows on the base commit. The view must not turn PowerShell's parse
 /// failure into an Unknown denial: the first row is a Node heredoc from real
-/// Codex history, reduced (`()=>{…` in JavaScript).
-const HARMLESS_IN_UNKNOWN: &[&str] = &["node <<'JS'\n)={\nJS", "x)={"];
+/// Codex history, reduced (`()=>{…` in JavaScript); the last is a Perl
+/// heredoc whose `$h={…}` is data. The PowerShell dialect denies that Perl
+/// heredoc on the base commit (its redirect reader), so it is Unknown-only.
+const HARMLESS_IN_UNKNOWN: &[&str] = &[
+    "node <<'JS'\n)={\nJS",
+    "x)={",
+    "cat > t.pl <<'EOF'\nsub f {\n  my $x=shift;\n  my $h={\n    a=>$x,\n  };\n  return $h;\n}\nEOF",
+];
 
 fn dcg_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
