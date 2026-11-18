@@ -5989,6 +5989,8 @@ fn parse_windows_launcher_segment_as(
 /// launcher reader cannot verify it:
 /// - The payload is read as written, cmd variables included (`git reset
 ///   --hard & echo %CD%`): this reading only adds denials.
+/// - When the `cmd` word ends a larger unquoted word (`--exec=cmd.exe /c …`),
+///   the call starts at `cmd`, where the scanner's POSIX reading starts it.
 /// - When the `cmd` word is inside a larger word, that word is a quoted
 ///   argument of another program (`tmux new-session -d 'cmd.exe /c …'`,
 ///   `schtasks /tr "cmd /c …"`). The program gets the word's value, so the
@@ -6063,23 +6065,39 @@ fn push_embedded_cmd_call_envelopes(
         } else {
             &[NativeArgv::Verbatim]
         };
-        let mut launcher = false;
-        for &argv in readings {
-            if let WindowsLauncherParse::Envelope(envelope) = parse_windows_launcher_segment_as(
-                &without_cr(call),
-                dialect,
-                argv,
-                LauncherExpansions::AsWritten,
-                max_payload_bytes,
-            ) {
-                launcher = true;
-                if !envelopes.contains(&envelope) {
-                    envelopes.push(envelope);
+        let mut read_call = |call: &str| {
+            let mut launcher = false;
+            for &argv in readings {
+                if let WindowsLauncherParse::Envelope(envelope) = parse_windows_launcher_segment_as(
+                    &without_cr(call),
+                    dialect,
+                    argv,
+                    LauncherExpansions::AsWritten,
+                    max_payload_bytes,
+                ) {
+                    launcher = true;
+                    if !envelopes.contains(&envelope) {
+                        envelopes.push(envelope);
+                    }
                 }
             }
-        }
-        if launcher {
+            launcher
+        };
+        if read_call(call) {
             continue;
+        }
+        // The `cmd` word may sit later in its word (`--exec=cmd.exe /c …`):
+        // the scanner's POSIX reading starts the call there. When no quote
+        // or escape before it is open, the text from `cmd` on is the call
+        // as written; otherwise the word's value below removes the quoting.
+        if let Some(from_cmd) = command
+            .get(start..cmd_offset)
+            .filter(|prefix| !prefix.is_empty() && !may_open_quoting(prefix, dialect))
+            .and_then(|_| command.get(cmd_offset..end))
+        {
+            if read_call(from_cmd) {
+                continue;
+            }
         }
         let raw_word = without_cr(raw_word);
         let Some(value) = shell_word_value(&raw_word, dialect) else {
@@ -6101,6 +6119,19 @@ fn push_embedded_cmd_call_envelopes(
             );
         }
     }
+}
+
+/// Whether `text` holds a byte that opens or escapes quoting in `dialect`, so
+/// a later byte of the same word may be quoted. `false` proves the text after
+/// it starts unquoted.
+fn may_open_quoting(text: &str, dialect: ShellDialect) -> bool {
+    let syntax: &[char] = match dialect {
+        ShellDialect::Posix => &['\'', '"', '\\', '$', '`'],
+        ShellDialect::PowerShell => &['\'', '"', '`'],
+        ShellDialect::Cmd => &['"', '^'],
+        ShellDialect::Unknown => &['\'', '"', '\\', '$', '`', '^'],
+    };
+    text.contains(syntax)
 }
 
 fn windows_launcher_envelopes(
