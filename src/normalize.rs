@@ -2173,6 +2173,372 @@ pub(crate) fn posix_dollar_expands(next: Option<char>) -> bool {
     })
 }
 
+/// An unknown parameter value in a reconstructed argv: one word that no rule
+/// reads as an option or a protected path.
+pub(crate) const POSIX_PARAMETER_VALUE: &str = "__dcg_parameter_value__";
+
+const MAX_PARAMETER_READING_DEPTH: usize = 16;
+const MAX_PARAMETER_READING_BYTES: usize = 16 * 1024;
+
+/// The argv fields of one raw POSIX word when every parameter in it is unset
+/// or empty (`[0]`) and when every parameter is set to an unknown value
+/// (`[1]`).
+///
+/// Expansions decide a word's argv: `-${Y}W` gives `-W` when `Y` is unset,
+/// `${X:--rf /tmp/zz}` gives the two fields `-rf` and `/tmp/zz`, and
+/// `${X:+--force}` gives `--force` when `X` is set. The text as written proves
+/// neither that a flag is present nor that it is absent, so callers read both:
+/// a destructive rule may deny on either reading, and an exemption must hold
+/// on both. Across words, callers also mix them ([`posix_reading_choices`]).
+/// Within one word, mixed readings (one parameter set, another unset) are not
+/// tried.
+///
+/// A set parameter reads as the one opaque word [`POSIX_PARAMETER_VALUE`];
+/// `$#`, `$?`, `$$`, `$!` and `$-` are always set. Quote removal and Bash
+/// field splitting on the default IFS (blank, tab, newline) are applied, the
+/// latter only to unquoted expansion results; pathname, brace and tilde
+/// expansion are not, so those characters stay literal.
+///
+/// A command substitution or arithmetic expansion inside double quotes is one
+/// field of unknown text, so it reads as [`POSIX_PARAMETER_VALUE`] in both
+/// readings, like `$?`.
+///
+/// `None` means the fields depend on an unquoted command or process
+/// substitution or arithmetic expansion, or the quoting is malformed or too
+/// deep.
+pub(crate) fn posix_parameter_word_readings(raw: &str) -> Option<[Vec<String>; 2]> {
+    if raw.len() > MAX_PARAMETER_READING_BYTES {
+        return None;
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let read = |set: bool| {
+        let mut reading = PosixWordReading::default();
+        reading.expand(&chars, set, PosixReadingContext::WORD, 0)?;
+        Some(reading.finish())
+    };
+    Some([read(false)?, read(true)?])
+}
+
+/// At most this many words whose two readings differ are mixed; 2^6 = 64
+/// argv choices.
+const MAX_MIXED_READING_WORDS: usize = 6;
+
+/// Argv choices for a command whose words each have an unset (`[0]`) and a
+/// set (`[1]`) reading ([`posix_parameter_word_readings`]): one reading index
+/// per word. One parameter may be set while another is unset, so
+/// `rm ${X:--rf} $DIR` runs `rm -rf <DIR>` though neither uniform reading
+/// shows it. The every-unset and every-set choices come first, then each mix.
+///
+/// The flag is `false` when more than [`MAX_MIXED_READING_WORDS`] words
+/// differ: then only the two uniform choices are given, which may judge a
+/// denial but cannot prove an exemption.
+pub(crate) fn posix_reading_choices<T: PartialEq>(words: &[[T; 2]]) -> (Vec<Vec<usize>>, bool) {
+    let varying: Vec<usize> = words
+        .iter()
+        .enumerate()
+        .filter(|(_, [unset, set])| unset != set)
+        .map(|(index, _)| index)
+        .collect();
+    let complete = varying.len() <= MAX_MIXED_READING_WORDS;
+    let mut choices = vec![vec![0; words.len()]];
+    if !varying.is_empty() {
+        choices.push(vec![1; words.len()]);
+    }
+    if complete {
+        for mask in 1..(1usize << varying.len()).saturating_sub(1) {
+            let mut choice = vec![0; words.len()];
+            for (bit, &word) in varying.iter().enumerate() {
+                choice[word] = (mask >> bit) & 1;
+            }
+            choices.push(choice);
+        }
+    }
+    (choices, complete)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PosixReadingContext {
+    /// Inside double quotes: no field splitting, and `'` is literal.
+    double: bool,
+    /// Unquoted text here is the result of an expansion, so its blanks
+    /// separate fields.
+    splits: bool,
+}
+
+impl PosixReadingContext {
+    const WORD: Self = Self {
+        double: false,
+        splits: false,
+    };
+}
+
+#[derive(Debug, Default)]
+struct PosixWordReading {
+    fields: Vec<String>,
+    current: String,
+    /// The current field exists even if empty (`""` or `''` was seen).
+    present: bool,
+    bytes: usize,
+}
+
+impl PosixWordReading {
+    fn push(&mut self, ch: char, splits: bool) -> Option<()> {
+        if splits && matches!(ch, ' ' | '\t' | '\n') {
+            if self.present {
+                self.fields.push(std::mem::take(&mut self.current));
+                self.present = false;
+            }
+            return Some(());
+        }
+        self.bytes += ch.len_utf8();
+        if self.bytes > MAX_PARAMETER_READING_BYTES {
+            return None;
+        }
+        self.current.push(ch);
+        self.present = true;
+        Some(())
+    }
+
+    fn push_str(&mut self, text: &str) -> Option<()> {
+        text.chars().try_for_each(|ch| self.push(ch, false))
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        if self.present {
+            self.fields.push(self.current);
+        }
+        self.fields
+    }
+
+    fn expand(
+        &mut self,
+        chars: &[char],
+        set: bool,
+        context: PosixReadingContext,
+        depth: usize,
+    ) -> Option<()> {
+        if depth > MAX_PARAMETER_READING_DEPTH {
+            return None;
+        }
+        let mut index = 0usize;
+        let mut double = context.double;
+        while let Some(&ch) = chars.get(index) {
+            index += 1;
+            let splits = context.splits && !double;
+            match ch {
+                '\\' => {
+                    let escaped = *chars.get(index)?;
+                    index += 1;
+                    if escaped == '\n' {
+                        continue;
+                    }
+                    if double && !matches!(escaped, '$' | '`' | '"' | '\\') {
+                        self.push('\\', false)?;
+                    }
+                    self.push(escaped, false)?;
+                }
+                '\'' if !double => {
+                    let close = chars[index..].iter().position(|c| *c == '\'')?;
+                    for &quoted in &chars[index..index + close] {
+                        self.push(quoted, false)?;
+                    }
+                    self.present = true;
+                    index += close + 1;
+                }
+                '"' => {
+                    double = !double;
+                    self.present = true;
+                }
+                // Quoted, a command substitution's output is one field
+                // whose text is unknown, read like a set parameter; unquoted,
+                // it may give any fields.
+                '`' if double => {
+                    let rest: String = chars[index..].iter().collect();
+                    let close =
+                        crate::packs::core::git::find_posix_substitution_close(&rest, 0, b'`')
+                            .ok()?;
+                    index += rest[..close].chars().count() + 1;
+                    self.parameter_value(true)?;
+                }
+                '`' => return None,
+                '<' | '>' if !double && chars.get(index) == Some(&'(') => return None,
+                '$' => {
+                    let context = PosixReadingContext {
+                        double,
+                        splits: context.splits,
+                    };
+                    index = self.dollar(chars, index, set, context, depth)?;
+                }
+                _ => self.push(ch, splits)?,
+            }
+        }
+        (double == context.double).then_some(())
+    }
+
+    /// Read the expansion after a `$` at `chars[index - 1]`; returns the index
+    /// after it.
+    fn dollar(
+        &mut self,
+        chars: &[char],
+        index: usize,
+        set: bool,
+        context: PosixReadingContext,
+        depth: usize,
+    ) -> Option<usize> {
+        match chars.get(index).copied() {
+            Some('{') => {
+                let close = posix_parameter_brace_close(chars, index + 1)?;
+                self.braced(&chars[index + 1..close], set, context, depth)?;
+                Some(close + 1)
+            }
+            Some('(') if context.double => {
+                let rest: String = chars[index..].iter().collect();
+                let close =
+                    crate::packs::core::git::find_posix_substitution_close(&rest, 1, b')').ok()?;
+                self.parameter_value(true)?;
+                Some(index + rest[..close].chars().count() + 1)
+            }
+            Some('(') => None,
+            Some('\'') if !context.double => {
+                let rest: String = chars[index + 1..].iter().collect();
+                let mut tail = rest.chars().peekable();
+                let mut decoded = String::new();
+                decode_ansi_c_quoted(&mut tail, &mut decoded).ok()?;
+                let consumed = rest.chars().count() - tail.count();
+                self.push_str(&decoded)?;
+                self.present = true;
+                Some(index + 1 + consumed)
+            }
+            // Locale quoting reads as double quotes; the `"` is next.
+            Some('"') if !context.double => Some(index),
+            Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {
+                let len = chars[index..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                    .count();
+                self.parameter_value(set)?;
+                Some(index + len)
+            }
+            Some(ch) if ch.is_ascii_digit() || matches!(ch, '@' | '*') => {
+                self.parameter_value(set)?;
+                Some(index + 1)
+            }
+            Some('#' | '?' | '$' | '!' | '-') => {
+                self.parameter_value(true)?;
+                Some(index + 1)
+            }
+            _ => {
+                self.push('$', context.splits && !context.double)?;
+                Some(index)
+            }
+        }
+    }
+
+    fn parameter_value(&mut self, set: bool) -> Option<()> {
+        if set {
+            self.push_str(POSIX_PARAMETER_VALUE)?;
+        }
+        Some(())
+    }
+
+    /// Read `${inner}`.
+    fn braced(
+        &mut self,
+        inner: &[char],
+        set: bool,
+        context: PosixReadingContext,
+        depth: usize,
+    ) -> Option<()> {
+        // `${#NAME}` is a length, always set; `${!NAME}` is an indirection.
+        // `${#}` and `${!}` alone are always-set special parameters.
+        let (inner, always_set) = match inner {
+            ['#'] | ['!'] => (inner, true),
+            ['#', rest @ ..] => (rest, true),
+            ['!', rest @ ..] => (rest, false),
+            _ => (inner, false),
+        };
+        let name_len = match inner.first() {
+            Some(ch) if ch.is_ascii_alphabetic() || *ch == '_' => inner
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                .count(),
+            Some(ch) if ch.is_ascii_digit() => {
+                inner.iter().take_while(|c| c.is_ascii_digit()).count()
+            }
+            Some('@' | '*' | '#' | '?' | '$' | '!' | '-') => 1,
+            _ => return None,
+        };
+        // Nested expansions keep this reading's choice (`set`); only this
+        // parameter may be forced set.
+        let parameter_set = set || always_set || matches!(inner[0], '#' | '?' | '$' | '!' | '-');
+        let operator = &inner[name_len..];
+        let operand = |prefix: &str| {
+            let prefix: Vec<char> = prefix.chars().collect();
+            operator.strip_prefix(prefix.as_slice())
+        };
+        let default = [":-", ":=", ":?", "-", "=", "?"]
+            .iter()
+            .find_map(|prefix| operand(prefix).map(|word| (word, prefix.ends_with('?'))));
+        let alternate = operand(":+").or_else(|| operand("+"));
+        // The operand of an unquoted expansion is field split; quotes inside
+        // it still protect their text.
+        let operand_context = PosixReadingContext {
+            double: context.double,
+            splits: !context.double,
+        };
+        match (default, alternate) {
+            (Some((word, fails_when_unset)), _) => {
+                if parameter_set {
+                    self.parameter_value(true)
+                } else if fails_when_unset {
+                    // `${X:?}` aborts the command when X is unset.
+                    Some(())
+                } else {
+                    self.expand(word, set, operand_context, depth + 1)
+                }
+            }
+            (None, Some(word)) => {
+                if parameter_set {
+                    self.expand(word, set, operand_context, depth + 1)
+                } else {
+                    Some(())
+                }
+            }
+            // A bare name, a subscript, or a pattern, case or substring
+            // operator: nothing when unset, an unknown value when set.
+            (None, None) => self.parameter_value(parameter_set),
+        }
+    }
+}
+
+/// The index of the `}` closing a `${` whose body starts at `start`.
+fn posix_parameter_brace_close(chars: &[char], start: usize) -> Option<usize> {
+    let mut index = start;
+    let mut depth = 0usize;
+    let mut single = false;
+    let mut double = false;
+    while let Some(&ch) = chars.get(index) {
+        match ch {
+            '\\' if !single => index += 1,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '$' if !single && chars.get(index + 1) == Some(&'{') => {
+                depth += 1;
+                index += 1;
+            }
+            '}' if !single && !double => {
+                if depth == 0 {
+                    return Some(index);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvalidAnsiCQuote;
 
@@ -5661,6 +6027,109 @@ mod tests {
             "b^lat body.txt",
             "a caret must remain data outside a proven Cmd dialect"
         );
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn posix_parameter_word_readings_give_unset_and_set_argv() {
+        const V: &str = POSIX_PARAMETER_VALUE;
+        let read = posix_parameter_word_readings;
+        let fields = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
+        // Default operands split on blanks; quotes inside them hold.
+        assert_eq!(
+            read("${X:--rf /tmp/zz}"),
+            Some([fields(&["-rf", "/tmp/zz"]), fields(&[V])])
+        );
+        assert_eq!(
+            read("${X:-. -\"W\"$Z}"),
+            Some([fields(&[".", "-W"]), fields(&[V])])
+        );
+        assert_eq!(
+            read("${X:-. \"a\nb\" -W}"),
+            Some([fields(&[".", "a\nb", "-W"]), fields(&[V])])
+        );
+        // Partial words.
+        assert_eq!(
+            read("-${Y}W"),
+            Some([fields(&["-W"]), fields(&[&format!("-{V}W")])])
+        );
+        assert_eq!(
+            read("${Y:--}W"),
+            Some([fields(&["-W"]), fields(&[&format!("{V}W")])])
+        );
+        assert_eq!(read("\"\"${Y:--W}"), Some([fields(&["-W"]), fields(&[V])]));
+        assert_eq!(
+            read("${X:+.}${Y:--W}"),
+            Some([fields(&["-W"]), fields(&[&format!(".{V}")])])
+        );
+        // Alternate values appear only when set; quoted words do not split.
+        assert_eq!(
+            read("${X:+--force}"),
+            Some([fields(&[]), fields(&["--force"])])
+        );
+        assert_eq!(
+            read("\"${X:---hard}\""),
+            Some([fields(&["--hard"]), fields(&[V])])
+        );
+        assert_eq!(
+            read("\"${X:-a b}\""),
+            Some([fields(&["a b"]), fields(&[V])])
+        );
+        assert_eq!(read("\"$X\""), Some([fields(&[""]), fields(&[V])]));
+        assert_eq!(read("$FILES"), Some([fields(&[]), fields(&[V])]));
+        // Always-set special parameters and lengths are one unknown value.
+        assert_eq!(read("$?"), Some([fields(&[V]), fields(&[V])]));
+        assert_eq!(read("${#X}"), Some([fields(&[V]), fields(&[V])]));
+        // A failing `${X:?}` runs nothing when X is unset.
+        assert_eq!(read("${X:?}"), Some([fields(&[]), fields(&[V])]));
+        // A quoted command substitution is one field of unknown text.
+        assert_eq!(read("\"$(pwd)\""), Some([fields(&[V]), fields(&[V])]));
+        assert_eq!(
+            read("\"$(git rev-parse \"x)\")/build\""),
+            Some([
+                fields(&[&format!("{V}/build")]),
+                fields(&[&format!("{V}/build")])
+            ])
+        );
+        assert_eq!(read("\"`pwd`\""), Some([fields(&[V]), fields(&[V])]));
+        assert_eq!(
+            read("\"${ROOT:-$(pwd)}\""),
+            Some([fields(&[V]), fields(&[V])])
+        );
+        // No reading for unquoted command substitution, arithmetic or bad
+        // quoting.
+        assert_eq!(read("$(echo -W)"), None);
+        assert_eq!(read("${X:-$(echo -W)}"), None);
+        assert_eq!(read("`echo -W`"), None);
+        assert_eq!(read("$((1+2))"), None);
+        assert_eq!(read("${X:-'a}"), None);
+        assert_eq!(read("${}"), None);
+    }
+
+    #[test]
+    fn posix_reading_choices_mix_words_up_to_the_bound() {
+        let word = |unset: &str, set: &str| [unset.to_string(), set.to_string()];
+        let fixed = word("rm", "rm");
+        let (choices, complete) =
+            posix_reading_choices(&[fixed.clone(), word("-rf", "V"), word("", "V")]);
+        assert!(complete);
+        assert_eq!(
+            choices,
+            vec![vec![0, 0, 0], vec![1, 1, 1], vec![0, 1, 0], vec![0, 0, 1]]
+        );
+        assert_eq!(
+            posix_reading_choices(std::slice::from_ref(&fixed)).0,
+            vec![vec![0]]
+        );
+        let many = vec![word("", "V"); MAX_MIXED_READING_WORDS];
+        assert_eq!(
+            posix_reading_choices(&many).0.len(),
+            1 << MAX_MIXED_READING_WORDS
+        );
+        let too_many = vec![word("", "V"); MAX_MIXED_READING_WORDS + 1];
+        let (choices, complete) = posix_reading_choices(&too_many);
+        assert!(!complete);
+        assert_eq!(choices.len(), 2);
     }
 
     #[test]

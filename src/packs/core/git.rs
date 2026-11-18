@@ -604,7 +604,7 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
                 let close = find_posix_substitution_close(command, index + 2, b')')?;
                 match render_static_producer_body(
                     command.get(index + 2..close).ok_or(())?,
-                    in_double,
+                    !in_double && posix_output_at_word_start(&output),
                 ) {
                     Ok(rendered) => output.push_str(&rendered),
                     Err(()) => {
@@ -623,7 +623,7 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
                 let close = find_posix_substitution_close(command, index + 1, b'`')?;
                 match render_static_producer_body(
                     command.get(index + 1..close).ok_or(())?,
-                    in_double,
+                    !in_double && posix_output_at_word_start(&output),
                 ) {
                     Ok(rendered) => output.push_str(&rendered),
                     Err(()) => {
@@ -658,7 +658,13 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
     })
 }
 
-fn find_posix_substitution_close(command: &str, start: usize, delimiter: u8) -> Result<usize, ()> {
+/// The byte index of the delimiter that closes a command substitution whose
+/// body starts at `start` (`)` for `$(`, `` ` `` for a backquote).
+pub(crate) fn find_posix_substitution_close(
+    command: &str,
+    start: usize,
+    delimiter: u8,
+) -> Result<usize, ()> {
     let bytes = command.as_bytes();
     let mut index = start;
     let mut depth = usize::from(delimiter == b')');
@@ -699,7 +705,17 @@ fn find_posix_substitution_close(command: &str, start: usize, delimiter: u8) -> 
     Err(())
 }
 
-fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<String, ()> {
+/// Whether text spliced after `output` starts an unquoted shell word.
+fn posix_output_at_word_start(output: &str) -> bool {
+    output.bytes().next_back().is_none_or(|byte| {
+        byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'(' | b')')
+    })
+}
+
+/// `word_start`: the substitution is unquoted and starts a shell word, so
+/// each output field lands at a word start where `~` reads as the home
+/// directory it expanded to.
+fn render_static_producer_body(body: &str, word_start: bool) -> Result<String, ()> {
     if body.len() > MAX_STATIC_SUBSTITUTION_BYTES
         || body.bytes().any(|byte| {
             matches!(
@@ -718,12 +734,12 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
                     | b']'
                     | b'{'
                     | b'}'
-                    | b'~'
                     | b'\n'
                     | b'\r'
                     | 0
             )
         })
+        || !tildes_read_alike(body, word_start)
     {
         return Err(());
     }
@@ -745,8 +761,11 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
         // substitution removes trailing newlines, so joining the literal
         // operands exactly reproduces the value that can become an executable
         // word without relying on implementation-specific echo behavior.
+        // A first word is an option only as `-` (zsh) or `-[neE]+` (bash,
+        // zsh; dash takes `-n`); any other dash word, `--hard` or `-W`, is
+        // printed, and echo then reads no further options.
         "echo"
-            if words.first().is_none_or(|word| !word.starts_with('-'))
+            if words.first().is_none_or(|word| !echo_option_word(word))
                 && words.iter().all(|word| !word.contains('\\')) =>
         {
             words.join(" ")
@@ -760,9 +779,10 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
                 || byte.is_ascii_whitespace()
                 || matches!(
                     byte,
-                    b'_' | b'.' | b'/' | b':' | b'+' | b',' | b'=' | b'@' | b'%' | b'-'
+                    b'_' | b'.' | b'/' | b':' | b'+' | b',' | b'=' | b'@' | b'%' | b'-' | b'~'
                 )
         })
+        || !tildes_read_alike(rendered, word_start)
     {
         return Err(());
     }
@@ -772,6 +792,33 @@ fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<St
     // unquoted word, literal whitespace intentionally reproduces field
     // splitting while the restricted alphabet prevents shell re-parsing.
     Ok(rendered.to_string())
+}
+
+/// Whether every `~` in `text` reads the same spliced into the command as in
+/// the producer: inside a word after a plain character (`HEAD~1`), where no
+/// shell expands it, or at a word start when the output itself lands at word
+/// starts (`$(echo -rf ~/x)` gives `-rf /home/u/x`, read as `-rf ~/x`). A `~`
+/// after `=` or `:` may or may not expand, so it has no reading.
+fn tildes_read_alike(text: &str, word_start: bool) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().all(|(index, byte)| {
+        *byte != b'~'
+            || index
+                .checked_sub(1)
+                .map_or(word_start, |before| match bytes[before] {
+                    b'=' | b':' => false,
+                    b' ' | b'\t' | b'\'' | b'"' => word_start,
+                    _ => true,
+                })
+    })
+}
+
+/// Whether some POSIX shell's `echo` reads `word`, as its first argument, as
+/// an option: `-` in zsh, `-` followed only by `n`, `e` or `E` in bash and
+/// zsh (dash: `-n`).
+fn echo_option_word(word: &str) -> bool {
+    word.strip_prefix('-')
+        .is_some_and(|flags| flags.chars().all(|flag| matches!(flag, 'n' | 'e' | 'E')))
 }
 
 #[derive(Clone)]
@@ -5286,15 +5333,19 @@ fn syntax_views_with_split_words(
             preserve_word(decoded)
         }
     };
-    let word_readings = |decoded: &str, may_split: bool| -> Option<WordReadings> {
-        if !(safe_readings && may_split) {
+    // A dynamic POSIX word, quoted or not, may give a flag (`"${Y:--W}"`).
+    let word_readings = |decoded: &str, may_split: bool, dynamic: bool| -> Option<WordReadings> {
+        if !(safe_readings && (may_split || (dynamic && dialect == ShellDialect::Posix))) {
             let word = regex_word(decoded, may_split);
             return Some([vec![word.clone()], vec![word]]);
         }
-        if dialect == ShellDialect::Posix
-            && let Some(readings) = posix_parameter_readings(decoded)
-        {
-            return Some(readings.map(|fields| fields.iter().map(|f| preserve_word(f)).collect()));
+        if dialect == ShellDialect::Posix {
+            // An unquoted command substitution may give any fields, flags
+            // included (`$(echo${IFS}-W)`), so it has no reading and proves
+            // no exemption. A quoted one is one opaque field, like `"$X"`.
+            return posix_parameter_readings(decoded).map(|readings| {
+                readings.map(|fields| fields.iter().map(|f| preserve_word(f)).collect())
+            });
         }
         if decoded.contains(char::is_whitespace) {
             return None;
@@ -5311,8 +5362,9 @@ fn syntax_views_with_split_words(
         let raw = token.text(command)?;
         if let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) {
             let may_split = git_token_expansion_may_split(raw, dialect);
+            let dynamic = git_token_has_active_expansion(raw, dialect);
             words.push(regex_word(&decoded, may_split));
-            readings.push(word_readings(&decoded, may_split));
+            readings.push(word_readings(&decoded, may_split, dynamic));
         }
     }
     if words.is_empty() {
@@ -5333,21 +5385,27 @@ fn syntax_views_with_split_words(
         readings = semantic
             .words
             .iter()
-            .map(|word| word_readings(&word.decoded, word.may_split))
+            .map(|word| word_readings(&word.decoded, word.may_split, word.dynamic))
             .collect();
         readings[executable_index] = Some([vec!["git".to_string()], vec!["git".to_string()]]);
     }
 
-    // Every word fixed: one view. Otherwise the all-unset and the all-set
-    // readings. Mixed readings are not tried.
+    // Every word fixed: one view. Otherwise every mix of the words' unset and
+    // set readings; an exemption must hold on each. Too many dynamic words
+    // to mix prove no exemption.
     let Some(readings) = readings.into_iter().collect::<Option<Vec<_>>>() else {
         return Some(Vec::new());
     };
-    let mut views = Vec::with_capacity(2);
-    for choice in 0..2 {
+    let (choices, complete) = crate::normalize::posix_reading_choices(&readings);
+    if !complete {
+        return Some(Vec::new());
+    }
+    let mut views = Vec::with_capacity(choices.len());
+    for choice in choices {
         let view = readings
             .iter()
-            .flat_map(|reading| reading[choice].iter().map(String::as_str))
+            .zip(&choice)
+            .flat_map(|(reading, &pick)| reading[pick].iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
         let view = crate::normalize::normalize_command(&view).into_owned();
@@ -5358,64 +5416,26 @@ fn syntax_views_with_split_words(
     Some(views)
 }
 
-/// An unknown parameter value in a reconstructed Git argv: one word that no
-/// rule reads as an option.
-const PARAMETER_VALUE: &str = "__dcg_parameter_value__";
-
-/// Possible argv fields of an unquoted `${NAME...}` argument, as two readings:
-/// `[unset or empty, set]`. A set parameter's value is unknown, so it reads as
-/// one opaque word. Returns `None` for any other dynamic word, and for operands
-/// that hold further expansions; those keep the conservative raw view.
+/// Possible argv fields of a dynamic POSIX argument, as two readings:
+/// `[every parameter unset or empty, every parameter set]`. See
+/// [`crate::normalize::posix_parameter_word_readings`]. `None` means the word
+/// holds an expansion with no reading (a command substitution); callers keep
+/// the conservative raw view for it.
 fn posix_parameter_argument_readings(word: &GitSemanticWord) -> Option<[Vec<String>; 2]> {
-    if !(word.dynamic && word.may_split) {
+    if !word.dynamic {
         return None;
     }
     posix_parameter_readings(&word.decoded)
 }
 
-/// [`posix_parameter_argument_readings`] for one decoded unquoted word.
+/// [`posix_parameter_argument_readings`] for one decoded word. A POSIX word
+/// with an expansion decodes to its raw text, so the readings see its quotes.
+/// A word with no `$` or backquote (a glob) reads as itself.
 fn posix_parameter_readings(decoded: &str) -> Option<[Vec<String>; 2]> {
-    if !git_dynamic_fragments(decoded, ShellDialect::Posix)
-        .iter()
-        .all(String::is_empty)
-    {
-        return None;
+    if !decoded.contains(['$', '`']) {
+        return Some([vec![decoded.to_string()], vec![decoded.to_string()]]);
     }
-    let inner = decoded.strip_prefix("${")?.strip_suffix('}')?;
-    let name_len = inner
-        .bytes()
-        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        .count();
-    if name_len == 0 || !inner.as_bytes()[0].is_ascii_alphabetic() {
-        return None;
-    }
-    let operator = &inner[name_len..];
-    let value = vec![PARAMETER_VALUE.to_string()];
-    // A bare parameter and pattern substitution or removal yield nothing or
-    // an unknown value.
-    if operator.is_empty() || operator.starts_with(['/', '%', '#']) {
-        return Some([Vec::new(), value]);
-    }
-    let (alternate, operand) = if let Some(operand) = operator
-        .strip_prefix(":+")
-        .or_else(|| operator.strip_prefix('+'))
-    {
-        (true, operand)
-    } else {
-        let operand = [":-", ":=", "-", "="]
-            .iter()
-            .find_map(|prefix| operator.strip_prefix(prefix))?;
-        (false, operand)
-    };
-    if operand.contains(['$', '`']) {
-        return None;
-    }
-    let fields = shell_words::split(operand).ok()?;
-    Some(if alternate {
-        [Vec::new(), fields]
-    } else {
-        [fields, value]
-    })
+    crate::normalize::posix_parameter_word_readings(decoded)
 }
 
 /// Build the decoded Git regex view without reintroducing inert argv data.
@@ -5469,42 +5489,42 @@ pub(crate) fn syntax_view_for_pattern_matching(
         .skip(executable_index + 1)
         .any(|word| word.dynamic)
     {
-        // An unquoted parameter-only argument is a choice of argv: it can
-        // vanish, give its operand's fields (`${X:-HEAD --hard}`,
-        // `${X:+--force}`) or give an unknown value. The raw regex view cannot
-        // walk punctuation inside `${...}` and would let operand text such as
-        // `--dry-run` act as a safe flag. Try each reading, deny-only: a
-        // reading is presented only when this pack denies it, never as a safe
-        // exemption. Keep all other dynamic words on the existing
-        // conservative path.
-        let args = &decoded.words[executable_index + 1..];
-        let readings: Option<Vec<[Vec<String>; 2]>> = args
-            .iter()
-            .filter(|word| word.dynamic)
-            .map(posix_parameter_argument_readings)
-            .collect();
-        if dialect == ShellDialect::Posix
-            && let Some(readings) = readings
-        {
-            for choice in 0..2 {
+        // A dynamic argument is a choice of argv: it can vanish, give its
+        // operand's fields (`${X:-HEAD --hard}`, `-${Y}W`, `${X:+--force}`)
+        // or give an unknown value. The raw regex view cannot walk
+        // punctuation inside `${...}` and would let operand text such as
+        // `--dry-run` act as a safe flag. Try the all-unset and the all-set
+        // readings, then each mix across words (`${X:---} $F` runs
+        // `git checkout -- <F>` only with X unset and F set), deny-only: a
+        // reading is presented only when this pack denies it, never as a
+        // safe exemption. A word with no reading (an unquoted command
+        // substitution) stays one opaque word in each reading.
+        if dialect == ShellDialect::Posix {
+            let args = &decoded.words[executable_index + 1..];
+            let readings: Vec<[Vec<String>; 2]> = args
+                .iter()
+                .map(|word| {
+                    posix_parameter_argument_readings(word)
+                        .unwrap_or_else(|| [vec![word.decoded.clone()], vec![word.decoded.clone()]])
+                })
+                .collect();
+            for choice in crate::normalize::posix_reading_choices(&readings).0 {
                 let mut candidate = String::from("git");
-                let mut dynamic = readings.iter();
-                for word in args {
-                    let fields = if word.dynamic {
-                        dynamic
-                            .next()
-                            .map_or(&[][..], |reading| &reading[choice][..])
-                    } else {
-                        std::slice::from_ref(&word.decoded)
-                    };
-                    for field in fields {
-                        candidate.push(' ');
-                        candidate.push_str(&shell_words::quote(field));
-                    }
+                for field in readings
+                    .iter()
+                    .zip(&choice)
+                    .flat_map(|(reading, &pick)| &reading[pick])
+                {
+                    candidate.push(' ');
+                    candidate.push_str(&shell_words::quote(field));
                 }
                 let sanitized = crate::context::sanitize_for_pattern_matching(&candidate);
-                if AMBIGUITY_ARBITER.check(sanitized.as_ref()).is_some() {
-                    return syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix);
+                // Judge the decoded view, where a field keeps its blanks and
+                // newlines inside one regex word, as the final match will.
+                if let Some(view) = syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix)
+                    && AMBIGUITY_ARBITER.check(&view).is_some()
+                {
+                    return Some(view);
                 }
             }
         }

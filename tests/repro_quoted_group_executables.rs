@@ -283,10 +283,10 @@ fn safe_quoted_shell_groups_remain_allowed() {
 /// reaches Git when the parameter is unset (`${X:-. -"W"}` runs
 /// `git restore --staged . -W`, which discards worktree changes). A safe
 /// exemption must hold under every reading of such a word, in a plain
-/// command and inside a subshell, function body or case arm alike. An operand
-/// that holds another expansion (`${X:-. -"W"$Z}`) has no reading yet; card
-/// t_c5ae5c0e owns it. Only dcg reads these strings; this test does not
-/// execute their shell source.
+/// command and inside a subshell, function body or case arm alike. Operands
+/// that hold further expansions are covered in `repro_expansion_argv.rs`.
+/// Only dcg reads these strings; this test does not execute their shell
+/// source.
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn expansion_operands_cannot_grant_core_git_exemptions() {
