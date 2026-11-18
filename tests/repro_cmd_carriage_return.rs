@@ -472,3 +472,45 @@ fn cmd_payloads_inside_other_commands_are_read_as_cmd() {
         );
     }
 }
+
+/// In PowerShell, `` `r `` inside a double-quoted string is a CR. Passed to
+/// cmd, that CR is removed, so `cmd /c "gi`rt reset --hard"` runs
+/// `git reset --hard`. Needs both the backtick decode (#18) and the Cmd CR
+/// reading.
+#[test]
+fn powershell_backtick_r_in_a_cmd_payload() {
+    for command in [
+        "cmd /c \"gi`rt reset --hard\"",
+        "cmd.exe /d /c \"echo ok&gi`rt reset --hard\"",
+    ] {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    let command = "cmd /c \"gi`rt status\"";
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        assert_eq!(
+            decision_in(command, dialect),
+            EvaluationDecision::Allow,
+            "{dialect:?}: {command:?}"
+        );
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        assert_eq!(
+            hook_decision(protocol, "PowerShell", command),
+            "allow",
+            "{protocol:?}: {command:?}"
+        );
+    }
+}
