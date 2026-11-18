@@ -19,6 +19,7 @@
 use fancy_regex::Regex;
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::LazyLock;
 
@@ -3327,23 +3328,38 @@ fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
 /// `return $c=…`, `Write-Output $c=…`). A target starts a word, or follows a
 /// block brace or an assignment operator inside one (`if(1){$c=…`,
 /// `$a=$b=…`). A word that holds only a target or a type constraint is
-/// continued by the next word (`[string] $c=…`, `$c =iex`). After a closing
-/// parenthesis a word may continue the target (`$c.$('p')=…`,
-/// `(Get-Item x).p=…`). A bare or quoted name is a target only as a hashtable
-/// key: after `@{`, or after `;` or a line break inside one. Quoted text,
-/// here-strings and escapes are skipped.
+/// continued by the next word (`[string] $c=…`, `$c =iex`). Brackets and
+/// braced names with blanks inside continue a target across words
+/// (`$c[$i + 1]=…`, `[Dictionary[string, int]]$c=…`, `${c d}=…`); the words
+/// inside are still read as usual. After a closing parenthesis a word may
+/// continue the target (`$c.$('p')=…`, `(Get-Item x).p=…`). A bare or quoted
+/// name is a target only as a hashtable key: after `@{`, or after `;` or a
+/// line break inside one. Quoted text, here-strings and escapes are skipped.
 pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
     if !command.contains('=') {
         return None;
     }
     let bytes = command.as_bytes();
+    let tokens = tokenize_powershell_raw(command);
+    let word_ends_at = |at: usize| {
+        at == bytes.len()
+            || tokens
+                .binary_search_by_key(&at, |token| token.byte_range.end)
+                .is_ok()
+    };
     let mut blanks: Vec<usize> = Vec::new();
     // Open braces, innermost last: `true` for a hashtable literal `@{`.
     let mut braces: Vec<bool> = Vec::new();
     let mut key_next = false;
     let mut after_target = false;
     let mut group_end = None;
-    for token in &tokenize_powershell_raw(command) {
+    // Where each `[` and `${` closes, read once when a target needs it.
+    let mut closes: Option<HashMap<usize, usize>> = None;
+    // Where a target that spans words left off: a value inside a later word
+    // (`1]=$b=iex`) or a word end that the next word continues (`] =iex`).
+    let mut value_starts: BTreeSet<usize> = BTreeSet::new();
+    let mut continued_at: BTreeSet<usize> = BTreeSet::new();
+    for token in &tokens {
         let (start, end) = (token.byte_range.start, token.byte_range.end);
         if token.kind == NormalizeTokenKind::Separator {
             let raw = token.text(command).unwrap_or_default();
@@ -3363,7 +3379,7 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
                 while j < end && bytes[j] == b']' {
                     j += 1;
                 }
-                j = powershell_member_chain_end(bytes, j, end).unwrap_or(j);
+                j = powershell_member_chain_end(bytes, j, end, None).unwrap_or(j);
             }
             if let Some(len) = powershell_assignment_operator_len(bytes, j, end) {
                 if group_end == Some(start) {
@@ -3378,16 +3394,38 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
         }
         group_end = None;
         while i < end {
-            if at_start
-                && let Some(target_end) = powershell_assignment_target_end(bytes, i, end, key)
-            {
-                if target_end == end {
+            at_start |= !value_starts.is_empty() && value_starts.remove(&i);
+            let target = if at_start {
+                powershell_assignment_target_end(bytes, i, end, key, None).or_else(|| {
+                    let closes = closes.get_or_insert_with(|| powershell_closing_ends(bytes));
+                    powershell_assignment_target_end(bytes, i, bytes.len(), key, Some(closes))
+                        .filter(|&target_end| target_end > end)
+                })
+            } else {
+                None
+            };
+            if let Some(target_end) = target {
+                if target_end > end {
+                    // `$c[ 0 ]=iex`: the operator is in a later word.
+                    if let Some(len) =
+                        powershell_assignment_operator_len(bytes, target_end, bytes.len())
+                    {
+                        blanks.push(target_end);
+                        let value = target_end + len;
+                        if !word_ends_at(value) {
+                            blanks.push(value);
+                            value_starts.insert(value);
+                        }
+                    } else if word_ends_at(target_end) {
+                        continued_at.insert(target_end);
+                    }
+                } else if target_end == end {
                     // `$c`, `[string]` or `$a,`: the next word continues it.
                     after_target = true;
                     key = false;
                     break;
-                }
-                if let Some(len) = powershell_assignment_operator_len(bytes, target_end, end) {
+                } else if let Some(len) = powershell_assignment_operator_len(bytes, target_end, end)
+                {
                     blanks.push(target_end);
                     i = target_end + len;
                     if i < end {
@@ -3421,12 +3459,17 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
                 _ => i += 1,
             }
         }
+        if !continued_at.is_empty() && continued_at.remove(&end) {
+            after_target = true;
+            key = false;
+        }
         // `@{` ends the word: the next word is a key.
         key_next = key;
     }
     if blanks.is_empty() {
         return None;
     }
+    blanks.sort_unstable();
     blanks.dedup();
     let mut spelled = String::with_capacity(command.len() + blanks.len());
     let mut last = 0;
@@ -3439,6 +3482,52 @@ pub(crate) fn space_powershell_assignments(command: &str) -> Option<String> {
     Some(spelled)
 }
 
+/// Position after the `]` or `}` that closes each `[` and `${` in the text,
+/// read across blanks with quoted text, escapes and here-strings skipped.
+/// One pass over the text, so a target read across words costs a lookup.
+fn powershell_closing_ends(bytes: &[u8]) -> HashMap<usize, usize> {
+    let len = bytes.len();
+    let mut closes = HashMap::new();
+    let mut open: Vec<usize> = Vec::new();
+    // Once a `${` has no closing brace, no later one has either.
+    let mut braces_close = true;
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'[' => {
+                open.push(i);
+                i += 1;
+            }
+            b']' => {
+                if let Some(at) = open.pop() {
+                    closes.insert(at, i + 1);
+                }
+                i += 1;
+            }
+            b'`' => i = consume_shell_escape(bytes, i, len),
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                match braces_close
+                    .then(|| braced_variable_end(bytes, i, len))
+                    .flatten()
+                {
+                    Some(close) => {
+                        closes.insert(i, close);
+                        i = close;
+                    }
+                    None => {
+                        braces_close = false;
+                        i += 2;
+                    }
+                }
+            }
+            b'@' => i = consume_powershell_here_string(bytes, i, len).unwrap_or(i + 1),
+            b'\'' | b'"' => i = powershell_quoted_end(bytes, i, len),
+            _ => i += 1,
+        }
+    }
+    closes
+}
+
 /// Whether `word` is exactly a PowerShell assignment operator (`=`, `+=`, …).
 pub(crate) fn is_powershell_assignment_operator(word: &str) -> bool {
     powershell_assignment_operator_len(word.as_bytes(), 0, word.len()) == Some(word.len())
@@ -3447,7 +3536,8 @@ pub(crate) fn is_powershell_assignment_operator(word: &str) -> bool {
 /// Whether `word` is a whole assignment target, or the part of one that a
 /// following word continues: `$c`, `$c.p[0]`, `[int]$c`, `[string]`, `$a,`.
 pub(crate) fn is_powershell_assignment_target(word: &str) -> bool {
-    powershell_assignment_target_end(word.as_bytes(), 0, word.len(), false) == Some(word.len())
+    powershell_assignment_target_end(word.as_bytes(), 0, word.len(), false, None)
+        == Some(word.len())
 }
 
 /// Length of the assignment operator at `i`, if one starts there: `=`,
@@ -3471,36 +3561,46 @@ fn powershell_assignment_operator_len(bytes: &[u8], i: usize, end: usize) -> Opt
 /// constraints before it (`[int[]]$c`), a static property (`[T]::P`), a bare
 /// type constraint, or, for a hashtable key, a bare or quoted name. `None`
 /// when no target starts at `i`.
+///
+/// Without `across` the target ends within `end`. With it, `end` is the end
+/// of the text, and each `[` and `${` closes where `across` says, so their
+/// blanks do not end the target (`$c[ 0 ]`, `${c d}`); any other blank does.
 fn powershell_assignment_target_end(
     bytes: &[u8],
     i: usize,
     end: usize,
     hash_key: bool,
+    across: Option<&HashMap<usize, usize>>,
 ) -> Option<usize> {
     if hash_key {
-        return powershell_member_name_end(bytes, i, end);
+        return powershell_member_name_end(bytes, i, end, across);
     }
+    let word_ends = |j: usize| {
+        j == end
+            || powershell_horizontal_space_len(bytes, j).is_some()
+            || matches!(bytes[j], b'\r' | b'\n')
+    };
     let mut j = i;
     let mut typed = false;
     while bytes.get(j) == Some(&b'[') && j < end {
-        j = powershell_bracket_end(bytes, j, end)?;
+        j = powershell_closing_end(bytes, j, end, across)?;
         typed = true;
     }
     if typed {
-        if j == end {
+        if word_ends(j) {
             return Some(j);
         }
         if bytes[j..end].starts_with(b"::") {
-            let name_end = powershell_member_name_end(bytes, j + 2, end)?;
-            return powershell_member_chain_end(bytes, name_end, end);
+            let name_end = powershell_member_name_end(bytes, j + 2, end, across)?;
+            return powershell_member_chain_end(bytes, name_end, end, across);
         }
     }
     loop {
-        j = powershell_variable_end(bytes, j, end)?;
-        j = powershell_member_chain_end(bytes, j, end)?;
+        j = powershell_variable_end(bytes, j, end, across)?;
+        j = powershell_member_chain_end(bytes, j, end, across)?;
         if j < end && bytes[j] == b',' {
             j += 1;
-            if j == end {
+            if word_ends(j) {
                 return Some(j);
             }
             continue;
@@ -3509,13 +3609,33 @@ fn powershell_assignment_target_end(
     }
 }
 
+/// Position after the `]` or `}` that closes the `[` or `${` at `i`: within
+/// `end`, or where `across` says.
+fn powershell_closing_end(
+    bytes: &[u8],
+    i: usize,
+    end: usize,
+    across: Option<&HashMap<usize, usize>>,
+) -> Option<usize> {
+    match across {
+        Some(closes) => closes.get(&i).copied(),
+        None if bytes[i] == b'[' => powershell_bracket_end(bytes, i, end),
+        None => braced_variable_end(bytes, i, end),
+    }
+}
+
 /// End of the variable (`$c`, `${c}`, `$env:C`, `$cé`) that starts at `j`.
-fn powershell_variable_end(bytes: &[u8], j: usize, end: usize) -> Option<usize> {
+fn powershell_variable_end(
+    bytes: &[u8],
+    j: usize,
+    end: usize,
+    across: Option<&HashMap<usize, usize>>,
+) -> Option<usize> {
     if j >= end || bytes[j] != b'$' {
         return None;
     }
     if bytes.get(j + 1) == Some(&b'{') {
-        return braced_variable_end(bytes, j, end);
+        return powershell_closing_end(bytes, j, end, across);
     }
     // `?` belongs to a variable name, except where `??=` begins.
     let mut k = j + 1;
@@ -3532,14 +3652,19 @@ fn powershell_variable_end(bytes: &[u8], j: usize, end: usize) -> Option<usize> 
 }
 
 /// End of the `.name` and `[index]` members that follow position `j`.
-fn powershell_member_chain_end(bytes: &[u8], mut j: usize, end: usize) -> Option<usize> {
+fn powershell_member_chain_end(
+    bytes: &[u8],
+    mut j: usize,
+    end: usize,
+    across: Option<&HashMap<usize, usize>>,
+) -> Option<usize> {
     while j < end {
         match bytes[j] {
-            b'.' => match powershell_member_name_end(bytes, j + 1, end) {
+            b'.' => match powershell_member_name_end(bytes, j + 1, end, across) {
                 Some(name_end) => j = name_end,
                 None => break,
             },
-            b'[' => j = powershell_bracket_end(bytes, j, end)?,
+            b'[' => j = powershell_closing_end(bytes, j, end, across)?,
             _ => break,
         }
     }
@@ -3548,10 +3673,15 @@ fn powershell_member_chain_end(bytes: &[u8], mut j: usize, end: usize) -> Option
 
 /// End of a member or hashtable-key name at `i`: a bare name (`p`, `é`), a
 /// quoted one (`'p'`, `"p"`) or a variable (`$n`).
-fn powershell_member_name_end(bytes: &[u8], i: usize, end: usize) -> Option<usize> {
+fn powershell_member_name_end(
+    bytes: &[u8],
+    i: usize,
+    end: usize,
+    across: Option<&HashMap<usize, usize>>,
+) -> Option<usize> {
     match bytes.get(i).filter(|_| i < end)? {
         b'\'' | b'"' => Some(powershell_quoted_end(bytes, i, end)),
-        b'$' => powershell_variable_end(bytes, i, end),
+        b'$' => powershell_variable_end(bytes, i, end, across),
         _ => {
             let mut k = i;
             while let Some(width) = powershell_name_char_len(bytes, k, end) {
@@ -6626,6 +6756,29 @@ mod tests {
             ("$c\u{2013}=iex 'x'", "$c \u{2013}= iex 'x'"),
             ("$c\u{2014}=iex 'x'", "$c \u{2014}= iex 'x'"),
             ("$c\u{2015}=iex 'x'", "$c \u{2015}= iex 'x'"),
+            // Brackets and braced names with blanks inside span words.
+            ("$c[$i + 1]=iex 'x'", "$c[$i + 1] = iex 'x'"),
+            ("$c[ 0 ]=iex 'x'", "$c[ 0 ] = iex 'x'"),
+            ("$c[0 ]=iex 'x'", "$c[0 ] = iex 'x'"),
+            ("$c[ 'a' ]=iex 'x'", "$c[ 'a' ] = iex 'x'"),
+            ("$c[ 0 ] =iex 'x'", "$c[ 0 ] = iex 'x'"),
+            ("$c[ 0 ][ 1 ]=iex 'x'", "$c[ 0 ][ 1 ] = iex 'x'"),
+            ("$c[ 0 ].p=iex 'x'", "$c[ 0 ].p = iex 'x'"),
+            ("$a[ 0 ]=$b=iex 'x'", "$a[ 0 ] = $b = iex 'x'"),
+            ("$a[ 0 ],$b=iex 'x'", "$a[ 0 ],$b = iex 'x'"),
+            ("[D[string, int]]$c=iex 'x'", "[D[string, int]]$c = iex 'x'"),
+            (
+                "[D[string, int]] $c=iex 'x'",
+                "[D[string, int]] $c = iex 'x'",
+            ),
+            ("${c d}=iex 'x'", "${c d} = iex 'x'"),
+            ("if(1){$c[ 0 ]=iex 'x'}", "if(1){$c[ 0 ] = iex 'x'}"),
+            // The words inside are still read: a target there is spaced too.
+            ("$c[ $($d=1) ]=iex 'x'", "$c[ $($d = 1) ] = iex 'x'"),
+            (
+                "Write-Output [a ; $c=iex 'x'",
+                "Write-Output [a ; $c = iex 'x'",
+            ),
             // Every hashtable key.
             ("@{a=1;b=iex 'x'}", "@{a = 1;b = iex 'x'}"),
             ("@{a=1\nb=iex 'x'\n}", "@{a = 1\nb = iex 'x'\n}"),
@@ -6650,6 +6803,11 @@ mod tests {
             "x=1 git status",
             "@'\n$c=iex 'x'\n'@",
             "git -c core.x=$y status",
+            "$c[ 0 ] -eq 'a=b'",
+            "Write-Output \"$c[ 0 ]=x\"",
+            "Write-Output '[ a ]=b'",
+            "[a ]=b",
+            "${c d} -eq 'a=b'",
         ] {
             assert_eq!(spaced(unchanged), None, "{unchanged:?}");
         }

@@ -7,9 +7,14 @@
 //! its command (aliases, functions, script-block consumers, `iex`) skipped
 //! even the spaced `$c = icm {…}`.
 //!
-//! A deny-only PowerShell view now puts blanks around every glued
-//! assignment operator after a target, wherever the word stands, so a glued
-//! spelling gets the verdict of its spaced twin. The readers judge the
+//! A deny-only PowerShell view now puts blanks around a glued assignment
+//! operator after a target, wherever the word stands, so the glued spellings
+//! below get the verdict of their spaced twins. Targets: variables (`${c}`,
+//! `$env:C`, Unicode names), members (`.p`, `.'p'`, `.$n`, `.$('p')`),
+//! indexes, type constraints, static properties, hashtable keys and
+//! `(expr).p`; brackets and braced names may hold blanks (`$c[$i + 1]`,
+//! `[Dictionary[string, int]]$c`, `${c d}`). A comment glued between target
+//! and operator (`$c<#x#>=`) is not covered yet. The readers judge the
 //! position, as they already did for the spaced spelling. That includes the
 //! spaced spelling's over-denials: `Write-Output $c=iex 'git reset --hard'`
 //! now denies, as `Write-Output $c = iex '…'` already did, although
@@ -118,6 +123,18 @@ const RUNS_IT: &[&str] = &[
     "$c=1; $c\u{2013}=iex 'git reset --hard'",
     "$c=1; $c\u{2014}=iex 'git reset --hard'",
     "$c=1; $c\u{2015}=iex 'git reset --hard'",
+    // A target's brackets or braced name with blanks inside span words.
+    "$c=@(1,2); $i=0; $c[$i + 1]=iex 'git reset --hard'",
+    "$c=@(1,2); $c[ 0 ]=iex 'git reset --hard'",
+    "$c=@(1,2); $c[0 ]=iex 'git reset --hard'",
+    "$c=@(1,2); $c[ 0 ] =iex 'git reset --hard'",
+    "$c=@{}; $c[ 'a' ]=iex 'git reset --hard'",
+    "$c=@(@{}); $c[ 0 ].p=iex 'git reset --hard'",
+    "$c=@(1,2); $c[ 0 ]=$d=iex 'git reset --hard'",
+    "$c=@(1,2); if(1){$c[ 0 ]=iex 'git reset --hard'}",
+    "[System.Collections.Generic.Dictionary[string, int]]$c=iex 'git reset --hard'",
+    "[System.Collections.Generic.Dictionary[string, int]] $c=iex 'git reset --hard'",
+    "${c d}=iex 'git reset --hard'",
 ];
 
 /// pwsh 7.5 runs no `git reset --hard` for any of these (sandboxed).
@@ -135,6 +152,10 @@ const HARMLESS: &[&str] = &[
     "$c=@{}; $c.'p'=git status",
     "$c=@{}; $c.$('p')=git status",
     "$c=1; $c\u{2013}=1",
+    "$c=@(1,2); $c[ 0 ]=git status",
+    "$c=@(1,2); $i=0; $c[$i + 1]=git status",
+    "$c=@(1,2); $c[ 0 ] =git status",
+    "[System.Collections.Generic.Dictionary[string, int]]$c=@{}",
     "$c=1; git status",
     "$c=$true",
     "$c=Get-Date",
