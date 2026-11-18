@@ -423,7 +423,8 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // escaped backtick before it are a variable too.
     "$l = Write-Output $$${git reset --hard}; & $l[1]",
     "$l = Write-Output ${git reset --hard}; & $l[-1]",
-    "$l = Write-Output ``${git reset --hard}; & $l[-1]", // Backtick twins of the round 2 rows: the POSIX reading takes the
+    "$l = Write-Output ``${git reset --hard}; & $l[-1]",
+    // Backtick twins of the round 2 rows: the POSIX reading takes the
     // backtick as a command substitution.
     "$l = Write-Output a `\n$x=@{git status}; & $l[-1]",
     "$l = Write-Output a `\n[ordered]@{git status}; & $l[-1]",
