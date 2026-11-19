@@ -200,6 +200,9 @@ fn proven_trap_and_stdin_handlers_are_judged() {
             r#"echo() { 2>/dev/null trap "$*" EXIT; }; echo 'git reset --hard'"#,
             r#"set -- 'git reset --hard'; trap "$1" EXIT"#,
             r#"f() { source /dev/stdin <<< "$1"; }; f 'git reset --hard'"#,
+            // The review of #43: a handler a frame binds as a quoted argument.
+            r#"f() { trap "$1" EXIT; }; f 'git reset --hard'"#,
+            r#"f() { trap -- "${1}" EXIT; }; f 'git reset --hard'"#,
         ],
     );
     assert_both(
@@ -207,6 +210,7 @@ fn proven_trap_and_stdin_handlers_are_judged() {
         &[
             r#"f() { trap "$*" EXIT; }; f 'echo done'"#,
             r#"f() { trap "$*" EXIT; }; f "$x""#,
+            r#"f() { trap "$1" EXIT; }; f 'rm -f /tmp/x.lock'"#,
         ],
     );
 }
@@ -234,6 +238,10 @@ fn proven_plain_argument_values_are_judged() {
             r#"x=--hard; echo "$x""#,
             r#"x=--hard; printf '%s\n' "$x" > notes.txt"#,
             r#"x=-la; ls "$x""#,
+            // A quoted value with spaces is one word of data here.
+            r#"msg='git reset --hard'; echo "$msg""#,
+            r#"msg='git reset --hard'; git commit -m "$msg""#,
+            r#"x='git reset --hard'; grep -F "$x" notes.txt"#,
         ],
     );
 }

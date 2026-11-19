@@ -20849,8 +20849,10 @@ fn posix_proven_variable_view(
 }
 
 /// [`posix_proven_variable_view`] that also splices a whole single-field
-/// argument whose proven value is a plain atom ([`literal_posix_argument_atom`]):
-/// `x=--hard; git reset "$x"` reads as `x=--hard; git reset --hard`. The
+/// argument: a double-quoted one as its proven value in one quoted word, a
+/// bare one only when the value is a plain atom ([`literal_posix_argument_atom`]).
+/// `x=--hard; git reset "$x"` reads as `x=--hard; git reset --hard`, and
+/// `x='git reset --hard'; trap "$x" EXIT` as `trap 'git reset --hard' EXIT`. The
 /// variable-aware analyses of such an argument keep the first view; this one
 /// is a second deny-only candidate, so it cannot remove a denial they find.
 /// A command name, a redirection target, a here-string operand and an
@@ -36115,7 +36117,7 @@ struct ProvenSplice<'a> {
     /// segment proofs: the prefix of `X=t eval '...'`, whose body runs with
     /// them.
     earlier_words: &'a str,
-    /// Also splice a whole single-field argument with a plain value
+    /// Also splice a whole single-field argument with its proven value
     /// ([`posix_proven_argument_view`]).
     arguments: bool,
 }
@@ -36519,16 +36521,21 @@ fn resolve_proven_variables_in_segment_with_ifs(
                             && !redirection
                             && !posix_word_is_assignment_prefix(&before[word_start..])
                             && !segment_text_may_assign(&out, name)
-                            && literal_posix_argument_atom(field)
+                            && (in_double_quote || literal_posix_argument_atom(field))
                         {
+                            // A double-quoted argument is one word whatever
+                            // its value holds: spell it as that one word
+                            // (`f() { trap "$1" EXIT; }; f 'git reset --hard'`
+                            // reads `trap 'git reset --hard' EXIT`).
                             if in_double_quote {
                                 out.pop();
                                 in_double_quote = false;
                                 rest = &tail[consumed + 1..];
+                                out.push_str(&posix_quote_argv_word(value));
                             } else {
                                 rest = &tail[consumed..];
+                                out.push_str(field);
                             }
-                            out.push_str(field);
                             substituted = true;
                             continue;
                         }
@@ -55210,6 +55217,8 @@ mod tests {
             ("x=--hard; git reset $x", true),
             ("x=--soft; git reset \"$x\"", false),
             ("x=--hard; echo \"$x\"", false),
+            ("f() { trap \"$1\" EXIT; }; f 'git reset --hard'", true),
+            ("msg='git reset --hard'; git commit -m \"$msg\"", false),
         ];
         // A plain value is spliced only where the segment ends fully literal;
         // beside a word that stays unresolved the first view keeps the role.
@@ -55221,6 +55230,10 @@ mod tests {
             ("f=/etc/sudoers; sudo -- cp \"$unknown\" \"$f\"", None),
             ("runner='x=y'; f=/etc/sudoers; $runner tee \"$f\"", None),
             ("runner=if; f=/etc/sudoers; $runner tee \"$f\"", None),
+            (
+                "x='git reset --hard'; trap \"$x\" EXIT",
+                Some("x='git reset --hard'; trap 'git reset --hard' EXIT"),
+            ),
         ] {
             assert_eq!(
                 posix_proven_argument_view(command, None, true)
