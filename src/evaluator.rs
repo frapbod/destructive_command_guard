@@ -12276,11 +12276,13 @@ fn powershell_spread_constructor_argument(argument: &str) -> Result<Option<&str>
 const MAX_POWERSHELL_SPREAD_GROUPS: usize = 8;
 
 /// The name inside a type literal that ends at `end` (`[a.b]` before `::`),
-/// also when only groups hold it (`( [a.b] )::`), or `None` when no bounded
+/// also when only groups hold it (`( [a.b] )::`) and when block comments sit
+/// around it (`[a.b]<#c#>::`), or `None` when no bounded
 /// type literal ends there. A group holding anything else (`([t]$n)`,
 /// `(Get-T)`) is not a static name.
 fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
-    let mut before = command.get(..end)?;
+    // Block comments may sit between the type and `::` (`[t]<#c#>::`).
+    let mut before = trim_powershell_code_blank_end(command.get(..end)?);
     // The first non-blank byte inside the group just read, which must open
     // the next group or the type literal.
     let mut group_start = None;
@@ -12305,10 +12307,10 @@ fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
         if group_start.is_some_and(|start| start != open) {
             return None;
         }
-        // Blank space, including a backtick line continuation, may surround
-        // what the group holds.
-        group_start = Some(powershell_blank_end(before, open + 1));
-        before = trim_powershell_blank_end(&before[..before.len() - 1]);
+        // Blank space, including a backtick line continuation, and block
+        // comments may surround what the group holds.
+        group_start = Some(powershell_code_blank_end(before, open + 1));
+        before = trim_powershell_code_blank_end(&before[..before.len() - 1]);
     }
     if !before.ends_with(']') {
         return None;
@@ -12438,6 +12440,54 @@ fn trim_powershell_blank_end(mut text: &str) -> &str {
     }
 }
 
+/// The most block comments read around a type literal before `::`.
+const MAX_POWERSHELL_TYPE_COMMENTS: usize = 8;
+
+/// The byte after the blank space and block comments at `start`
+/// ([`powershell_blank_end`]).
+fn powershell_code_blank_end(command: &str, mut start: usize) -> usize {
+    for _ in 0..MAX_POWERSHELL_TYPE_COMMENTS {
+        start = powershell_blank_end(command, start);
+        if !command[start..].starts_with("<#") {
+            break;
+        }
+        start = skip_powershell_block_comment(command, start);
+    }
+    powershell_blank_end(command, start)
+}
+
+/// `text` without the blank space and block comments at its end
+/// ([`trim_powershell_blank_end`]). A comment opens at the first `<#` after
+/// the `#>` before its own, searched within
+/// [`MAX_POWERSHELL_MEMBER_NAME_SPELLING`] bytes.
+fn trim_powershell_code_blank_end(mut text: &str) -> &str {
+    for _ in 0..MAX_POWERSHELL_TYPE_COMMENTS {
+        text = trim_powershell_blank_end(text);
+        let Some(body) = text.strip_suffix("#>") else {
+            return text;
+        };
+        let mut floor = body
+            .len()
+            .saturating_sub(MAX_POWERSHELL_MEMBER_NAME_SPELLING);
+        while !body.is_char_boundary(floor) {
+            floor -= 1;
+        }
+        let window = &body[floor..];
+        let after_close = window.rfind("#>").map_or(0, |close| close + 2);
+        let Some(open) = window[after_close..]
+            .find("<#")
+            .map(|open| floor + after_close + open)
+        else {
+            return text;
+        };
+        if skip_powershell_block_comment(text, open) != text.len() {
+            return text;
+        }
+        text = &text[..open];
+    }
+    trim_powershell_blank_end(text)
+}
+
 /// The member name spelled at `start` and the byte after its spelling,
 /// reading delimited spellings only up to `end`
 /// ([`powershell_member_name_after_dot`]).
@@ -12466,6 +12516,11 @@ fn powershell_member_name_spelling(
                     match bounded.as_bytes().get(index)? {
                         b'`' => index = escape_sequence_end(bounded, index),
                         b'"' => break index + 1,
+                        // A `"` inside `$( … )` does not end the name.
+                        b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                            index =
+                                find_powershell_subexpression_close(bounded, index + 2).ok()? + 1;
+                        }
                         _ => index += 1,
                     }
                 }
@@ -12487,15 +12542,20 @@ fn powershell_member_name_spelling(
             Some((name, close + 1))
         }
         // A here-string names the member by its body: verbatim for `@'`, and
-        // for `@"` with its escapes decoded as in a `"…"` name, unless a `$`
-        // may expand. A body holding `"` names no member dcg looks for: the
-        // quote stays in the name, escaped or not.
+        // for `@"` with its escapes decoded as in a `"…"` name. In `@"` a `$`
+        // may expand, so that name is not static whatever else the body
+        // holds; otherwise a body holding `"` names no member dcg looks for:
+        // the quote stays in the name, escaped or not.
         b'@' => {
             let (quote, content_start, end) = powershell_here_string_end(bounded, start)?;
             let body = bounded[content_start..end - 2]
                 .strip_suffix('\n')
                 .map_or("", |body| body.strip_suffix('\r').unwrap_or(body));
-            let name = if quote == b'\'' || body.contains('"') {
+            let name = if quote == b'\'' {
+                Some(body.to_string())
+            } else if body.contains('$') {
+                None
+            } else if body.contains('"') {
                 Some(body.to_string())
             } else {
                 parse_static_powershell_source(&format!("\"{body}\"")).ok()
@@ -12513,8 +12573,16 @@ fn powershell_member_name_spelling(
                 let close = find_powershell_subexpression_close(bounded, start + 2).ok()?;
                 Some((None, close + 1))
             }
+            // A backtick escapes a `}` inside the braces (`${a`}b}`).
             Some(b'{') => {
-                let close = start + 2 + bounded.get(start + 2..)?.find('}')?;
+                let mut close = start + 2;
+                loop {
+                    match bounded.as_bytes().get(close)? {
+                        b'`' => close = escape_sequence_end(bounded, close),
+                        b'}' => break,
+                        _ => close += 1,
+                    }
+                }
                 Some((None, close + 1))
             }
             _ => {
@@ -12535,7 +12603,8 @@ fn powershell_member_name_spelling(
 /// `$a.b.`, `(…).`, `[t]::m().`), not a dot inside a bareword argument
 /// (`Write-Output a.b`), which is text.
 fn powershell_dot_follows_expression(command: &str, dot: usize) -> bool {
-    let before = &command.as_bytes()[..dot];
+    // Block comments may sit before `::` (`[t]<#c#>::Create`).
+    let before = trim_powershell_code_blank_end(&command[..dot]).as_bytes();
     match before.last() {
         Some(b')' | b']') => true,
         Some(_) => before

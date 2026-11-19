@@ -403,6 +403,26 @@ const RUNS_IT: &[&str] = &[
     "$a='git reset --hard'; [scriptblock]::@\"\n`Create\n\"@($a).Invoke()",
     "$t=[scriptblock]; $f=$t::@\"\n`Create\n\"@; $f.Invoke('git reset --hard').Invoke()",
     "$a='git reset --hard'; (`\n[scriptblock])::Create($a).Invoke()",
+    // Review round 3 (runner rv3/truth.out, rv3/truth2.out, p4/k-truth.out):
+    // a `$` in a `@"…"@` name is not static even beside a `"`; block
+    // comments before `::`; an escaped `}` in a `${…}` name; and a `"` inside
+    // the `$( … )` of a `"…"` name.
+    "[scriptblock]::@\"\n$(\"Create\")\n\"@('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.@\"\n$(\"InvokeScript\")\n\"@('git reset --hard')",
+    "$t=[scriptblock]; $t::@\"\n$(\"Create\")\n\"@('git reset --hard').Invoke()",
+    "$a='git reset --hard'; [scriptblock]<#c#>::Create($a).Invoke()",
+    "$a='git reset --hard'; [scriptblock]<#c#>::'Create'($a).Invoke()",
+    "$a='git reset --hard'; [System.Management.Automation.ScriptBlock]<#c#>::Create($a).Invoke()",
+    "$a='git reset --hard'; $f=[scriptblock]<#c#>::Create; $f.Invoke($a).Invoke()",
+    "$a='git reset --hard'; ([scriptblock])<#c#>::Create($a).Invoke()",
+    "$a='git reset --hard'; [scriptblock]<#a#><#b#>::Create($a).Invoke()",
+    "$a='git reset --hard'; [scriptblock]<# x <# y #>::Create($a).Invoke()",
+    "$a='git reset --hard'; ([scriptblock]<#c#>)<#d#>::Create($a).Invoke()",
+    "$a='git reset --hard'; (<#c#>[scriptblock]<#d#>)::Create($a).Invoke()",
+    "${a`}b}='InvokeScript'; $ExecutionContext.InvokeCommand.${a`}b}('git reset --hard')",
+    "$t=[scriptblock]; ${a`}b}='Create'; $t::${a`}b}('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.\"$(\"InvokeScript\")\"('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.\"$(\"Invoke\"+\"Script\")\"('git reset --hard')",
 ];
 
 /// Name spellings longer than dcg's first reading window (review round 2;
@@ -600,6 +620,11 @@ const HARMLESS: &[&str] = &[
     "[powershell]::Create().@\"\nAddScript\n\"@('git status').Invoke()",
     "$t=[Text.StringBuilder]; $f = $t::new; $f.Invoke().Append('x') | Out-Null",
     "$t=[scriptblock]; $f = $t::new; $f.OverloadDefinitions | Out-Null",
+    // Twins of the review round 3 rows; each ran `git status`.
+    "[scriptblock]::@\"\n$(\"Create\")\n\"@('git status').Invoke()",
+    "$ExecutionContext.InvokeCommand.@\"\n$(\"InvokeScript\")\n\"@('git status')",
+    "[scriptblock]<#c#>::Create('git status').Invoke()",
+    "$ExecutionContext.InvokeCommand.\"$(\"InvokeScript\")\"('git status')",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -667,6 +692,12 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // Twin of the round 2 `@"…"@` escape rows: Unknown's POSIX reading
     // takes the backtick as command substitution.
     "[scriptblock]::@\"\n`Create\n\"@('git status').Invoke()",
+    // Twins of the review round 3 `${a`}b}` rows; each ran `git status`.
+    // Unknown's POSIX reading takes the `${…}` as a substitution it cannot
+    // verify, on base f9b376a2 too.
+    "${a`}b}='InvokeScript'; $ExecutionContext.InvokeCommand.${a`}b}('git status')",
+    "$t=[scriptblock]; ${a`}b}='Create'; $t::${a`}b}('git status').Invoke()",
+    "${a`}b}='Create'; [scriptblock]::${a`}b}('git status').Invoke()",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
