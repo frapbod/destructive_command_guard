@@ -4067,3 +4067,47 @@ fn unclosed_braced_parameters_keep_the_hook_within_budget() {
         assert!(outcome.is_allow_shape(), "codex={codex}\n{outcome}");
     }
 }
+
+/// Bash and zsh remove a line continuation before they read tokens, so a
+/// continuation between `$` and `'` still opens an ANSI-C string, in which
+/// `\'` is an escaped quote. Each blocked command runs its git command in
+/// Bash 3.2, 5.3, sh, zsh and Linux bash 5.2 (measured with
+/// `scripts/shell-truth`, Nov 18 2026); the allowed ones run none.
+#[test]
+fn line_continuation_between_dollar_and_quote_hides_no_git_command() {
+    for command in [
+        "echo $\\\n'a\\'' ; git reset --hard #'",
+        "echo $\\\n'a\\'' && git push --force origin main #'",
+        "echo $\\\n\\\n'a\\'' ; git reset --hard #'",
+        "x=$\\\n'a\\''; git reset --hard #'",
+        "echo $$\\\n$\\\n'a\\'' ; git reset --hard #'",
+        "echo \\$$\\\n'a\\'' ; git reset --hard #'",
+        "echo $(echo $\\\n'a\\'' ; git reset --hard #'\n)",
+        "echo $\\\n$'a\\' ; git reset --hard ; #'",
+    ] {
+        for codex in [true, false] {
+            let outcome = run_hook_raw(&multiline_payload(command, codex), &[]);
+            assert_eq!(
+                outcome.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+                "codex={codex} {command:?}\n{outcome}"
+            );
+        }
+    }
+    for command in [
+        "echo $'a\\'b'; git status",
+        "echo $\\\n'a\\'b'; git status",
+        "echo $\\\n'a\\'' # git reset --hard'",
+        "echo $\\\n$'a' ; git status",
+        "printf '%s\\n' $\\\n'x'",
+        "echo '$\\\n' ; git status",
+    ] {
+        for codex in [true, false] {
+            let outcome = run_hook_raw(&multiline_payload(command, codex), &[]);
+            assert!(
+                outcome.is_allow_shape(),
+                "codex={codex} {command:?}\n{outcome}"
+            );
+        }
+    }
+}

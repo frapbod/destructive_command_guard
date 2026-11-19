@@ -17567,6 +17567,48 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             }
         }
     }
+    // The shell removes a line continuation before it reads tokens, so Bash
+    // and zsh read `$\`LF`'` as `$'`: `echo $\`LF`'a\'' ; git reset --hard #'`
+    // runs `git reset --hard`. The scanners see an ANSI-C string only when
+    // the `$` stands right before the `'`. When a continuation splits them,
+    // read the command again with the continuations moved in front of the
+    // `$` (see `dollar_quotes_across_line_continuations`), through this
+    // whole function, so the readings here and below apply to the joined
+    // `$'` too; that copy has no such split left, so it is not read a third
+    // time. Only POSIX shells have this line continuation, so the copy is
+    // read as POSIX even when the dialect is unknown: PowerShell would read
+    // the moved `$'…'` as a statement of its own on the next line. Deny
+    // wins. What the user authorized as written stays authorized, and the
+    // copy spends no allow-once grant.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && !crate::context::PlainDollarQuoteReading::active()
+        && let Some(spelled) = crate::context::dollar_quotes_across_line_continuations(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                &spelled,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                ShellDialect::Posix,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        adopt_alternate_reading(&mut result, alternate, command);
+    }
     // Bash reads `$'…'` as an ANSI-C string, which `\'` does not close.
     // PowerShell (the shell Codex runs on Windows) and dash (`/bin/sh` on
     // Debian, so any `sh -c`) read `$'` as a literal `$` and a plain quote.
@@ -53336,6 +53378,42 @@ mod tests {
                 "{command} must not deny: {:?}",
                 result.pattern_info
             );
+        }
+    }
+
+    /// A line continuation between `$` and `'` still opens a Bash ANSI-C
+    /// string. The copy with the `$` moved next to its quote is read as
+    /// POSIX only: as PowerShell (in the unknown dialect, with the packs a
+    /// native Windows install has on) the moved `$'x'` starts a line of its
+    /// own, which `windows.filesystem` denied for harmless text.
+    #[test]
+    fn dollar_quotes_across_line_continuations_are_read_as_posix_only() {
+        let packs = [
+            "core.git",
+            "core.filesystem",
+            "windows.filesystem",
+            "windows.system",
+        ];
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in [
+                "echo $\\\n'a\\'' ; git reset --hard #'",
+                "echo $\\\n'a\\'' && git push --force origin main #'",
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(result.is_denied(), "{dialect:?} {command:?}");
+            }
+            for command in [
+                "printf '%s\\n' $\\\n'x'",
+                "# note $\\\n'a' ; echo hi",
+                "echo $\\\n'a\\'b'; git status",
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    !result.is_denied(),
+                    "{dialect:?} {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
         }
     }
 
