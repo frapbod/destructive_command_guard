@@ -17566,8 +17566,11 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // `$` (see `dollar_quotes_across_line_continuations`), through this
     // whole function, so the readings here and below apply to the joined
     // `$'` too; that copy has no such split left, so it is not read a third
-    // time. Deny wins. What the user authorized as written stays
-    // authorized, and the copy spends no allow-once grant.
+    // time. Only POSIX shells have this line continuation, so the copy is
+    // read as POSIX even when the dialect is unknown: PowerShell would read
+    // the moved `$'…'` as a statement of its own on the next line. Deny
+    // wins. What the user authorized as written stays authorized, and the
+    // copy spends no allow-once grant.
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
         && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
@@ -17590,7 +17593,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 None,
                 project_path,
                 deadline,
-                shell_dialect,
+                ShellDialect::Posix,
                 nested_command_depth,
                 inherited_automated_stdin,
             )
