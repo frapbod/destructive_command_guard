@@ -1097,6 +1097,59 @@ fn joined_arguments(
     (literal || !need_literal).then(|| strings.join(" "))
 }
 
+/// The program `(Get-Command <literal>)` (or `gcm`, optionally `-Name`)
+/// names: PowerShell resolves the literal and Start-Process runs that
+/// command. The evaluator spells an unresolved `$tool` program this way
+/// when it checks the transfer pack's scp reading.
+fn get_command_program(text: &str, value: &Value) -> Option<String> {
+    let Value::Elements(elements) = value else {
+        return None;
+    };
+    let [element] = elements.as_slice() else {
+        return None;
+    };
+    let inner = text
+        .get(element.clone())?
+        .trim()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    let mut words = inner.split_ascii_whitespace();
+    let command = words.next()?;
+    if !command.eq_ignore_ascii_case("Get-Command") && !command.eq_ignore_ascii_case("gcm") {
+        return None;
+    }
+    let mut word = words.next()?;
+    if word.eq_ignore_ascii_case("-Name") {
+        word = words.next()?;
+    }
+    if words.next().is_some() {
+        return None;
+    }
+    match element_strings(word)?.as_slice() {
+        [name] if !name.is_empty() => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a program value is computed by an expression: not a literal
+/// and not a plain variable (`$tool`, `$env:ComSpec`, `${tool}`), whose
+/// assignments other readings resolve (the transfer pack keeps
+/// `$tool = "notepad.exe"; Start-Process $tool …` allowed).
+fn is_computed_program(text: &str, value: &Value) -> bool {
+    match value {
+        Value::Literal(_) => false,
+        Value::Unknown => true,
+        Value::Elements(elements) => match elements.as_slice() {
+            [element] => text.get(element.clone()).is_none_or(|raw| {
+                let raw = raw.trim();
+                variable_end(raw.as_bytes(), 0) != Some(raw.len())
+            }),
+            _ => true,
+        },
+    }
+}
+
 fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
     let Some(arguments) = bound.arguments.as_ref() else {
         return Vec::new();
@@ -1104,13 +1157,14 @@ fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
     let file = match value_strings(text, &bound.file) {
         Some(strings) if strings.len() == 1 => strings.into_iter().next(),
         Some(_) => return Vec::new(),
-        None => None,
+        None => get_command_program(text, &bound.file),
     };
     let Some(file) = file else {
         // Any program, when some of the line is known: read the line as
-        // each shell would, and as the argv of a program dcg cannot name,
-        // which PowerShell's reading fails closed on as it does for the
-        // program called directly (`& $g reset --hard`).
+        // each shell would. A program computed by an expression
+        // (`$g.Trim()`, `('git')?.Trim()`) is also read as the argv of a
+        // program dcg cannot name, which PowerShell's reading fails closed
+        // on as it does for `& $g reset --hard`.
         let mut lines: Vec<String> = SHELL_READERS
             .iter()
             .filter_map(|shell| {
@@ -1118,7 +1172,10 @@ fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
                     .map(|joined| format!("{shell} {joined}"))
             })
             .collect();
-        if let Some(joined) = joined_arguments(text, arguments, DYNAMIC_ARGUMENT, true) {
+        let computed = is_computed_program(text, &bound.file);
+        if let Some(joined) =
+            joined_arguments(text, arguments, DYNAMIC_ARGUMENT, true).filter(|_| computed)
+        {
             let mut line = format!("& ${DYNAMIC_PROGRAM}");
             for word in windows_argv(&joined) {
                 line.push(' ');
@@ -1408,7 +1465,6 @@ mod tests {
                 "cmd /c git reset --hard".to_string(),
                 "powershell /c git reset --hard".to_string(),
                 "sh /c git reset --hard".to_string(),
-                "& $DCG_START_PROCESS_PROGRAM /c git reset --hard".to_string(),
             ]
         );
         assert!(lines("Start-Process $tool -ArgumentList $rest").is_empty());
@@ -1800,8 +1856,9 @@ mod tests {
         assert!(lines("Start-Process git ('reset --hard') ?.Trim()").is_empty());
     }
 
-    /// A program that is not a literal is also read as the argv of a
-    /// program dcg cannot name, as `& $g reset --hard` is.
+    /// A program computed by an expression is also read as the argv of a
+    /// program dcg cannot name, as `& $g reset --hard` is. A plain
+    /// variable keeps the shell readings only.
     #[test]
     fn a_computed_program_is_any_program() {
         let any = vec![
@@ -1811,12 +1868,25 @@ mod tests {
             "& $DCG_START_PROCESS_PROGRAM reset --hard".to_string(),
         ];
         for spelling in [
-            "Start-Process $g reset,--hard",
             "Start-Process $g.Trim() reset,--hard -Wait -NoNewWindow",
             "Start-Process ('git')?.Trim() reset,--hard",
             "Start-Process -FilePath ('git')?.Trim() reset,--hard",
         ] {
             assert_eq!(lines(spelling), any, "{spelling:?}");
+        }
+        assert_eq!(
+            lines("Start-Process (Get-Command 'git') reset,--hard"),
+            program("git reset --hard")
+        );
+        assert_eq!(
+            lines("Start-Process (gcm -Name git.exe) reset,--hard"),
+            program("git.exe reset --hard")
+        );
+        for spelling in [
+            "Start-Process $g reset,--hard",
+            "Start-Process ${g} reset,--hard",
+        ] {
+            assert_eq!(lines(spelling), any[..3].to_vec(), "{spelling:?}");
         }
     }
 

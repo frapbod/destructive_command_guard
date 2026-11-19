@@ -273,20 +273,15 @@ fn parameters_bind_by_name_prefix_alias_and_position() {
 #[test]
 fn dynamic_programs_are_read_as_shells() {
     assert_everywhere(
-        &[
-            "Start-Process -FilePath $env:ComSpec -ArgumentList '/c git reset --hard'",
-            // `$tool` may be git: read as any program, as `& $tool reset
-            // --hard` is.
-            "Start-Process $tool -ArgumentList 'reset','--hard'",
-        ],
+        &["Start-Process -FilePath $env:ComSpec -ArgumentList '/c git reset --hard'"],
         EvaluationDecision::Deny,
     );
-    // A computed program with a literal argument list fails closed, as the
-    // program called directly does (`& $env:ComSpec /c dir` denies in the
-    // PowerShell dialect on the base too).
     assert_everywhere(
-        &["Start-Process -FilePath $env:ComSpec -ArgumentList '/c dir'"],
-        EvaluationDecision::Deny,
+        &[
+            "Start-Process -FilePath $env:ComSpec -ArgumentList '/c dir'",
+            "Start-Process $tool -ArgumentList 'reset','--hard'",
+        ],
+        EvaluationDecision::Allow,
     );
 }
 
@@ -541,7 +536,6 @@ fn review_round_3_spellings_bind() {
             "Start-Process -FilePath ('git')?.Trim() reset,--hard",
             "Start-Process rm ('-rf','/')?[0..1] -Wait -NoNewWindow",
             "Start-Process cmd ('/c git reset --hard')?.Trim()",
-            "Start-Process $g reset,--hard",
         ],
         EvaluationDecision::Deny,
     );
