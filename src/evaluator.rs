@@ -41167,7 +41167,7 @@ fn parent_expanded_source_verdict(
         return Some(EvaluationResult::indeterminate_due_to_budget());
     }
     let mut reading = content.clone();
-    reading.content = source.to_owned();
+    source.clone_into(&mut reading.content);
     reading.content_range = None;
     reading.word_range = None;
     reading.parent_expanded_source = None;
