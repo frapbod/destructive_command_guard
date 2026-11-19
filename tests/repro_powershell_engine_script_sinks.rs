@@ -373,6 +373,8 @@ const RUNS_IT: &[&str] = &[
     "[scriptblock]::Create.Invoke(@('git reset --hard')).Invoke()",
     "([scriptblock]::Create).Invoke('git reset --hard').Invoke()",
     "[scriptblock]::'Create'.Invoke.Invoke('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $f=$t::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$n='Create'; $t=[scriptblock]; $t::$n('git reset --hard').Invoke()",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -524,6 +526,8 @@ const HARMLESS: &[&str] = &[
     "[powershell]::Create().AddCommand('Get-Date').Invoke() | Out-Null",
     "[scriptblock]::{Create}('git status').Invoke()",
     "$ExecutionContext.InvokeCommand.{InvokeScript}('git status')",
+    "$x=[IO.File]; $x::Create('a.txt').Dispose()",
+    "[scriptblock]::Create('git status').Invoke()",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
