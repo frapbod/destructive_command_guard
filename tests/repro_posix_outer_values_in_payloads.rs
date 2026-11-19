@@ -267,6 +267,81 @@ fn outer_values_in_shell_stdin_are_unknown_child_text() {
     assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
 }
 
+/// The same holds whatever wrapper or runner stands before the shell that
+/// reads the stdin. Measured with Linux bash (fake `git`): `/usr/bin/timeout
+/// 5 /bin/bash <<EOF`, `/usr/bin/nice /bin/bash <<EOF`, `exec /bin/bash <<EOF`
+/// and `/usr/bin/timeout 5 /bin/bash <<< "…"` run `git reset --hard`;
+/// docker, kubectl and ssh pass on the stdin the parent already expanded.
+/// An escaped `\$` in an unquoted body is a value of the next shell:
+/// `bash <<EOF` + `bash -c "'gi\${x}t' reset --hard"` runs it too.
+#[test]
+fn outer_values_in_shell_stdin_behind_a_wrapper_are_unknown_child_text() {
+    let body = "'gi${x}t' reset --hard";
+    let heads = [
+        "timeout 30 ssh host",
+        "timeout 5 bash",
+        "docker exec -i c sh",
+        "docker exec -i c bash",
+        "docker exec -i c bash -s",
+        "docker compose exec -T svc sh",
+        "kubectl exec -i p -- sh",
+        "kubectl exec -i deploy/x -- bash -s",
+        "kubectl --context c -n ns exec -i p -- sh",
+        "nice bash",
+        "nice -n 10 bash",
+        "stdbuf -oL bash",
+        "time bash",
+        "exec bash",
+        "sudo -u u bash",
+        "su - u",
+        "sudo -iu u",
+    ];
+    let mut commands: Vec<String> = heads
+        .iter()
+        .map(|head| format!("{head} <<EOF\n{body}\nEOF"))
+        .collect();
+    for head in [
+        "timeout 30 ssh host",
+        "timeout 5 bash",
+        "docker exec -i c sh",
+        "kubectl exec -i p -- sh",
+    ] {
+        commands.push(format!("{head} <<< \"{body}\""));
+    }
+    commands.push("timeout 5 bash <<-EOF\n\t'gi${x}t' reset --hard\n\tEOF".into());
+    commands.push("nice bash <<EOF\n'r${x}m' -rf /\nEOF".into());
+    commands.push("bash <<EOF\nbash -c \"'gi\\${x}t' reset --hard\"\nEOF".into());
+    let commands: Vec<&str> = commands.iter().map(String::as_str).collect();
+    let misses = misses(&commands, &POSIX, EvaluationDecision::Deny);
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
+/// Behind a wrapper, a harmless value stays data, and a body an interpreter
+/// or a data sink receives keeps its own reading.
+#[test]
+fn shell_stdin_behind_a_wrapper_keeps_harmless_values_and_data_sinks() {
+    let misses = misses(
+        &[
+            "timeout 30 ssh host <<EOF\ncd $DIR && git pull\nEOF",
+            "docker exec -i c sh <<EOF\nls $HOME\nEOF",
+            "kubectl exec -i p -- sh <<EOF\ncat /etc/$f\nEOF",
+            "timeout 5 bash <<EOF\necho \\$HOME \\`date\\`\nEOF",
+            "python3 <<EOF\nprint('$HOME')\nEOF",
+            "cat > /tmp/s.sh <<EOF\n'gi${x}t' status\nEOF",
+            "tee /tmp/x <<EOF\n'gi${x}t' reset --hard\nEOF",
+            r#"grep x <<< "'gi${x}t' reset --hard""#,
+            "git commit -F - <<EOF\nfix: don't read '$x'\nEOF",
+            "psql <<EOF\nselect '$x';\nEOF",
+            "kubectl apply -f - <<EOF\nnamespace: $NS\nEOF",
+            "mail -s hi bob <<EOF\nhello $USER\nEOF",
+            r#"read -r a b <<< "$line""#,
+        ],
+        &POSIX,
+        EvaluationDecision::Allow,
+    );
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
 /// A quoted heredoc delimiter keeps the body as written, and a value the
 /// parent substitutes as data stays data, as in a `-c` word.
 #[test]

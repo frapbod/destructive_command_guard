@@ -38388,6 +38388,10 @@ fn evaluate_heredoc(
         // hands bash `'git' reset --hard` when `x` is empty (measured with
         // Linux bash), so read that source too, each value spelled where the
         // child reads it (`heredoc::posix_shell_source_from_heredoc_body`).
+        // That holds for every body dcg reads as shell or unknown text,
+        // whatever wrapper or runner stands before the shell (`timeout 5
+        // bash`, `docker exec -i c sh`, `sudo -u u bash`); an interpreter
+        // keeps its own language and a data sink stays exempt below.
         // It is added beside the body, not put in its place: the body's
         // range carries other proofs. Here-strings are read this way at
         // extraction, like `-c` words.
@@ -38399,7 +38403,10 @@ fn evaluate_heredoc(
                     | crate::heredoc::HeredocType::IndentStripped
             )
         ) && !content.quoted
-            && crate::heredoc::stdin_feeds_posix_shell(content.target_command.as_deref()))
+            && (matches!(
+                content.language,
+                crate::heredoc::ScriptLanguage::Bash | crate::heredoc::ScriptLanguage::Unknown
+            ) || crate::heredoc::stdin_feeds_posix_shell(content.target_command.as_deref())))
         .then(|| crate::heredoc::posix_shell_source_from_heredoc_body(&content.content))
         .flatten()
         .map(|source| {

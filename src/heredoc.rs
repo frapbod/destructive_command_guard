@@ -2582,7 +2582,9 @@ fn is_posix_shell_interpreter(name: &str) -> bool {
 
 /// Whether the program that receives a heredoc or here-string reads it as
 /// POSIX shell source: a POSIX shell (`bash`, `bash -s`), or `ssh`, whose
-/// remote shell does (`ssh host`, `ssh host bash`).
+/// remote shell does (`ssh host`, `ssh host bash`). A receiver behind a
+/// wrapper or runner (`timeout 5 bash`, `docker exec -i c sh`) is not named
+/// here; callers also take a body dcg reads as shell or unknown text.
 pub(crate) fn stdin_feeds_posix_shell(target: Option<&str>) -> bool {
     target.is_some_and(|name| {
         is_posix_shell_interpreter(name) || name.strip_suffix(".exe").unwrap_or(name) == "ssh"
@@ -2628,10 +2630,21 @@ pub(crate) fn heredoc_body_expands(body: &str) -> bool {
 /// after its parent shell expanded the body
 /// ([`posix_shell_source_with_outer_values`]):
 /// `bash <<EOF` + `'gi${x}t' reset --hard` hands bash `'git' reset --hard`
-/// when `x` is empty (measured with Linux bash). `None` when the body holds
-/// no value or cannot be read.
+/// when `x` is empty (measured with Linux bash). A body with no value whose
+/// escapes the parent removes is that decoded text: `bash <<EOF` +
+/// `bash -c "'gi\${x}t' reset --hard"` hands bash `bash -c "'gi${x}t' …"`,
+/// where `${x}` is a value of the next shell. `None` when the body reads the
+/// same to the child or cannot be read.
 pub(crate) fn posix_shell_source_from_heredoc_body(body: &str) -> Option<String> {
-    posix_shell_source_with_outer_values([heredoc_body_as_double_quoted_word(body).as_str()])
+    let word = heredoc_body_as_double_quoted_word(body);
+    posix_shell_source_with_outer_values([word.as_str()]).or_else(|| {
+        if heredoc_body_expands(body) {
+            return None;
+        }
+        crate::normalize::decode_posix_literal_word(&word)
+            .filter(|decoded| decoded.as_ref() != body)
+            .map(std::borrow::Cow::into_owned)
+    })
 }
 
 /// Recover the original word around an existing payload locator's inner span.
@@ -8073,18 +8086,6 @@ fn extract_herestrings(
             }
             // Extract the command that receives the here-string
             let target_cmd = extract_heredoc_target_command(command, full_match.start());
-            // A shell reads the operand after the parent shell expanded it,
-            // as it reads a `-c` word ([`with_posix_outer_values`]):
-            // `bash <<< "'gi${x}t' reset --hard"` hands bash
-            // `'git' reset --hard` when `x` is empty (measured with Linux
-            // bash).
-            let content = if stdin_feeds_posix_shell(target_cmd.as_deref()) {
-                posix_shell_source_with_outer_values([raw]).unwrap_or(content)
-            } else {
-                content
-            };
-            let content_range = (command.get(raw_content_range.clone()) == Some(content.as_str()))
-                .then_some(raw_content_range);
             let language = target_cmd
                 .as_deref()
                 .map_or(ScriptLanguage::Unknown, ScriptLanguage::from_command);
@@ -8097,6 +8098,23 @@ fn extract_herestrings(
             } else {
                 language
             };
+            // A shell reads the operand after the parent shell expanded it,
+            // as it reads a `-c` word ([`with_posix_outer_values`]):
+            // `bash <<< "'gi${x}t' reset --hard"` hands bash
+            // `'git' reset --hard` when `x` is empty (measured with Linux
+            // bash). That holds for every operand read as shell source,
+            // including one whose shell sits behind a wrapper or runner
+            // (`timeout 5 bash <<<`, `docker exec -i c sh <<<`); a data sink
+            // such as `grep` stays exempt at evaluation.
+            let content = if language == ScriptLanguage::Bash
+                || stdin_feeds_posix_shell(target_cmd.as_deref())
+            {
+                posix_shell_source_with_outer_values([raw]).unwrap_or(content)
+            } else {
+                content
+            };
+            let content_range = (command.get(raw_content_range.clone()) == Some(content.as_str()))
+                .then_some(raw_content_range);
 
             extracted.push(ExtractedContent {
                 content,
@@ -17384,7 +17402,6 @@ ls"#,
                 ),
             ),
             ("a \\\nb $x", Some("a b ${DCG_POSIX_VALUE}")),
-            ("'gi\\${x}t' reset", None),
             ("echo '$ x' \\n", None),
         ] {
             assert_eq!(
@@ -17393,6 +17410,22 @@ ls"#,
                 "{body:?}"
             );
             assert_eq!(heredoc_body_expands(body), want.is_some(), "{body:?}");
+        }
+        // No value, but the parent removes an escape: the next shell reads
+        // the decoded text, where `${x}` is its own value.
+        for (body, want) in [
+            ("'gi\\${x}t' reset", "'gi${x}t' reset"),
+            (
+                "bash -c \"'gi\\${x}t' reset --hard\"",
+                "bash -c \"'gi${x}t' reset --hard\"",
+            ),
+        ] {
+            assert_eq!(
+                posix_shell_source_from_heredoc_body(body).as_deref(),
+                Some(want),
+                "{body:?}"
+            );
+            assert!(!heredoc_body_expands(body), "{body:?}");
         }
     }
 
