@@ -5,6 +5,9 @@
 //! `CreateNestedPipeline`, a `Runspaces.Command` built with `isScript`,
 //! `Parser::ParseInput`, and the `$( … )` inside `ExpandString`'s text.
 //! `[scriptblock]::Create` is read the same way, by any spelling.
+//! A method reached through .NET reflection, a PSObject member table, a
+//! type alias or a run-time name is not verified when dcg cannot read its
+//! arguments.
 //! dcg read their string argument as data, so
 //! `$ExecutionContext.InvokeCommand.InvokeScript("git reset --hard")` passed
 //! in the PowerShell dialect.
@@ -473,6 +476,65 @@ const RUNS_IT: &[&str] = &[
     "$t=[scriptblock]; $f = 'x y<#' ? $t<#c#>::Create : 0; $f.Invoke('git reset --hard').Invoke()",
     "$a = ${a <#}, $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
     "$a = <#a#>'x y<#', $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    // Reached through reflection, a PSObject member table, a reflected
+    // constructor or a type alias, or by a name and a source that are not
+    // static (card t_4d2ad884; runner p1/truth.out, p2/truth.out).
+    "[scriptblock].GetMethod('Create').Invoke($null, @('git reset --hard')).Invoke()",
+    "[scriptblock].GetMethod('Create', [type[]]@([string])).Invoke($null, @('git reset --hard')).Invoke()",
+    "[scriptblock].GetMember('Create')[0].Invoke($null, @('git reset --hard')).Invoke()",
+    "[scriptblock].GetMember('Cre*')[0].Invoke($null, @('git reset --hard')).Invoke()",
+    "[scriptblock].InvokeMember('Create', 'InvokeMethod,Static,Public', $null, $null, @('git reset --hard')).Invoke()",
+    "[System.Reflection.RuntimeReflectionExtensions]::GetRuntimeMethod([scriptblock], 'Create', [type[]]@([string])).Invoke($null, @('git reset --hard')).Invoke()",
+    "[scriptblock].GetMethods() | ? Name -eq 'Create' | % { $_.Invoke($null, @('git reset --hard')).Invoke() }",
+    "([scriptblock].GetMethods() | ? Name -eq Create)[0].Invoke($null, @('git reset --hard')).Invoke()",
+    "[Delegate]::CreateDelegate([Func[string,scriptblock]], [scriptblock].GetMethod('Create')).Invoke('git reset --hard').Invoke()",
+    "[Delegate]::CreateDelegate([Func[string,scriptblock]], [scriptblock], 'Create').Invoke('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.GetType().GetMethod('InvokeScript', [type[]]@([string])).Invoke($ExecutionContext.InvokeCommand, @(,'git reset --hard'))",
+    "$ExecutionContext.InvokeCommand.GetType().InvokeMember('InvokeScript', 'InvokeMethod,Instance,Public', $null, $ExecutionContext.InvokeCommand, @('git reset --hard'))",
+    "[Delegate]::CreateDelegate([Func[string,System.Collections.ObjectModel.Collection[psobject]]], $ExecutionContext.InvokeCommand, 'InvokeScript').Invoke('git reset --hard')",
+    "$m='Create'; [scriptblock].GetMethod($m).Invoke($null, @('git reset --hard')).Invoke()",
+    "$a='git reset --hard'; [scriptblock].GetMethod('Create').Invoke($null, @($a)).Invoke()",
+    "$ExecutionContext.InvokeCommand.PSObject.Methods['InvokeScript'].Invoke('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.PSObject.Members.Item('InvokeScript').Invoke('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.PSObject.Methods.Match('InvokeS*')[0].Invoke('git reset --hard')",
+    "($ExecutionContext.InvokeCommand.PSObject.Methods | ? Name -eq 'InvokeScript').Invoke('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.psobject.Methods.Where({$_.Name -like 'Invoke*t'})[0].Invoke('git reset --hard')",
+    "$m = $ExecutionContext.InvokeCommand.PSObject.Methods['InvokeScript']; $m.Invoke('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.PSObject.Methods.Item('InvokeScript').Invoke('git reset --hard')",
+    "$n='InvokeScript'; $ExecutionContext.InvokeCommand.PSObject.Methods[$n].Invoke('git reset --hard')",
+    "[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')::Add('sb',[scriptblock]); [sb]::Create('git reset --hard').Invoke()",
+    "$ta=[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators'); $ta::Add('sb',[scriptblock]); [sb]::Create('git reset --hard').Invoke()",
+    "$a='git reset --hard'; [psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')::Add('sb',[scriptblock]); [sb]::Create($a).Invoke()",
+    "[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')::Add('c',[System.Management.Automation.Runspaces.Command]); $p=[powershell]::Create(); [void]$p.Commands.AddCommand([c]::new('git reset --hard',$true)); $p.Invoke()",
+    "$a='git reset --hard'; ({}).GetType()::Create($a).Invoke()",
+    "$p=[powershell]::Create(); [void]$p.Commands.AddCommand([System.Management.Automation.Runspaces.Command].GetConstructor([type[]]@([string],[bool])).Invoke(@('git reset --hard',$true))); $p.Invoke()",
+    "$p=[powershell]::Create(); [void]$p.Commands.AddCommand([Activator]::CreateInstance([System.Management.Automation.Runspaces.Command], @('git reset --hard', $true))); $p.Invoke()",
+    "$p=[powershell]::Create(); [void]$p.Commands.AddCommand([Activator]::CreateInstance([type]'System.Management.Automation.Runspaces.Command', 'git reset --hard', $true)); $p.Invoke()",
+    "$m='InvokeScript'; $a2='git reset --hard'; $ExecutionContext.InvokeCommand.\"$m\"($a2)",
+    "${ab}='InvokeScript'; $a2='git reset --hard'; $ExecutionContext.InvokeCommand.\"${ab}\"($a2)",
+    "$m='InvokeScript'; $a2='git reset --hard'; $ExecutionContext.InvokeCommand.$m($a2)",
+    "$m='AddScript'; $a2='git reset --hard'; [powershell]::Create().$m($a2).Invoke()",
+    "$a2='git reset --hard'; $t=[scriptblock]; $t::Create($a2).Invoke()",
+    "$m='Invoke'+'Script'; $a2='git reset --hard'; $ic=$ExecutionContext.InvokeCommand; $ic.$m($a2)",
+    "$m='InvokeScript'; $a2='git reset --hard'; @($ExecutionContext.InvokeCommand).ForEach($m, $a2)",
+    "$m='InvokeScript'; $a2='git reset --hard'; $ExecutionContext.InvokeCommand | % $m $a2",
+    "$a2='git reset --hard'; $t=[System.Management.Automation.Runspaces.Command]; $p=[powershell]::Create(); [void]$p.Commands.AddCommand($t::new($a2, $true)); $p.Invoke()",
+    "$ic=$ExecutionContext.InvokeCommand; $p=$ic.PSObject; $p.Methods['InvokeScript'].Invoke('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.'PSObject'.'Methods'['InvokeScript'].Invoke('git reset --hard')",
+    "[scriptblock].'GetMethod'('Create').Invoke($null, @('git reset --hard')).Invoke()",
+    "[System.Reflection.TypeExtensions]::GetMethod([scriptblock], 'Create', [type[]]@([string])).Invoke($null, @('git reset --hard')).Invoke()",
+    "$n='System.Management.Automation.TypeAcc'+'elerators'; [psobject].Assembly.GetType($n)::Add('sb',[scriptblock]); [sb]::Create('git reset --hard').Invoke()",
+    "[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')::Add('c',[System.Management.Automation.Runspaces.Command]); $c=New-Object c 'git reset --hard',$true; $p=[powershell]::Create(); [void]$p.Commands.AddCommand($c); $p.Invoke()",
+    "$ExecutionContext.InvokeCommand.GetType().GetMethods() | ? Name -eq InvokeScript | select -First 1 | % { $_.Invoke($ExecutionContext.InvokeCommand, @('git reset --hard')) }",
+    "$ExecutionContext.InvokeCommand.PSObject.Methods[('Invoke'+'Script')].Invoke('git reset --hard')",
+    "$m=$ExecutionContext.InvokeCommand.PSObject.Members.Match('InvokeScr*'); $m[0].Invoke('git reset --hard')",
+    "$x=[pscustomobject]@{a=1}; $n='InvokeScript'; $x | Out-Null; $ExecutionContext.InvokeCommand.psobject.Members.Item($n).Invoke('git reset --hard')",
+    // `foreach` after `|` or `&` is ForEach-Object (runner p3).
+    "$ExecutionContext.InvokeCommand | foreach InvokeScript 'git reset --hard'",
+    "$ExecutionContext.InvokeCommand | foreach ('Invoke'+'Script') 'git reset --hard'",
+    "& foreach -InputObject $ExecutionContext.InvokeCommand InvokeScript 'git reset --hard'",
+    "$m='InvokeScript'; $a='git reset --hard'; $ExecutionContext.InvokeCommand | foreach $m $a",
+    "$a='git reset --hard'; $t='System.Management.Automation.Runspaces.Command'; $c=New-Object $t $a,$true; $p=[powershell]::Create(); [void]$p.Commands.AddCommand($c); $p.Invoke()",
 ];
 
 /// Name spellings longer than dcg's first reading window (review round 2;
@@ -697,6 +759,25 @@ const HARMLESS: &[&str] = &[
     "Write-Output 'abc'.Length; git status",
     "Write-Output x >out.InvokeScript; git status",
     "Write-Output ä.InvokeScript; git status",
+    // Ordinary reflection, member tables, constructors and member names
+    // that are not static (card t_4d2ad884; runner p2/truth.out).
+    "$x=1; foreach ($i in 1) { git status }",
+    "(1).GetType().Name",
+    "[type]::GetType('System.String').Name",
+    "$g=[pscustomobject]@{Members=@('a','b')}; $i=1; $g.Members[$i]",
+    "$o=[pscustomobject]@{a=1}; $o.PSObject.Members['a'].Value",
+    "[string].GetMethod('Concat', [type[]]@([string],[string])).Invoke($null, @('a','b'))",
+    "$s='abc'; $m='ToUpper'; $s.$m()",
+    "[IO.File].GetMethod('Create', [type[]]@([string])).Name",
+    "$o=Get-Item .; $o.PSObject.Methods['ToString'].Invoke()",
+    "$t=[Text.StringBuilder]; $a='x'; $t::new($a).ToString()",
+    "$h=@{a=1}; $k='a'; $h.$k",
+    "[Activator]::CreateInstance([Text.StringBuilder], @('x')).ToString()",
+    "[Text.StringBuilder].GetConstructor([type[]]@([string])).Invoke(@('x')).ToString()",
+    "$o=[pscustomobject]@{a=1}; $o.PSObject.Methods.Item('ToString').Invoke()",
+    "$b='x'; $c='y'; Write-Output a.$b($c)",
+    "$g=[pscustomobject]@{Members=@('a','b')}; $g.Members | % { $_ }",
+    "[Activator]::CreateInstance([Text.StringBuilder]).Append('x').ToString()",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base

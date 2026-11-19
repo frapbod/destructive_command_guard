@@ -13235,8 +13235,10 @@ fn powershell_engine_sink_for_name(name: Option<&str>) -> Option<PowerShellEngin
 }
 
 /// Judge the first argument of an engine member: a static value is the
-/// source it runs; any other value cannot be verified, except for a member
-/// whose name is not static, which is mostly an ordinary method.
+/// source it runs, and any other value cannot be verified. That includes a
+/// member whose name is not static: a run-time string can name any engine
+/// method (`$m = 'InvokeScript'; $ic.$m($a)`), and dcg cannot read the
+/// argument it would run.
 fn push_powershell_engine_sink(
     sinks: &mut Vec<ExecutableTextSink>,
     sink: PowerShellEngineSink,
@@ -13272,8 +13274,7 @@ fn push_powershell_engine_sink(
             source,
             "a PowerShell method dcg cannot name may execute its string argument",
         ),
-        (Err(()), PowerShellEngineSink::AnyMethod) => return,
-        (Err(()), PowerShellEngineSink::Script | PowerShellEngineSink::Expand) => {
+        (Err(()), _) => {
             unverified(sinks);
             return;
         }
@@ -13284,6 +13285,276 @@ fn push_powershell_engine_sink(
         context,
         nonlocal_filesystem: false,
     });
+}
+
+/// How a .NET reflection or PowerShell member-table member reaches another
+/// member: by a string, by listing them, or as a constructor. Each can hand
+/// back an engine method ([`POWERSHELL_ENGINE_SCRIPT_METHODS`],
+/// [`POWERSHELL_TYPED_SCRIPT_METHODS`]) as an object whose arguments are
+/// given where dcg cannot follow them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PowerShellReflection {
+    /// `GetMethod('InvokeScript', …)`, `GetMember('Cre*')`,
+    /// `InvokeMember('Create', …)`, `GetRuntimeMethod`, `GetDeclaredMethod(s)`
+    /// and `[Delegate]::CreateDelegate(…, 'InvokeScript')`: a member by name.
+    Lookup,
+    /// `GetMethods()`, `GetMembers()`, `GetRuntimeMethods()`,
+    /// `DeclaredMethods`, `DeclaredMembers`: every member, picked by a filter
+    /// or a position dcg does not read.
+    Listing,
+    /// `.Methods` and `.Members` of a PSObject: by index or `Item` with a
+    /// name, by `Match` with a wildcard pattern, or listed.
+    MemberTable,
+    /// `GetConstructor(…)`, `GetConstructors()` and `CreateInstance(type, …)`
+    /// build the script `Command` type ([`POWERSHELL_SCRIPT_COMMAND_TYPE`]).
+    Constructor,
+    /// `GetType(name)` on an assembly or `[type]`: a type by name, which may
+    /// be an engine type or the type alias table
+    /// ([`powershell_type_aliases_possible`]).
+    TypeByName,
+}
+
+/// The reflection and member-table members dcg reads, by name.
+const POWERSHELL_REFLECTION_MEMBERS: [(&str, PowerShellReflection); 17] = [
+    ("getmethod", PowerShellReflection::Lookup),
+    ("getmember", PowerShellReflection::Lookup),
+    ("getruntimemethod", PowerShellReflection::Lookup),
+    ("getdeclaredmethod", PowerShellReflection::Lookup),
+    ("getdeclaredmethods", PowerShellReflection::Lookup),
+    ("invokemember", PowerShellReflection::Lookup),
+    ("createdelegate", PowerShellReflection::Lookup),
+    ("getmethods", PowerShellReflection::Listing),
+    ("getmembers", PowerShellReflection::Listing),
+    ("getruntimemethods", PowerShellReflection::Listing),
+    ("declaredmethods", PowerShellReflection::Listing),
+    ("declaredmembers", PowerShellReflection::Listing),
+    ("methods", PowerShellReflection::MemberTable),
+    ("members", PowerShellReflection::MemberTable),
+    ("getconstructor", PowerShellReflection::Constructor),
+    ("getconstructors", PowerShellReflection::Constructor),
+    ("createinstance", PowerShellReflection::Constructor),
+];
+
+/// `GetType` with a name argument ([`PowerShellReflection::TypeByName`]).
+const POWERSHELL_GET_TYPE_METHOD: &str = "gettype";
+
+/// The reflection member a static member name selects, if any.
+fn powershell_reflection_kind(name: &str) -> Option<PowerShellReflection> {
+    if name.eq_ignore_ascii_case(POWERSHELL_GET_TYPE_METHOD) {
+        return Some(PowerShellReflection::TypeByName);
+    }
+    POWERSHELL_REFLECTION_MEMBERS
+        .iter()
+        .find(|(member, _)| name.eq_ignore_ascii_case(member))
+        .map(|(_, kind)| *kind)
+}
+
+/// One member access the engine-method walker reads: the static member
+/// name, the `.` or `::` at `dot`, the byte after the member's spelling,
+/// whether the member follows `.PSObject`, and whether the command may
+/// rename types ([`powershell_type_aliases_possible`]).
+struct PowerShellMemberAccess<'a> {
+    name: &'a str,
+    dot: usize,
+    is_static: bool,
+    after_name: usize,
+    after_psobject: bool,
+    aliases: bool,
+}
+
+/// Whether a command may add a type alias through
+/// `System.Management.Automation.TypeAccelerators` (`::Add('sb',
+/// [scriptblock])`), after which `[sb]` names the ScriptBlock type. The table
+/// is an internal type, reached only by its name, so a command that does not
+/// spell it can add an alias only through a type name dcg cannot read, which
+/// is not verified ([`PowerShellReflection::TypeByName`]).
+fn powershell_type_aliases_possible(command: &str) -> bool {
+    const TABLE: &[u8] = b"accelerators";
+    command
+        .as_bytes()
+        .windows(TABLE.len())
+        .any(|window| window.eq_ignore_ascii_case(TABLE))
+}
+
+/// The type a static type literal names before `dot`, or `None` when it is
+/// not a static name or the command may rename types.
+fn powershell_static_type_before(command: &str, dot: usize, aliases: bool) -> Option<&str> {
+    if aliases {
+        None
+    } else {
+        powershell_type_literal_before(command, dot)
+    }
+}
+
+/// Whether a member name or wildcard pattern reached by a string may name an
+/// engine method. `Create` counts unless the type that holds it is named and
+/// is not ScriptBlock.
+fn powershell_lookup_name_runs_script(name: &str, create: bool) -> bool {
+    let create = create
+        && if name.contains(['*', '?', '[']) {
+            powershell_wildcard_matches(name, POWERSHELL_SCRIPTBLOCK_CREATE).unwrap_or(true)
+        } else {
+            name.eq_ignore_ascii_case(POWERSHELL_SCRIPTBLOCK_CREATE)
+        };
+    create || powershell_member_pattern_sink(Some(name)).is_some()
+}
+
+/// `[scriptblock]::Create` ([`POWERSHELL_TYPED_SCRIPT_METHODS`]).
+const POWERSHELL_SCRIPTBLOCK_CREATE: &str = "create";
+
+/// The top-level arguments of the call whose `(` is at `open`, or `None`
+/// when the call is not balanced (a parse error: PowerShell runs nothing).
+fn powershell_call_arguments(command: &str, open: usize) -> Option<Vec<&str>> {
+    let close = find_powershell_subexpression_close(command, open + 1).ok()?;
+    let mut arguments = Vec::new();
+    let mut rest = Some(&command[open + 1..close]);
+    while let Some(text) = rest {
+        let (argument, after) = powershell_first_method_argument(text);
+        if !(after.is_none() && arguments.is_empty() && argument.trim().is_empty()) {
+            arguments.push(argument);
+        }
+        rest = after;
+    }
+    Some(arguments)
+}
+
+/// Why a reflection or member-table access cannot be verified, or `None`
+/// when it reaches no engine method. A static name that may name one, a name
+/// that is not static, a listing, and a constructor of a type that may be
+/// the script `Command` type all hand back a method whose arguments dcg
+/// cannot follow. A member table read by a name that is not static, or
+/// listed, counts only on `.PSObject` (`.Members` is also an ordinary
+/// property). A lookup by a static name that is no engine method
+/// (`GetMethod('ToString')`) and `GetType` with a static name are left alone.
+fn powershell_reflection_reason(
+    command: &str,
+    access: &PowerShellMemberAccess,
+    kind: PowerShellReflection,
+    long_spellings: &mut usize,
+) -> Option<&'static str> {
+    const BY_NAME: &str = "a PowerShell method that runs script text may be reached by name through reflection or a member table, where dcg cannot follow its arguments";
+    const NAME_NOT_STATIC: &str = "a PowerShell member is reached through reflection or a member table by a name dcg cannot read";
+    const LISTED: &str = "PowerShell members are listed through reflection or a member table, where dcg cannot follow which one runs";
+    const CONSTRUCTOR: &str = "a PowerShell script command may be built through reflection, where dcg cannot follow its arguments";
+    let bytes = command.as_bytes();
+    let after_name = access.after_name;
+    let called = bytes.get(after_name) == Some(&b'(');
+    // `Create` is reached on the type before the `.`; a named type other
+    // than ScriptBlock does not have it. A static helper (`::CreateDelegate`,
+    // `::GetRuntimeMethod`) takes the type as an argument.
+    let create = access.is_static
+        || powershell_typed_method_sink(
+            powershell_static_type_before(command, access.dot, access.aliases),
+            POWERSHELL_SCRIPTBLOCK_TYPE,
+        )
+        .is_some();
+    let by_name = |name: Result<String, ()>| match name {
+        Ok(name) => powershell_lookup_name_runs_script(&name, create).then_some(BY_NAME),
+        Err(()) => Some(NAME_NOT_STATIC),
+    };
+    match kind {
+        PowerShellReflection::Lookup => {
+            if !called {
+                return None;
+            }
+            let arguments = powershell_call_arguments(command, after_name)?;
+            // Any static argument may be the name (`CreateDelegate` takes
+            // it third, a static helper second); the name's own position
+            // must be static.
+            let name_position = if access.name.eq_ignore_ascii_case("createdelegate") {
+                2
+            } else {
+                usize::from(access.is_static)
+            };
+            for (position, argument) in arguments.iter().enumerate() {
+                let name = parse_static_powershell_source(argument);
+                if name.is_ok() || position == name_position {
+                    if let Some(reason) = by_name(name) {
+                        return Some(reason);
+                    }
+                }
+            }
+            None
+        }
+        PowerShellReflection::Listing => Some(LISTED),
+        PowerShellReflection::MemberTable => {
+            let only_psobject = |reason| access.after_psobject.then_some(reason);
+            match bytes.get(after_name) {
+                // `.Methods['InvokeScript']`: the index names the member.
+                Some(b'[') => {
+                    let start = powershell_blank_end(command, after_name + 1);
+                    let name = powershell_member_name_spelling(command, start, command.len())
+                        .filter(|(_, end)| {
+                            bytes.get(powershell_blank_end(command, *end)) == Some(&b']')
+                        })
+                        .and_then(|(name, _)| name)
+                        .ok_or(());
+                    match by_name(name) {
+                        Some(NAME_NOT_STATIC) => only_psobject(NAME_NOT_STATIC),
+                        reason => reason,
+                    }
+                }
+                // `.Methods.Item('InvokeScript')`, `.Members.Match('Invoke*')`.
+                Some(b'.') => {
+                    let Some((Some(next), after_next)) =
+                        powershell_member_name_after_dot(command, after_name + 1, long_spellings)
+                    else {
+                        return only_psobject(LISTED);
+                    };
+                    let lookup = ["item", "match"]
+                        .iter()
+                        .any(|member| next.eq_ignore_ascii_case(member));
+                    if !lookup || bytes.get(after_next) != Some(&b'(') {
+                        return only_psobject(LISTED);
+                    }
+                    let arguments = powershell_call_arguments(command, after_next)?;
+                    match by_name(
+                        arguments
+                            .first()
+                            .map_or(Err(()), |name| parse_static_powershell_source(name)),
+                    ) {
+                        Some(NAME_NOT_STATIC) => only_psobject(NAME_NOT_STATIC),
+                        reason => reason,
+                    }
+                }
+                _ => only_psobject(LISTED),
+            }
+        }
+        PowerShellReflection::Constructor => {
+            if access.name.eq_ignore_ascii_case("createinstance") {
+                // `CreateInstance(type, args…)`: a type alone runs the
+                // constructor without arguments, which holds no script.
+                let arguments = called
+                    .then(|| powershell_call_arguments(command, after_name))
+                    .flatten()?;
+                let [type_argument, _, ..] = arguments.as_slice() else {
+                    return None;
+                };
+                // A type literal or a static type name string.
+                let type_name = parse_static_powershell_source(type_argument)
+                    .unwrap_or_else(|()| type_argument.trim().to_string());
+                let type_name = (!access.aliases).then_some(type_name.as_str());
+                powershell_typed_method_sink(type_name, POWERSHELL_SCRIPT_COMMAND_TYPE)
+                    .map(|_| CONSTRUCTOR)
+            } else {
+                powershell_typed_method_sink(
+                    powershell_static_type_before(command, access.dot, access.aliases),
+                    POWERSHELL_SCRIPT_COMMAND_TYPE,
+                )
+                .map(|_| CONSTRUCTOR)
+            }
+        }
+        PowerShellReflection::TypeByName => {
+            if !called {
+                return None;
+            }
+            let arguments = powershell_call_arguments(command, after_name)?;
+            let name = arguments.first()?;
+            parse_static_powershell_source(name)
+                .is_err()
+                .then_some(NAME_NOT_STATIC)
+        }
+    }
 }
 
 /// Whether `rest` starts with a call of `method` (`.invoke(`), ignoring case.
@@ -13303,10 +13574,15 @@ fn powershell_method_invocation(rest: &str, method: &str) -> bool {
 /// argument, or a reference to the method that is not a call here
 /// (`$m = $ic.InvokeScript; $m.Invoke(…)`), cannot be verified. A member
 /// whose name is not static (`$ic.$n(…)`) may be one of them: a static
-/// string argument is judged as source, and anything else is left alone.
+/// string argument is judged as source, and any other argument cannot be
+/// verified. A member reached through reflection or a member table
+/// ([`powershell_reflection_reason`]) is judged there.
 fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     let mut examined = 0usize;
     let mut long_spellings = 0usize;
+    let aliases = powershell_type_aliases_possible(command);
+    // Where the last `.PSObject` member spelling ended.
+    let mut psobject_end = None;
     // Instance (`.`) and static (`::`) member access, each searched once.
     let mut next_dot = find_powershell_code_marker(command, ".", 0);
     let mut next_static = find_powershell_code_marker(command, "::", 0);
@@ -13333,6 +13609,44 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
         let Some((name, mut after_name)) = member else {
             continue;
         };
+        let after_psobject = psobject_end == Some(dot);
+        psobject_end = name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("psobject"))
+            .then_some(after_name);
+        if let Some((kind, member)) = name
+            .as_deref()
+            .and_then(|member| Some((powershell_reflection_kind(member)?, member)))
+        {
+            // Each access reads at most one argument list or name; the bound
+            // keeps repeated ones from rescanning the command without limit.
+            // `GetType()` reads nothing.
+            examined += usize::from(!command[after_name..].starts_with("()"));
+            if examined > MAX_POWERSHELL_ENGINE_SCRIPT_CALLS {
+                sinks.push(ExecutableTextSink::Unverified {
+                    rule: SINK_ANALYSIS_BOUNDS_RULE,
+                    reason: "command contains too many executable text sinks for bounded analysis",
+                });
+                return;
+            }
+            let access = PowerShellMemberAccess {
+                name: member,
+                dot,
+                is_static,
+                after_name,
+                after_psobject,
+                aliases,
+            };
+            if let Some(reason) =
+                powershell_reflection_reason(command, &access, kind, &mut long_spellings)
+            {
+                sinks.push(ExecutableTextSink::Unverified {
+                    rule: POWERSHELL_ENGINE_SCRIPT_RULE,
+                    reason,
+                });
+            }
+            continue;
+        }
         let intrinsic_foreach = !is_static
             && name
                 .as_deref()
@@ -13347,7 +13661,7 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
                 .map(|(_, script_type)| *script_type)
         });
         let constructor = script_type == Some(POWERSHELL_SCRIPT_COMMAND_TYPE);
-        let type_before = || powershell_type_literal_before(command, dot);
+        let type_before = || powershell_static_type_before(command, dot, aliases);
         let sink = if let Some(script_type) = script_type {
             powershell_typed_method_sink(type_before(), script_type)
         } else if is_static
@@ -13454,7 +13768,15 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
             sink = member_sink;
             argument = powershell_first_method_argument(arguments).0;
         }
-        push_powershell_engine_sink(sinks, sink, parse_static_powershell_source(argument));
+        let source = parse_static_powershell_source(argument);
+        // Bareword text (`Write-Output a.$n($b)`) calls no method.
+        if sink == PowerShellEngineSink::AnyMethod
+            && source.is_err()
+            && !powershell_dot_follows_expression(command, dot)
+        {
+            continue;
+        }
+        push_powershell_engine_sink(sinks, sink, source);
     }
 }
 
@@ -13997,6 +14319,7 @@ fn powershell_member_pattern_sink(name: Option<&str>) -> Option<PowerShellEngine
 /// target are skipped; a splat (`@p`) binds parameters dcg cannot see, so it
 /// fails closed too.
 fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    let aliases = powershell_type_aliases_possible(command);
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
     // Where statements may end, in order; a `(` or `)` token opens or closes
     // a group instead.
@@ -14062,6 +14385,24 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
         if !(call_operator
             || (!raw_command.starts_with(['\'', '"']) && command_position(token_index)))
         {
+            continue;
+        }
+        // Where a statement starts, `foreach` is the loop keyword
+        // (`foreach ($x in $y) { … }`); only after `|` or a call operator is
+        // it ForEach-Object.
+        let after_pipe = tokens[..token_index]
+            .iter()
+            .rev()
+            .find(|token| {
+                token
+                    .text(command)
+                    .is_some_and(|text| !text.trim().is_empty())
+            })
+            .is_some_and(|token| {
+                token.kind == NormalizeTokenKind::Separator
+                    && token.text(command).is_some_and(|text| text.trim() == "|")
+            });
+        if powershell_word_equals(raw_command, "foreach") && !(call_operator || after_pipe) {
             continue;
         }
         if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
@@ -14318,9 +14659,10 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                 powershell_member_pattern_sink(name.as_deref())
             }
             // A type name that is not static may be that type.
-            PowerShellMemberCmdlet::NewObject => {
-                powershell_typed_method_sink(name.as_deref(), POWERSHELL_SCRIPT_COMMAND_TYPE)
-            }
+            PowerShellMemberCmdlet::NewObject => powershell_typed_method_sink(
+                name.as_deref().filter(|_| !aliases),
+                POWERSHELL_SCRIPT_COMMAND_TYPE,
+            ),
         };
         let Some(sink) = sink else {
             continue;
@@ -68643,7 +68985,12 @@ mod tests {
             ("$x.$n('a')", vec!["a"]),
             ("$x.${n}.Invoke('a')", vec!["a"]),
             ("$x.$('n')('a')", vec!["a"]),
-            ("$x.$n($y)", vec![]),
+            // A name that is not static with a source that is not static may
+            // run it (card t_4d2ad884); text and a call without an argument
+            // do not.
+            ("$x.$n($y)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            ("$x.$n()", vec![]),
+            ("Write-Output a.$n($y)", vec![]),
             ("$x.$p", vec![]),
             ("@($x).ForEach('InvokeScript', 'a', 'b')", vec!["a"]),
             ("@($x).ForEach({ $_ })", vec![]),
@@ -68658,7 +69005,7 @@ mod tests {
             ("[a.Runspaces.Command]::new('a')", vec![]),
             ("[Text.StringBuilder]::new('a', 1)", vec![]),
             ("$t::new('a', 1)", vec!["a"]),
-            ("$t::new($a, 1)", vec![]),
+            ("$t::new($a, 1)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
             ("[a.Command, a.b]::new('a', $true)", vec!["a"]),
             ("[Command]::new.Invoke(@('a', $true))", vec!["a"]),
             ("[Command]::new.Invoke(('a', $true))", vec!["a"]),
@@ -68674,7 +69021,7 @@ mod tests {
             ("[Command]::new.Invoke('a')", vec![]),
             ("[Command]::new($a)", vec![]),
             ("[Command]::new(@('a', $true))", vec![]),
-            ("$t::new.Invoke($a)", vec![]),
+            ("$t::new.Invoke($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
             ("[Text.StringBuilder]::new.Invoke($a)", vec![]),
             (
                 "[a.Parser]::ParseInput('a', [ref]$null, [ref]$null)",
@@ -68693,11 +69040,11 @@ mod tests {
             ("[scriptblock]::{Create}('a')", vec!["a"]),
             ("[a.ScriptBlock, a.b]::Create.Invoke('a')", vec!["a"]),
             ("$t::Create('a')", vec!["a"]),
-            ("$t::Create($a)", vec![]),
+            ("$t::Create($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
             ("[scriptblock]::$n('a')", vec!["a"]),
             ("[scriptblock]::$n($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
             ("$f = $t::Create", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
-            ("[IO.File]::$n($a)", vec![]),
+            ("[IO.File]::$n($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
             (
                 "[scriptblock]::Create($a)",
                 vec![POWERSHELL_ENGINE_SCRIPT_RULE],
@@ -68733,8 +69080,8 @@ mod tests {
                 "$x.@('InvokeScript')($a)",
                 vec![POWERSHELL_ENGINE_SCRIPT_RULE],
             ),
-            ("$x.@\"\n$n\n\"@($a)", vec![]),
-            ("$x.@('a', 'b')($a)", vec![]),
+            ("$x.@\"\n$n\n\"@($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            ("$x.@('a', 'b')($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
             ("$x.@'\n\nInvokeScript\n'@('a')", vec![]),
             ("$x.@'\nInvokeScript'@('a')", vec![]),
             ("$x.@{}('a')", vec![]),
@@ -68751,8 +69098,11 @@ mod tests {
             ("([IO.File])::Create($a)", vec![]),
             ("([IO.File])::Create('a')", vec![]),
             ("([t]$n)::Create('a')", vec!["a"]),
-            ("([t]$n)::Create($a)", vec![]),
-            ("([scriptblock] + [x])::Create($a)", vec![]),
+            ("([t]$n)::Create($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            (
+                "([scriptblock] + [x])::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
             ("$a[0]::Create('a')", vec!["a"]),
             ("$a[0]::new('a', 1)", vec!["a"]),
             // Only `Create` taken as a value on a type dcg cannot name may
@@ -68834,6 +69184,124 @@ mod tests {
                 "(".repeat(100_000),
                 ")".repeat(100_000)
             ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let input_started = std::time::Instant::now();
+            let _ = sources(command);
+            timings.push((index, input_started.elapsed()));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}: {timings:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Script methods reached through reflection, a PSObject member table or
+    /// a type alias (card t_4d2ad884): a lookup whose name may be one, by any
+    /// spelling or a wildcard, or is not static, a listing, and a reflected
+    /// `Command` constructor are not verified; other names are left alone.
+    #[test]
+    fn engine_script_sinks_read_reflection_and_type_aliases() {
+        let sources = |command: &str| {
+            let mut sinks = Vec::new();
+            collect_powershell_engine_script_sinks(command, &mut sinks);
+            collect_powershell_member_cmdlet_sinks(command, &mut sinks);
+            sinks
+                .into_iter()
+                .map(|sink| match sink {
+                    ExecutableTextSink::Payload { source, .. } => source,
+                    ExecutableTextSink::Unverified { rule, .. } => rule.to_string(),
+                    _ => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let rule = POWERSHELL_ENGINE_SCRIPT_RULE;
+        for (command, expected) in [
+            ("[scriptblock].GetMethod('Create')", vec![rule]),
+            ("[scriptblock].'GetMethod'(\"Cre\" + 'ate', $t)", vec![rule]),
+            ("$t.GetMember('Cre*')", vec![rule]),
+            (
+                "$t.InvokeMember('Create', 'InvokeMethod', $null, $null, $a)",
+                vec![rule],
+            ),
+            ("$x.GetType().GetMethod('InvokeScript', $t)", vec![rule]),
+            (
+                "[a.TypeExtensions]::GetMethod([scriptblock], 'Create')",
+                vec![rule],
+            ),
+            (
+                "[Delegate]::CreateDelegate($t, $x, 'InvokeScript')",
+                vec![rule],
+            ),
+            ("[Delegate]::CreateDelegate($t, $x, $n)", vec![rule]),
+            ("[scriptblock].GetMethod($n)", vec![rule]),
+            ("[scriptblock].GetMethods()", vec![rule]),
+            ("[IO.File].GetMethod('Create')", vec![]),
+            ("[string].GetMethod('Concat', $t)", vec![]),
+            ("$x.GetType().GetMethod('ToString')", vec![]),
+            ("$x.PSObject.Methods['InvokeScript']", vec![rule]),
+            ("$x.PSObject.Methods[('Invoke' + 'Script')]", vec![rule]),
+            ("$p.Methods['InvokeScript']", vec![rule]),
+            ("$x.PSObject.Members.Item('InvokeScript')", vec![rule]),
+            ("$x.PSObject.Members.Match('InvokeS*')", vec![rule]),
+            ("$x.PSObject.Methods[$n]", vec![rule]),
+            ("$x.PSObject.Methods | ? Name -eq a", vec![rule]),
+            ("$x.PSObject.Methods['ToString']", vec![]),
+            ("$x.PSObject.Members.Item('a')", vec![]),
+            ("$x.PSObject.Properties[$n]", vec![]),
+            ("$g.Members[$i]", vec![]),
+            ("$g.Members | % { $_ }", vec![]),
+            ("[a.Runspaces.Command].GetConstructor($t)", vec![rule]),
+            ("$t.GetConstructors()", vec![rule]),
+            ("[Text.StringBuilder].GetConstructor($t)", vec![]),
+            (
+                "[Activator]::CreateInstance([a.Runspaces.Command], $a)",
+                vec![rule],
+            ),
+            (
+                "[Activator]::CreateInstance('a.Runspaces.Command', $a)",
+                vec![rule],
+            ),
+            ("[Activator]::CreateInstance($t, $a)", vec![rule]),
+            (
+                "[Activator]::CreateInstance([Text.StringBuilder], $a)",
+                vec![],
+            ),
+            ("[Activator]::CreateInstance($t)", vec![]),
+            ("$a.GetType($n)", vec![rule]),
+            ("[type]::GetType('System.String')", vec![]),
+            ("$x.GetType()", vec![]),
+            // An alias table in the command makes every named type a type
+            // dcg cannot name.
+            (
+                "$x::Add('sb', [scriptblock]); [sb]::Create('a')  # Accelerators",
+                vec!["a"],
+            ),
+            (
+                "$x::Add('sb', [scriptblock]); [sb]::Create($a)  # accelerators",
+                vec![rule],
+            ),
+            (
+                "$x::Add('c', $t)  # accelerators\nNew-Object c 'a', $true",
+                vec!["a"],
+            ),
+            ("[sb]::Create('a')", vec![]),
+            ("New-Object c 'a', $true", vec![]),
+        ] {
+            assert_eq!(sources(command), expected, "{command:?}");
+        }
+        let started = std::time::Instant::now();
+        let mut timings = Vec::new();
+        for (index, command) in [
+            "$x.GetMethod($n".repeat(20_000),
+            "$x.PSObject.Methods['".repeat(20_000),
+            "$x.Methods.Item(".repeat(20_000),
+            format!("{}a{}", "$x.GetMethod(".repeat(20_000), ")".repeat(20_000)),
+            "$x.GetType()".repeat(50_000),
+            "accelerator".repeat(50_000),
         ]
         .iter()
         .enumerate()
@@ -69028,6 +69496,20 @@ mod tests {
                 "foreach ($x in $y) { Write-Output $x -NoEnumerate }",
                 vec![],
             ),
+            // `foreach` is ForEach-Object only after `|` or a call operator;
+            // a name and an argument that are not static may run script
+            // (card t_4d2ad884).
+            ("$r = foreach ($i in $y) { $i }", vec![]),
+            ("foreach InvokeScript 'a'", vec![]),
+            ("$x | foreach InvokeScript 'a'", vec!["a"]),
+            ("& foreach InvokeScript 'a'", vec!["a"]),
+            ("$x | % $m $a", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            ("$x | foreach $m $a", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            (
+                "New-Object $t $a, $true",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("$x | % $m", vec![]),
             // A parameter the cmdlet does not have, or a prefix of parameters
             // that bind in different ways (`-A`: -ArgumentList or -AsJob).
             (
