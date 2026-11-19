@@ -4760,9 +4760,11 @@ fn powershell_quoted_end(bytes: &[u8], i: usize, end: usize) -> usize {
     end
 }
 
-/// Read PowerShell comments and smart quotes in a separate deny-only view.
-/// Masked comments preserve line ends; block-comment line ends are spaces.
-/// Smart quotes use their ASCII spelling so the existing readers see them.
+/// Read PowerShell comments, smart quotes and braced variable names in a
+/// separate deny-only view. Masked comments preserve line ends; block-comment
+/// line ends are spaces. Smart quotes use their ASCII spelling so the existing
+/// readers see them. A braced variable name that is not a plain name is
+/// spelled `_` (see [`mask_powershell_braced_variable_name`]).
 pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
     let has_smart_quotes = command
         .chars()
@@ -4859,8 +4861,10 @@ fn tokenize_powershell_with_comments(
         let start = i;
         i = if literal_mode {
             consume_powershell_literal_word(bytes, i, len)
+        } else if read_comments {
+            consume_powershell_word(bytes, i, len, Some(&mut masked))
         } else {
-            consume_powershell_word(bytes, i, len, read_comments)
+            consume_powershell_word(bytes, i, len, None)
         };
 
         if start == i {
@@ -5220,7 +5224,17 @@ fn powershell_block_comment_starts_after(bytes: &[u8], i: usize) -> bool {
         && powershell_comment_predecessor_role(bytes, i) != PowerShellHashRole::Literal
 }
 
-fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments: bool) -> usize {
+/// One word of the PowerShell reading. With `masked` (the comment-reading
+/// view), a braced variable name is read through its closing `}` and, unless
+/// it is a plain name, spelled as `_` in that view (see
+/// [`mask_powershell_braced_variable_name`]).
+fn consume_powershell_word(
+    bytes: &[u8],
+    mut i: usize,
+    len: usize,
+    mut masked: Option<&mut Option<Vec<u8>>>,
+) -> usize {
+    let read_comments = masked.is_some();
     let mut quote = PowerShellQuote::Unquoted;
 
     while i < len {
@@ -5239,18 +5253,8 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments
                 }
                 match byte {
                     b'`' => i = consume_shell_escape(bytes, i, len),
-                    b'$' if read_comments && bytes.get(i + 1) == Some(&b'{') => {
-                        // Braced variable names may contain spaces and `#`.
-                        // Neither starts a comment until the closing brace.
-                        i += 2;
-                        while i < len && bytes[i] != b'}' {
-                            i = if bytes[i] == b'`' {
-                                consume_shell_escape(bytes, i, len)
-                            } else {
-                                i + 1
-                            };
-                        }
-                        i = (i + 1).min(len);
+                    b'$' if let Some(masked) = masked.as_deref_mut() => {
+                        i = mask_powershell_braced_variable_name(bytes, i, len, masked);
                     }
                     b'@' => {
                         i = consume_powershell_here_string(bytes, i, len).unwrap_or(i + 1);
@@ -5284,12 +5288,58 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments
                     quote = PowerShellQuote::Unquoted;
                     i += 1;
                 }
+                // An expandable string reads `${…}` the same way: its `"`
+                // does not end the string (`"${a"b}; …"` is one string).
+                b'$' if let Some(masked) = masked.as_deref_mut() => {
+                    i = mask_powershell_braced_variable_name(bytes, i, len, masked);
+                }
                 _ => i += 1,
             },
         }
     }
 
     i
+}
+
+/// Read the `$` at `i`: the position after the variable `$$`, after the
+/// braced variable `${…}` that starts there (through the `}` that closes it,
+/// or to `len` when none does), or after the `$` alone.
+///
+/// PowerShell reads a braced variable name as literal text up to the first
+/// `}` not escaped by a backtick: a quote, `#`, `;`, `(` or `$(` in it is part
+/// of the name (measured in pwsh 7.5: `${a'b} = 1; git reset --hard` and
+/// `"${a"b}"; git reset --hard` run `git reset --hard`, while
+/// `Write-Output ${a';git reset --hard'}` and `${a$(git reset --hard)b}` run
+/// nothing). dcg's PowerShell readers each walk quotes their own way and none
+/// of them knows this, so a quote in such a name opened a string that hid
+/// the rest of the command. In the comment-reading view every byte of a name
+/// that is not a plain name (letters, digits, `_` and `:`, as in
+/// `${env:Path}`) is spelled `_`: the length and every boundary outside the
+/// name stay, and the readers find the statements PowerShell finds. `$$` is a
+/// variable of its own, so `$${…}` is `$$` and a block, as
+/// `powershell_brace_opener` in the evaluator reads it.
+fn mask_powershell_braced_variable_name(
+    bytes: &[u8],
+    i: usize,
+    len: usize,
+    masked: &mut Option<Vec<u8>>,
+) -> usize {
+    match bytes.get(i + 1) {
+        Some(b'$') => return (i + 2).min(len),
+        Some(b'{') if i + 1 < len => {}
+        _ => return i + 1,
+    }
+    let Some(end) = braced_variable_end(bytes, i, len) else {
+        return len;
+    };
+    let name = i + 2..end - 1;
+    if !bytes[name.clone()]
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+    {
+        masked.get_or_insert_with(|| bytes.to_vec())[name].fill(b'_');
+    }
+    end
 }
 
 /// Consume a PowerShell single- or double-quoted here-string as one raw word.
