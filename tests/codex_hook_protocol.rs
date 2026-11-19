@@ -1302,6 +1302,32 @@ EOF
         "x=$(echo a b) xargs git reset --hard",
         "x=`echo a b` xargs git reset --hard",
         "x=$(echo a b) find . -exec git reset --hard \\;",
+        // Any subscript before `=`: bash reads an array assignment, even an
+        // empty or bad one, and runs the command. Quotes, `${…}`, `$(…)`
+        // and backticks can hide a `]`, and readers see quote-removed words.
+        "x[']']=a git reset --hard",
+        r#"x["]"]=a git reset --hard"#,
+        r"x[\]]=a git reset --hard",
+        r"x[$'\x5d']=a git reset --hard",
+        "x['[']=a git reset --hard",
+        r#"x["["]=a git reset --hard"#,
+        r"x[\[]=a git reset --hard",
+        "x[']]']=a git reset --hard",
+        "x[${y:-]}]=a git reset --hard",
+        "x[']']=a git push --force origin main",
+        "x[${y:-]}]=a xargs git reset --hard",
+        "x[$(echo ])]=a xargs git reset --hard",
+        "x[`echo ]`]=a xargs git reset --hard",
+        "x['']=a git reset --hard",
+        r#"x[""]=a git reset --hard"#,
+        "x[]=a git reset --hard",
+        "x['']=a git push --force origin main",
+        // A `$(…)` body inside double quotes, or inside `${…}`, is command
+        // text too: its `#` starts a comment.
+        "echo \"$(echo a #)\" '\n)\" ; git reset --hard #'",
+        "x=\"$(echo a #)\" '\n)\" git reset --hard #'",
+        "echo \"${y:-$(echo a #)}\" '\n)}\" ; git reset --hard #'",
+        "echo ${y:-$(echo a #)} '\n)} ; git reset --hard #'",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1324,6 +1350,15 @@ EOF
         "x=$(echo a b) find . -name '*.rs'",
         "find . -name '*.rs' | xargs grep -l foo",
         "x[i=1]=a git status",
+        "x[']']=a git status",
+        r#"x["]"]=a git status"#,
+        "x[$(echo 1)]=a git status",
+        "x[i=1]=a echo hi",
+        r#"x["a=b"]=a git status"#,
+        r#"echo "$(date)"; git status"#,
+        r#"echo "$(echo a) git reset --hard""#,
+        r#"echo "$(echo a # c
+)" done"#,
         "x=$(echo a \\\nb) git status",
         "echo $(echo a # c\n) done",
         "printf '%s\\n' $(ls) ; git status",

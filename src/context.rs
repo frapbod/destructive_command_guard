@@ -3128,11 +3128,11 @@ fn consume_word_token(
                         b'\\' => {
                             i = (i + 2).min(len);
                         }
+                        // The body is command text, as outside quotes:
+                        // `"$(echo a #)" '` LF `)"` is one string.
                         b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
                             has_inline_code = true;
-                            i += 1; // Skip past (
-                            // Note: we don't track nesting inside double quotes for simplicity
-                            // This is conservative (treats more as potentially dangerous)
+                            i = crate::normalize::consume_shell_paren_construct(bytes, i + 2, len);
                         }
                         b'`' => {
                             has_inline_code = true;
@@ -3202,89 +3202,6 @@ fn consume_word_token(
     }
 
     (i, has_inline_code)
-}
-
-#[must_use]
-fn consume_dollar_paren<T: AsRef<[u8]> + ?Sized>(command: &T, start: usize) -> usize {
-    consume_dollar_paren_recursive(command, start, 0)
-}
-
-fn consume_dollar_paren_recursive<T: AsRef<[u8]> + ?Sized>(
-    command: &T,
-    start: usize,
-    recursion_depth: usize,
-) -> usize {
-    let bytes: &[u8] = command.as_ref();
-    // Prevent stack overflow on pathological input
-    if recursion_depth > 500 {
-        return bytes.len(); // Fail safe: consume rest of command to ensure masking
-    }
-
-    let len = bytes.len();
-
-    debug_assert_eq!(bytes.get(start), Some(&b'$'));
-    debug_assert_eq!(bytes.get(start + 1), Some(&b'('));
-
-    let mut i = start + 2;
-    let mut depth: u32 = 1;
-
-    while i < len {
-        match bytes[i] {
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                if depth == 1 {
-                    // End of command substitution
-                    return i + 1;
-                }
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            b'\\' => {
-                i = (i + 2).min(len);
-            }
-            b'\'' => {
-                // Single quotes inside: consume until closing
-                i += 1;
-                while i < len && bytes[i] != b'\'' {
-                    i += 1;
-                }
-                if i < len {
-                    i += 1;
-                }
-            }
-            b'"' => {
-                // Double quotes inside: consume until closing, respecting escapes
-                i += 1;
-                while i < len {
-                    match bytes[i] {
-                        b'"' => {
-                            i += 1;
-                            break;
-                        }
-                        b'\\' => {
-                            i = (i + 2).min(len);
-                        }
-                        b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
-                            // Recursively consume nested command substitution inside double quotes
-                            // to ensure we don't treat its contents (like closing quotes) as ours.
-                            i = consume_dollar_paren_recursive(command, i, recursion_depth + 1);
-                        }
-                        _ => {
-                            i += 1;
-                        }
-                    }
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    len
 }
 
 #[must_use]
@@ -3436,7 +3353,7 @@ fn consume_braced_parameter_core_with(
                         b'\\' => i = (i + 2).min(len),
                         b'$' if bytes.get(i + 1) == Some(&b'(') => {
                             has_inline_code = true;
-                            i = consume_dollar_paren(command, i);
+                            i = crate::normalize::consume_shell_paren_construct(bytes, i + 2, len);
                         }
                         b'`' => {
                             has_inline_code = true;
@@ -3446,9 +3363,11 @@ fn consume_braced_parameter_core_with(
                     }
                 }
             }
+            // A `$(…)` body is command text: a `#` that starts a word there
+            // starts a comment, so a `}` or quote in it ends nothing.
             b'$' if bytes.get(i + 1) == Some(&b'(') => {
                 has_inline_code = true;
-                i = consume_dollar_paren(command, i);
+                i = crate::normalize::consume_shell_paren_construct(bytes, i + 2, len);
             }
             b'`' => {
                 has_inline_code = true;

@@ -670,8 +670,19 @@ pub(crate) fn find_posix_substitution_close(
     let mut depth = usize::from(delimiter == b')');
     let mut in_single = false;
     let mut in_double = false;
+    // A `$(…)` body is command text: a comment or a `case` pattern in it
+    // closes nothing (`x="$(echo a #)" '` LF `)" git reset --hard`).
+    let mut text = crate::normalize::CommandText::new(bytes, start);
 
     while index < bytes.len() {
+        if delimiter == b')'
+            && !in_single
+            && !in_double
+            && let crate::normalize::CommandTextStep::Continue(next) = text.step(bytes, index)
+        {
+            index = next;
+            continue;
+        }
         match bytes[index] {
             b'\\' if !in_single => index = index.saturating_add(2),
             b'\'' if !in_double => {

@@ -5324,55 +5324,30 @@ pub fn is_env_assignment(word: &str) -> bool {
     {
         return false;
     }
-    let mut i = 1 + bytes[1..]
+    let i = 1 + bytes[1..]
         .iter()
         .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
         .count();
-    // A subscript ends at the `]` that closes it, as bash's `skipsubscript`
-    // reads it: an `=` inside (`x[i=1]=a`, `x["a=b"]=a`) is not the one that
-    // assigns.
-    if bytes.get(i) == Some(&b'[') {
-        let Some(close) = subscript_end(bytes, i) else {
-            return false;
-        };
-        if close == i + 1 {
-            return false;
+    // A subscript before the `=` makes an array assignment, and bash reads
+    // it as one, then runs the command, even when the subscript is empty or
+    // bad (`x[]=a git …`, `x['']=a git …`). Callers pass raw words and
+    // quote-removed ones (`x[']']=a` becomes `x[]]=a`), and a subscript can
+    // hold quotes, `${…}`, `$(…)` and backticks that hide a `]`. So any `]`
+    // followed by `=` or `+=` counts: a word read as an assignment that is
+    // none (`x[a]]=b`) only makes the next word the command, which fails
+    // closed.
+    match bytes.get(i) {
+        Some(b'=') => true,
+        Some(b'+') => bytes.get(i + 1) == Some(&b'='),
+        Some(b'[') => {
+            let rest = &bytes[i + 1..];
+            memchr::memchr_iter(b']', rest).any(|at| {
+                let after = &rest[at + 1..];
+                after.starts_with(b"=") || after.starts_with(b"+=")
+            })
         }
-        i = close + 1;
+        _ => false,
     }
-    if bytes.get(i) == Some(&b'+') {
-        i += 1;
-    }
-    bytes.get(i) == Some(&b'=')
-}
-
-/// The index of the `]` that closes the subscript whose `[` is at `open`:
-/// brackets nest, and quotes and backslashes hide a `]`.
-fn subscript_end(bytes: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 1,
-            b'\'' => i += memchr::memchr(b'\'', &bytes[i + 1..])? + 1,
-            b'"' => {
-                i += 1;
-                while bytes.get(i)? != &b'"' {
-                    i += if bytes[i] == b'\\' { 2 } else { 1 };
-                }
-            }
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8148,7 +8123,6 @@ mod tests {
             "-FOO=value",
             "FOO-BAR=value",
             "FOO[=value",
-            "FOO[]=value",
             "FOO]x[0]=value",
         ] {
             assert!(
@@ -8753,7 +8727,7 @@ mod tests {
     }
 
     #[test]
-    fn env_assignments_end_their_subscript_at_its_closing_bracket() {
+    fn env_assignments_take_any_subscript_before_the_equals() {
         for word in [
             "x=1",
             "_x+=1",
@@ -8765,11 +8739,23 @@ mod tests {
             "x[i==1]=a",
             "x[a[1]]=b",
             "x[$(pwd)]=a",
+            // Quote-removed forms of `x[']']=a`, `x['[']=a` and `x['']=a`.
+            "x[]]=a",
+            "x[[]=a",
+            "x[]=a",
+            "x[]+=a",
+            "x[${y:-]}]=a",
+            "x[$(echo ])]=a",
+            "x[`echo ]`]=a",
+            "x[$'\\x5d']=a",
+            // No shell assigns here; reading one as an assignment fails closed.
+            "x[a]]=b",
+            "x[1][2]=a",
         ] {
             assert!(is_env_assignment(word), "{word:?}");
         }
         for word in [
-            "=a", "1x=a", "x", "x[]=a", "x[1]", "x[1]b=c", "x[a]]=b", "x[1=a", "x+1=a", "-x=1",
+            "=a", "1x=a", "x", "x[1]", "x[1]b=c", "x[1=a", "x+1=a", "-x=1", "x[1]+a=b", "x[",
         ] {
             assert!(!is_env_assignment(word), "{word:?}");
         }
