@@ -7307,6 +7307,176 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
         .map(BashHashReading::Spelled)
 }
 
+/// zsh's reading of its `=(…)` process substitutions, spelled as the
+/// `<(…)` form the shared readers know; `None` when there is none.
+///
+/// zsh (the macOS login shell, which Claude Code and Codex run commands in
+/// there) runs the body of `=(…)` and puts the name of a temporary file
+/// holding its output in its place, as `<(…)` puts a pipe's name. Bash,
+/// dash and the shared readers have no such form, so `echo =(git reset
+/// --hard)` was read as `echo` with a plain word, while zsh runs `git reset
+/// --hard` (Bash reports a syntax error and runs nothing). zsh reads `=(`
+/// this way where it starts a word (lex.c `gettokstr`, `intpos`) and where
+/// its expansion starts the text being expanded (subst.c, `Equals` before
+/// `Inpar`). Measured with `scripts/shell-truth` (zsh 5.9), zsh runs the
+/// body of a `=(` that comes:
+///
+/// - at the start of a word: after the start, a blank or newline, `;`,
+///   `&`, `|`, `(`, `)`, `<`, `>` or a backquote (`echo =(…)`, `=(…)`,
+///   `echo x;=(…)`, `cat <=(…)`, `echo 2>=(…)`, `cat <<<=(…)`,
+///   `echo $(=(…))`, `` echo `=(…)` ``, `echo =(…)x`);
+/// - right after an assignment's `=` (`X==(…)`, `X+==(…)`, `X[1]==(…)`,
+///   `local X==(…)`, `X=1 Y==(…) true`);
+/// - at the start of the word after a `${…}` operator: `-`, `:-`, `+`,
+///   `:+`, `=`, `:=`, `::=`, or a substitution's `/` (`${x:-=(…)}`,
+///   `${x==(…)}`, `${x/1/=(…)}`).
+///
+/// It does not run one inside a word (`echo a=(…)`, `echo ""=(…)`,
+/// `echo $x=(…)`), after `\=`, or in quotes. Spelled: such a `=` as `<`,
+/// or as `$` after a `<` or `>` (so `cat <=(…)` reads as `cat <$(…)`, not as
+/// the heredoc operator `<<`), so the shared readers judge the body and the
+/// text that follows the word, as they do for `<(…)`. Quotes are not read:
+/// a spelled `=` in quotes is only another quoted word, and the caller reads
+/// the spelling too, with deny winning, so the command as written still
+/// answers. The bodies of heredocs with a quoted delimiter are raw text and
+/// passed over (an interpreter that reads one as zsh text reads it through
+/// the caller again); zsh does run a `$(…)` in an unquoted body. A command
+/// whose lookups back from each `=(` would read more than 16 times its
+/// length (plus 4 KiB) is [`BashHashReading::Unread`].
+///
+/// Length preserving (one ASCII byte for another), so every range in the
+/// view is the same range in `command`.
+#[must_use]
+pub(crate) fn zsh_equals_process_substitutions(command: &str) -> Option<BashHashReading> {
+    let bytes = command.as_bytes();
+    memchr::memmem::find(bytes, b"=(")?;
+    let mut bodies = crate::context::undisputed_quoted_heredoc_body_ranges(command).into_iter();
+    let mut body = bodies.next();
+    let mut budget = 16 * bytes.len() + 4096;
+    let mut spelled: Option<Vec<u8>> = None;
+    for at in memchr::memmem::find_iter(bytes, b"=(") {
+        while body.as_ref().is_some_and(|body| body.end <= at) {
+            body = bodies.next();
+        }
+        if body.as_ref().is_some_and(|body| body.start <= at) {
+            continue;
+        }
+        match zsh_equals_substitution_starts(bytes, at, &mut budget) {
+            Some(true) => {
+                let spelling = if at > 0 && matches!(bytes[at - 1], b'<' | b'>') {
+                    b'$'
+                } else {
+                    b'<'
+                };
+                spelled.get_or_insert_with(|| bytes.to_vec())[at] = spelling;
+            }
+            Some(false) => {}
+            None => return Some(BashHashReading::Unread),
+        }
+    }
+    // Only an ASCII byte changed into another ASCII byte.
+    spelled
+        .and_then(|spelled| String::from_utf8(spelled).ok())
+        .map(BashHashReading::Spelled)
+}
+
+/// Whether zsh runs the `=(` at `at` as a process substitution (see
+/// [`zsh_equals_process_substitutions`]); `None` once `budget` bytes have
+/// been read back.
+fn zsh_equals_substitution_starts(bytes: &[u8], at: usize, budget: &mut usize) -> Option<bool> {
+    let word_start = |i: usize| {
+        i == 0
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'`'
+            )
+    };
+    if word_start(at) {
+        return Some(true);
+    }
+    let name_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // Reads back from `end` (exclusive) over an optional `[…]` subscript and
+    // a name; the index where the name starts, if there is one.
+    let name_start = |end: usize, budget: &mut usize| -> Option<Option<usize>> {
+        let mut i = end;
+        if i > 0 && bytes[i - 1] == b']' {
+            loop {
+                *budget = budget.checked_sub(1)?;
+                i -= 1;
+                if i == 0 {
+                    return Some(None);
+                }
+                if bytes[i - 1] == b'[' {
+                    i -= 1;
+                    break;
+                }
+            }
+        }
+        let name_end = i;
+        while i > 0 && name_byte(bytes[i - 1]) {
+            *budget = budget.checked_sub(1)?;
+            i -= 1;
+        }
+        Some((i < name_end).then_some(i))
+    };
+    let before = bytes[at - 1];
+    // An assignment's value: `NAME=`, `NAME+=` or `NAME[…]=` at a word start.
+    if before == b'=' {
+        let end = if at >= 2 && bytes[at - 2] == b'+' {
+            at - 2
+        } else {
+            at - 1
+        };
+        if let Some(start) = name_start(end, budget)?
+            && word_start(start)
+        {
+            return Some(true);
+        }
+    }
+    // The word after a `${NAME` operator.
+    let operator_starts = |end: usize| -> SmallVec<[usize; 3]> {
+        let mut starts = SmallVec::new();
+        let tail = &bytes[..end];
+        for operator in [&b"::="[..], b":-", b":+", b":=", b"-", b"+", b"="] {
+            if tail.ends_with(operator) {
+                starts.push(end - operator.len());
+            }
+        }
+        starts
+    };
+    if matches!(before, b'-' | b'+' | b'=') {
+        for start in operator_starts(at) {
+            if let Some(name) = name_start(start, budget)?
+                && name >= 2
+                && &bytes[name - 2..name] == b"${"
+            {
+                return Some(true);
+            }
+        }
+    }
+    // A substitution's replacement: `${NAME/pattern/` or `${NAME//pattern/`.
+    if before == b'/' {
+        let mut i = at - 1;
+        while i > 0 {
+            *budget = budget.checked_sub(1)?;
+            i -= 1;
+            match bytes[i] {
+                b'}' | b'\n' => break,
+                // The pattern ends at its first `/`.
+                b'/' => {
+                    let slash = if i > 0 && bytes[i - 1] == b'/' { i - 1 } else { i };
+                    let name = name_start(slash, budget)?;
+                    return Some(name.is_some_and(|name| {
+                        name >= 2 && &bytes[name - 2..name] == b"${"
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(false)
+}
+
 /// Bash 3.2's reading of the comments in `$((…))` bodies, and of the
 /// comments that only Bash 3.2 reads in `$(…)`, `<(…)` and `>(…)` bodies;
 /// `None` when there is none.
@@ -9901,6 +10071,74 @@ mod tests {
             Some(BashHashReading::Spelled(spelled)) => Some(spelled),
             Some(BashHashReading::Unread) => panic!("unread: {command:?}"),
         }
+    }
+
+    /// zsh runs a `=(…)` body where the `=` starts a word, an assignment
+    /// value or the word after a `${…}` operator (measured with
+    /// `scripts/shell-truth`, zsh 5.9); nowhere else.
+    #[test]
+    fn zsh_equals_process_substitutions_spell_the_bodies_zsh_runs() {
+        let spelled = |command: &str| match zsh_equals_process_substitutions(command) {
+            Some(BashHashReading::Spelled(spelled)) => Some(spelled),
+            Some(BashHashReading::Unread) => Some("<unread>".to_string()),
+            None => None,
+        };
+        for (command, want) in [
+            ("echo =(git x)", Some("echo <(git x)")),
+            ("=(git x)", Some("<(git x)")),
+            ("echo x;=(git x)", Some("echo x;<(git x)")),
+            ("echo x\t=(git x)y", Some("echo x\t<(git x)y")),
+            ("true&&=(git x)", Some("true&&<(git x)")),
+            ("echo x|=(git x)", Some("echo x|<(git x)")),
+            ("(=(git x))", Some("(<(git x))")),
+            ("echo $(=(git x))", Some("echo $(<(git x))")),
+            ("echo `=(git x)`", Some("echo `<(git x)`")),
+            ("cat <=(git x)", Some("cat <$(git x)")),
+            ("cat <<<=(git x)", Some("cat <<<$(git x)")),
+            ("echo 2>=(git x)", Some("echo 2>$(git x)")),
+            ("X==(git x)", Some("X=<(git x)")),
+            ("X+==(git x)", Some("X+=<(git x)")),
+            ("X[1]==(git x)", Some("X[1]=<(git x)")),
+            ("local X==(git x)", Some("local X=<(git x)")),
+            ("echo ${x:-=(git x)}", Some("echo ${x:-<(git x)}")),
+            ("echo ${x-=(git x)}", Some("echo ${x-<(git x)}")),
+            ("echo ${x:+=(git x)}", Some("echo ${x:+<(git x)}")),
+            ("echo ${x==(git x)}", Some("echo ${x=<(git x)}")),
+            ("echo ${x::==(git x)}", Some("echo ${x::=<(git x)}")),
+            ("echo ${x[1]:-=(git x)}", Some("echo ${x[1]:-<(git x)}")),
+            ("echo ${x/1/=(git x)}", Some("echo ${x/1/<(git x)}")),
+            ("echo ${x//a/=(git x)}", Some("echo ${x//a/<(git x)}")),
+            ("echo ${x/a/b/=(git x)}", None),
+            ("cmd /c echo =(true)$X", Some("cmd /c echo <(true)$X")),
+            // Inside a word, or after a `=` that is not an assignment's.
+            ("echo a=(git x)", None),
+            ("echo $x=(git x)", None),
+            ("echo ==(git x)", None),
+            ("echo -n=(git x)", None),
+            ("x=(a b)", None),
+            ("x+=(a b)", None),
+            ("echo ${x#=(git x)}", None),
+            ("echo $[1]=(git x)", None),
+            // A heredoc body with a quoted delimiter is raw text.
+            ("cat <<'EOF'\n=(git x)\nEOF", None),
+        ] {
+            assert_eq!(spelled(command).as_deref(), want, "{command:?}");
+        }
+    }
+
+    /// The lookups back from each `=(` stop at a budget.
+    #[test]
+    fn zsh_equals_process_substitutions_read_back_within_a_budget() {
+        let command = format!("X[{}", "]==(".repeat(20_000));
+        assert_eq!(
+            zsh_equals_process_substitutions(&command),
+            Some(BashHashReading::Unread)
+        );
+        let command = format!("echo ${{x/{}", "/=(".repeat(20_000));
+        assert!(matches!(
+            zsh_equals_process_substitutions(&command),
+            Some(BashHashReading::Spelled(_))
+        ));
     }
 
     /// Each `#` at a token start in an open paren or right after a `)` is

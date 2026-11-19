@@ -17962,11 +17962,13 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // a `{` after `$$`, a Bash 5.3 `${ …; }`, and a `'` in a double-quoted
     // `${…}`. The fifth is the same for the blanks Bash reads inside one
     // word in a `$[…]` or an assignment subscript (see
-    // `bash_bracket_words`). The last is the same for a comment that Bash
+    // `bash_bracket_words`). The sixth is the same for a comment that Bash
     // 3.2 reads in a `$((…))` body, or after an escaped blank in a `$(…)`
-    // body (see `bash32_comments`).
+    // body (see `bash32_comments`). The last is zsh's `=(…)` process
+    // substitution, which runs its body as `<(…)` does, spelled `<(…)` (see
+    // `zsh_equals_process_substitutions`).
     let mut bash_spelling: Option<String> = None;
-    for reading_kind in 0..6 {
+    for reading_kind in 0..7 {
         if result.decision != EvaluationDecision::Allow
             || result.bypass_method == Some(BypassMethod::AllowOnce)
             || !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
@@ -17983,7 +17985,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             2 => None,
             3 => crate::normalize::bash_parameter_openers(command),
             4 => crate::normalize::bash_bracket_words(command),
-            _ => crate::normalize::bash32_comments(command),
+            5 => crate::normalize::bash32_comments(command),
+            _ => crate::normalize::zsh_equals_process_substitutions(command),
         };
         let Some(reading) = reading else {
             continue;
