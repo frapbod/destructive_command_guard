@@ -3142,7 +3142,10 @@ pub(crate) fn powershell_word_is_quoted_marker(raw: &str) -> bool {
 /// and 7.5). So `cmd '--%' -x /c ver # & git status` hands cmd `/c ver # &
 /// git status`: `#` starts no comment and `&` separates nothing (measured
 /// with pwsh 7.5). The PowerShell tokenizer gives that parameter its own
-/// word, also when it is glued to the closing quote (`'--%'-x`).
+/// word, also when it is glued to the closing quote (`'--%'-x`). PowerShell
+/// makes this check only for a command argument; the evaluator also judges
+/// the line with the marker read as an expression
+/// ([`powershell_quoted_marker_expression_view`]).
 #[must_use]
 pub(crate) fn powershell_stop_parsing_words(words: &[&str], index: usize) -> usize {
     let Some(raw) = words.get(index) else {
@@ -4789,6 +4792,47 @@ fn tokenize_powershell_with_comments(
         String::from_utf8(bytes).expect("masking whole comment bytes preserves UTF-8")
     });
     (tokens, masked)
+}
+
+/// The command with the first quoted `'--%'` that the PowerShell tokenizer
+/// reads as the stop-parsing token (a parameter word follows it,
+/// [`powershell_stop_parsing_words`]) read as an ordinary string instead.
+///
+/// PowerShell's parser makes that check only for a command argument
+/// (`Parser.cs` `GetVerbatimCommandArgumentToken`, called from the
+/// command-argument loop). Where the string is an expression (a statement
+/// start, after `=`, inside `( )`, in an array or a method call), the word
+/// after it is an operator and the line goes on: `'--%' -f 1; git status`,
+/// `$a = '--%' -join ','; git status` and `if ('--%' -eq $x) { 1 }; git
+/// status` run git (measured with pwsh 7.5). The tokenizer cannot tell the
+/// two apart, so the evaluator judges both readings, deny wins. The `%` of
+/// the marker becomes `_`, so the view has the same length as `command` and
+/// spans still address it. A later quoted marker keeps its reading: the
+/// evaluator judges this view the same way, one marker at a time. Returns
+/// `None` when no quoted marker starts verbatim text.
+#[must_use]
+pub(crate) fn powershell_quoted_marker_expression_view(command: &str) -> Option<String> {
+    if !command.contains('%') {
+        return None;
+    }
+    let tokens = tokenize_powershell_raw(command);
+    let marker = tokens.windows(2).find_map(|pair| {
+        let (word, parameter) = (&pair[0], &pair[1]);
+        if word.kind != NormalizeTokenKind::Word || parameter.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let raw = command.get(word.byte_range.clone())?;
+        let next = command.get(parameter.byte_range.clone())?;
+        if !powershell_word_is_quoted_marker(raw)
+            || powershell_parameter_token_len(next) != Some(next.len())
+        {
+            return None;
+        }
+        Some(word.byte_range.start + raw.rfind('%')?)
+    })?;
+    let mut view = command.to_string();
+    view.replace_range(marker..=marker, "_");
+    Some(view)
 }
 
 /// For the PowerShell word `command[start..word_end]`: when it starts with a

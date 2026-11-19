@@ -574,8 +574,6 @@ fn a_quoted_stop_parsing_token_before_a_parameter_stops_parsing() {
             r"cmd '--%' -x /c echo $x",
             // Verbatim text ends at a pipe or `&&`.
             r"cmd '--%' -x /c ver | Select-String x",
-            // cmd receives `/c echo ^& git reset --hard`, an escaped `&`.
-            r"cmd /c echo '--%' -x ^& git reset --hard",
             // No parameter after the quoted marker: parsing goes on, and
             // `-x'y'`, `--x`, `-1` and `-` are not parameters.
             r"cmd '--%' /c ver # & git reset --hard",
@@ -588,21 +586,88 @@ fn a_quoted_stop_parsing_token_before_a_parameter_stops_parsing() {
         "PowerShell",
         EvaluationDecision::Allow,
     );
-    // Verbatim text after the quoted marker and the parameter is not
-    // PowerShell code: the next statement is cmd's argument, not a command.
-    let allow_statements = expect_everywhere(
-        &strings(&[r"Write-Output '--%' -x; git reset --hard"]),
+    assert!(
+        deny.is_empty() && deny_ps.is_empty() && allow.is_empty(),
+        "deny misses:\n{}\n{}\nallow misses:\n{}",
+        deny.join("\n"),
+        deny_ps.join("\n"),
+        allow.join("\n")
+    );
+}
+
+/// Review round 5. PowerShell checks for a quoted `'--%'` only in its
+/// command-argument loop. Where the string is an expression (a statement
+/// start, after `=`, inside `( )`, in `if ( )`, an array or a method call),
+/// the word after it is an operator and the line goes on: each row below
+/// runs git (pwsh 7.5, fake git). dcg judges the line both ways, deny wins.
+#[test]
+fn a_quoted_stop_parsing_token_in_an_expression_does_not_stop_parsing() {
+    let deny = expect_everywhere(
+        &strings(&[
+            r"'--%' -f 1; git reset --hard",
+            r"$a = '--%' -f 1; git reset --hard",
+            r"Write-Output ('--%' -replace 'x','y'); git reset --hard",
+            r"if ('--%' -eq $x) { 1 }; git reset --hard",
+            r"$a = '--%' -join ','; git reset --hard",
+            r#""--%" -like '*'; git reset --hard"#,
+            r"[string]'--%' -f 1; git reset --hard",
+            r"@('--%' -f 1); git reset --hard",
+            r"$h = @{a='--%' -f 1}; git reset --hard",
+            r"$a = '--%' -split 'x'; git reset --hard",
+            r"$b = '--%' -ne 'a'; git reset --hard",
+            r"$a = 1, '--%' -f 1; git reset --hard",
+            r"$a = '--%' -f 1 & git reset --hard",
+            r"'--%' -f 1 && git reset --hard",
+            r"$a = '--%' -f 1 | ForEach-Object { git reset --hard }",
+            r"$a = '--%'-f 1; git reset --hard",
+            r"$a = '--%' -match 'x'; git reset --hard",
+            r"if ('--%' -match 'x') { git reset --hard }",
+            r"while ('--%' -ne '--%') {}; git reset --hard",
+            r"$x.Replace('--%' -f 1, 'y'); git reset --hard",
+            r#"$a = '--%' -f 1; cmd /c "git reset --hard""#,
+            r#"$x = 'a & git reset --hard'; $a = '--%' -f 1; cmd /c "echo $x""#,
+            r"$a = '--%' -f 1; cmd /c git reset --hard",
+            // Each marker is read both ways, one after the other.
+            r"$a = '--%' -f 1; $b = '--%' -f 2; git reset --hard",
+            r"$a = '--%' -f 1; cmd '--%' -x /c ver # & git reset --hard",
+        ]),
+        &PS,
+        "PowerShell",
+        EvaluationDecision::Deny,
+    );
+    let deny_ps = expect_everywhere(
+        &strings(&[
+            r"$a = '--%' -f 1; Remove-Item -Recurse -Force C:\src",
+            r#"$s = "--%" -replace '%',''; Remove-Item -Recurse -Force C:\src"#,
+            // As a command argument the marker starts verbatim text and git
+            // does not run; read both ways, this denies (accepted over-deny).
+            r"Write-Output '--%' -x; git reset --hard",
+            r"Write-Output '--%' -f 1; git reset --hard",
+            // cmd receives `/c echo ^& git reset --hard`, an escaped `&`; read
+            // as an expression, `&` ends the statement.
+            r"cmd /c echo '--%' -x ^& git reset --hard",
+        ]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Deny,
+    );
+    let allow = expect_everywhere(
+        &strings(&[
+            r"$a = '--%' -f 1; git status",
+            r"'--%' -f 1",
+            r"cmd '--%' -x /c ver",
+            r"cmd '--%' -x /c ver | Select-String x",
+        ]),
         &[ShellDialect::PowerShell],
         "PowerShell",
         EvaluationDecision::Allow,
     );
     assert!(
-        deny.is_empty() && deny_ps.is_empty() && allow.is_empty() && allow_statements.is_empty(),
-        "deny misses:\n{}\n{}\nallow misses:\n{}\n{}",
+        deny.is_empty() && deny_ps.is_empty() && allow.is_empty(),
+        "deny misses:\n{}\n{}\nallow misses:\n{}",
         deny.join("\n"),
         deny_ps.join("\n"),
-        allow.join("\n"),
-        allow_statements.join("\n")
+        allow.join("\n")
     );
 }
 

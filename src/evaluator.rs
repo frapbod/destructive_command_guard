@@ -18394,49 +18394,66 @@ fn evaluate_command_in_dialect_union(
         primary
     };
 
-    // PowerShell's dot-source operator runs a command like the call operator:
-    // `. git reset --hard` runs Git. Judge the line with each dot in command
-    // position read as `&`, and each call operator after `return`, `throw` or
-    // `exit` moved to its statement start, deny wins. The view has the same
-    // length, so a denial's span still addresses the command. What the user
-    // allowed as written stays allowed. The view is not a request the user made, so it may spend no
-    // allow-once grant: one for the `&` spelling belongs to that request
-    // (GH#537). A grant for the dot spelling itself is found at the outer
-    // entry, after this view denies.
-    let primary = if matches!(
+    // Two PowerShell readings the line's own tokens miss, each judged as a
+    // view of the same length (a denial's span still addresses the
+    // command), deny wins:
+    // - The dot-source operator runs a command like the call operator: `.
+    //   git reset --hard` runs Git. Each dot in command position reads as
+    //   `&`, and each call operator after `return`, `throw` or `exit` moves
+    //   to its statement start.
+    // - A quoted `'--%'` before a parameter word starts verbatim text only
+    //   when it is a command argument; as an expression (`'--%' -f 1; git
+    //   reset --hard`) the line goes on. The tokenizer reads it as verbatim,
+    //   so the marker is also read as an ordinary string.
+    // What the user allowed as written stays allowed. A view is not a
+    // request the user made, so it may spend no allow-once grant: one for
+    // the `&` spelling belongs to that request (GH#537). A grant for the
+    // dot spelling itself is found at the outer entry, after this view
+    // denies.
+    let mut primary = primary;
+    if matches!(
         shell_dialect,
         ShellDialect::PowerShell | ShellDialect::Unknown
-    ) && primary.decision == EvaluationDecision::Allow
-        && primary.allowlist_override.is_none()
-        && let Some(view) = crate::normalize::powershell_invocation_operator_view(command)
-        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
-    {
-        let alternate = if deadline_exceeded(deadline) {
-            EvaluationResult::indeterminate_due_to_budget()
-        } else {
-            let _allow_once_scope = AllowOnceSuppressionScope::enter();
-            evaluate_command_with_pack_order_deadline_at_path_inner(
-                &view,
-                enabled_keywords,
-                ordered_packs,
-                keyword_index,
-                compiled_overrides,
-                allowlists,
-                heredoc_settings,
-                None,
-                project_path,
-                deadline,
-                shell_dialect,
-                nested_command_depth,
-                inherited_automated_stdin,
-            )
-        };
-        let mut primary = primary;
-        adopt_alternate_reading(&mut primary, alternate, command);
-        primary
-    } else {
-        primary
-    };
+    ) {
+        let readings: [fn(&str) -> Option<String>; 2] = [
+            crate::normalize::powershell_invocation_operator_view,
+            crate::normalize::powershell_quoted_marker_expression_view,
+        ];
+        for reading in readings {
+            if primary.decision != EvaluationDecision::Allow || primary.allowlist_override.is_some()
+            {
+                break;
+            }
+            let Some(view) = reading(command) else {
+                continue;
+            };
+            if explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+            {
+                break;
+            }
+            let alternate = if deadline_exceeded(deadline) {
+                EvaluationResult::indeterminate_due_to_budget()
+            } else {
+                let _allow_once_scope = AllowOnceSuppressionScope::enter();
+                evaluate_command_with_pack_order_deadline_at_path_inner(
+                    &view,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    None,
+                    project_path,
+                    deadline,
+                    shell_dialect,
+                    nested_command_depth,
+                    inherited_automated_stdin,
+                )
+            };
+            adopt_alternate_reading(&mut primary, alternate, command);
+        }
+    }
 
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0
