@@ -982,6 +982,111 @@ fn bash_data_hash_hides_no_later_git_command() {
     }
 }
 
+/// `${` openers that Bash reads another way than dcg's shared readers. Each
+/// blocked command runs its git command in Bash 3.2, 5.3, sh, dash or
+/// Linux bash 5.2 (measured with `scripts/shell-truth`, Nov 18 2026).
+///
+/// - `$$` is one parameter, so the `{` after it opens nothing: those are
+///   denied in both protocols.
+/// - Bash 5.3 reads `${ …; }` and `${| …; }` as command substitutions, and
+///   Bash ends a double-quoted `${…}` past a `'`-quoted `}` where dash does
+///   not. dcg does not read either the Bash way, so it fails closed: Codex
+///   denies and Claude asks, also for a harmless command after one.
+#[test]
+// Shell text: clippy takes `${y:- }` for a format argument.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn bash_parameter_openers_hide_no_later_git_command() {
+    let payload = |command: &str, codex: bool| {
+        let mut payload = serde_json::json!({
+            "session_id": "sess-parameter-openers",
+            "cwd": "/tmp/test-workdir",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_use_id": "call_parameter_openers",
+        });
+        if codex {
+            payload["turn_id"] = serde_json::json!("turn-parameter-openers");
+        }
+        payload.to_string().into_bytes()
+    };
+    let claude_decision = |command: &str| {
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert_eq!(claude.exit_code, 0, "claude {command:?}\n{claude}");
+        claude.stdout_json()["hookSpecificOutput"]["permissionDecision"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    for (command, claude) in [
+        ("echo $${ ; git reset --hard", "deny"),
+        ("echo $${ && git push --force origin main", "deny"),
+        ("echo $\\\n${ ; git reset --hard", "deny"),
+        ("bash -c 'echo $${ ; git reset --hard'", "deny"),
+        ("echo ${ : # \"\n}; git reset --hard\n# \"", "ask"),
+        ("echo \"${ : # \"\n}\"; git reset --hard\n# \"", "ask"),
+        ("echo ${| : # \"\n}; git reset --hard\n# \"", "ask"),
+        ("echo ${ git reset --hard; }", "ask"),
+        ("echo ${\ngit reset --hard\n}", "ask"),
+        ("echo ${|git reset --hard; }", "ask"),
+        ("echo \\$${ git reset --hard; }", "ask"),
+        ("echo $$${ git reset --hard; }", "ask"),
+        ("echo ${ : # \"\n}; git status\n# \"", "ask"),
+        ("cat <<EOF\n${ git reset --hard; }\nEOF", "ask"),
+        ("echo \"${y:-'}\" #'}\"; git reset --hard", "ask"),
+        (
+            "echo \"${y:-'}\" #'}\" && git push --force origin main",
+            "ask",
+        ),
+        ("echo \"${y:-'}\" #'}\"; git status", "ask"),
+        // The same dispute behind a line continuation between `$` and `{`.
+        ("echo \"$\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
+        (
+            "echo \"$\\\n{y:-'}\" #'}\" && git push --force origin main",
+            "ask",
+        ),
+        ("echo \"$\\\n\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
+        ("x=\"$\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
+        // The same dispute at the second `$` of `$$` (Bash 3.2 reads a `${`
+        // there inside double quotes).
+        ("echo \"$${y:-'}\" #'}\"; git reset --hard", "ask"),
+        (
+            "echo \"$${y:-'}\" #'}\" && git push --force origin main",
+            "ask",
+        ),
+        ("x=\"$${y:-'}\" #'}\"; git reset --hard", "ask"),
+        ("echo \"$$\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
+        // The assignment-prefix forms that merged PR #12 already denies.
+        ("x=${y:- a} git reset --hard", "deny"),
+        ("x=${y:- } git reset --hard", "deny"),
+        ("x=${y:- a} git push --force origin main", "deny"),
+        ("y=1 x=${y:- #} git reset --hard", "deny"),
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+        assert_eq!(claude_decision(command), claude, "claude {command:?}");
+    }
+    for command in [
+        "echo $${ ; git status",
+        "echo $${x}; git status",
+        "echo \"$${HOME}\"; git status",
+        "mkdir -p /tmp/x$${RANDOM}",
+        "echo \"pid: $$\" {a,b}",
+        "echo $\\\n${ ; git status",
+        "echo $$; git status # git reset --hard",
+        "echo \"${y:-'a'}\" # git reset --hard",
+        "x=${y:- a} git status",
+        "y=1 x=${y:- #} git status",
+        "echo ${x:-a b} # git reset --hard",
+        "cat <<'EOF'\n${ git reset --hard; }\nEOF",
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+}
+
 #[test]
 fn vscode_copilot_terminal_tool_variants_block_destructive_commands() {
     for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {

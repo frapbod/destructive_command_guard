@@ -17431,19 +17431,28 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // or right after a parenthesis, where dcg's readers start a comment by
     // a table and shells disagree (see `paren_hashes_as_data`): a false
     // comment there then fails closed too.
+    //
+    // The last reading is the same for the `${` openers that Bash reads
+    // another way than the shared readers (see `bash_parameter_openers`):
+    // a `{` after `$$`, a Bash 5.3 `${ …; }`, and a `'` in a double-quoted
+    // `${…}`.
     let mut bash_spelling: Option<String> = None;
-    for extglob in [None, Some(false), Some(true)] {
+    for reading_kind in 0..4 {
         if result.decision != EvaluationDecision::Allow
             || result.bypass_method == Some(BypassMethod::AllowOnce)
             || !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
-            || (extglob == Some(true) && memchr::memchr(b'!', command.as_bytes()).is_none())
         {
             break;
         }
-        let reading = match extglob {
-            None => crate::normalize::paren_hashes_as_data(command)
+        let reading = match reading_kind {
+            0 => crate::normalize::paren_hashes_as_data(command)
                 .map(crate::normalize::BashHashReading::Spelled),
-            Some(extglob) => crate::normalize::bash_hashes_as_data(command, extglob),
+            1 => crate::normalize::bash_hashes_as_data(command, false),
+            2 if memchr::memchr(b'!', command.as_bytes()).is_some() => {
+                crate::normalize::bash_hashes_as_data(command, true)
+            }
+            2 => None,
+            _ => crate::normalize::bash_parameter_openers(command),
         };
         let Some(reading) = reading else {
             continue;
@@ -40565,10 +40574,12 @@ fn evaluate_heredoc(
             // reset --hard'`. The whole body, read by the evaluator, gets its
             // Bash reading too (see `bash_hashes_as_data`), and so does a
             // `#` in or after a parenthesis that it may misread as a comment
-            // (see `paren_hashes_as_data`).
+            // (see `paren_hashes_as_data`), and a `${` opener it may misread
+            // (see `bash_parameter_openers`).
             let bash_data_hash = per_command_pass
                 && !destination_source_context
                 && (crate::normalize::paren_hashes_as_data(&content.content).is_some()
+                    || crate::normalize::bash_parameter_openers(&content.content).is_some()
                     || [false, true].into_iter().any(|extglob| {
                         crate::normalize::bash_hashes_as_data(&content.content, extglob).is_some()
                     }));
