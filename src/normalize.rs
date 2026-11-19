@@ -10627,6 +10627,38 @@ mod tests {
     }
 
     #[test]
+    fn powershell_comment_view_spells_braced_variable_names_plainly() {
+        // A name that is not a plain name is spelled `_`, bare or in an
+        // expandable string, through the first unescaped `}`.
+        for (command, view) in [
+            ("${a'b} = 1; git reset --hard", "${___} = 1; git reset --hard"),
+            ("\"${a\"b}\"; git reset --hard", "\"${___}\"; git reset --hard"),
+            ("${a`}'b}; x", "${_____}; x"),
+            ("${x:- it's}; x", "${________}; x"),
+            ("$$${a'b}; x", "$$${___}; x"),
+            ("${a'b} # it's", "${___}       "),
+        ] {
+            assert_eq!(
+                mask_powershell_comments(command).as_deref(),
+                Some(view),
+                "{command:?}"
+            );
+        }
+        // Plain and scope-qualified names stay; `$${` is `$$` and a block,
+        // `` `${ `` a literal `$` and a block; an unclosed `${` is no name;
+        // single quotes hold literal text.
+        for command in [
+            "${env:Path}; ${my_var}",
+            "$${a'b'}",
+            "`${a'b'}",
+            "${a'b",
+            "'${a''b}'",
+        ] {
+            assert_eq!(mask_powershell_comments(command), None, "{command:?}");
+        }
+    }
+
+    #[test]
     fn powershell_assignment_values_start_a_statement_wherever_a_target_starts() {
         let separated = |command: &str| powershell_assignment_views(command).separated;
         for (assignment, view) in [
