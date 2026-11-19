@@ -208,3 +208,38 @@ fn a_redirection_does_not_hide_a_trap_handler() {
         ],
     );
 }
+
+/// A heredoc operator before the command word left its delimiter as the
+/// command word when the segment held the operator line without the body (or
+/// the heredoc had no body), so `eval` and `trap` were not read. Every shell
+/// runs the eval or the trap handler.
+#[test]
+fn a_heredoc_operator_does_not_hide_eval_or_trap() {
+    assert_both(
+        "deny",
+        &[
+            "<<EOF eval 'git reset --hard'\nhi\nEOF",
+            "x='git reset --hard'; <<EOF eval \"$x\"\nhi\nEOF",
+            "x='git reset --hard'; <<'EOF' eval \"$x\"\nhi\nEOF",
+            "x='git reset --hard'; 0<<EOF eval \"$x\"\nhi\nEOF",
+            "x='git reset --hard'; <<-EOF eval \"$x\"\n\thi\n\tEOF",
+            "x='git reset --hard'; 2>/dev/null <<EOF eval \"$x\"\nhi\nEOF",
+            "x='git reset --hard'; <<EOF command eval \"$x\"\nhi\nEOF",
+            "x='git reset --hard'; command <<EOF eval \"$x\"\nhi\nEOF",
+            "x='git reset --hard'; <<EOF command -p eval \"$x\"\nhi\nEOF",
+            "x='git reset --hard'; <<EOF eval \"$x\"",
+            "echo() {\n<<EOF eval \"$*\"\nhi\nEOF\n}\necho 'git reset --hard'",
+            "<<EOF trap 'git reset --hard' EXIT\nhi\nEOF",
+            "f() {\n<<EOF trap 'git reset --hard' EXIT\nhi\nEOF\n}\nf",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            "<<EOF echo eval 'git reset --hard'\nhi\nEOF",
+            "<<EOF eval 'echo hi'\nhi\nEOF",
+            "<<EOF echo 'git reset --hard'\nhi\nEOF",
+            "<<EOF trap 'echo bye' EXIT\nhi\nEOF",
+        ],
+    );
+}

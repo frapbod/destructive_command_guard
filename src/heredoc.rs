@@ -624,6 +624,13 @@ fn respelled_command_may_be_present(command: &str) -> bool {
 /// Length preserving (every blanked byte becomes a space, so the view stays
 /// UTF-8 and every range in it is the same range in `command`); linear.
 fn blank_local_redirects(command: &str) -> Option<String> {
+    blank_redirect_words(command, false)
+}
+
+/// [`blank_local_redirects`], and with `heredoc_operators` also each heredoc
+/// operator (`<<`, `<<-`, descriptor digits included) with its delimiter
+/// word, whether or not its body follows in `command`.
+fn blank_redirect_words(command: &str, heredoc_operators: bool) -> Option<String> {
     let bytes = command.as_bytes();
     memchr::memchr2(b'<', b'>', bytes)?;
     let len = bytes.len();
@@ -681,7 +688,32 @@ fn blank_local_redirects(command: &str) -> Option<String> {
             }
             // `<<`, `<<-`, `<<<`: a heredoc or here-string operator, whose
             // second `<` must not be read as a redirect of the delimiter.
-            b'<' => index + bytes[index..].iter().take_while(|&&b| b == b'<').count(),
+            b'<' => {
+                let run = bytes[index..].iter().take_while(|&&b| b == b'<').count();
+                let heredoc = (heredoc_operators && run == 2)
+                    .then(|| heredoc_delimiter(command, index))
+                    .flatten();
+                match heredoc {
+                    Some((delimiter_end, ..)) => {
+                        let mut start = index;
+                        while start > 0 && bytes[start - 1].is_ascii_digit() {
+                            start -= 1;
+                        }
+                        if start > 0
+                            && start < index
+                            && !matches!(
+                                bytes[start - 1],
+                                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+                            )
+                        {
+                            start = index;
+                        }
+                        view.get_or_insert_with(|| bytes.to_vec())[start..delimiter_end].fill(b' ');
+                        delimiter_end
+                    }
+                    _ => index + run,
+                }
+            }
             // `$'…'` takes backslash escapes, so `\'` does not close it.
             b'$' if bytes.get(index + 1) == Some(&b'\'') => {
                 let mut at = index + 2;
@@ -818,6 +850,24 @@ pub(crate) fn redirection_free_view(command: &str) -> Option<String> {
         return blank_local_redirects(command);
     };
     Some(blank_local_redirects(&view).unwrap_or(view))
+}
+
+/// The view a reader of a simple command's words reads: the
+/// [`redirection_free_view`] of `command`, with every heredoc operator and
+/// its delimiter word blanked as well. A segment that holds a heredoc's
+/// operator line without its body and terminator (they are later lines), or
+/// a heredoc with no body at all, keeps its operator in that view, so the
+/// delimiter would read as the command word: `<<EOF eval "$x"` runs `eval`.
+/// The bodies stay out of it as before; only the operator words are added.
+///
+/// Length preserving; `None` when there is nothing to blank.
+pub(crate) fn command_words_view(command: &str) -> Option<String> {
+    let view = redirection_free_view(command);
+    let source = view.as_deref().unwrap_or(command);
+    if !contains_active_heredoc_operator(source) {
+        return view;
+    }
+    blank_redirect_words(source, true).or(view)
 }
 
 /// The byte ranges [`redirection_free_view`] blanks for each heredoc: the
@@ -25179,6 +25229,32 @@ EOF";
 
     /// The argv view blanks every redirection the shell performs, heredocs
     /// whole, and nothing else, at unchanged byte offsets.
+    #[test]
+    fn command_words_view_blanks_heredoc_operators_without_their_bodies() {
+        for (command, expected) in [
+            // The operator line of a heredoc whose body is on later lines.
+            ("<<EOF eval \"$x\"", Some("      eval \"$x\"")),
+            ("<<'EOF' eval \"$x\"", Some("        eval \"$x\"")),
+            ("<<-EOF trap x EXIT", Some("       trap x EXIT")),
+            ("0<< EOF eval x", Some("        eval x")),
+            ("2>/dev/null <<EOF eval x", Some("                  eval x")),
+            ("command <<EOF eval x", Some("command       eval x")),
+            ("cat<<EOF", Some("cat     ")),
+            // A whole heredoc stays blanked as `redirection_free_view` does.
+            ("<<EOF eval x\nhi\nEOF", Some("      eval x\n      ")),
+            // A here-string, a quoted operator and no redirection at all.
+            ("<<<x eval y", Some("     eval y")),
+            ("echo '<<EOF' eval", None),
+            ("eval x", None),
+        ] {
+            assert_eq!(
+                command_words_view(command).as_deref(),
+                expected,
+                "{command:?}"
+            );
+        }
+    }
+
     #[test]
     fn redirection_free_view_blanks_every_redirection() {
         for (command, expected) in [

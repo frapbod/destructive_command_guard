@@ -8191,11 +8191,12 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
         // that opens it (`f() { eval …`, `case a in a) eval …`).
         let (segment, peeled) = posix_segment_command(whole_segment);
         // A redirection is not a command word and may stand anywhere in the
-        // command (`2>/dev/null eval …`, `command 2>&1 eval …`). Find the
-        // command word in the length-preserving view without redirections;
-        // offsets and the arguments still come from `segment`, and the
-        // redirect targets themselves are read by the substitution scanners.
-        let words_view = crate::heredoc::redirection_free_view(segment);
+        // command (`2>/dev/null eval …`, `command 2>&1 eval …`, `<<EOF eval
+        // …` whose body is on the next lines). Find the command word in the
+        // length-preserving view without redirections; offsets and the
+        // arguments still come from `segment`, and the redirect targets
+        // themselves are read by the substitution scanners.
+        let words_view = crate::heredoc::command_words_view(segment);
         let words_source = words_view.as_deref().unwrap_or(segment);
         let tokens = tokenize_for_shell_dialect(words_source, ShellDialect::Posix);
         let words: Vec<_> = tokens
@@ -21924,9 +21925,9 @@ fn posix_deferred_command_views(command: &str) -> Vec<String> {
             continue;
         }
         // A redirection is not a word of the command, wherever it stands
-        // (`2>/dev/null trap … EXIT`, `trap 2>&1 … EXIT`): read the words in
-        // the length-preserving view without redirections.
-        let words_view = crate::heredoc::redirection_free_view(segment);
+        // (`2>/dev/null trap … EXIT`, `trap 2>&1 … EXIT`, `<<EOF trap … EXIT`):
+        // read the words in the length-preserving view without redirections.
+        let words_view = crate::heredoc::command_words_view(segment);
         let Ok(words) = shell_words::split(words_view.as_deref().unwrap_or(segment).trim()) else {
             continue;
         };
@@ -53654,6 +53655,24 @@ mod tests {
             ("f() { command 2>&1 -p eval \"$*\"; }; f hi", true),
             ("x='git reset --hard'; 2>/dev/null eval \"$x\"", true),
             ("x='git reset --hard'; eval \"$x\" 2>/dev/null", true),
+            // A heredoc operator before the command word, with its body on
+            // the next lines or with none at all.
+            ("<<EOF eval 'git reset --hard'\nhi\nEOF", true),
+            ("x='git reset --hard'; <<EOF eval \"$x\"\nhi\nEOF", true),
+            ("x='git reset --hard'; 0<<'EOF' eval \"$x\"\nhi\nEOF", true),
+            (
+                "x='git reset --hard'; <<EOF command -p eval \"$x\"\nhi\nEOF",
+                true,
+            ),
+            ("x='git reset --hard'; <<EOF eval \"$x\"", true),
+            (
+                "echo() {\n<<EOF eval \"$*\"\nhi\nEOF\n}\necho 'git reset --hard'",
+                true,
+            ),
+            ("<<EOF trap 'git reset --hard' EXIT\nhi\nEOF", true),
+            ("<<EOF echo eval 'git reset --hard'\nhi\nEOF", false),
+            ("<<EOF eval 'echo hi'\nhi\nEOF", false),
+            ("<<EOF trap 'echo bye' EXIT\nhi\nEOF", false),
             ("command -v eval", false),
             ("command -V eval", false),
             ("command -pv eval", false),
