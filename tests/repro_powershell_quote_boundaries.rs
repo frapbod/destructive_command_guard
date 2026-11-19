@@ -437,6 +437,109 @@ fn powershell_glued_comments_follow_the_parse_mode() {
     }
 }
 
+/// The parse mode after a statement keyword and after a block statement.
+/// `return`, `throw` and `exit` take a pipeline and `break`, `continue`,
+/// `class`, `enum` and `data` a label or name, so a `#` or `<#` glued to the
+/// operand starts a comment; a block statement (`if`, `function`, `try`,
+/// `do … while (…)`) is followed by a new statement with no separator. Only
+/// at a statement start: after `|`, `&&` or `(` and as an argument the word
+/// is a command name. The call operators `&` and `.` take a command name in
+/// argument mode. Every row was measured with sandboxed pwsh 7.5: each
+/// dangerous row ran `git reset --hard`, no harmless row did.
+#[test]
+fn powershell_glued_comments_after_keywords_and_block_statements() {
+    let dangerous = [
+        "& { return ${c}<#x#>=iex 'git reset --hard' }",
+        "& { throw ${c}<#x#>=iex 'git reset --hard' }",
+        "& { exit ${c}<#x#>=iex 'git reset --hard' }",
+        "function f { return $c<#x#>=iex 'git reset --hard' }; f",
+        "& { return ${c}#'\n}; git reset --hard\n#'",
+        "& { return $c#'\n}; git reset --hard\n#'",
+        "& { return ${c}<#'#>}; git reset --hard; #'",
+        "& { return $c<#'#>}; git reset --hard; #'",
+        "try { throw ${c}#'\n} catch {}; git reset --hard\n#'",
+        "try { throw $c#'\n} catch {}; git reset --hard\n#'",
+        "try { throw $c<#'#>} catch {}; git reset --hard; #'",
+        "function f { return ${c}#'\n}; git reset --hard\n#'",
+        "1 | % { return ${c}#'\n}; git reset --hard\n#'",
+        "1 | % { return $c<#'#>}; git reset --hard; #'",
+        "foreach ($i in 1) { break ${c}#'\n}; git reset --hard\n#'",
+        "foreach ($i in 1) { continue ${c}#'\n}; git reset --hard\n#'",
+        "& { return ,${c}#'\n}; git reset --hard\n#'",
+        "& { return -not ${c}#'\n}; git reset --hard\n#'",
+        "& { return [int]${c}#'\n}; git reset --hard\n#'",
+        "& { return 1#'\n}; git reset --hard\n#'",
+        "& { Return ${c}#'\n}; git reset --hard\n#'",
+        "& { Return -1#'\n}; git reset --hard\n#'",
+        "& { $a = return $c#'\n}; git reset --hard\n#'",
+        "data a#'\n{ 1 }; git reset --hard\n#'",
+        "class a#'\n{ }; git reset --hard\n#'",
+        "enum a#'\n{ x }; git reset --hard\n#'",
+        "if (1) { } $c#'\ngit reset --hard\n#'",
+        "if(1){}$c#'\ngit reset --hard\n#'",
+        "if (1)\n{ } $c#'\ngit reset --hard\n#'",
+        "if (0) { } else { } $c#'\ngit reset --hard\n#'",
+        "function f { } $c#'\ngit reset --hard\n#'",
+        "try { } catch { } $c#'\ngit reset --hard\n#'",
+        "while (0) { } $c#'\ngit reset --hard\n#'",
+        "do { } while (0) $c#'\ngit reset --hard\n#'",
+        "class a { } $c#'\ngit reset --hard\n#'",
+        "foreach ($i in 1) { } ${c}<#'#>; git reset --hard; #'",
+        // A `<#` glued to a command name inside `(...)` is text.
+        "ls (a<#); git reset --hard",
+    ];
+    // Not listed: `& { return ${c}#x }`, `& { echo $c<#'#>}; …` and the like.
+    // pwsh rejects them (MissingEndCurlyBrace: the comment or a quoted word
+    // takes the `}`), so nothing runs, and dcg denies a block it cannot
+    // segment. Harmless rows are PowerShell readings only: a POSIX shell
+    // may read them otherwise, and Unknown denies what either reading runs.
+    let harmless = [
+        "Write-Output return${c}#x",
+        "echo a | return $c#'\ngit reset --hard\n#'",
+        "(return $c#'\n); git reset --hard\n#'",
+        ". ${c}#'\ngit reset --hard\n#'",
+        ". $c<#'#>; git reset --hard; #'",
+        "& $c<#'#>; git reset --hard; #'",
+        "$x = & $c#'\ngit reset --hard\n#'",
+        "& { } $c#'\ngit reset --hard\n#'",
+        "1 | foreach { } $c#'\ngit reset --hard\n#'",
+        "if (1) { } a#'\ngit reset --hard\n#'",
+        "function f { } a#'\ngit reset --hard\n#'",
+    ];
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        for command in dangerous {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+    for command in harmless {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Allow,
+            "{command:?}"
+        );
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in dangerous {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+        for command in harmless {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn powershell_comment_codex_bash_label() {
