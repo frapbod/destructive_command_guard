@@ -423,6 +423,20 @@ const RUNS_IT: &[&str] = &[
     "$t=[scriptblock]; ${a`}b}='Create'; $t::${a`}b}('git reset --hard').Invoke()",
     "$ExecutionContext.InvokeCommand.\"$(\"InvokeScript\")\"('git reset --hard')",
     "$ExecutionContext.InvokeCommand.\"$(\"Invoke\"+\"Script\")\"('git reset --hard')",
+    // Review round 4 (runner rv4/truth.out, rv4/truth2.out, p5/w-truth.out):
+    // the method taken as a value on a member chain that starts at a group,
+    // index, braced variable, hashtable or script block.
+    "$t=[scriptblock]; $f=(gv t).Value::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$s=[scriptblock]; $f=(gv s).Value::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$f=(@{a=[scriptblock]}).a::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$f={}::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$m=(Get-Variable ExecutionContext).Value.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+    "$ic=$ExecutionContext.InvokeCommand; $m=(gv ic).Value.InvokeScript; $m.Invoke('git reset --hard')",
+    "${i c}=$ExecutionContext.InvokeCommand; $m=${i c}.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=@{b=[scriptblock]}}; $f=$h['a'].b::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$f=@{a=[scriptblock]}.a::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$a=@($ExecutionContext.InvokeCommand); $m=$a[0].InvokeScript; $m.Invoke('git reset --hard')",
+    "$m=(gv ExecutionContext).Value.InvokeCommand.InvokeScript; & { $m.Invoke('git reset --hard') }",
 ];
 
 /// Name spellings longer than dcg's first reading window (review round 2;

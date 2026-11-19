@@ -12600,20 +12600,18 @@ fn powershell_member_name_spelling(
 }
 
 /// Whether the `.` at `dot` is member access on an expression (`$x.`,
-/// `$a.b.`, `(…).`, `[t]::m().`), not a dot inside a bareword argument
-/// (`Write-Output a.b`), which is text.
+/// `$a.b.`, `${a}.`, `(…).`, `(…).b.`, `$a[0].b.`, `{}::`, `[t]::m().`), not
+/// a dot inside a bareword argument (`Write-Output a.b`), which is text.
 fn powershell_dot_follows_expression(command: &str, dot: usize) -> bool {
     // Block comments may sit before `::` (`[t]<#c#>::Create`).
     let before = trim_powershell_code_blank_end(&command[..dot]).as_bytes();
-    match before.last() {
-        Some(b')' | b']') => true,
-        Some(_) => before
-            .iter()
-            .rev()
-            .find(|&&byte| !(byte.is_ascii_alphanumeric() || b"_.:?{}".contains(&byte)))
-            .is_some_and(|&byte| byte == b'$'),
-        None => false,
-    }
+    // The member chain before the dot ends at a variable, or at the close of
+    // a group, call, index, braced variable, script block or hashtable.
+    before
+        .iter()
+        .rev()
+        .find(|&&byte| !(byte.is_ascii_alphanumeric() || b"_.:?".contains(&byte)))
+        .is_some_and(|&byte| matches!(byte, b'$' | b')' | b']' | b'}'))
 }
 
 /// The first argument of a .NET method call's argument text, up to the first
