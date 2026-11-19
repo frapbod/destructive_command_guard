@@ -4143,6 +4143,10 @@ struct WindowsLauncherEnvelope {
 enum WindowsLauncherParse {
     NotLauncher,
     Envelope(WindowsLauncherEnvelope),
+    /// A launcher whose payload has more than one reading (cmd's quote
+    /// handling after `/C`, [`cmd_switch_command_readings`]): every one is
+    /// judged, and deny wins.
+    Envelopes(Vec<WindowsLauncherEnvelope>),
     Unverified(String),
 }
 
@@ -5513,18 +5517,31 @@ fn parse_cmd_launcher(
                     "cmd {option} has no statically inspectable payload"
                 ));
             };
-            return match validate_launcher_payload_with(
-                command,
-                ShellDialect::Cmd,
-                max_payload_bytes,
-                expansions,
-            ) {
-                Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
+            let mut envelopes = Vec::new();
+            for command in cmd_switch_command_readings(&command) {
+                match validate_launcher_payload_with(
                     command,
-                    dialect: ShellDialect::Cmd,
-                    launcher: if option == "/c" { "cmd /c" } else { "cmd /k" },
-                }),
-                Err(reason) => WindowsLauncherParse::Unverified(reason),
+                    ShellDialect::Cmd,
+                    max_payload_bytes,
+                    expansions,
+                ) {
+                    Ok(command) => {
+                        let envelope = WindowsLauncherEnvelope {
+                            command,
+                            dialect: ShellDialect::Cmd,
+                            launcher: if option == "/c" { "cmd /c" } else { "cmd /k" },
+                        };
+                        if !envelopes.contains(&envelope) {
+                            envelopes.push(envelope);
+                        }
+                    }
+                    Err(reason) => return WindowsLauncherParse::Unverified(reason),
+                }
+            }
+            return if envelopes.len() == 1 {
+                WindowsLauncherParse::Envelope(envelopes.remove(0))
+            } else {
+                WindowsLauncherParse::Envelopes(envelopes)
             };
         }
         if cmd_word_has_variable(&option) {
@@ -5541,11 +5558,59 @@ fn parse_cmd_launcher(
                     "cmd host switch {raw:?} is unknown"
                 ));
             }
+            // A word that is not a switch does not end cmd's switches: cmd
+            // looks for a `/` switch anywhere on its command line (ReactOS
+            // cmd's `Initialize` scans every `/`), so `cmd foo /c git reset
+            // --hard` may run git. What Windows cmd.exe does with the word is
+            // not measured: fail closed when a `/C`, `/K` or `/R` follows.
+            if words[index..].iter().any(|raw| {
+                cmd_text_has_run_switch(raw)
+                    || cmd_host_switch(raw, switch_dialect)
+                        .is_some_and(|word| cmd_text_has_run_switch(&word))
+            }) {
+                return WindowsLauncherParse::Unverified(format!(
+                    "cmd may read a /C, /K or /R switch after {raw:?}, which is not a switch"
+                ));
+            }
             return WindowsLauncherParse::NotLauncher;
         }
         index += 1;
     }
     WindowsLauncherParse::NotLauncher
+}
+
+/// Whether `text` holds `/C`, `/K` or `/R` (any case), the switches after
+/// which cmd runs the rest of its command line.
+fn cmd_text_has_run_switch(text: &str) -> bool {
+    text.as_bytes().windows(2).any(|pair| {
+        pair[0] == b'/' && matches!(pair[1].to_ascii_lowercase(), b'c' | b'k' | b'r')
+    })
+}
+
+/// The command texts cmd.exe may run for `command`, the text after its `/C`
+/// or `/K` switch.
+///
+/// When that text starts with a quote (after blanks), cmd removes that quote
+/// and the last quote and runs the rest (`cmd /?`; ReactOS cmd's
+/// `GetCmdLineCommand`): `cmd /c '"git reset --hard"'` in PowerShell hands
+/// cmd `"git reset --hard"`, and cmd runs `git reset --hard`. It keeps both
+/// quotes only without `/S`, with exactly two quotes, whitespace and no
+/// special character between them, and when the quoted text names an
+/// executable file (`"C:\Program Files\x\y.exe" arg`). A lone leading quote
+/// is removed too. Whether a file exists is not known here, nor exactly how
+/// the outer program quoted cmd's command line, so both texts are read: as
+/// written and with the quotes removed. Deny wins.
+fn cmd_switch_command_readings(command: &str) -> Vec<String> {
+    let command = command.trim_start();
+    let mut readings = vec![command.to_string()];
+    if let Some(rest) = command.strip_prefix('"') {
+        let stripped = match rest.rfind('"') {
+            Some(last) => format!("{}{}", &rest[..last], &rest[last + 1..]),
+            None => rest.to_string(),
+        };
+        readings.push(stripped);
+    }
+    readings
 }
 
 fn cmd_control_envelope(
@@ -6200,6 +6265,12 @@ fn parse_cmd_control_command_at_depth(
                 Some(WindowsLauncherParse::Unverified(reason)) => {
                     return Some(WindowsLauncherParse::Unverified(reason));
                 }
+                // Only a `cmd /c` launcher has several readings.
+                Some(WindowsLauncherParse::Envelopes(_)) => {
+                    return Some(WindowsLauncherParse::Unverified(
+                        "cmd control group has more than one reading".to_string(),
+                    ));
+                }
                 Some(WindowsLauncherParse::NotLauncher) | None => {}
             }
         }
@@ -6217,6 +6288,11 @@ fn parse_cmd_control_command_at_depth(
             }
             Some(WindowsLauncherParse::Unverified(reason)) => {
                 return Some(WindowsLauncherParse::Unverified(reason));
+            }
+            Some(WindowsLauncherParse::Envelopes(_)) => {
+                return Some(WindowsLauncherParse::Unverified(
+                    "cmd control command has more than one reading".to_string(),
+                ));
             }
             Some(WindowsLauncherParse::NotLauncher) | None
                 if reorder_cmd_leading_redirections(segment).is_some() =>
@@ -6487,14 +6563,21 @@ fn push_embedded_cmd_call_envelopes(
         let mut read_call = |call: &str| {
             let mut launcher = false;
             for &argv in readings {
-                if let WindowsLauncherParse::Envelope(envelope) = parse_windows_launcher_segment_as(
+                let parsed = match parse_windows_launcher_segment_as(
                     &without_cr(call),
                     dialect,
                     argv,
                     LauncherExpansions::AsWritten,
                     max_payload_bytes,
                 ) {
-                    launcher = true;
+                    WindowsLauncherParse::Envelope(envelope) => vec![envelope],
+                    WindowsLauncherParse::Envelopes(readings) => readings,
+                    WindowsLauncherParse::NotLauncher | WindowsLauncherParse::Unverified(_) => {
+                        continue;
+                    }
+                };
+                launcher = true;
+                for envelope in parsed {
                     if !envelopes.contains(&envelope) {
                         envelopes.push(envelope);
                     }
@@ -6716,6 +6799,7 @@ fn windows_launcher_envelopes(
         {
             return match control {
                 WindowsLauncherParse::Envelope(envelope) => Ok((vec![envelope], true)),
+                WindowsLauncherParse::Envelopes(envelopes) => Ok((envelopes, true)),
                 WindowsLauncherParse::Unverified(reason) => Err(reason),
                 WindowsLauncherParse::NotLauncher => Ok((Vec::new(), false)),
             };
@@ -6824,6 +6908,14 @@ fn windows_launcher_envelopes(
                             segment_envelopes.push(envelope);
                         }
                     }
+                    WindowsLauncherParse::Envelopes(readings) => {
+                        launcher_reading = true;
+                        for envelope in readings {
+                            if !segment_envelopes.contains(&envelope) {
+                                segment_envelopes.push(envelope);
+                            }
+                        }
+                    }
                     WindowsLauncherParse::Unverified(reason) => {
                         launcher_reading = true;
                         unverified = Some(reason);
@@ -6870,6 +6962,13 @@ fn windows_launcher_envelopes(
             WindowsLauncherParse::Envelope(envelope) => {
                 if !envelopes.contains(&envelope) {
                     envelopes.push(envelope);
+                }
+            }
+            WindowsLauncherParse::Envelopes(readings) => {
+                for envelope in readings {
+                    if !envelopes.contains(&envelope) {
+                        envelopes.push(envelope);
+                    }
                 }
             }
             WindowsLauncherParse::Unverified(reason) => {
