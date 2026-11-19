@@ -2423,6 +2423,209 @@ fn inline_program_at<'a>(
     }
 }
 
+/// How a POSIX shell's source spells a value its parent shell substituted
+/// into that source ([`posix_shell_source_with_outer_values`]).
+pub(crate) const POSIX_OUTER_VALUE: &str = "${DCG_POSIX_VALUE}";
+
+/// The source a POSIX shell receives from the argv `words` its parent shell
+/// expands first (one `-c` word, or the words `ssh` and the command-string
+/// runners join with spaces), with the parent's quotes removed and each
+/// value it substitutes spelled as an unknown value of the child.
+///
+/// The parent substitutes `$x`, `${x}`, `$(…)` and backquotes outside its
+/// single quotes before the child starts: `bash -c "'gi${x}t' reset --hard"`
+/// hands bash `'git' reset --hard` when `x` is empty, and the value lands
+/// inside the child's single quotes (measured with Linux bash). Read as
+/// written, the child kept `'gi${x}t'` as literal text. Each value becomes
+/// [`POSIX_OUTER_VALUE`] where the child reads it: as is outside the child's
+/// quotes and inside its double quotes, and closed out of its single or
+/// ANSI-C quotes as `'"${…}"'`, one field of unknown text, which may also be
+/// empty. A value outside the child's quotes is source text the child could
+/// parse further; it is read as an expansion, as the payload was before. A
+/// command the parent runs to make a value (`$(…)`) is judged where the
+/// parent runs it, at the top level.
+///
+/// The child's quote state is followed through quotes and backslashes only;
+/// a comment or heredoc body holding an odd quote before a value can put the
+/// value in the wrong context (accepted risk). `None` when the words hold no
+/// value or are not words this reading can take apart (see
+/// [`crate::normalize::decode_posix_literal_word`]).
+fn posix_shell_source_with_outer_values<'w>(
+    words: impl IntoIterator<Item = &'w str>,
+) -> Option<String> {
+    const MARK: char = '\u{E000}';
+    let mut decoded = String::new();
+    for (index, word) in words.into_iter().enumerate() {
+        if word.contains(MARK) {
+            return None;
+        }
+        let marked =
+            crate::normalize::posix_word_with_values_replaced(word, MARK.encode_utf8(&mut [0; 4]));
+        if index > 0 {
+            decoded.push(' ');
+        }
+        decoded.push_str(&crate::normalize::decode_posix_literal_word(
+            marked.as_deref().unwrap_or(word),
+        )?);
+    }
+    if !decoded.contains(MARK) {
+        return None;
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        AnsiC,
+        Double,
+    }
+    let ansi_c = !crate::context::PlainDollarQuoteReading::active();
+    let mut output = String::with_capacity(decoded.len() + 2 * POSIX_OUTER_VALUE.len());
+    let mut quote = Quote::None;
+    let mut chars = decoded.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == MARK {
+            match quote {
+                Quote::Single => {
+                    output.push_str("'\"");
+                    output.push_str(POSIX_OUTER_VALUE);
+                    output.push_str("\"'");
+                }
+                Quote::AnsiC => {
+                    output.push_str("'\"");
+                    output.push_str(POSIX_OUTER_VALUE);
+                    output.push_str("\"$'");
+                }
+                Quote::None | Quote::Double => output.push_str(POSIX_OUTER_VALUE),
+            }
+            continue;
+        }
+        match (quote, ch) {
+            // An escape before a value escapes its first byte; the value
+            // stays unknown text either way.
+            (Quote::None | Quote::Double | Quote::AnsiC, '\\') if chars.peek() == Some(&MARK) => {
+                continue;
+            }
+            (Quote::None | Quote::Double | Quote::AnsiC, '\\') => {
+                output.push(ch);
+                if let Some(next) = chars.next() {
+                    output.push(next);
+                }
+                continue;
+            }
+            (Quote::None, '\'') => quote = Quote::Single,
+            (Quote::None, '$') if ansi_c && chars.peek() == Some(&'\'') => {
+                output.push('$');
+                output.push('\'');
+                chars.next();
+                quote = Quote::AnsiC;
+                continue;
+            }
+            (Quote::None, '"') => quote = Quote::Double,
+            (Quote::Single | Quote::AnsiC, '\'') | (Quote::Double, '"') => quote = Quote::None,
+            _ => {}
+        }
+        output.push(ch);
+    }
+    Some(output)
+}
+
+/// A POSIX shell program whose word the parent shell expands
+/// ([`posix_shell_source_with_outer_values`]). It stays unresolved: its text
+/// is not the word's bytes, and the values are unknown.
+fn with_posix_outer_values<'a>(command: &str, program: InlineProgram<'a>) -> InlineProgram<'a> {
+    if program.resolved {
+        return program;
+    }
+    match command
+        .get(program.word_range.clone())
+        .and_then(|word| posix_shell_source_with_outer_values([word]))
+    {
+        Some(content) => InlineProgram {
+            content: Cow::Owned(content),
+            content_range: None,
+            ..program
+        },
+        None => program,
+    }
+}
+
+/// Whether an inline-script interpreter name is a POSIX shell whose `-c`
+/// source [`with_posix_outer_values`] reads.
+fn is_posix_shell_interpreter(name: &str) -> bool {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    matches!(name, "sh" | "bash" | "dash" | "zsh" | "mksh")
+        || name
+            .strip_prefix("ksh")
+            .is_some_and(|version| version.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether the program that receives a heredoc or here-string reads it as
+/// POSIX shell source: a POSIX shell (`bash`, `bash -s`), or `ssh`, whose
+/// remote shell does (`ssh host`, `ssh host bash`). A receiver behind a
+/// wrapper or runner (`timeout 5 bash`, `docker exec -i c sh`) is not named
+/// here; callers also take a body dcg reads as shell or unknown text.
+pub(crate) fn stdin_feeds_posix_shell(target: Option<&str>) -> bool {
+    target.is_some_and(|name| {
+        is_posix_shell_interpreter(name) || name.strip_suffix(".exe").unwrap_or(name) == "ssh"
+    })
+}
+
+/// An unquoted-delimiter heredoc body spelled as one double-quoted POSIX
+/// word with the same expansions. In such a body the parent shell expands
+/// `$x`, `${x}`, `$(…)` and backquotes, and a backslash escapes only `$`,
+/// `` ` ``, `\` and a newline, as inside double quotes; unlike there, `"` is
+/// literal, so it and a backslash before it are escaped here.
+fn heredoc_body_as_double_quoted_word(body: &str) -> String {
+    let mut word = String::with_capacity(body.len() + 8);
+    word.push('"');
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('"') => word.push_str(r#"\\\""#),
+                Some(next) => {
+                    word.push('\\');
+                    word.push(next);
+                }
+                None => word.push_str(r"\\"),
+            },
+            '"' => word.push_str(r#"\""#),
+            _ => word.push(ch),
+        }
+    }
+    word.push('"');
+    word
+}
+
+/// Whether the parent shell substitutes any value into an unquoted-delimiter
+/// heredoc body. Its quotes are data to the parent, so `'$x'` in the body
+/// still expands. `true` when the body cannot be read.
+pub(crate) fn heredoc_body_expands(body: &str) -> bool {
+    crate::normalize::posix_word_value_ranges(&heredoc_body_as_double_quoted_word(body))
+        .is_none_or(|values| !values.is_empty())
+}
+
+/// The source a POSIX shell reads from an unquoted-delimiter heredoc body
+/// after its parent shell expanded the body
+/// ([`posix_shell_source_with_outer_values`]):
+/// `bash <<EOF` + `'gi${x}t' reset --hard` hands bash `'git' reset --hard`
+/// when `x` is empty (measured with Linux bash). A body with no value whose
+/// escapes the parent removes is that decoded text: `bash <<EOF` +
+/// `bash -c "'gi\${x}t' reset --hard"` hands bash `bash -c "'gi${x}t' …"`,
+/// where `${x}` is a value of the next shell. `None` when the body reads the
+/// same to the child or cannot be read.
+pub(crate) fn posix_shell_source_from_heredoc_body(body: &str) -> Option<String> {
+    let word = heredoc_body_as_double_quoted_word(body);
+    posix_shell_source_with_outer_values([word.as_str()]).or_else(|| {
+        if heredoc_body_expands(body) {
+            return None;
+        }
+        crate::normalize::decode_posix_literal_word(&word)
+            .filter(|decoded| decoded.as_ref() != body)
+            .map(std::borrow::Cow::into_owned)
+    })
+}
+
 /// Recover the original word around an existing payload locator's inner span.
 /// The locators retain their option/consumer grammar; quote removal happens
 /// once, here, rather than independently in every interpreter extractor.
@@ -2854,6 +3057,11 @@ fn extract_inline_scripts(
                 inline_program_at(command, captured.start, captured, skip_reasons)
             } else {
                 inline_program(command, captured, skip_reasons)
+            };
+            let program = if is_posix_shell_interpreter(cmd_name) {
+                with_posix_outer_values(command, program)
+            } else {
+                program
             };
             // The shell consumes these as options after -c, not as code.
             // The dedicated options-after-c locator recovers the operand.
@@ -3986,6 +4194,21 @@ fn joined_payload_words(raw: &str) -> Option<String> {
     Some(out)
 }
 
+/// [`joined_payload_words`] for words the local shell expands first
+/// ([`posix_shell_source_with_outer_values`]).
+fn joined_payload_with_outer_values(raw: &str) -> Option<String> {
+    let tokens = crate::normalize::tokenize_for_normalization(raw);
+    let words = tokens
+        .iter()
+        .map(|token| {
+            (token.kind == crate::normalize::NormalizeTokenKind::Word)
+                .then(|| token.text(raw))
+                .flatten()
+        })
+        .collect::<Option<Vec<&str>>>()?;
+    posix_shell_source_with_outer_values(words)
+}
+
 /// Push a runner or `ssh` payload for re-evaluation: the raw span, and for a
 /// joined multi-word payload also the joined command line (which is not a
 /// substring of the command, so it carries no content range). `false` when
@@ -4014,7 +4237,10 @@ fn push_joined_payload(
                     reason: format!("{target} has an unresolved joined program argument"),
                 });
                 InlineProgram {
-                    content: Cow::Borrowed(content),
+                    // The remote or runner shell receives the words as the
+                    // local shell expanded them.
+                    content: joined_payload_with_outer_values(content)
+                        .map_or(Cow::Borrowed(content), Cow::Owned),
                     content_range: None,
                     word_range: payload.content,
                     resolved: false,
@@ -4022,7 +4248,12 @@ fn push_joined_payload(
             }
         }
     } else {
-        inline_program(command, payload.content, skip_reasons)
+        // The remote or runner shell receives the word as the local shell
+        // expanded it.
+        with_posix_outer_values(
+            command,
+            inline_program(command, payload.content, skip_reasons),
+        )
     };
     push_windows_inner(
         extracted,
@@ -7820,9 +8051,6 @@ fn extract_herestrings(
                 });
                 continue;
             }
-            let content_range = (command.get(raw_content_range.clone()) == Some(content.as_str()))
-                .then_some(raw_content_range);
-
             // Extract the command that receives the here-string
             let target_cmd = extract_heredoc_target_command(command, full_match.start());
             let language = target_cmd
@@ -7837,6 +8065,23 @@ fn extract_herestrings(
             } else {
                 language
             };
+            // A shell reads the operand after the parent shell expanded it,
+            // as it reads a `-c` word ([`with_posix_outer_values`]):
+            // `bash <<< "'gi${x}t' reset --hard"` hands bash
+            // `'git' reset --hard` when `x` is empty (measured with Linux
+            // bash). That holds for every operand read as shell source,
+            // including one whose shell sits behind a wrapper or runner
+            // (`timeout 5 bash <<<`, `docker exec -i c sh <<<`); a data sink
+            // such as `grep` stays exempt at evaluation.
+            let content = if language == ScriptLanguage::Bash
+                || stdin_feeds_posix_shell(target_cmd.as_deref())
+            {
+                posix_shell_source_with_outer_values([raw]).unwrap_or(content)
+            } else {
+                content
+            };
+            let content_range = (command.get(raw_content_range.clone()) == Some(content.as_str()))
+                .then_some(raw_content_range);
 
             extracted.push(ExtractedContent {
                 content,
@@ -17064,6 +17309,93 @@ mod tests {
     #[allow(unused_imports)]
     use proptest::prelude::*;
 
+    /// Each value the parent shell substitutes is spelled where the child
+    /// shell reads it: closed out of the child's single and ANSI-C quotes,
+    /// as is elsewhere. Text the parent does not expand stays as written.
+    #[test]
+    fn outer_values_are_spelled_where_the_child_shell_reads_them() {
+        for (words, want) in [
+            (
+                &[r#""'gi${x}t' reset --hard""#][..],
+                r#"'gi'"${DCG_POSIX_VALUE}"'t' reset --hard"#,
+            ),
+            (&[r#""'$x' reset""#], r#"''"${DCG_POSIX_VALUE}"'' reset"#),
+            (
+                &[r#""gi$(true)t `x` \"$y\"""#],
+                r#"gi${DCG_POSIX_VALUE}t ${DCG_POSIX_VALUE} "${DCG_POSIX_VALUE}""#,
+            ),
+            (&[r#""\$'a${x}b'""#], r#"$'a'"${DCG_POSIX_VALUE}"$'b'"#),
+            (&["gi${x}t' reset'"], "gi${DCG_POSIX_VALUE}t reset"),
+            (&[r#""'gi'"${x:-'}'}"'t'""#], r"'gi'${DCG_POSIX_VALUE}'t'"),
+            (
+                &[r#""'gi${x}t'""#, "reset"],
+                r#"'gi'"${DCG_POSIX_VALUE}"'t' reset"#,
+            ),
+            (&[r#""a\\${x}""#], r"a${DCG_POSIX_VALUE}"),
+            (&["--", "$CMD"], "-- ${DCG_POSIX_VALUE}"),
+        ] {
+            assert_eq!(
+                posix_shell_source_with_outer_values(words.iter().copied()).as_deref(),
+                Some(want),
+                "{words:?}"
+            );
+        }
+        for word in [
+            r#""'gi\${x}t' reset""#,
+            r"'gi${x}t'",
+            r"$'gi${x}t'",
+            r#""echo hi""#,
+            r#""unterminated ${x}"#,
+            "gi${x}*",
+        ] {
+            assert_eq!(
+                posix_shell_source_with_outer_values([word]),
+                None,
+                "{word:?}"
+            );
+        }
+        // An unquoted-delimiter heredoc body: its quotes are data to the
+        // parent, and only `\$`, `` \` ``, `\\` and backslash-newline escape.
+        for (body, want) in [
+            (
+                "'gi${x}t' reset --hard",
+                Some(r#"'gi'"${DCG_POSIX_VALUE}"'t' reset --hard"#),
+            ),
+            (
+                "echo \"a\" \\\"$x\\\"\nls",
+                Some(
+                    r#"echo "a" \"${DCG_POSIX_VALUE}\"
+ls"#,
+                ),
+            ),
+            ("a \\\nb $x", Some("a b ${DCG_POSIX_VALUE}")),
+            ("echo '$ x' \\n", None),
+        ] {
+            assert_eq!(
+                posix_shell_source_from_heredoc_body(body).as_deref(),
+                want,
+                "{body:?}"
+            );
+            assert_eq!(heredoc_body_expands(body), want.is_some(), "{body:?}");
+        }
+        // No value, but the parent removes an escape: the next shell reads
+        // the decoded text, where `${x}` is its own value.
+        for (body, want) in [
+            ("'gi\\${x}t' reset", "'gi${x}t' reset"),
+            (
+                "bash -c \"'gi\\${x}t' reset --hard\"",
+                "bash -c \"'gi${x}t' reset --hard\"",
+            ),
+        ] {
+            assert_eq!(
+                posix_shell_source_from_heredoc_body(body).as_deref(),
+                Some(want),
+                "{body:?}"
+            );
+            assert!(!heredoc_body_expands(body), "{body:?}");
+        }
+    }
+
     /// With an unquoted delimiter, bash and zsh end a body at a line joined
     /// across a backslash-newline, and the lines after it are commands, which
     /// no data mask may hide; a quoted delimiter joins no lines.
@@ -24474,8 +24806,10 @@ EOF";
             ("bash -c +e -- 'x'", "x"),
             ("bash -c 2>&1 -x 2>/dev/null 'x'", "x"),
             ("bash +e -c 'x'", "x"),
-            ("sh -c -- $CMD", "$CMD"),
-            ("sh 2>/dev/null -c $CMD", "$CMD"),
+            // The parent shell substitutes `$CMD`; the child's source is
+            // that unknown value (`posix_shell_source_with_outer_values`).
+            ("sh -c -- $CMD", "${DCG_POSIX_VALUE}"),
+            ("sh 2>/dev/null -c $CMD", "${DCG_POSIX_VALUE}"),
             ("python3 2>/dev/null -c 'x'", "x"),
             ("python3 -c 2>/dev/null 'x'", "x"),
             ("sh>/dev/null -c 'x'", "x"),

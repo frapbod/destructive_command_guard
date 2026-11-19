@@ -2222,6 +2222,103 @@ pub(crate) fn posix_dollar_expands(next: Option<char>) -> bool {
     })
 }
 
+/// The byte ranges of the values one raw POSIX argv word holds: each
+/// parameter expansion (`$x`, `${x}`, `${x:-a}`, `$1`, `$?`), command
+/// substitution (`$(…)`, backquotes) and arithmetic expansion (`$((…))`,
+/// `$[…]`) the shell replaces before the program starts, outside single
+/// quotes and ANSI-C quotes and not escaped (`\$x` is literal). A `$` before
+/// anything else is literal. A quote opened and never closed returns `None`;
+/// an expansion that never closes runs to the end of the word.
+pub(crate) fn posix_word_value_ranges(raw: &str) -> Option<Vec<Range<usize>>> {
+    let bytes = raw.as_bytes();
+    let mut ranges = Vec::new();
+    let mut double = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\'' if !double => index += 1 + raw[index + 1..].find('\'')? + 1,
+            b'$' if !double && crate::context::ansi_c_quote_starts_at(bytes, index) => {
+                index += 2;
+                loop {
+                    match bytes.get(index)? {
+                        b'\\' => index += 2,
+                        b'\'' => break,
+                        _ => index += 1,
+                    }
+                }
+                index += 1;
+            }
+            b'$' if !double && bytes.get(index + 1) == Some(&b'"') => {
+                double = true;
+                index += 2;
+            }
+            b'"' => {
+                double = !double;
+                index += 1;
+            }
+            b'`' => {
+                let mut end = index + 1;
+                loop {
+                    match bytes.get(end) {
+                        Some(b'\\') => end += 2,
+                        Some(b'`') => break,
+                        Some(_) => end += 1,
+                        None => break,
+                    }
+                }
+                let end = (end + 1).min(bytes.len());
+                ranges.push(index..end);
+                index = end;
+            }
+            b'$' if posix_dollar_expands(raw[index + 1..].chars().next()) => {
+                let end = match bytes[index + 1] {
+                    b'{' => crate::context::consume_braced_parameter(raw, index).0,
+                    b'(' => consume_shell_paren_construct(bytes, index + 2, bytes.len()),
+                    b'[' => raw[index..]
+                        .find(']')
+                        .map_or(raw.len(), |close| index + close + 1),
+                    first if first.is_ascii_alphabetic() || first == b'_' => {
+                        let mut end = index + 2;
+                        while bytes
+                            .get(end)
+                            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                        {
+                            end += 1;
+                        }
+                        end
+                    }
+                    _ => index + 2,
+                };
+                ranges.push(index..end);
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    (!double).then_some(ranges)
+}
+
+/// One raw POSIX argv word with each value the shell substitutes in it
+/// ([`posix_word_value_ranges`]) replaced by `value`, quotes and escapes kept
+/// for the decoder. `None` when the word holds no value or its quoting is
+/// unterminated.
+pub(crate) fn posix_word_with_values_replaced(raw: &str, value: &str) -> Option<String> {
+    let ranges = posix_word_value_ranges(raw)?;
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut output = String::with_capacity(raw.len() + ranges.len() * value.len());
+    let mut copied = 0usize;
+    for range in ranges {
+        output.push_str(&raw[copied..range.start]);
+        output.push_str(value);
+        copied = range.end;
+    }
+    output.push_str(&raw[copied..]);
+    Some(output)
+}
+
 /// An unknown parameter value in a reconstructed argv: one word that no rule
 /// reads as an option or a protected path.
 pub(crate) const POSIX_PARAMETER_VALUE: &str = "__dcg_parameter_value__";
