@@ -521,7 +521,9 @@ fn review_round_3_spellings_bind() {
             "Start-Process git 'a'.Replace('a','reset --hard')",
             "Start-Process git 'reset','--hard'.Trim()",
             "Start-Process git @'\nreset --hard\n'@.Trim()",
-            "$g='git'; Start-Process $g.Trim() reset,--hard",
+            // `$g='git'; Start-Process $g.Trim() reset,--hard` is judged as
+            // the direct `& $g.Trim() reset --hard` since review round 4
+            // (Known limits; card t_5a31da41).
             "$c='/c git reset --hard'; Start-Process cmd $c.Trim()",
             "Start-Process git ('reset --hard')?.Trim() -Wait -NoNewWindow",
             "Start-Process git ('reset','--hard')?[0..1]",
@@ -548,6 +550,73 @@ fn review_round_3_spellings_bind() {
             "Start-Process notepad",
             "Start-Process $file",
         ],
+        EvaluationDecision::Allow,
+    );
+}
+
+/// Review round 4: a program dcg cannot name is judged no stricter than
+/// the same direct call (`& <program> <argv>`). Installs and launches from
+/// a computed path stay allowed; a shell reached through a variable, a
+/// path whose last part names git, and `('git')?.Trim()` stay denied.
+#[test]
+fn unnamed_programs_are_judged_as_the_direct_call() {
+    assert_everywhere_with(
+        &[
+            "Start-Process \"$env:TEMP\\installer.exe\" -ArgumentList '/S' -Wait",
+            "Start-Process -FilePath \"$env:TEMP\\vs_buildtools.exe\" -ArgumentList '--quiet','--wait','--norestart' -Wait",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '--install'",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '/quiet','/norestart' -Wait",
+            "Start-Process \"$env:ProgramFiles\\nodejs\\node.exe\" -ArgumentList 'server.js' -NoNewWindow",
+            "Start-Process -FilePath \"$env:windir\\system32\\notepad.exe\" -ArgumentList 'C:\\x.txt'",
+            "Start-Process \"$PWD\\bin\\app.exe\" '--help'",
+            "Start-Process \"${env:ProgramFiles(x86)}\\Microsoft\\Edge\\Application\\msedge.exe\" 'https://example.com'",
+            "Start-Process \"$PSHOME\\pwsh.exe\" -ArgumentList '-NoProfile','-File','build.ps1'",
+            "Start-Process $exe.FullName -ArgumentList '--version'",
+            "Start-Process $installer.FullName -ArgumentList '/S','/D=C:\\Tools' -Wait -PassThru",
+            "Start-Process ('notepad')?.Trim() 'C:\\x.txt'",
+            "Start-Process $exe -ArgumentList '/S' -Wait",
+            "$exe = 'C:\\x\\app.exe'; Start-Process $exe -ArgumentList '--x'",
+        ],
+        EvaluationDecision::Allow,
+        &WIDE_PACKS,
+    );
+    assert_everywhere(
+        &[
+            "Start-Process $env:ComSpec -ArgumentList '/c','git reset --hard'",
+            "Start-Process \"$env:ComSpec\" '/c git reset --hard'",
+            "Start-Process (Get-Command 'cmd') '/c git reset --hard'",
+            "Start-Process (Get-Command $env:ComSpec) '/c git reset --hard'",
+            "Start-Process \"$env:ProgramFiles\\Git\\cmd\\git.exe\" -ArgumentList 'reset','--hard'",
+            "Start-Process ('git')?.Trim() reset,--hard",
+            "Start-Process (Get-Command git).Source reset,--hard",
+            "Start-Process $exe -ArgumentList '-NoProfile','-Command','git reset --hard'",
+        ],
+        EvaluationDecision::Deny,
+    );
+}
+
+/// Review round 4: PowerShell 7.5 reads a dash word whose name is followed
+/// directly by a quote as one plain word (`-r'f x'` reached rm as `-rf x`
+/// and `-C'. reset --hard'` reached git as `-C. reset --hard`), not as a
+/// parameter.
+#[test]
+fn a_quote_after_a_dash_name_is_a_plain_word() {
+    assert_everywhere(
+        &[
+            "Start-Process rm -r'f /' -Wait -NoNewWindow",
+            "Start-Process rm -R'f /' -Wait -NoNewWindow",
+            "Start-Process rm -f'r /' -Wait -NoNewWindow",
+            "Start-Process rm -rf' /' -Wait -NoNewWindow",
+            "Start-Process -FilePath rm -r'f /' -Wait -NoNewWindow",
+            "Start-Process rm -Wait -NoNewWindow -r'f /'",
+            "Start-Process git -C'. reset --hard' -Wait -NoNewWindow",
+            "Start-Process git -C\". reset --hard\" -Wait -NoNewWindow",
+            "Start-Process git -C\u{2019}. reset --hard\u{2019} -Wait -NoNewWindow",
+        ],
+        EvaluationDecision::Deny,
+    );
+    assert_everywhere(
+        &["Start-Process git -C'. status' -Wait -NoNewWindow"],
         EvaluationDecision::Allow,
     );
 }

@@ -507,6 +507,35 @@ fn is_parameter_start(text: &str, at: usize) -> bool {
     })
 }
 
+/// PowerShell's quote characters: ASCII and the typographic ones it
+/// accepts alike (‘ ’ ‚ ‛ “ ” „).
+fn is_powershell_quote(character: char) -> bool {
+    matches!(character, '\'' | '"' | '\u{2018}'..='\u{201E}')
+}
+
+/// The end of the parameter name at `at`, when a parameter starts there.
+/// A quote right after the name makes the whole one plain word instead:
+/// PowerShell 7.5 passes `-r'f x'` to the program as `-rf x`, and
+/// `-ArgumentList'reset'` as `-ArgumentListreset`.
+fn parameter_name_end(text: &str, at: usize) -> Option<usize> {
+    if !is_parameter_start(text, at) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut end = at + dash_len(text, at)?;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'?'))
+    {
+        end += 1;
+    }
+    let quote_follows = text
+        .get(end..)
+        .and_then(|tail| tail.chars().next())
+        .is_some_and(is_powershell_quote);
+    (!quote_follows).then_some(end)
+}
+
 /// The end of `--` (any two dashes) at `at` when it stands alone.
 fn end_of_parameters(text: &str, at: usize) -> Option<usize> {
     let first = dash_len(text, at)?;
@@ -575,16 +604,9 @@ fn units(text: &str, mut at: usize, limit: usize) -> (Vec<Unit>, Vec<bool>, usiz
             previous_end = Some(at);
             continue;
         }
-        if is_parameter_start(text, at) {
+        if let Some(name_end) = parameter_name_end(text, at) {
             let start = at;
             let name_start = at + dash_len(text, at).unwrap_or(1);
-            let mut name_end = name_start;
-            while bytes
-                .get(name_end)
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'?'))
-            {
-                name_end += 1;
-            }
             let attached = if bytes.get(name_end) == Some(&b':') {
                 let value_start = skip_blanks(text, name_end + 1, false);
                 if value_start >= bytes.len() || ends_statement(bytes, value_start) {
@@ -1150,6 +1172,123 @@ fn is_computed_program(text: &str, value: &Value) -> bool {
     }
 }
 
+/// A program name taken from the literal parts of a program dcg cannot
+/// read whole: the one string a member access or index applies to
+/// (`('git')?.Trim()` names `git`), or the last path part of an
+/// expandable string or word (`"$env:ProgramFiles\Git\cmd\git.exe"` names
+/// `git.exe`).
+fn derived_program(text: &str, value: &Value) -> Option<String> {
+    let Value::Elements(elements) = value else {
+        return None;
+    };
+    let [element] = elements.as_slice() else {
+        return None;
+    };
+    let raw = text.get(element.clone())?.trim();
+    if let Some(strings) = derived_strings(raw) {
+        return match strings.as_slice() {
+            [name] if !name.is_empty() && !name.chars().any(char::is_whitespace) => {
+                Some(name.clone())
+            }
+            _ => None,
+        };
+    }
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(raw);
+    let (head, tail) = inner.rsplit_once(['\\', '/'])?;
+    (head.contains('$')
+        && !tail.is_empty()
+        && tail
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-+~ ".contains(&byte)))
+    .then(|| tail.to_string())
+}
+
+/// Whether a line, as cmd.exe reads it, runs a command: only `/C`, `/K`
+/// and `/R` take command text (`/S/C` is two switches). Any word with
+/// such a switch counts, wherever it stands.
+fn cmd_runs_command(argv: &[String]) -> bool {
+    argv.iter().any(|word| {
+        word.starts_with('/')
+            && word.split('/').skip(1).any(|switch| {
+                switch
+                    .chars()
+                    .next()
+                    .is_some_and(|first| matches!(first.to_ascii_lowercase(), 'c' | 'k' | 'r'))
+            })
+    })
+}
+
+/// The lines of a call whose program dcg cannot name (a variable, an
+/// expression, an expandable string).
+///
+/// - It may be a shell, when the line invokes that shell's command reader
+///   by the shell's own rules: cmd with `/C`, `/K` or `/R`; PowerShell with
+///   `-Command`, `-EncodedCommand` or a command string
+///   ([`crate::evaluator::powershell_host_may_run_inline`]); sh always
+///   (its reading allows a script name or an option it does not know).
+///   A cmd or PowerShell switch
+///   reading fails closed on options it does not know, so reading every
+///   line as every shell would deny `Start-Process $exe -ArgumentList '/S'`
+///   and other installs that the same direct call allows.
+/// - A program computed by an expression is read as the same program
+///   called directly, as written (`Start-Process $i.FullName '/S'` as
+///   `& $i.FullName /S`): never stricter than the direct call, and as
+///   strict as it. A plain variable is left to the readings that resolve
+///   its assignment (the transfer pack keeps `$tool = 'notepad.exe'` …
+///   allowed), as the direct `& $tool` is in a Bash hook.
+/// - A name taken from its literal parts ([`derived_program`]) is read as
+///   that program.
+fn unnamed_program_lines(text: &str, program: &Value, arguments: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for shell in SHELL_READERS {
+        let Some(joined) = joined_arguments(text, arguments, &dynamic_argument(shell), true) else {
+            continue;
+        };
+        let invokes = match shell {
+            "cmd" => cmd_runs_command(&windows_argv(&joined)),
+            "powershell" => {
+                crate::evaluator::powershell_host_may_run_inline(&windows_argv(&joined), |word| {
+                    word.contains(DYNAMIC_ARGUMENT)
+                })
+            }
+            _ => true,
+        };
+        if invokes {
+            lines.push(format!("{shell} {joined}"));
+        }
+    }
+    if is_computed_program(text, program) {
+        if let Some(joined) = joined_arguments(text, arguments, DYNAMIC_ARGUMENT, true) {
+            let written = match program {
+                Value::Elements(elements) if elements.len() == 1 => text
+                    .get(elements[0].clone())
+                    .map(|raw| raw.trim().to_string()),
+                _ => None,
+            };
+            let mut line = format!(
+                "& {}",
+                written.unwrap_or_else(|| format!("${DYNAMIC_PROGRAM}"))
+            );
+            for word in windows_argv(&joined) {
+                line.push(' ');
+                line.push_str(&powershell_word(&word));
+            }
+            lines.push(line);
+        }
+    }
+    if let Some(name) = derived_program(text, program) {
+        let named = Bound {
+            file: Value::Literal(name),
+            arguments: Some(arguments.clone()),
+        };
+        lines.extend(bound_lines(text, &named));
+    }
+    lines
+}
+
 fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
     let Some(arguments) = bound.arguments.as_ref() else {
         return Vec::new();
@@ -1160,30 +1299,7 @@ fn bound_lines(text: &str, bound: &Bound) -> Vec<String> {
         None => get_command_program(text, &bound.file),
     };
     let Some(file) = file else {
-        // Any program, when some of the line is known: read the line as
-        // each shell would. A program computed by an expression
-        // (`$g.Trim()`, `('git')?.Trim()`) is also read as the argv of a
-        // program dcg cannot name, which PowerShell's reading fails closed
-        // on as it does for `& $g reset --hard`.
-        let mut lines: Vec<String> = SHELL_READERS
-            .iter()
-            .filter_map(|shell| {
-                joined_arguments(text, arguments, &dynamic_argument(shell), true)
-                    .map(|joined| format!("{shell} {joined}"))
-            })
-            .collect();
-        let computed = is_computed_program(text, &bound.file);
-        if let Some(joined) =
-            joined_arguments(text, arguments, DYNAMIC_ARGUMENT, true).filter(|_| computed)
-        {
-            let mut line = format!("& ${DYNAMIC_PROGRAM}");
-            for word in windows_argv(&joined) {
-                line.push(' ');
-                line.push_str(&powershell_word(&word));
-            }
-            lines.push(line);
-        }
-        return lines;
+        return unnamed_program_lines(text, &bound.file, arguments);
     };
     if file.is_empty() {
         return Vec::new();
@@ -1856,24 +1972,64 @@ mod tests {
         assert!(lines("Start-Process git ('reset --hard') ?.Trim()").is_empty());
     }
 
-    /// A program computed by an expression is also read as the argv of a
-    /// program dcg cannot name, as `& $g reset --hard` is. A plain
-    /// variable keeps the shell readings only.
+    /// A program dcg cannot name is read as the same program called
+    /// directly, as written, when an expression computes it; as a shell
+    /// only when the line invokes that shell's command reader; and as the
+    /// program its literal parts name.
     #[test]
-    fn a_computed_program_is_any_program() {
-        let any = vec![
-            "cmd reset --hard".to_string(),
-            "powershell reset --hard".to_string(),
-            "sh reset --hard".to_string(),
-            "& $DCG_START_PROCESS_PROGRAM reset --hard".to_string(),
-        ];
+    fn unnamed_programs_read_as_the_direct_call() {
+        let strings = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            lines("Start-Process $g.Trim() reset,--hard -Wait -NoNewWindow"),
+            strings(&[
+                "powershell reset --hard",
+                "sh reset --hard",
+                "& $g.Trim() reset --hard",
+            ])
+        );
         for spelling in [
-            "Start-Process $g.Trim() reset,--hard -Wait -NoNewWindow",
             "Start-Process ('git')?.Trim() reset,--hard",
             "Start-Process -FilePath ('git')?.Trim() reset,--hard",
         ] {
-            assert_eq!(lines(spelling), any, "{spelling:?}");
+            assert_eq!(
+                lines(spelling),
+                strings(&[
+                    "powershell reset --hard",
+                    "sh reset --hard",
+                    "& ('git')?.Trim() reset --hard",
+                    "& git reset --hard",
+                    "git reset --hard",
+                ]),
+                "{spelling:?}"
+            );
         }
+        assert_eq!(
+            lines(
+                "Start-Process \"$env:ProgramFiles\\Git\\cmd\\git.exe\" -ArgumentList 'reset','--hard'"
+            ),
+            strings(&[
+                "powershell reset --hard",
+                "sh reset --hard",
+                "& \"$env:ProgramFiles\\Git\\cmd\\git.exe\" reset --hard",
+                "& git.exe reset --hard",
+                "git.exe reset --hard",
+            ])
+        );
+        // An install: no shell reads `/S`, the direct call is read as is,
+        // and the program is the installer its path names.
+        assert_eq!(
+            lines("Start-Process \"$env:TEMP\\installer.exe\" -ArgumentList '/S' -Wait"),
+            strings(&[
+                "sh /S",
+                "& \"$env:TEMP\\installer.exe\" /S",
+                "& installer.exe /S",
+                "installer.exe /S",
+            ])
+        );
+        assert_eq!(
+            lines("Start-Process $exe.FullName -ArgumentList '--version'"),
+            strings(&["sh --version", "& $exe.FullName --version"])
+        );
         assert_eq!(
             lines("Start-Process (Get-Command 'git') reset,--hard"),
             program("git reset --hard")
@@ -1882,12 +2038,88 @@ mod tests {
             lines("Start-Process (gcm -Name git.exe) reset,--hard"),
             program("git.exe reset --hard")
         );
+        // A plain variable keeps the shell readings only.
         for spelling in [
             "Start-Process $g reset,--hard",
             "Start-Process ${g} reset,--hard",
         ] {
-            assert_eq!(lines(spelling), any[..3].to_vec(), "{spelling:?}");
+            assert_eq!(
+                lines(spelling),
+                strings(&["powershell reset --hard", "sh reset --hard"]),
+                "{spelling:?}"
+            );
         }
+        assert_eq!(
+            lines("Start-Process $exe -ArgumentList '/S','/D=C:\\Tools'"),
+            strings(&["sh /S /D=C:\\Tools"])
+        );
+        // A shell's own command switches.
+        assert_eq!(
+            lines("Start-Process $exe -ArgumentList '/s','/c','git reset --hard'"),
+            strings(&["cmd /s /c git reset --hard", "sh /s /c git reset --hard",])
+        );
+        assert_eq!(
+            lines("Start-Process $exe -ArgumentList '-NoProfile','-c','git reset --hard'"),
+            strings(&[
+                "powershell -NoProfile -c git reset --hard",
+                "sh -NoProfile -c git reset --hard",
+            ])
+        );
+        // An element dcg cannot read is not a command string it can judge.
+        assert_eq!(
+            lines("Start-Process $exe -ArgumentList $flag,'/S'"),
+            strings(&["sh \"$DCG_START_PROCESS_ARGUMENT\" /S"])
+        );
+    }
+
+    /// A cmd.exe line runs a command only after `/C`, `/K` or `/R`.
+    #[test]
+    fn cmd_command_switches() {
+        let argv = |line: &str| windows_argv(line);
+        assert!(cmd_runs_command(&argv("/c git reset --hard")));
+        assert!(cmd_runs_command(&argv("/S /K dir")));
+        assert!(cmd_runs_command(&argv("/s/c dir")));
+        assert!(cmd_runs_command(&argv("/R dir")));
+        assert!(!cmd_runs_command(&argv("/S /D=C:\\Tools")));
+        assert!(!cmd_runs_command(&argv("/quiet /norestart")));
+        assert!(!cmd_runs_command(&argv("--install -c x")));
+    }
+
+    /// Measured with PowerShell 7.5: a quote right after a parameter name
+    /// makes one plain word, which the program receives (`-r'f x'` is
+    /// `-rf x`).
+    #[test]
+    fn a_quote_after_a_parameter_name_makes_a_word() {
+        for (spelling, expected) in [
+            ("Start-Process rm -r'f /' -Wait -NoNewWindow", "rm -rf /"),
+            ("Start-Process rm -R'f /'", "rm -Rf /"),
+            ("Start-Process rm -f'r /'", "rm -fr /"),
+            ("Start-Process -FilePath rm -r'f /'", "rm -rf /"),
+            ("Start-Process rm -Wait -NoNewWindow -r'f /'", "rm -rf /"),
+            (
+                "Start-Process git -C'. reset --hard' -Wait",
+                "git -C. reset --hard",
+            ),
+            (
+                "Start-Process git -C\". reset --hard\"",
+                "git -C. reset --hard",
+            ),
+            (
+                "Start-Process git -ArgumentList'reset','--hard'",
+                "git -ArgumentListreset --hard",
+            ),
+        ] {
+            assert_eq!(lines(spelling), program(expected), "{spelling:?}");
+        }
+        // A parameter followed by a group or script block keeps its value.
+        assert_eq!(
+            lines("Start-Process git -Args{reset --hard}"),
+            program("git reset --hard")
+        );
+        assert_eq!(
+            lines("Start-Process git -Args('reset --hard')"),
+            program("git reset --hard")
+        );
     }
 
     /// Arguments glued with no blank that do not bind as scanned are read

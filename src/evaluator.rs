@@ -4959,6 +4959,57 @@ fn powershell_command_payload(
     }
 }
 
+/// Whether a PowerShell host given `arguments` (decoded argv words) runs
+/// code given on its command line: `-Command`, `-EncodedCommand`, or, in
+/// Windows PowerShell 5.1, a first argument that is not a switch (the
+/// command string). `false` when the host stops at a switch it does not
+/// know or does not model, reads a script file, or runs nothing. A first
+/// non-switch argument for which `is_unknown` holds is a value dcg cannot
+/// read, not a command string it can judge, so it gives `false` too.
+///
+/// `Start-Process` uses this to decide whether a program it cannot name may
+/// be a PowerShell host for its argument list (`'-c','…'` is; `'/S'`,
+/// `'--install'` and `'-y'` are not, though [`parse_powershell_launcher`]
+/// fails closed on them for a program that is known to be PowerShell).
+pub(crate) fn powershell_host_may_run_inline(
+    arguments: &[String],
+    is_unknown: impl Fn(&str) -> bool,
+) -> bool {
+    use PowerShellHostOption::{
+        Command, EncodedCommand, File, NoValue, OptionalValue, Unknown, Unmodeled, Value,
+    };
+    let words: Vec<String> = arguments
+        .iter()
+        .map(|argument| format!("'{}'", argument.replace('\'', "''")))
+        .collect();
+    [PowerShellHost::Windows, PowerShellHost::Core]
+        .into_iter()
+        .any(|host| {
+            let mut index = 0usize;
+            while let Some(raw) = words.get(index) {
+                match powershell_host_option(
+                    raw,
+                    host,
+                    ShellDialect::PowerShell,
+                    NativeArgv::Verbatim,
+                ) {
+                    Command | EncodedCommand => return true,
+                    File | Unmodeled => return false,
+                    NoValue => index += 1,
+                    OptionalValue | Value => index += 2,
+                    Unknown => {
+                        let argument = &arguments[index];
+                        return host == PowerShellHost::Windows
+                            && !powershell_argument_is_dashed(argument)
+                            && !argument.trim().is_empty()
+                            && !is_unknown(argument);
+                    }
+                }
+            }
+            false
+        })
+}
+
 /// `executable` is the launcher's lower-case base name without `.exe`:
 /// `powershell` (Windows PowerShell 5.1) or `pwsh` (PowerShell 6+).
 fn parse_powershell_launcher(
