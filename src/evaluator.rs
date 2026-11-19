@@ -40902,65 +40902,11 @@ fn evaluate_heredoc(
                 return Some(EvaluationResult::indeterminate_due_to_budget());
             }
 
-            if !m.severity.blocks_by_default() {
-                continue;
-            }
-
-            let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
-
-            if let Some(hit) =
-                context
-                    .allowlists
-                    .match_rule_at_path(&pack_id, &pattern_name, context.project_path)
+if let Some(blocked) =
+                heredoc_ast_finding_verdict(command, &content, m, context, first_allowlist_hit)
             {
-                if first_allowlist_hit.is_none() {
-                    let reason =
-                        format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
-                    let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
-                    *first_allowlist_hit = Some((
-                        PatternMatch {
-                            pack_id: Some(pack_id),
-                            pattern_name: Some(pattern_name),
-                            severity: Some(ast_severity_to_pack_severity(m.severity)),
-                            reason,
-                            source: MatchSource::HeredocAst,
-                            matched_span: mapped_span,
-                            matched_text_preview: Some(m.matched_text_preview),
-                            explanation: None,
-                            suggestions: &[],
-                        },
-                        hit.layer,
-                        hit.entry.reason.clone(),
-                    ));
-                }
-                continue;
+                return Some(blocked);
             }
-
-            let reason = format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
-            let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
-            return Some(EvaluationResult {
-                decision: EvaluationDecision::Deny,
-                pattern_info: Some(PatternMatch {
-                    pack_id: Some(pack_id),
-                    pattern_name: Some(pattern_name),
-                    severity: Some(ast_severity_to_pack_severity(m.severity)),
-                    reason,
-                    source: MatchSource::HeredocAst,
-                    matched_span: mapped_span,
-                    matched_text_preview: Some(m.matched_text_preview),
-                    explanation: None,
-                    suggestions: &[],
-                }),
-                allowlist_override: None,
-                effective_mode: Some(crate::packs::DecisionMode::Deny),
-                skipped_due_to_budget: false,
-                quick_rejected: false,
-                regex_evaluation_incomplete: false,
-                branch_context: None,
-                session_occurrence: None,
-                graduated_response: None,
-                bypass_method: None,
-            });
         }
 
         // Conservative exec-sink backstop (#136, wired up for #459).
@@ -41017,13 +40963,20 @@ fn evaluate_heredoc(
         // Destructive verbs the rm/git backstop does not know (`dd`, `mkfs`,
         // `wipefs`, `truncate`, …), reconstructed from an argv-split spawn and
         // sent through the packs.
-        if let Some(blocked) = exec_sink_pack_verdict(command, &content, context) {
+        if let Some(blocked) = exec_sink_pack_verdict(command, &content, context, false) {
             return Some(blocked);
         }
         // Source the body builds and runs in its own language, which no
         // layer above reads.
         if let Some(blocked) =
             dynamic_source_verdict(command, &content, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
+        // The same program as the interpreter receives it, when the parent
+        // shell substituted values into it first.
+        if let Some(blocked) =
+            parent_expanded_source_verdict(command, &content, context, first_allowlist_hit)
         {
             return Some(blocked);
         }
@@ -41138,6 +41091,105 @@ fn retry_transient_ast_failure(
     DEFAULT_MATCHER.find_matches_with_timeout(&content.content, content.language, retry)
 }
 
+/// The verdict on one AST finding in an extracted body: `None` for a finding
+/// that does not block by default, or one an allowlist grants (the first
+/// grant is recorded); otherwise its denial.
+fn heredoc_ast_finding_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    m: crate::ast_matcher::PatternMatch,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    if !m.severity.blocks_by_default() {
+        return None;
+    }
+    let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
+    let allow_hit = context
+        .allowlists
+        .match_rule_at_path(&pack_id, &pattern_name, context.project_path);
+    let pattern_match = PatternMatch {
+        reason: format_heredoc_denial_reason(content, &m, &pack_id, &pattern_name),
+        pack_id: Some(pack_id),
+        pattern_name: Some(pattern_name),
+        severity: Some(ast_severity_to_pack_severity(m.severity)),
+        source: MatchSource::HeredocAst,
+        matched_span: map_heredoc_span(command, content, m.start, m.end),
+        matched_text_preview: Some(m.matched_text_preview),
+        explanation: None,
+        suggestions: &[],
+    };
+    if let Some(hit) = allow_hit {
+        if first_allowlist_hit.is_none() {
+            *first_allowlist_hit = Some((pattern_match, hit.layer, hit.entry.reason.clone()));
+        }
+        return None;
+    }
+    Some(EvaluationResult {
+        decision: EvaluationDecision::Deny,
+        pattern_info: Some(pattern_match),
+        allowlist_override: None,
+        effective_mode: Some(crate::packs::DecisionMode::Deny),
+        skipped_due_to_budget: false,
+        quick_rejected: false,
+        regex_evaluation_incomplete: false,
+        branch_context: None,
+        session_occurrence: None,
+        graduated_response: None,
+        bypass_method: None,
+    })
+}
+
+/// The program a non-shell interpreter receives after its parent shell
+/// substituted values into it ([`crate::heredoc::ExtractedContent::parent_expanded_source`]),
+/// judged by the layers that read a body's own code: its AST findings, the
+/// exec-sink backstop, the commands its sinks hand a shell, and source it
+/// builds and runs. Each value is unknown text
+/// ([`crate::heredoc::OUTER_VALUE_MARK`]); a string a sink hands a shell
+/// spells it where that shell reads it ([`reconstructed_interpreter_commands_verdict`]).
+///
+/// `python3 -c "import os; os.system(\"'gi${x}t' reset --hard\")"` runs
+/// `git reset --hard` when `x` is empty (measured with Linux bash and dash).
+/// Read as written, the program kept `\"` and `${x}` as text: the literal
+/// recovery skipped it, and the sink's string was `'gi${x}t'`, one quoted
+/// word. This reading can only add a denial. A layer that cannot finish on
+/// it leaves the decision to the body as written, which every layer has
+/// already read with its own failure policy.
+fn parent_expanded_source_verdict(
+    command: &str,
+    content: &crate::heredoc::ExtractedContent,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let source = content.parent_expanded_source.as_deref()?;
+    if deadline_exceeded(context.deadline) {
+        return Some(EvaluationResult::indeterminate_due_to_budget());
+    }
+    let mut reading = content.clone();
+    reading.content = source.to_owned();
+    reading.content_range = None;
+    reading.word_range = None;
+    reading.parent_expanded_source = None;
+    if let Ok(matches) = DEFAULT_MATCHER.find_matches(&reading.content, reading.language) {
+        for m in matches {
+            if let Some(blocked) =
+                heredoc_ast_finding_verdict(command, &reading, m, context, first_allowlist_hit)
+            {
+                return Some(blocked);
+            }
+        }
+    }
+    if let Some(blocked) =
+        exec_sink_backstop_verdict(command, &reading, context, first_allowlist_hit)
+    {
+        return Some(blocked);
+    }
+    if let Some(blocked) = exec_sink_pack_verdict(command, &reading, context, true) {
+        return Some(blocked);
+    }
+    dynamic_source_verdict(command, &reading, context, first_allowlist_hit)
+}
+
 /// The exec-sink backstop's verdict on one extracted body.
 ///
 /// Every blocking match is weighed: an allowlisted one is recorded and
@@ -41203,10 +41255,17 @@ fn exec_sink_backstop_verdict(
 /// inner-command loop uses, one source of truth for the verb rules and their
 /// allowlists. Calls the rm/git backstop owns are skipped inside
 /// `exec_sink_reconstructed_commands`, so this never re-denies them.
+///
+/// `parent_expanded` marks a body read as its interpreter receives it after
+/// the parent shell substituted values ([`parent_expanded_source_verdict`]).
+/// Its bytes are not the command's, so no source proof can grant the
+/// documentation exemption, and the values are already marks: it is read
+/// as a complete program with other consumers.
 fn exec_sink_pack_verdict(
     command: &str,
     content: &crate::heredoc::ExtractedContent,
     context: HeredocEvaluationContext<'_>,
+    parent_expanded: bool,
 ) -> Option<EvaluationResult> {
     let named =
         crate::ast_matcher::exec_sink_reconstructed_commands(&content.content, content.language);
@@ -41242,7 +41301,9 @@ fn exec_sink_pack_verdict(
         .clone()
         .map(|range| (range, None))
         .or_else(|| decoded_program.map(|(word, program)| (word, Some(program))))
-        .filter(|_| command.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
+        .filter(|_| {
+            !parent_expanded && command.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+        })
         .map(|(range, program)| (command.to_owned(), range, program, content.language));
     // The proof's budget grows with the program it reads (#555). Past the
     // base budget it may take at most half of what remains of the deadline:
@@ -41258,7 +41319,7 @@ fn exec_sink_pack_verdict(
     }
     let proof = move || {
         let Some((source, range, decoded_program, language)) = source_identity else {
-            return (!inline).then_some(false);
+            return (!inline || parent_expanded).then_some(false);
         };
         if let Some(program) = decoded_program {
             // The complete word, decoded by the extractor's own lexer.
@@ -41283,7 +41344,9 @@ fn exec_sink_pack_verdict(
     // An unquoted heredoc body is expanded by the outer shell first: its
     // backquotes run then, so its literals are judged whole (#560 narrows
     // only what a later shell might run).
-    let recovered = if content.heredoc_type.is_some() && !content.quoted {
+    // The parent's substitutions in a parent-expanded body are marks, not
+    // text it runs, so its literals are screened like a quoted body's.
+    let recovered = if content.heredoc_type.is_some() && !content.quoted && !parent_expanded {
         crate::ast_matcher::expanded_interpreter_literal_shell_commands(
             &content.content,
             content.language,
@@ -41334,12 +41397,30 @@ fn reconstructed_interpreter_commands_verdict(
     context: HeredocEvaluationContext<'_>,
     commands: Vec<crate::ast_matcher::ReconstructedCommand>,
 ) -> Option<EvaluationResult> {
-    for reconstructed in commands {
+    // A value the parent shell substituted into the program
+    // ([`parent_expanded_source_verdict`]) is unknown text in the string the
+    // sink hands a shell: read it where that shell reads it, and read the
+    // string with every value empty (`'gi'"${…}"'t'` is `'git'` then). Deny
+    // wins.
+    let mark = crate::heredoc::OUTER_VALUE_MARK;
+    let readings = commands.into_iter().flat_map(|reconstructed| {
+        let texts = if reconstructed.command.contains(mark) {
+            vec![
+                crate::heredoc::posix_source_with_marked_values(&reconstructed.command),
+                reconstructed.command.replace(mark, ""),
+            ]
+        } else {
+            vec![reconstructed.command]
+        };
+        let (start, end) = (reconstructed.start, reconstructed.end);
+        texts.into_iter().map(move |text| (text, start, end))
+    });
+    for (reconstructed, start, end) in readings {
         if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
         }
         let result = evaluate_command_with_pack_order_deadline_at_path_inner(
-            &reconstructed.command,
+            &reconstructed,
             context.enabled_keywords,
             context.ordered_packs,
             context.keyword_index,
@@ -41365,7 +41446,7 @@ fn reconstructed_interpreter_commands_verdict(
                     &info.reason,
                     content.heredoc_type.is_some(),
                     content.execution_target(),
-                    content.content[..reconstructed.start.min(content.content.len())]
+                    content.content[..start.min(content.content.len())]
                         .bytes()
                         .filter(|byte| *byte == b'\n')
                         .count()
@@ -41374,8 +41455,7 @@ fn reconstructed_interpreter_commands_verdict(
                 if info.source != MatchSource::ConfigOverride {
                     info.source = MatchSource::HeredocAst;
                 }
-                info.matched_span =
-                    map_heredoc_span(command, content, reconstructed.start, reconstructed.end);
+                info.matched_span = map_heredoc_span(command, content, start, end);
                 info.matched_text_preview = info
                     .matched_span
                     .as_ref()
@@ -41432,10 +41512,15 @@ fn check_exec_sink_fallback(
         {
             return Some(blocked);
         }
-        if let Some(blocked) = exec_sink_pack_verdict(command, &item, context) {
+        if let Some(blocked) = exec_sink_pack_verdict(command, &item, context, false) {
             return Some(blocked);
         }
         if let Some(blocked) = dynamic_source_verdict(command, &item, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
+        if let Some(blocked) =
+            parent_expanded_source_verdict(command, &item, context, first_allowlist_hit)
         {
             return Some(blocked);
         }
@@ -41740,6 +41825,7 @@ fn literal_dynamic_source_verdict(
     literal.content_range = None;
     literal.word_range = None;
     literal.additional_execution_target = None;
+    literal.parent_expanded_source = None;
 
     for finding in crate::ast_matcher::scan_filesystem_sink_fallback(source, literal.language) {
         if finding.severity.blocks_by_default() {
@@ -41788,7 +41874,7 @@ fn literal_dynamic_source_verdict(
     {
         return Some(blocked);
     }
-    if let Some(blocked) = exec_sink_pack_verdict(command, &literal, context) {
+    if let Some(blocked) = exec_sink_pack_verdict(command, &literal, context, false) {
         return Some(blocked);
     }
     let reading = match dynamic_source_reading_within_deadline(&literal, None, context) {
@@ -63895,6 +63981,7 @@ mod tests {
                 heredoc_type: Some(crate::heredoc::HeredocType::Standard),
                 target_command: Some("python3".to_string()),
                 additional_execution_target: None,
+                parent_expanded_source: None,
             };
             for transient in [
                 MatchError::Timeout {

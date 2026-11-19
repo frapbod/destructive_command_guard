@@ -1593,6 +1593,13 @@ pub struct ExtractedContent {
     /// raw-shell quote classification keeps `target_command`'s original
     /// provenance. This evidence cannot grant a literal-data exemption.
     pub additional_execution_target: Option<String>,
+    /// For a non-shell interpreter's program that its parent POSIX shell
+    /// expands first (a double-quoted `-c`/`-e` word, an unquoted heredoc
+    /// body, a double-quoted here-string): the program the interpreter
+    /// receives, each substituted value left as [`OUTER_VALUE_MARK`]
+    /// ([`interpreter_source_with_outer_values`]). `content` stays the text
+    /// as written; this is a second reading that can only add a denial.
+    pub parent_expanded_source: Option<String>,
 }
 
 impl ExtractedContent {
@@ -2503,7 +2510,22 @@ pub(crate) const POSIX_OUTER_VALUE: &str = "${DCG_POSIX_VALUE}";
 fn posix_shell_source_with_outer_values<'w>(
     words: impl IntoIterator<Item = &'w str>,
 ) -> Option<String> {
-    const MARK: char = '\u{E000}';
+    posix_words_with_marked_values(words).map(|decoded| posix_source_with_marked_values(&decoded))
+}
+
+/// Where a value the parent shell substitutes sits in a decoded source
+/// ([`posix_words_with_marked_values`]). A private-use character: no reader
+/// gives it a meaning, so it stays where the value landed until the reader
+/// that knows the value's context spells it ([`posix_source_with_marked_values`]).
+pub(crate) const OUTER_VALUE_MARK: char = '\u{E000}';
+
+/// The text a program receives from the argv `words` its parent POSIX shell
+/// expands first (joined with spaces), with the parent's quotes and escapes
+/// removed and each value it substitutes left as one [`OUTER_VALUE_MARK`].
+/// `None` when the words hold no value, already hold the mark, or are not
+/// words [`crate::normalize::decode_posix_literal_word`] can take apart.
+fn posix_words_with_marked_values<'w>(words: impl IntoIterator<Item = &'w str>) -> Option<String> {
+    const MARK: char = OUTER_VALUE_MARK;
     let mut decoded = String::new();
     for (index, word) in words.into_iter().enumerate() {
         if word.contains(MARK) {
@@ -2518,9 +2540,14 @@ fn posix_shell_source_with_outer_values<'w>(
             marked.as_deref().unwrap_or(word),
         )?);
     }
-    if !decoded.contains(MARK) {
-        return None;
-    }
+    decoded.contains(MARK).then_some(decoded)
+}
+
+/// A POSIX shell source holding [`OUTER_VALUE_MARK`]s, with each mark
+/// spelled as one unknown value where the shell reads it
+/// ([`posix_shell_source_with_outer_values`]).
+pub(crate) fn posix_source_with_marked_values(decoded: &str) -> String {
+    const MARK: char = OUTER_VALUE_MARK;
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
         None,
@@ -2576,7 +2603,29 @@ fn posix_shell_source_with_outer_values<'w>(
         }
         output.push(ch);
     }
-    Some(output)
+    output
+}
+
+/// The program a non-shell interpreter (Python, Node, Ruby, Perl, PHP, …)
+/// receives from the argv `words` its parent POSIX shell expands first, each
+/// substituted value left as [`OUTER_VALUE_MARK`]
+/// ([`ExtractedContent::parent_expanded_source`]).
+///
+/// `python3 -c "import os; os.system(\"'gi${x}t' reset --hard\")"` hands
+/// Python `os.system("'git' reset --hard")` when `x` is empty, and its
+/// `/bin/sh` runs `git reset --hard` (measured with Linux bash and dash). The
+/// value lands in the interpreter's string literal first and then in the
+/// shell's quotes, so only the reader of the string the program hands a
+/// shell can spell it ([`posix_source_with_marked_values`]). `None` for a
+/// shell or unrecognized program, and as for [`posix_words_with_marked_values`].
+fn interpreter_source_with_outer_values<'w>(
+    words: impl IntoIterator<Item = &'w str>,
+    language: ScriptLanguage,
+) -> Option<String> {
+    if matches!(language, ScriptLanguage::Bash | ScriptLanguage::Unknown) {
+        return None;
+    }
+    posix_words_with_marked_values(words)
 }
 
 /// A POSIX shell program whose word the parent shell expands
@@ -3143,9 +3192,16 @@ fn extract_inline_scripts(
                 });
                 continue;
             }
+            let language = ScriptLanguage::from_command(cmd_name);
+            // A shell's own word was read above; a PowerShell word keeps
+            // its native path.
+            let parent_expanded_source = (!program.resolved && !is_powershell)
+                .then(|| command.get(program.word_range.clone()))
+                .flatten()
+                .and_then(|word| interpreter_source_with_outer_values([word], language));
             extracted.push(ExtractedContent {
                 content: program.content.into_owned(),
-                language: ScriptLanguage::from_command(cmd_name),
+                language,
                 delimiter: None,
                 byte_range: full_match.start()..full_match.end().max(program.word_range.end),
                 content_range: program.content_range,
@@ -3154,6 +3210,7 @@ fn extract_inline_scripts(
                 heredoc_type: None,
                 target_command: Some(cmd_name.to_string()), // -c/-e content is executed by the interpreter
                 additional_execution_target: None,
+                parent_expanded_source,
             });
         }
     };
@@ -3512,6 +3569,7 @@ fn push_windows_inner(
         heredoc_type: None,
         target_command: Some(target.to_string()),
         additional_execution_target: None,
+        parent_expanded_source: None,
     });
     true
 }
@@ -4714,6 +4772,10 @@ fn extract_deno_eval_inline_scripts(
             heredoc_type: None,
             target_command: Some("deno".to_string()),
             additional_execution_target: None,
+            parent_expanded_source: interpreter_source_with_outer_values(
+                command.get(program.word_range.clone()).filter(|_| !program.resolved),
+                ScriptLanguage::from_command("deno"),
+            ),
         });
     }
 }
@@ -8123,13 +8185,17 @@ fn extract_herestrings(
             // including one whose shell sits behind a wrapper or runner
             // (`timeout 5 bash <<<`, `docker exec -i c sh <<<`); a data sink
             // such as `grep` stays exempt at evaluation.
-            let content = if language == ScriptLanguage::Bash
-                || stdin_feeds_posix_shell(target_cmd.as_deref())
-            {
+            let reads_shell =
+                language == ScriptLanguage::Bash || stdin_feeds_posix_shell(target_cmd.as_deref());
+            let content = if reads_shell {
                 posix_shell_source_with_outer_values([raw]).unwrap_or(content)
             } else {
                 content
             };
+            // Any other interpreter reads it expanded too.
+            let parent_expanded_source = (!reads_shell)
+                .then(|| interpreter_source_with_outer_values([raw], language))
+                .flatten();
             let content_range = (command.get(raw_content_range.clone()) == Some(content.as_str()))
                 .then_some(raw_content_range);
 
@@ -8144,6 +8210,7 @@ fn extract_herestrings(
                 heredoc_type: Some(HeredocType::HereString),
                 target_command: target_cmd,
                 additional_execution_target: None,
+                parent_expanded_source,
             });
         }
     };
@@ -8487,6 +8554,16 @@ fn extract_heredocs(
                         target_cmd = Some(source.interpreter.clone());
                     }
                 }
+                // The parent shell expands an unquoted-delimiter body before
+                // the interpreter reads it, as it expands a `-c` word.
+                let parent_expanded_source = (!quoted)
+                    .then(|| {
+                        interpreter_source_with_outer_values(
+                            [heredoc_body_as_double_quoted_word(&content).as_str()],
+                            language,
+                        )
+                    })
+                    .flatten();
                 extracted.push(ExtractedContent {
                     content,
                     language,
@@ -8498,6 +8575,7 @@ fn extract_heredocs(
                     heredoc_type: Some(heredoc_type),
                     target_command: target_cmd,
                     additional_execution_target,
+                    parent_expanded_source,
                 });
             }
             Err(reason) => {
