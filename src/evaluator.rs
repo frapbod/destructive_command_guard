@@ -5561,22 +5561,40 @@ fn parse_cmd_launcher(
             // A word that is not a switch does not end cmd's switches: cmd
             // looks for a `/` switch anywhere on its command line (ReactOS
             // cmd's `Initialize` scans every `/`), so `cmd foo /c git reset
-            // --hard` may run git. What Windows cmd.exe does with the word is
-            // not measured: fail closed when a `/C`, `/K` or `/R` follows.
-            if words[index..].iter().any(|raw| {
-                cmd_text_has_run_switch(raw)
-                    || cmd_host_switch(raw, switch_dialect)
-                        .is_some_and(|word| cmd_text_has_run_switch(&word))
-            }) {
+            // --hard` runs git there. Windows cmd.exe either does the same
+            // or runs nothing from its command line, so the reading goes on
+            // to a later `/c`. A redirection the outer shell left in the
+            // words (`cmd 2>nul /c dir`, `cmd 2> nul /c dir`) is not cmd's
+            // argv. A switch inside the word (`foo/c`) is not modeled: it
+            // fails closed.
+            if let Some(operator) = cmd_redirection_operator(raw) {
+                index += if operator.len() == raw.len() { 2 } else { 1 };
+                continue;
+            }
+            if cmd_text_has_run_switch(raw) || cmd_text_has_run_switch(&option) {
                 return WindowsLauncherParse::Unverified(format!(
-                    "cmd may read a /C, /K or /R switch after {raw:?}, which is not a switch"
+                    "cmd may read a /C, /K or /R switch inside {raw:?}"
                 ));
             }
-            return WindowsLauncherParse::NotLauncher;
         }
         index += 1;
     }
     WindowsLauncherParse::NotLauncher
+}
+
+/// The redirection operator a raw word starts with (`>`, `>>`, `<`, after
+/// an optional stream number: `2>nul`, `2>`), if any.
+fn cmd_redirection_operator(raw: &str) -> Option<&str> {
+    let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = &raw[digits..];
+    let operator = if rest.starts_with(">>") {
+        2
+    } else if rest.starts_with(['>', '<']) {
+        1
+    } else {
+        return None;
+    };
+    Some(&raw[..digits + operator])
 }
 
 /// Whether `text` holds `/C`, `/K` or `/R` (any case), the switches after
@@ -69093,12 +69111,22 @@ mod cmd_switch_quote_tests {
     }
 
     #[test]
-    fn run_switches_after_a_word_that_is_not_a_switch_fail_closed() {
-        for segment in [
-            "cmd foo /c git reset --hard",
-            "cmd foo /K dir",
-            "cmd foo/r dir",
+    fn switches_after_a_word_that_is_not_a_switch_are_still_read() {
+        for (segment, dialect, payload) in [
+            ("cmd foo /c git reset --hard", ShellDialect::PowerShell, "git reset --hard"),
+            ("cmd foo /K dir", ShellDialect::PowerShell, "dir"),
+            ("cmd /d foo /c ver", ShellDialect::Posix, "ver"),
+            ("cmd 2>nul /c dir", ShellDialect::Cmd, "dir"),
+            ("cmd 2> nul /c dir", ShellDialect::Cmd, "dir"),
         ] {
+            let WindowsLauncherParse::Envelope(envelope) =
+                parse_windows_launcher_segment(segment, dialect, 1024)
+            else {
+                panic!("{segment:?} was not read as a cmd launcher");
+            };
+            assert_eq!(envelope.command, payload, "{segment:?}");
+        }
+        for segment in ["cmd foo/r dir", "cmd foo/c dir", "cmd foo /x /c dir"] {
             assert!(
                 matches!(
                     parse_windows_launcher_segment(segment, ShellDialect::PowerShell, 1024),

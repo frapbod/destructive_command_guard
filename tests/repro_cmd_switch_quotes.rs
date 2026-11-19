@@ -8,8 +8,9 @@
 //!
 //! cmd also looks for its switches anywhere on its command line (ReactOS
 //! cmd's `Initialize` scans every `/`), so a word that is not a switch before
-//! `/C` does not end them (`cmd foo /c git reset --hard`). What Windows
-//! cmd.exe does there is not measured, so dcg fails closed.
+//! `/C` does not end them (`cmd foo /c git reset --hard` runs git there).
+//! Windows cmd.exe does that or runs nothing from its command line, so dcg
+//! reads on to the `/C`; a switch inside a word (`foo/c`) fails closed.
 
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
@@ -258,9 +259,10 @@ fn a_quoted_cmd_payload_is_read_as_cmd_strips_its_quotes() {
     assert_no_misses(&[powershell, posix, cmd]);
 }
 
-/// A word that is not a switch before `/C`, `/K` or `/R` fails closed.
+/// A word that is not a switch before `/C` or `/K` does not hide the
+/// payload; a switch inside such a word fails closed.
 #[test]
-fn a_word_that_is_not_a_switch_before_slash_c_fails_closed() {
+fn a_word_that_is_not_a_switch_before_slash_c_does_not_hide_the_payload() {
     let powershell = expect_everywhere(
         &strings(&[
             r"cmd foo /c git reset --hard",
@@ -289,6 +291,8 @@ fn a_word_that_is_not_a_switch_before_slash_c_fails_closed() {
         &[
             r"cmd foo /c git reset --hard",
             r"cmd .y /c git reset --hard",
+            r"cmd 2>nul /c git reset --hard",
+            r"cmd 2> nul foo /c git reset --hard",
         ],
         EvaluationDecision::Deny,
     );
@@ -316,6 +320,9 @@ fn quoted_program_paths_and_harmless_payloads_stay_allowed() {
             r"cmd",
             r"cmd /d",
             r"cmd foo",
+            r"cmd foo /c ver",
+            r"cmd '--%' -x /c ver",
+            r"cmd 2>$null /c dir",
         ]),
         &[ShellDialect::PowerShell],
         "PowerShell",
@@ -338,6 +345,9 @@ fn quoted_program_paths_and_harmless_payloads_stay_allowed() {
             r#"cmd /s /c ""C:\Program Files\x\y.exe" "a b"""#,
             r#"cmd /c "where git""#,
             r#"cmd /c ""dir"""#,
+            r#"cmd 2>nul /c "dir""#,
+            r"cmd 2> nul /c dir",
+            r"cmd foo /c ver",
         ],
         EvaluationDecision::Allow,
     );
