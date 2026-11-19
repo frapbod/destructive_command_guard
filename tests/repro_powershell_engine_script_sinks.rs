@@ -395,7 +395,47 @@ const RUNS_IT: &[&str] = &[
     "$a='git reset --hard'; ( ( [scriptblock] ) )::Create($a).Invoke()",
     "$a='git reset --hard'; ([System.Management.Automation.ScriptBlock])::Create($a).Invoke()",
     "$a=@([scriptblock]); $a[0]::Create('git reset --hard').Invoke()",
+    // A `@"…"@` name decodes its escapes, and a line continuation is blank
+    // space in the group around a type (review round 2; runner
+    // rv2/truth.out, rv2/truth2.out, rv2/truth3.out).
+    "$a='git reset --hard'; $ExecutionContext.InvokeCommand.@\"\nInvoke`Script\n\"@($a)",
+    "[scriptblock]::@\"\n`Create\n\"@('git reset --hard').Invoke()",
+    "$a='git reset --hard'; [scriptblock]::@\"\n`Create\n\"@($a).Invoke()",
+    "$t=[scriptblock]; $f=$t::@\"\n`Create\n\"@; $f.Invoke('git reset --hard').Invoke()",
+    "$a='git reset --hard'; (`\n[scriptblock])::Create($a).Invoke()",
 ];
+
+/// Name spellings longer than dcg's first reading window (review round 2;
+/// runner rv2/truth.out, rv2/truth3.out): the rows that ran `git reset
+/// --hard` in sandboxed PowerShell 7.5, and their twins that ran `git
+/// status`. `SP` is 300 blanks, `XS` 300 `x` and `CS` 300 `c`.
+fn long_spelling_rows() -> (Vec<String>, Vec<String>) {
+    let expand = |row: &str| {
+        row.replace("SP", &" ".repeat(300))
+            .replace("XS", &"x".repeat(300))
+            .replace("CS", &"c".repeat(300))
+    };
+    let runs_it = [
+        "[scriptblock]::(SP'Create')('git reset --hard').Invoke()",
+        "[scriptblock]::@(SP'Create')('git reset --hard').Invoke()",
+        "[scriptblock]::$(SP'Create')('git reset --hard').Invoke()",
+        "[scriptblock]::@'SP\nCreate\n'@('git reset --hard').Invoke()",
+        "${XS}='Create'; [scriptblock]::${XS}('git reset --hard').Invoke()",
+        "[scriptblock]::(<#CS#>'Create')('git reset --hard').Invoke()",
+        "$ExecutionContext.InvokeCommand.(SP'InvokeScript')('git reset --hard')",
+        "[scriptblock]::('Cre'+SP'ate')('git reset --hard').Invoke()",
+        "[scriptblock]::\"$(SP'Create')\"('git reset --hard').Invoke()",
+        "[scriptblock]::@\"\n$(SP'Create')\n\"@('git reset --hard').Invoke()",
+    ];
+    let harmless = [
+        "[scriptblock]::(SP'Create')('git status').Invoke()",
+        "[scriptblock]::\"$(SP'Create')\"('git status').Invoke()",
+    ];
+    (
+        runs_it.iter().map(|row| expand(row)).collect(),
+        harmless.iter().map(|row| expand(row)).collect(),
+    )
+}
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
 const HARMLESS: &[&str] = &[
@@ -624,6 +664,9 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "$ExecutionContext.InvokeCommand.{ InvokeScript }('git reset --hard')",
     "[scriptblock]::{Cre`ate}('git reset --hard').Invoke()",
     "[scriptblock]::{$n}('git reset --hard').Invoke()",
+    // Twin of the round 2 `@"…"@` escape rows: Unknown's POSIX reading
+    // takes the backtick as command substitution.
+    "[scriptblock]::@\"\n`Create\n\"@('git status').Invoke()",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
@@ -744,15 +787,25 @@ fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
 /// The PowerShell tool label, in both hook formats.
 #[test]
 fn powershell_tool_judges_engine_script_methods() {
+    let (long_runs_it, long_harmless) = long_spelling_rows();
     for protocol in [Protocol::Claude, Protocol::Codex] {
-        for command in RUNS_IT {
+        for command in RUNS_IT
+            .iter()
+            .copied()
+            .chain(long_runs_it.iter().map(String::as_str))
+        {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "deny",
                 "{protocol:?}: {command:?}"
             );
         }
-        for command in HARMLESS.iter().chain(HARMLESS_IN_POWERSHELL) {
+        for command in HARMLESS
+            .iter()
+            .chain(HARMLESS_IN_POWERSHELL)
+            .copied()
+            .chain(long_harmless.iter().map(String::as_str))
+        {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "allow",
@@ -767,7 +820,12 @@ fn powershell_tool_judges_engine_script_methods() {
 #[cfg(windows)]
 #[test]
 fn codex_bash_label_on_windows_judges_engine_script_methods() {
-    for command in RUNS_IT {
+    let (long_runs_it, _) = long_spelling_rows();
+    for command in RUNS_IT
+        .iter()
+        .copied()
+        .chain(long_runs_it.iter().map(String::as_str))
+    {
         assert_eq!(
             hook_decision(Protocol::Codex, "Bash", command),
             "deny",
@@ -778,15 +836,24 @@ fn codex_bash_label_on_windows_judges_engine_script_methods() {
 
 #[test]
 fn powershell_and_unknown_dialects_judge_engine_script_methods() {
+    let (long_runs_it, long_harmless) = long_spelling_rows();
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
-        for command in RUNS_IT {
+        for command in RUNS_IT
+            .iter()
+            .copied()
+            .chain(long_runs_it.iter().map(String::as_str))
+        {
             assert_eq!(
                 decision_in(command, dialect),
                 EvaluationDecision::Deny,
                 "{dialect:?}: {command:?}"
             );
         }
-        for command in HARMLESS {
+        for command in HARMLESS
+            .iter()
+            .copied()
+            .chain(long_harmless.iter().map(String::as_str))
+        {
             assert_eq!(
                 decision_in(command, dialect),
                 EvaluationDecision::Allow,

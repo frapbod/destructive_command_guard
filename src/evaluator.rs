@@ -12305,9 +12305,10 @@ fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
         if group_start.is_some_and(|start| start != open) {
             return None;
         }
-        let inner = &before[open + 1..before.len() - 1];
-        group_start = Some(open + 1 + (inner.len() - inner.trim_start().len()));
-        before = &before[..open + 1 + inner.trim_end().len()];
+        // Blank space, including a backtick line continuation, may surround
+        // what the group holds.
+        group_start = Some(powershell_blank_end(before, open + 1));
+        before = trim_powershell_blank_end(&before[..before.len() - 1]);
     }
     if !before.ends_with(']') {
         return None;
@@ -12342,10 +12343,17 @@ fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
 /// runs.
 const POWERSHELL_EXPAND_STRING_METHOD: &str = "expandstring";
 
-/// The longest member-name spelling read after a `.`: a quoted name or a
-/// parenthesized name expression. The real names are at most 20 characters;
-/// the bound keeps a run of `.(` or `.'` from rescanning the command.
+/// The longest member-name spelling read after a `.` in one pass: a quoted
+/// name or a parenthesized name expression. The real names are at most 20
+/// characters; the bound keeps a run of `.(` or `.'` from rescanning the
+/// command. A spelling that does not close within it is read again in the
+/// whole command, at most [`MAX_POWERSHELL_LONG_MEMBER_SPELLINGS`] times.
 const MAX_POWERSHELL_MEMBER_NAME_SPELLING: usize = 256;
+
+/// The most member-name spellings longer than
+/// [`MAX_POWERSHELL_MEMBER_NAME_SPELLING`] read in one command; past it the
+/// command is not verified.
+const MAX_POWERSHELL_LONG_MEMBER_SPELLINGS: usize = 8;
 
 /// The most method calls one command may hold that could run script text
 /// (named sinks and calls whose name is not static); past it the command is
@@ -12362,14 +12370,45 @@ const MAX_POWERSHELL_ENGINE_SCRIPT_CALLS: usize = 4 * MAX_EXECUTABLE_TEXT_SINKS;
 fn powershell_member_name_after_dot(
     command: &str,
     after_dot: usize,
+    long_spellings: &mut usize,
 ) -> Option<(Option<String>, usize)> {
     let bytes = command.as_bytes();
-    let mut start = after_dot;
-    while let Some(character) = command.get(start..)?.chars().next() {
+    let start = powershell_blank_end(command, after_dot);
+    let mut window_end = command
+        .len()
+        .min(start.saturating_add(MAX_POWERSHELL_MEMBER_NAME_SPELLING));
+    while !command.is_char_boundary(window_end) {
+        window_end -= 1;
+    }
+    if let Some(member) = powershell_member_name_spelling(command, start, window_end) {
+        return Some(member);
+    }
+    // A quoted, grouped, here-string, block or `$( )`/`${ }` spelling the
+    // window cuts off is read in the whole command: dropping it would leave
+    // the call unjudged.
+    let delimited = match bytes.get(start) {
+        Some(b'\'' | b'"' | b'(' | b'@' | b'{') => true,
+        Some(b'$') => matches!(bytes.get(start + 1), Some(b'(' | b'{')),
+        _ => false,
+    };
+    if window_end == command.len() || !delimited {
+        return None;
+    }
+    *long_spellings += 1;
+    if *long_spellings > MAX_POWERSHELL_LONG_MEMBER_SPELLINGS {
+        return None;
+    }
+    powershell_member_name_spelling(command, start, command.len())
+}
+
+/// The byte after the blank space at `start`: whitespace, line breaks and
+/// backtick line continuations.
+fn powershell_blank_end(command: &str, mut start: usize) -> usize {
+    let bytes = command.as_bytes();
+    while let Some(character) = command.get(start..).and_then(|rest| rest.chars().next()) {
         if character.is_whitespace() {
             start += character.len_utf8();
         } else if character == '`' && matches!(bytes.get(start + 1), Some(b'\n' | b'\r')) {
-            // A backtick line continuation is blank space too.
             start += if bytes.get(start + 1..start + 3) == Some(b"\r\n") {
                 3
             } else {
@@ -12379,13 +12418,36 @@ fn powershell_member_name_after_dot(
             break;
         }
     }
-    let mut bounded_end = command
-        .len()
-        .min(start.saturating_add(MAX_POWERSHELL_MEMBER_NAME_SPELLING));
-    while !command.is_char_boundary(bounded_end) {
-        bounded_end -= 1;
+    start
+}
+
+/// `text` without the blank space at its end, as [`powershell_blank_end`]
+/// reads it.
+fn trim_powershell_blank_end(mut text: &str) -> &str {
+    loop {
+        if let Some(rest) = text
+            .strip_suffix("`\n")
+            .or_else(|| text.strip_suffix("`\r\n"))
+        {
+            text = rest;
+        } else if let Some(last) = text.chars().next_back().filter(|last| last.is_whitespace()) {
+            text = &text[..text.len() - last.len_utf8()];
+        } else {
+            return text;
+        }
     }
-    let bounded = &command[..bounded_end];
+}
+
+/// The member name spelled at `start` and the byte after its spelling,
+/// reading delimited spellings only up to `end`
+/// ([`powershell_member_name_after_dot`]).
+fn powershell_member_name_spelling(
+    command: &str,
+    start: usize,
+    end: usize,
+) -> Option<(Option<String>, usize)> {
+    let bytes = command.as_bytes();
+    let bounded = &command[..end];
     let word_end = |from: usize, extra: &[u8]| {
         bytes[from..]
             .iter()
@@ -12425,13 +12487,19 @@ fn powershell_member_name_after_dot(
             Some((name, close + 1))
         }
         // A here-string names the member by its body: verbatim for `@'`, and
-        // for `@"` only a body with no `$` or escape to expand.
+        // for `@"` with its escapes decoded as in a `"…"` name, unless a `$`
+        // may expand. A body holding `"` names no member dcg looks for: the
+        // quote stays in the name, escaped or not.
         b'@' => {
             let (quote, content_start, end) = powershell_here_string_end(bounded, start)?;
             let body = bounded[content_start..end - 2]
                 .strip_suffix('\n')
                 .map_or("", |body| body.strip_suffix('\r').unwrap_or(body));
-            let name = (quote == b'\'' || !body.contains(['$', '`'])).then(|| body.to_string());
+            let name = if quote == b'\'' || body.contains('"') {
+                Some(body.to_string())
+            } else {
+                parse_static_powershell_source(&format!("\"{body}\"")).ok()
+            };
             Some((name, end))
         }
         // A script block names the member by its text, unchanged
@@ -12636,6 +12704,7 @@ fn powershell_method_invocation(rest: &str, method: &str) -> bool {
 /// string argument is judged as source, and anything else is left alone.
 fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     let mut examined = 0usize;
+    let mut long_spellings = 0usize;
     // Instance (`.`) and static (`::`) member access, each searched once.
     let mut next_dot = find_powershell_code_marker(command, ".", 0);
     let mut next_static = find_powershell_code_marker(command, "::", 0);
@@ -12651,8 +12720,15 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
         } else {
             next_dot = find_powershell_code_marker(command, ".", after_dot);
         }
-        let Some((name, mut after_name)) = powershell_member_name_after_dot(command, after_dot)
-        else {
+        let member = powershell_member_name_after_dot(command, after_dot, &mut long_spellings);
+        if long_spellings > MAX_POWERSHELL_LONG_MEMBER_SPELLINGS {
+            sinks.push(ExecutableTextSink::Unverified {
+                rule: SINK_ANALYSIS_BOUNDS_RULE,
+                reason: "command contains too many long PowerShell member names for bounded analysis",
+            });
+            return;
+        }
+        let Some((name, mut after_name)) = member else {
             continue;
         };
         let intrinsic_foreach = !is_static
@@ -67816,8 +67892,51 @@ mod tests {
             // be the script method; `new` there is an ordinary constructor.
             ("$f = $t::new", vec![]),
             ("$f = $t::@('Create')", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            // A `@"…"@` name decodes escapes; only `$` makes it dynamic, and a
+            // name holding `"` is no member dcg looks for (review round 2).
+            (
+                "$x.@\"\nInvoke`Script\n\"@($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "$f = $t::@\"\n`Create\n\"@",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("$x.@\"\nInvoke\"Script\n\"@('a')", vec![]),
+            ("[scriptblock]::@\"\nCre`ate\n\"@('a')", vec![]),
+            // Blank space around a grouped type includes a line continuation.
+            (
+                "(`\n[scriptblock])::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "( [scriptblock] `\r\n)::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
         ] {
             assert_eq!(sources(command), expected, "{command:?}");
+        }
+        // A spelling longer than the first reading window is read in the
+        // whole command, a bounded number of times (review round 2).
+        let blanks = " ".repeat(MAX_POWERSHELL_MEMBER_NAME_SPELLING);
+        for (command, expected) in [
+            (format!("[scriptblock]::({blanks}'Create')('a')"), vec!["a"]),
+            (format!("$x.\"{blanks}\"('a')"), vec![]),
+            (
+                format!("$x.({blanks}'InvokeScript')($a)"),
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (format!("$x.({blanks}"), vec![]),
+            (
+                format!("$x.({blanks}'a')").repeat(MAX_POWERSHELL_LONG_MEMBER_SPELLINGS),
+                vec![],
+            ),
+            (
+                format!("$x.({blanks}'a')").repeat(MAX_POWERSHELL_LONG_MEMBER_SPELLINGS + 1),
+                vec![SINK_ANALYSIS_BOUNDS_RULE],
+            ),
+        ] {
+            assert_eq!(sources(&command), expected, "{command:?}");
         }
         let started = std::time::Instant::now();
         let mut timings = Vec::new();
