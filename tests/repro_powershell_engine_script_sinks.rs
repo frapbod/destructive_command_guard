@@ -437,6 +437,27 @@ const RUNS_IT: &[&str] = &[
     "$f=@{a=[scriptblock]}.a::Create; $f.Invoke('git reset --hard').Invoke()",
     "$a=@($ExecutionContext.InvokeCommand); $m=$a[0].InvokeScript; $m.Invoke('git reset --hard')",
     "$m=(gv ExecutionContext).Value.InvokeCommand.InvokeScript; & { $m.Invoke('git reset --hard') }",
+    // Review round 5 (runner rv5/truth.out, rv5/truth2.out, p7/truth.out):
+    // the method taken as a value on a chain that holds a quoted or
+    // here-string member name, a name with letters outside ASCII, or a block
+    // comment between its parts.
+    "$m=$ExecutionContext.'InvokeCommand'.InvokeScript; $m.Invoke('git reset --hard')",
+    "$m=$ExecutionContext.\"InvokeCommand\".InvokeScript; $m.Invoke('git reset --hard')",
+    "$m=$ExecutionContext.@'\nInvokeCommand\n'@.InvokeScript; $m.Invoke('git reset --hard')",
+    "$p='InvokeCommand'; $m=$ExecutionContext.\"$p\".InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=[scriptblock]}; $f=$h.'a'::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$m=$ExecutionContext.‘InvokeCommand’.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=[scriptblock]}; $f=$h.“a”::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$ä=[scriptblock]; $f=$ä::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$ö=$ExecutionContext.InvokeCommand; $m=$ö.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{ä=[scriptblock]}; $f=$h.ä::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$m=$ExecutionContext<#c#>.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=[scriptblock]}; $f=$h<#c#>.a::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$m=$ExecutionContext.'InvokeCommand'<#c#>.InvokeScript; $m.Invoke('git reset --hard')",
+    "$m=$ExecutionContext<#a#><#b#>.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=[scriptblock]}; $f=$h.@\"\na\n\"@::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$h=@{'ä'=[scriptblock]}; $f=$h.'ä'<#c#>::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$ä=@{b=$ExecutionContext.InvokeCommand}; $m=$ä.b.InvokeScript; & { $m.Invoke('git reset --hard') }",
 ];
 
 /// Name spellings longer than dcg's first reading window (review round 2;
@@ -644,6 +665,16 @@ const HARMLESS: &[&str] = &[
     "Write-Output InvokeCommand.InvokeScript",
     "Write-Output Widget::Create",
     "Write-Output a.b.InvokeScript; git status",
+    // A quoted string is an expression even as an argument, a comment glued
+    // to a bareword is part of the word, and a word after blank space, a
+    // redirection or a name outside ASCII is text (review round 5; runner
+    // rv5/truth.out, p7/truth.out).
+    "Write-Output 'abc'.Length; git status",
+    "Write-Output $x <#c#>a.InvokeScript; git status",
+    "Write-Output x >out.InvokeScript; git status",
+    "Write-Output ä.InvokeScript; git status",
+    "Write-Output Widget<#c#>::Create; git status",
+    "Write-Output x<#c#>.InvokeScript; git status",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base

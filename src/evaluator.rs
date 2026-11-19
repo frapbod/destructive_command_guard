@@ -12599,19 +12599,57 @@ fn powershell_member_name_spelling(
     }
 }
 
+/// Whether `character` delimits a PowerShell string: the ASCII quotes and the
+/// typographic ones PowerShell reads as quotes.
+fn is_powershell_quote(character: char) -> bool {
+    matches!(character, '\'' | '"' | '\u{2018}'..='\u{201e}')
+}
+
 /// Whether the `.` at `dot` is member access on an expression (`$x.`,
-/// `$a.b.`, `${a}.`, `(…).`, `(…).b.`, `$a[0].b.`, `{}::`, `[t]::m().`), not
-/// a dot inside a bareword argument (`Write-Output a.b`), which is text.
+/// `$a.b.`, `$ä.`, `${a}.`, `(…).`, `(…).b.`, `$a[0].b.`, `{}::`, `'a'.`,
+/// `$h.'a'::`, `.@'…'@.`, `$a<#c#>.b.`, `[t]::m().`), not a dot inside a
+/// bareword argument (`Write-Output a.b`), which is text.
 fn powershell_dot_follows_expression(command: &str, dot: usize) -> bool {
-    // Block comments may sit before `::` (`[t]<#c#>::Create`).
-    let before = trim_powershell_code_blank_end(&command[..dot]).as_bytes();
-    // The member chain before the dot ends at a variable, or at the close of
-    // a group, call, index, braced variable, script block or hashtable.
-    before
-        .iter()
-        .rev()
-        .find(|&&byte| !(byte.is_ascii_alphanumeric() || b"_.:?".contains(&byte)))
-        .is_some_and(|&byte| matches!(byte, b'$' | b')' | b']' | b'}'))
+    // Block comments may sit between the parts of the chain
+    // (`[t]<#c#>::Create`, `$a<#c#>.b.InvokeScript`).
+    let mut before = trim_powershell_code_blank_end(&command[..dot]);
+    for _ in 0..=MAX_POWERSHELL_TYPE_COMMENTS {
+        // Walk back over the names and separators of the chain. PowerShell
+        // names may hold any letter, so every other character outside ASCII
+        // except blank space and quotes is read as a name character.
+        let Some((index, end)) = before.char_indices().rev().find(|&(_, character)| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '.' | ':' | '?')
+                || !(character.is_ascii()
+                    || character.is_whitespace()
+                    || is_powershell_quote(character)))
+        }) else {
+            return false;
+        };
+        match end {
+            // A variable, or the close of a group, call, index, braced
+            // variable, script block, hashtable or string.
+            '$' | ')' | ']' | '}' => return true,
+            character if is_powershell_quote(character) => return true,
+            // The close of a here-string.
+            '@' => return before[..index].ends_with(is_powershell_quote),
+            // A block comment glued between parts of the chain. A `>` that
+            // ends no comment is a redirection (`x >out.InvokeScript`), and a
+            // comment after blank space starts another word.
+            '>' if before[..index].ends_with('#') => {
+                let comment_less = trim_powershell_code_blank_end(&before[..=index]);
+                if comment_less.len() > index
+                    || before.as_bytes().get(comment_less.len()) != Some(&b'<')
+                {
+                    return false;
+                }
+                before = comment_less;
+            }
+            _ => return false,
+        }
+    }
+    // More comments than the bound: read as an expression, which fails closed.
+    true
 }
 
 /// The first argument of a .NET method call's argument text, up to the first
