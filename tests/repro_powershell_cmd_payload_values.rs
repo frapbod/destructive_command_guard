@@ -563,6 +563,10 @@ fn a_quoted_stop_parsing_token_before_a_parameter_stops_parsing() {
         &strings(&[
             r"cmd '--%' -x /c rd /s /q C:\src",
             r"cmd /d '--%' -x /c ver # & rd /s /q C:\src",
+            // Accepted over-deny (t_31ec0d46): cmd gets `/c echo $x`. Read as
+            // an expression as well, the marker is a plain string, cmd reads
+            // on past it to `/c`, and `$x` is then a PowerShell value.
+            r"cmd '--%' -x /c echo $x",
         ]),
         &[ShellDialect::PowerShell],
         "PowerShell",
@@ -571,7 +575,6 @@ fn a_quoted_stop_parsing_token_before_a_parameter_stops_parsing() {
     let allow = expect_everywhere(
         &strings(&[
             r"cmd '--%' -x /c ver",
-            r"cmd '--%' -x /c echo $x",
             // Verbatim text ends at a pipe or `&&`.
             r"cmd '--%' -x /c ver | Select-String x",
             // No parameter after the quoted marker: parsing goes on, and
