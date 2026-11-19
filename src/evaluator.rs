@@ -12232,7 +12232,9 @@ fn powershell_typed_method_sink(
         })
         .unwrap_or(name.len());
     let name = name[..end].trim();
-    if name.is_empty()
+    // A type name starts with a letter; anything else before `::` is an
+    // index that holds the type in a value (`$a[0]::Create`).
+    if !name.starts_with(|first: char| first.is_alphabetic() || first == '_')
         || !name
             .chars()
             .all(|character| character.is_alphanumeric() || "_.+`[], =-".contains(character))
@@ -12274,9 +12276,39 @@ fn powershell_spread_constructor_argument(argument: &str) -> Result<Option<&str>
 const MAX_POWERSHELL_SPREAD_GROUPS: usize = 8;
 
 /// The name inside a type literal that ends at `end` (`[a.b]` before `::`),
-/// or `None` when no bounded type literal ends there.
+/// also when only groups hold it (`( [a.b] )::`), or `None` when no bounded
+/// type literal ends there. A group holding anything else (`([t]$n)`,
+/// `(Get-T)`) is not a static name.
 fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
-    let before = command.get(..end)?;
+    let mut before = command.get(..end)?;
+    // The first non-blank byte inside the group just read, which must open
+    // the next group or the type literal.
+    let mut group_start = None;
+    for _ in 0..MAX_POWERSHELL_SPREAD_GROUPS {
+        if !before.ends_with(')') {
+            break;
+        }
+        let mut depth = 0usize;
+        let open = before
+            .bytes()
+            .rev()
+            .take(MAX_POWERSHELL_MEMBER_NAME_SPELLING)
+            .position(|byte| {
+                match byte {
+                    b')' => depth += 1,
+                    b'(' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map(|offset| before.len() - 1 - offset)?;
+        if group_start.is_some_and(|start| start != open) {
+            return None;
+        }
+        let inner = &before[open + 1..before.len() - 1];
+        group_start = Some(open + 1 + (inner.len() - inner.trim_start().len()));
+        before = &before[..open + 1 + inner.trim_end().len()];
+    }
     if !before.ends_with(']') {
         return None;
     }
@@ -12293,6 +12325,9 @@ fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
                 depth -= 1;
                 if depth == 0 {
                     let open = before.len() - 1 - offset;
+                    if group_start.is_some_and(|start| start != open) {
+                        return None;
+                    }
                     return before.get(open + 1..before.len() - 1);
                 }
             }
@@ -12381,10 +12416,23 @@ fn powershell_member_name_after_dot(
                 end,
             ))
         }
-        b'(' => {
-            let close = find_powershell_subexpression_close(bounded, start + 1).ok()?;
-            let name = parse_static_powershell_source(&bounded[start + 1..close]).ok();
+        // An array expression names the member by its value, like a group
+        // (`.@('InvokeScript')`; `.@('a', 'b')` is not a static name).
+        b'(' | b'@' if bytes[start] == b'(' || bytes.get(start + 1) == Some(&b'(') => {
+            let open = if bytes[start] == b'(' { start } else { start + 1 };
+            let close = find_powershell_subexpression_close(bounded, open + 1).ok()?;
+            let name = parse_static_powershell_source(&bounded[open + 1..close]).ok();
             Some((name, close + 1))
+        }
+        // A here-string names the member by its body: verbatim for `@'`, and
+        // for `@"` only a body with no `$` or escape to expand.
+        b'@' => {
+            let (quote, content_start, end) = powershell_here_string_end(bounded, start)?;
+            let body = bounded[content_start..end - 2]
+                .strip_suffix('\n')
+                .map_or("", |body| body.strip_suffix('\r').unwrap_or(body));
+            let name = (quote == b'\'' || !body.contains(['$', '`'])).then(|| body.to_string());
+            Some((name, end))
         }
         // A script block names the member by its text, unchanged
         // (`.{InvokeScript}`; `.{ InvokeScript }` names ` InvokeScript `).
@@ -12647,9 +12695,12 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
         }
         let called = command.as_bytes().get(after_name) == Some(&b'(');
         // A method whose name is not static and is not called here is
-        // mostly an ordinary member; a typed script method on a type dcg
-        // cannot name (`$f = $t::Create`) may be the script one.
-        if sink == PowerShellEngineSink::AnyMethod && !called && script_type.is_none() {
+        // mostly an ordinary member, and so is `new` on a type dcg cannot
+        // name; `Create` there (`$f = $t::Create`) may be the ScriptBlock one.
+        if sink == PowerShellEngineSink::AnyMethod
+            && !called
+            && script_type != Some(POWERSHELL_SCRIPTBLOCK_TYPE)
+        {
             continue;
         }
         // Each call reads its argument list once; the bound keeps nested or
@@ -67717,6 +67768,54 @@ mod tests {
             ("[scriptblock]::{ Create }('a')", vec![]),
             ("$x.{InvokeScript}('a')", vec!["a"]),
             ("$x.{ InvokeScript }('a')", vec![]),
+            // A here-string or array expression names the member by its
+            // value (review round 1).
+            ("[scriptblock]::@'\nCreate\n'@('a')", vec!["a"]),
+            ("[scriptblock]::@\"\r\nCreate\r\n\"@('a')", vec!["a"]),
+            ("[scriptblock]::@('Create')('a')", vec!["a"]),
+            (
+                "[scriptblock]::@('Cre' + 'ate')($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "[scriptblock]::@'\nCreate\n'@.Invoke($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "[scriptblock]::@\"\n$n\n\"@($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("$x.@'\nInvokeScript\n'@('a')", vec!["a"]),
+            (
+                "$x.@('InvokeScript')($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("$x.@\"\n$n\n\"@($a)", vec![]),
+            ("$x.@('a', 'b')($a)", vec![]),
+            ("$x.@'\n\nInvokeScript\n'@('a')", vec![]),
+            ("$x.@'\nInvokeScript'@('a')", vec![]),
+            ("$x.@{}('a')", vec![]),
+            // A type literal held only by groups names that type; another
+            // group or an index holds the type in a value.
+            (
+                "([scriptblock])::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "( ( [scriptblock] ) )::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("([IO.File])::Create($a)", vec![]),
+            ("([IO.File])::Create('a')", vec![]),
+            ("([t]$n)::Create('a')", vec!["a"]),
+            ("([t]$n)::Create($a)", vec![]),
+            ("([scriptblock] + [x])::Create($a)", vec![]),
+            ("$a[0]::Create('a')", vec!["a"]),
+            ("$a[0]::new('a', 1)", vec!["a"]),
+            // Only `Create` taken as a value on a type dcg cannot name may
+            // be the script method; `new` there is an ordinary constructor.
+            ("$f = $t::new", vec![]),
+            ("$f = $t::@('Create')", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
         ] {
             assert_eq!(sources(command), expected, "{command:?}");
         }
@@ -67734,6 +67833,15 @@ mod tests {
             "[scriptblock]::{".repeat(50_000),
             ".{".repeat(100_000),
             ".`\n".repeat(100_000),
+            ".@'\n".repeat(100_000),
+            ".@(".repeat(100_000),
+            format!("{}'\n'@('a')", "$x.@'\n".repeat(50_000)),
+            format!(
+                "{}[scriptblock]{}::Create($a)",
+                "(".repeat(200_000),
+                ")".repeat(200_000)
+            ),
+            "())::Create($a)".repeat(20_000),
             format!(
                 "[Command]::new.Invoke({}a{})",
                 "(".repeat(100_000),
