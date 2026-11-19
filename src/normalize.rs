@@ -2192,9 +2192,11 @@ pub(crate) enum ShellTokenRole {
 /// The state is needed only for PowerShell's `--%` stop-parsing token. Create a
 /// decoder per command segment. A syntax token whose decoded value is `--%`
 /// (including quoted forms) is consumed as shell control syntax
-/// ([`Self::decode`] returns `None`); subsequent tokens are still returned as
-/// parser-visible tokens, but byte-for-byte because PowerShell no longer
-/// interprets their shell syntax. POSIX syntax-role tokens decode only
+/// ([`Self::decode`] returns `None`). After the stop-parsing token
+/// ([`powershell_word_stops_parsing`]; a word that starts with a quote is
+/// not one) subsequent tokens are still returned as parser-visible tokens,
+/// but byte-for-byte because PowerShell no longer interprets their shell
+/// syntax. POSIX syntax-role tokens decode only
 /// deterministic quote/escape syntax; unknown and data-role input deliberately
 /// remain unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2247,7 +2249,7 @@ impl ShellTokenDecoder {
                 }
                 let decoded = decode_powershell_syntax_token(token);
                 if decoded.as_ref() == "--%" {
-                    self.powershell_stop_parsing = true;
+                    self.powershell_stop_parsing = powershell_word_stops_parsing(token);
                     return None;
                 }
                 Some(decoded)
@@ -3084,6 +3086,25 @@ enum PowerShellQuote {
     Unquoted,
     Single,
     Double,
+}
+
+/// Whether a raw PowerShell word is the stop-parsing token `--%`, after
+/// which PowerShell hands the rest of the line (up to a pipe or newline) to
+/// the program as written.
+///
+/// PowerShell stops parsing for `--%` spelled bare, with backticks (`` -`-%
+/// ``) or with a quoted part after its first character (`--'%'`). A word
+/// that starts with a quote (`'--%'`, `"--%"`, `‘--%’`) is dropped from a
+/// native program's argv but does not stop parsing: `$x = 'a'; git '--%'
+/// $x` hands git `a`, and `Write-Output '--%'; git status` runs git
+/// (measured with pwsh 7.5). [`ShellTokenDecoder::decode`] consumes both.
+#[must_use]
+pub(crate) fn powershell_word_stops_parsing(raw: &str) -> bool {
+    const QUOTES: [char; 9] = [
+        '\'', '"', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{201C}', '\u{201D}',
+        '\u{201E}',
+    ];
+    !raw.starts_with(QUOTES) && decode_powershell_syntax_token(raw).as_ref() == "--%"
 }
 
 fn decode_powershell_syntax_token(token: &str) -> Cow<'_, str> {
@@ -4653,13 +4674,8 @@ fn tokenize_powershell_with_comments(
             byte_range: start..i,
         });
 
-        if !literal_mode {
-            let raw = &command[start..i];
-            // PowerShell recognizes stop-parsing by the token's decoded value:
-            // quoted `"--%"` and `'--%'` behave the same as bare `--%`.
-            if decode_powershell_syntax_token(raw).as_ref() == "--%" {
-                literal_mode = true;
-            }
+        if !literal_mode && powershell_word_stops_parsing(&command[start..i]) {
+            literal_mode = true;
         }
     }
 
@@ -9700,13 +9716,13 @@ mod tests {
 
     #[test]
     fn powershell_raw_tokenizer_honors_stop_parsing_until_newline() {
-        let command = "git branch \"--%\" --delete \"feature name\" ; echo\r\nGet-Date; echo";
+        let command = "git branch -`-% --delete \"feature name\" ; echo\r\nGet-Date; echo";
         assert_eq!(
             raw_token_snapshot(command, ShellDialect::PowerShell),
             vec![
                 (NormalizeTokenKind::Word, "git".to_string()),
                 (NormalizeTokenKind::Word, "branch".to_string()),
-                (NormalizeTokenKind::Word, "\"--%\"".to_string()),
+                (NormalizeTokenKind::Word, "-`-%".to_string()),
                 (NormalizeTokenKind::Word, "--delete".to_string()),
                 (NormalizeTokenKind::Word, "\"feature name\"".to_string()),
                 (NormalizeTokenKind::Word, ";".to_string()),
@@ -9843,20 +9859,53 @@ mod tests {
             "tokens after --% must remain literal"
         );
 
-        for quoted_marker in [r#""--%""#, "'--%'"] {
-            let mut quoted_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+        // pwsh 7.5: `--%` with backticks or a quoted part after its first
+        // character stops parsing (`$x = 'a'; git --'%' $x` hands git `$x`).
+        for marker in ["-`-%", "--`%", "--'%'", "-\"-%\""] {
+            let mut marker_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+            assert_eq!(marker_decoder.decode(marker, ShellTokenRole::Syntax), None);
             assert_eq!(
-                quoted_decoder.decode(quoted_marker, ShellTokenRole::Syntax),
-                None,
-                "PowerShell recognizes --% by decoded token value"
+                marker_decoder
+                    .decode("g`it", ShellTokenRole::Syntax)
+                    .as_deref(),
+                Some("g`it"),
+                "{marker} stops parsing"
             );
+        }
+        // A word that starts with a quote is dropped from a native argv but
+        // does not stop parsing: `$x = 'a'; git '--%' $x` hands git `a`, and
+        // `Write-Output '--%'; git status` runs git (pwsh 7.5).
+        for quoted_marker in [r#""--%""#, "'--%'", "\u{2018}--%\u{2019}"] {
+            let mut quoted_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+            let decoded = quoted_decoder.decode(quoted_marker, ShellTokenRole::Syntax);
+            if quoted_marker.starts_with('\u{2018}') {
+                assert_eq!(decoded.as_deref(), Some(quoted_marker));
+            } else {
+                assert_eq!(decoded, None, "{quoted_marker} is dropped");
+            }
             assert_eq!(
                 quoted_decoder
                     .decode("g`it", ShellTokenRole::Syntax)
                     .as_deref(),
-                Some("g`it"),
-                "quoted --% must arm literal mode just like bare --%"
+                Some("git"),
+                "{quoted_marker} does not stop parsing"
             );
+        }
+    }
+
+    #[test]
+    fn powershell_tokenizer_does_not_stop_parsing_at_a_quoted_marker() {
+        // `Write-Output '--%'; git reset --hard` runs git (pwsh 7.5).
+        for command in [
+            "Write-Output '--%'; git reset --hard",
+            "Write-Output \"--%\"; git reset --hard",
+        ] {
+            let separators: Vec<String> = raw_token_snapshot(command, ShellDialect::PowerShell)
+                .into_iter()
+                .filter(|(kind, _)| *kind == NormalizeTokenKind::Separator)
+                .map(|(_, text)| text)
+                .collect();
+            assert_eq!(separators, vec![";".to_string()], "{command}");
         }
     }
 

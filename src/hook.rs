@@ -5213,6 +5213,10 @@ mod tests {
             "eval 'rm -rf ~/x'",
             "rm \\\n-rf ~/x",
             "Get-ChildItem -Recurse | Select-Object Name",
+            // A launcher inside a PowerShell group: the Unknown reading must
+            // find it (tests/repro_powershell_cmd_payload_values.rs).
+            "$x='&git'; $y = (cmd /c \"ver $x reset --hard\")",
+            "$x='&git'; Write-Output (cmd /c ver $($x) reset --hard)",
         ];
         for command in posix_parseable {
             assert_eq!(
