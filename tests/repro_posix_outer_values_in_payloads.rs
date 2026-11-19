@@ -100,11 +100,16 @@ fn hook_decision(protocol: Protocol, command: &str) -> String {
 }
 
 fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
+    decision_with_packs(
+        command,
+        dialect,
+        &["core.git", "core.filesystem", "windows.filesystem"],
+    )
+}
+
+fn decision_with_packs(command: &str, dialect: ShellDialect, packs: &[&str]) -> EvaluationDecision {
     let enabled: std::collections::HashSet<String> =
-        ["core.git", "core.filesystem", "windows.filesystem"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        packs.iter().copied().map(str::to_string).collect();
     let ordered = REGISTRY.expand_enabled_ordered(&enabled);
     let keywords = REGISTRY.collect_enabled_keywords(&enabled);
     let index = REGISTRY.build_enabled_keyword_index(&ordered);
@@ -403,4 +408,45 @@ fn harmless_outer_values_in_a_cmd_payload_fail_closed_like_cmd_variables() {
         EvaluationDecision::Deny,
     );
     assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
+/// The outer shell's own redirections never reach cmd.exe, so a value in
+/// one is not cmd text: `cmd /c ver 2>$null` (a common PowerShell suffix
+/// that desktop Codex sends through the Unknown reading) is not a cmd
+/// variable. Without `core.filesystem`, whose redirect rule judges the
+/// redirection itself, nothing else denies it. A value cmd does receive
+/// still fails closed, with or without a redirection beside it.
+#[test]
+fn outer_redirections_beside_a_cmd_payload_are_not_cmd_values() {
+    let mut found = Vec::new();
+    for command in [
+        "cmd /c ver 2>$null",
+        "cmd /c ver 2> $null",
+        "cmd.exe /c ver >$null",
+        "cmd /c ver>$null",
+        r"cmd /c dir C:\x 2>$null",
+        r#"cmd /c "ver" 2>"$null""#,
+        "cmd /c ver <$in",
+    ] {
+        for dialect in POSIX {
+            let got = decision_with_packs(command, dialect, &["core.git", "windows.filesystem"]);
+            if got != EvaluationDecision::Allow {
+                found.push(format!("{dialect:?}: {command:?} -> {got:?}"));
+            }
+        }
+    }
+    found.extend(misses(
+        &[
+            r#"cmd /c "gi${X}t reset --hard" 2>$null"#,
+            "cmd /c gi${X}t reset --hard 2>$null",
+            r#"cmd.exe /c "$X reset --hard" 2>/dev/null"#,
+            "cmd /c 2>$log gi${X}t reset --hard",
+            "cmd /c 2> $log $X reset --hard",
+            "cmd /c gi${X}t>$out reset --hard",
+            r#"cmd.exe /c "r${X}d /s /q C:\x" >$log"#,
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    ));
+    assert!(found.is_empty(), "misses:\n{}", found.join("\n"));
 }

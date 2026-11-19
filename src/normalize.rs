@@ -2460,8 +2460,28 @@ pub(crate) fn posix_dollar_expands(next: Option<char>) -> bool {
 /// anything else is literal. A quote opened and never closed returns `None`;
 /// an expansion that never closes runs to the end of the word.
 pub(crate) fn posix_word_value_ranges(raw: &str) -> Option<Vec<Range<usize>>> {
+    posix_word_scan(raw).map(|scan| scan.values)
+}
+
+/// Where the shell's own redirection starts in one raw POSIX word: the
+/// offset of the first `<` or `>` outside quotes, escapes and values
+/// (`ver>$null` at 3, `2>$null` at 1). The shell consumes the text from
+/// there (an operator and its target, or a `<(…)` / `>(…)` substitution),
+/// so the program never receives it as an argument. `None` when the word
+/// has none or its quoting is unterminated.
+pub(crate) fn posix_word_redirection_start(raw: &str) -> Option<usize> {
+    posix_word_scan(raw)?.redirection
+}
+
+struct PosixWordScan {
+    values: Vec<Range<usize>>,
+    redirection: Option<usize>,
+}
+
+fn posix_word_scan(raw: &str) -> Option<PosixWordScan> {
     let bytes = raw.as_bytes();
     let mut ranges = Vec::new();
+    let mut redirection = None;
     let mut double = false;
     let mut index = 0usize;
     while index < bytes.len() {
@@ -2523,10 +2543,17 @@ pub(crate) fn posix_word_value_ranges(raw: &str) -> Option<Vec<Range<usize>>> {
                 ranges.push(index..end);
                 index = end;
             }
+            b'<' | b'>' if !double => {
+                redirection.get_or_insert(index);
+                index += 1;
+            }
             _ => index += 1,
         }
     }
-    (!double).then_some(ranges)
+    (!double).then_some(PosixWordScan {
+        values: ranges,
+        redirection,
+    })
 }
 
 /// One raw POSIX argv word with each value the shell substitutes in it
