@@ -3999,7 +3999,10 @@ fn line_continuation_between_dollar_and_quote_hides_no_git_command() {
     ] {
         for codex in [true, false] {
             let outcome = run_hook_raw(&multiline_payload(command, codex), &[]);
-            assert!(outcome.is_allow_shape(), "codex={codex} {command:?}\n{outcome}");
+            assert!(
+                outcome.is_allow_shape(),
+                "codex={codex} {command:?}\n{outcome}"
+            );
         }
     }
 }
