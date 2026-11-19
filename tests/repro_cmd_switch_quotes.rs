@@ -353,3 +353,94 @@ fn quoted_program_paths_and_harmless_payloads_stay_allowed() {
     );
     assert_no_misses(&[powershell, posix, cmd]);
 }
+
+/// A run switch glued to the end of a value switch (`/v:on/c`) or another
+/// switch fails closed; any words before `/c` in a cmd call inside another
+/// command (xargs, wsl, find -exec, a subshell) are read as at the top
+/// level; and a program `Start-Process` cannot name may be cmd past a word
+/// that is not a switch.
+#[test]
+fn glued_and_embedded_cmd_switches_do_not_hide_the_payload() {
+    let powershell = expect_everywhere(
+        &strings(&[
+            r"cmd /v:on/c git reset --hard",
+            r"cmd /e:on/c git reset --hard",
+            r"cmd /f:off/k git reset --hard",
+            r"cmd /d/c git reset --hard",
+            r"cmd /V:ON/C git reset --hard",
+            r"(cmd foo /c git reset --hard)",
+        ]),
+        &PS,
+        "PowerShell",
+        EvaluationDecision::Deny,
+    );
+    let powershell_only = expect_everywhere(
+        &strings(&[
+            r"cmd /f:off/k rd /s /q C:\src",
+            r"Start-Process $exe 'foo /c git reset --hard'",
+            r"Start-Process $exe -ArgumentList 'foo','/c','git reset --hard'",
+        ]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Deny,
+    );
+    let posix = expect_everywhere(
+        &strings(&[
+            r"cmd.exe /v:on/c git reset --hard",
+            r"xargs cmd.exe foo /c git reset --hard",
+            r"xargs -0 cmd.exe foo /c git reset --hard",
+            r"wsl cmd.exe foo /c git reset --hard",
+            r"wsl.exe -e cmd.exe foo /c git reset --hard",
+            r"(cmd.exe foo /c git reset --hard)",
+            r"find . -exec cmd.exe foo /c git reset --hard \;",
+            r#"xargs cmd.exe foo /c '"git reset --hard"'"#,
+            r"xargs cmd.exe /v:on /c git reset --hard",
+            r"xargs cmd.exe /e:on /c git reset --hard",
+            r"(cmd.exe /v:on /c git reset --hard)",
+            r"xargs cmd.exe /v:on/c git reset --hard",
+            r"xargs cmd.exe foo/c git reset --hard",
+        ]),
+        &POSIX,
+        "Bash",
+        EvaluationDecision::Deny,
+    );
+    let cmd = cmd_misses(
+        &[
+            r"cmd /v:on/c git reset --hard",
+            r"cmd /e:on/c git reset --hard",
+            r"cmd /d/c git reset --hard",
+        ],
+        EvaluationDecision::Deny,
+    );
+    let allowed_powershell = expect_everywhere(
+        &strings(&[
+            r"cmd /v:on /c dir",
+            r"cmd /e:on /f:off /c ver",
+            r"Start-Process $exe '/S /D=C:\Tools'",
+            r"Start-Process $exe 'install C:/repo/x'",
+            r"Start-Process $exe 'foo /c ver'",
+        ]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Allow,
+    );
+    let allowed_posix = expect_everywhere(
+        &strings(&[
+            r"xargs cmd.exe foo /c ver",
+            r"(cmd.exe /v:on /c dir)",
+            r"wsl cmd.exe /e:on /c ver",
+            r"find . -name '*.c' -exec ls {} \;",
+        ]),
+        &[ShellDialect::Posix],
+        "Bash",
+        EvaluationDecision::Allow,
+    );
+    assert_no_misses(&[
+        powershell,
+        powershell_only,
+        posix,
+        cmd,
+        allowed_powershell,
+        allowed_posix,
+    ]);
+}

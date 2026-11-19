@@ -5241,16 +5241,24 @@ pub(crate) fn powershell_host_may_run_inline(
 
 /// Whether cmd.exe given `arguments` (decoded argv words) runs command
 /// text, as [`parse_cmd_launcher`] reads it: an exact `/C` or `/K` reached
-/// past switches that run nothing (`/D`, `/Q`, `/S`, `/E:…`, …). Any other
-/// word before it (`/configure`, `/VERYSILENT`, `/R`, a value dcg cannot
-/// read) gives `false`: the launcher would fail closed on that argv, not on
-/// code cmd runs. `Start-Process` uses this to decide whether a program it
-/// cannot name may be cmd for its argument list.
+/// past switches that run nothing (`/D`, `/Q`, `/S`, `/E:…`, …) and past
+/// words that are not switches (`foo /c …`, which the launcher reads on
+/// past). A `/` word that is not such a switch (`/configure`, `/VERYSILENT`,
+/// `/R`, `/v:on/c`) gives `false`: the launcher would fail closed on that
+/// argv, not on code cmd runs, and installer argument lists start with such
+/// words. Unlike the launcher, a run switch inside a word that does not
+/// start with `/` (`foo/c`, `C:/repo/x`) is not read here: in an argument
+/// list of a program dcg cannot name it is far more often a path than cmd's
+/// switch. `Start-Process` uses this to decide whether a program it cannot
+/// name may be cmd for its argument list.
 pub(crate) fn cmd_host_may_run_inline(arguments: &[String]) -> bool {
     for argument in arguments {
         let option = argument.to_ascii_lowercase();
         if matches!(option.as_str(), "/c" | "/k") {
             return true;
+        }
+        if !option.starts_with('/') {
+            continue;
         }
         if !cmd_switch_is_non_executing(&option) {
             return false;
@@ -5446,11 +5454,17 @@ fn cmd_word_has_variable(word: &str) -> bool {
     })
 }
 
+/// Whether `option` (lower case) is a cmd switch that runs nothing. A value
+/// switch (`/E:`, `/F:`, `/V:`) whose value holds a run switch (`/v:on/c`)
+/// is not: cmd looks for `/` switches anywhere on its command line (ReactOS
+/// cmd's `Initialize`), so the `/c` there may start the command.
 fn cmd_switch_is_non_executing(option: &str) -> bool {
     matches!(option, "/d" | "/q" | "/a" | "/u" | "/s" | "/?")
-        || ["/e:", "/f:", "/v:"]
-            .iter()
-            .any(|prefix| option.starts_with(prefix))
+        || ["/e:", "/f:", "/v:"].iter().any(|prefix| {
+            option
+                .strip_prefix(prefix)
+                .is_some_and(|value| !cmd_text_has_run_switch(value))
+        })
 }
 
 /// Under [`NativeArgv::Msys`] the switches read as `cmd_host_switch` reads
@@ -5553,6 +5567,13 @@ fn parse_cmd_launcher(
             ));
         }
         if !cmd_switch_is_non_executing(&option) {
+            // A run switch glued to another switch (`/v:on/c`, `/d/c`) is
+            // not modeled: it fails closed.
+            if option.get(1..).is_some_and(cmd_text_has_run_switch) {
+                return WindowsLauncherParse::Unverified(format!(
+                    "cmd may read a /C, /K or /R switch inside {raw:?}"
+                ));
+            }
             if option.starts_with('/') {
                 return WindowsLauncherParse::Unverified(format!(
                     "cmd host switch {raw:?} is unknown"
