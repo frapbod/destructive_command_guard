@@ -53370,6 +53370,42 @@ mod tests {
         }
     }
 
+    /// A line continuation between `$` and `'` still opens a Bash ANSI-C
+    /// string. The copy with the `$` moved next to its quote is read as
+    /// POSIX only: as PowerShell (in the unknown dialect, with the packs a
+    /// native Windows install has on) the moved `$'x'` starts a line of its
+    /// own, which `windows.filesystem` denied for harmless text.
+    #[test]
+    fn dollar_quotes_across_line_continuations_are_read_as_posix_only() {
+        let packs = [
+            "core.git",
+            "core.filesystem",
+            "windows.filesystem",
+            "windows.system",
+        ];
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in [
+                "echo $\\\n'a\\'' ; git reset --hard #'",
+                "echo $\\\n'a\\'' && git push --force origin main #'",
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(result.is_denied(), "{dialect:?} {command:?}");
+            }
+            for command in [
+                "printf '%s\\n' $\\\n'x'",
+                "# note $\\\n'a' ; echo hi",
+                "echo $\\\n'a\\'b'; git status",
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    !result.is_denied(),
+                    "{dialect:?} {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
     /// `deno eval "<code>"` is Deno's `node -e`; its payload was never
     /// extracted, and `Deno.removeSync` was not modeled either.
     #[test]
