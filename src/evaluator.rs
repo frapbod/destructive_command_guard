@@ -17264,16 +17264,26 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // A command too costly to read that way fails closed. What the user
     // authorized as written stays authorized, and the spelling spends no
     // allow-once grant.
+    //
+    // The first reading (`None`) is the same kind of spelling for a `#` in
+    // or right after a parenthesis, where dcg's readers start a comment by
+    // a table and shells disagree (see `paren_hashes_as_data`): a false
+    // comment there then fails closed too.
     let mut bash_spelling: Option<String> = None;
-    for extglob in [false, true] {
+    for extglob in [None, Some(false), Some(true)] {
         if result.decision != EvaluationDecision::Allow
             || result.bypass_method == Some(BypassMethod::AllowOnce)
             || !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
-            || (extglob && memchr::memchr(b'!', command.as_bytes()).is_none())
+            || (extglob == Some(true) && memchr::memchr(b'!', command.as_bytes()).is_none())
         {
             break;
         }
-        let Some(reading) = crate::normalize::bash_hashes_as_data(command, extglob) else {
+        let reading = match extglob {
+            None => crate::normalize::paren_hashes_as_data(command)
+                .map(crate::normalize::BashHashReading::Spelled),
+            Some(extglob) => crate::normalize::bash_hashes_as_data(command, extglob),
+        };
+        let Some(reading) = reading else {
             continue;
         };
         if let crate::normalize::BashHashReading::Spelled(spelled) = &reading
@@ -40336,12 +40346,15 @@ fn evaluate_heredoc(
             // `((…))` or a `=~` regex group) as a comment, as dash does, and
             // so hands on no command after it: `bash -c '(( x = 1 #)); git
             // reset --hard'`. The whole body, read by the evaluator, gets its
-            // Bash reading too (see `bash_hashes_as_data`).
+            // Bash reading too (see `bash_hashes_as_data`), and so does a
+            // `#` in or after a parenthesis that it may misread as a comment
+            // (see `paren_hashes_as_data`).
             let bash_data_hash = per_command_pass
                 && !destination_source_context
-                && [false, true].into_iter().any(|extglob| {
-                    crate::normalize::bash_hashes_as_data(&content.content, extglob).is_some()
-                });
+                && (crate::normalize::paren_hashes_as_data(&content.content).is_some()
+                    || [false, true].into_iter().any(|extglob| {
+                        crate::normalize::bash_hashes_as_data(&content.content, extglob).is_some()
+                    }));
             if destination_source_context || bash_data_hash {
                 // `f=/etc/sudoers; tee "$f"` requires both statements. Keep
                 // the existing per-command checks as well: they reach bodies

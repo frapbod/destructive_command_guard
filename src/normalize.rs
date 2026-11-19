@@ -6343,6 +6343,75 @@ pub(crate) fn powershell_line_breaks_as_line_feeds(command: &str) -> Option<Stri
     String::from_utf8(spelled).ok()
 }
 
+/// `command` with each `#` that may start a comment inside a parenthesis, or
+/// right after one, spelled `_`; `None` when it has no such `#`.
+///
+/// Whether such a `#` starts a comment depends on what the parenthesis is,
+/// and shells disagree. Bash starts one after the `)` of a subshell
+/// (`(true)#it's` LF `git reset --hard` runs `git reset --hard`), while zsh
+/// reads a `#` in or after a glob or case-pattern group as data:
+/// `ls (a|(b)#); git reset --hard`, `ls ( #); git reset --hard` and
+/// `case x in a|(#)) ;; esac; git reset --hard` run it in zsh (measured
+/// with `scripts/shell-truth`). dcg's readers decide by one table
+/// ([`crate::context::PosixParens`]), which cannot see command position or
+/// pattern context everywhere. A false comment hides the rest of its line,
+/// so the evaluator also reads this spelling, in which each such `#` is
+/// data, and deny wins: a wrong decision either way only over-blocks. A
+/// missed comment already fails closed, as its quotes then open strings
+/// that every reader sees alike.
+///
+/// Spelled: a `#` at a token start (see [`token_starts_at`]) while a `(` is
+/// open, or right after a `)`. A `#` after a word byte (`2#1`, `$#`) starts
+/// no comment to any reader and is left alone. The scan counts parentheses
+/// without reading quotes, as a quote in a comment is what it must not
+/// trust; a `)` never takes the count below zero. So a quoted `(` can only
+/// add spellings, and a quoted `)` in the same group can end the count early
+/// (`ls (a")" #)`), a known limit. Heredoc bodies that every shell reads as
+/// bodies are raw text and passed over (see
+/// [`crate::context::undisputed_heredoc_body_ranges`]). The cost: a real
+/// comment there that names a destructive command (`(true)# git reset
+/// --hard`, or one inside a subshell) is denied.
+///
+/// Length preserving (one ASCII byte for another), so every range in the
+/// view is the same range in `command`.
+#[must_use]
+pub(crate) fn paren_hashes_as_data(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let first_open = memchr::memchr2(b'(', b')', bytes)?;
+    memchr::memchr(b'#', &bytes[first_open..])?;
+    let bodies = crate::context::undisputed_heredoc_body_ranges(command);
+    let mut bodies = bodies.iter().peekable();
+    let mut spelled: Option<Vec<u8>> = None;
+    let mut depth = 0usize;
+    let mut i = first_open;
+    while i < bytes.len() {
+        if let Some(body) = bodies.peek() {
+            if i >= body.end {
+                bodies.next();
+                continue;
+            }
+            if i >= body.start {
+                i = body.end;
+                continue;
+            }
+        }
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'#' if token_starts_at(bytes, i, 0)
+                && (depth > 0 || byte_before(bytes, i, 0) == Some(b')')) =>
+            {
+                spelled.get_or_insert_with(|| bytes.to_vec())[i] = b'_';
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Only an ASCII byte changed into another ASCII byte.
+    spelled.and_then(|spelled| String::from_utf8(spelled).ok())
+}
+
 /// The Bash reading [`bash_hashes_as_data`] gives a command.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BashHashReading {
@@ -7873,6 +7942,41 @@ mod tests {
             None => None,
             Some(BashHashReading::Spelled(spelled)) => Some(spelled),
             Some(BashHashReading::Unread) => panic!("unread: {command:?}"),
+        }
+    }
+
+    /// Each `#` at a token start in an open paren or right after a `)` is
+    /// spelled; a comment after a blank outside parens and a `#` after a
+    /// word byte are not.
+    #[test]
+    fn paren_hashes_as_data_spells_hashes_in_and_after_parens() {
+        for (command, spelled) in [
+            (
+                "(true)#it's\ngit reset --hard",
+                Some("(true)_it's\ngit reset --hard"),
+            ),
+            ("ls (a|(b)#); x", Some("ls (a|(b)_); x")),
+            ("ls ( #); x", Some("ls ( _); x")),
+            (
+                "case x in # c\n(#) ;; esac",
+                Some("case x in # c\n(_) ;; esac"),
+            ),
+            ("(true)\\\n#; x", Some("(true)\\\n_; x")),
+            // A quote in a comment does not stop the count.
+            ("( # it's\n) ; ls (#)", Some("( _ it's\n) ; ls (_)")),
+            ("echo $(date) # x", None),
+            ("(true) # x", None),
+            ("echo $((2#1)) $# ${#x}", None),
+            ("# (x)\nls", None),
+            ("ls # x", None),
+            // A heredoc body is raw text.
+            ("cat <<'EOF'\n(\n#\nEOF\n# x", None),
+        ] {
+            assert_eq!(
+                paren_hashes_as_data(command).as_deref(),
+                spelled,
+                "{command:?}"
+            );
         }
     }
 

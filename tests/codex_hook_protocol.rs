@@ -3862,6 +3862,37 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         // zsh reads `#` after a case-pattern or glob `(` as data.
         "case x in (#) ;; esac; git reset --hard",
         "ls *(#); git reset --hard",
+        // zsh reads a `#` in or after a glob or case-pattern group as data,
+        // where the shared table cannot tell the group from a subshell. The
+        // evaluator also reads each `#` in or after a paren as data, so a
+        // false comment there fails closed.
+        "ls (a|(b)#); git reset --hard",
+        "case x in (a|(b)#)) ;; esac; git reset --hard",
+        "ls ((b)#); git reset --hard",
+        "case x in ((b)#)) ;; esac; git reset --hard",
+        "ls time (b)#; git reset --hard",
+        "ls then (b)#; git reset --hard",
+        "ls !(b)#; git reset --hard",
+        "case x in # c\n(#) ;; esac; git reset --hard",
+        "case x in a) :;; # c\n(#) ;; esac; git reset --hard",
+        "case x in\n# c\n(#) ;; esac; git reset --hard",
+        "case x in a) :;;\\\n(#) ;; esac; git reset --hard",
+        "case x in a|(#)) ;; esac; git reset --hard",
+        "case x in a) :;;\n  # it's\n(#) ;; esac; git reset --hard",
+        "case x in a) :;| (#) ;; esac; git reset --hard",
+        "case x in a) :;;\n# c\nb|(#)) ;; esac; git reset --hard",
+        // ... also after a blank inside the group.
+        "ls ( #); git reset --hard",
+        "ls (a| #); git reset --hard",
+        "ls (a|(b) #); git reset --hard",
+        "ls (a|(b)\t#); git reset --hard",
+        "ls ((b) #); git reset --hard",
+        "case x in ( #) ;; esac; git reset --hard",
+        "case x in a|( #)) ;; esac; git reset --hard",
+        // Where the table reads a real comment, the data reading still
+        // denies text in it: a wrong decision only over-blocks.
+        "(true)#; git reset --hard",
+        "(( 1 ))# git reset --hard",
     ] {
         let codex = run_hook_raw(&multiline_payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -3889,6 +3920,13 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         "echo \"${y:-\" #\"}\" #it's\ngit status",
         "(( 1 ))#it's\ngit status",
         "(ls)#it's\ngit status",
+        "(true)#it's\ngit status",
+        "case x in x)#it's\ngit status;; esac",
+        // A comment after a blank outside any paren is read as before.
+        "echo $(date) # git reset --hard",
+        "(true) # git reset --hard",
+        "ls (x)\n# git reset --hard",
+        "x=$(git rev-parse HEAD)\n# never git reset --hard here\necho $x",
     ] {
         let codex = run_hook_raw(&multiline_payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
