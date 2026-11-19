@@ -993,6 +993,8 @@ fn bash_data_hash_hides_no_later_git_command() {
 ///   not. dcg does not read either the Bash way, so it fails closed: Codex
 ///   denies and Claude asks, also for a harmless command after one.
 #[test]
+// Shell text: clippy takes `${y:- }` for a format argument.
+#[allow(clippy::literal_string_with_formatting_args)]
 fn bash_parameter_openers_hide_no_later_git_command() {
     let payload = |command: &str, codex: bool| {
         let mut payload = serde_json::json!({
