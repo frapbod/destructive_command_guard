@@ -41399,22 +41399,30 @@ fn reconstructed_interpreter_commands_verdict(
 ) -> Option<EvaluationResult> {
     // A value the parent shell substituted into the program
     // ([`parent_expanded_source_verdict`]) is unknown text in the string the
-    // sink hands a shell: read it where that shell reads it, and read the
-    // string with every value empty (`'gi'"${…}"'t'` is `'git'` then). Deny
-    // wins.
+    // sink hands a shell. Read it where that shell reads it, the view that
+    // reads an unknown value in a quoted command name (`'gi'"${…}"''`), as
+    // for a shell's own source (`heredoc::posix_shell_source_with_outer_values`),
+    // and the string with every value empty (`'gi'"${…}"'t'` is `'git'`
+    // then). Deny wins.
     let mark = crate::heredoc::OUTER_VALUE_MARK;
-    let readings = commands.into_iter().flat_map(|reconstructed| {
-        let texts = if reconstructed.command.contains(mark) {
-            vec![
-                crate::heredoc::posix_source_with_marked_values(&reconstructed.command),
-                reconstructed.command.replace(mark, ""),
-            ]
-        } else {
-            vec![reconstructed.command]
-        };
+    let mut readings = Vec::with_capacity(commands.len());
+    for reconstructed in commands {
         let (start, end) = (reconstructed.start, reconstructed.end);
-        texts.into_iter().map(move |text| (text, start, end))
-    });
+        if !reconstructed.command.contains(mark) {
+            readings.push((reconstructed.command, start, end));
+            continue;
+        }
+        let spelled = crate::heredoc::posix_source_with_marked_values(&reconstructed.command);
+        let unknown_name_view = match posix_proven_variable_view(&spelled, context.deadline, true) {
+            Ok(view) => view,
+            Err(ProvenViewIncomplete::Budget) => {
+                return Some(EvaluationResult::indeterminate_due_to_budget());
+            }
+        };
+        readings.push((reconstructed.command.replace(mark, ""), start, end));
+        readings.push((spelled, start, end));
+        readings.extend(unknown_name_view.map(|view| (view, start, end)));
+    }
     for (reconstructed, start, end) in readings {
         if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());

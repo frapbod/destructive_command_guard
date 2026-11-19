@@ -17524,6 +17524,63 @@ ls"#,
         }
     }
 
+    /// A non-shell interpreter's program that the parent shell expands keeps
+    /// its text as written and carries the program as received, with each
+    /// value as one mark; text the parent leaves alone carries none.
+    #[test]
+    fn interpreter_programs_carry_the_parent_expanded_source() {
+        let m = OUTER_VALUE_MARK;
+        let sources = |command: &str| -> Vec<(ScriptLanguage, Option<String>)> {
+            match extract_content(command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(items) | ExtractionResult::Partial { extracted: items, .. } => items
+                    .into_iter()
+                    .map(|item| (item.language, item.parent_expanded_source))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        for (command, language, want) in [
+            (
+                r#"python3 -c "import os; os.system(\"'gi${x}t' reset\")""#,
+                ScriptLanguage::Python,
+                format!("import os; os.system(\"'gi{m}t' reset\")"),
+            ),
+            (
+                r#"node -e "x('$(id)' + \`$y\`)""#,
+                ScriptLanguage::JavaScript,
+                format!("x('{m}' + `{m}`)"),
+            ),
+            (
+                "python3 <<EOF\nos.system(\"'gi${x}t' \\$y\")\nEOF",
+                ScriptLanguage::Python,
+                format!("os.system(\"'gi{m}t' $y\")\n"),
+            ),
+            (
+                r#"ruby <<< "system(\"'gi$x'\")""#,
+                ScriptLanguage::Ruby,
+                format!("system(\"'gi{m}'\")"),
+            ),
+        ] {
+            assert!(
+                sources(command).contains(&(language, Some(want.clone()))),
+                "{command:?}: {:?}, want {want:?}",
+                sources(command)
+            );
+        }
+        for command in [
+            r#"python3 -c 'import os; os.system("gi${x}t")'"#,
+            r#"python3 -c "import os; os.system(\"'gi\${x}t' reset\")""#,
+            "python3 <<'EOF'\nos.system(\"'gi${x}t'\")\nEOF",
+            r#"bash -c "'gi${x}t' reset --hard""#,
+        ] {
+            assert!(
+                sources(command).iter().all(|(_, source)| source.is_none()),
+                "{command:?}: {:?}",
+                sources(command)
+            );
+        }
+    }
+
     /// With an unquoted delimiter, bash and zsh end a body at a line joined
     /// across a backslash-newline, and the lines after it are commands, which
     /// no data mask may hide; a quoted delimiter joins no lines.
