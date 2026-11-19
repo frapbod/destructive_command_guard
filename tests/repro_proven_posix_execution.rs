@@ -188,6 +188,29 @@ fn harmless_and_unknown_commands_keep_current_policy() {
     assert_both("deny", &[r#"eval "$*""#]);
 }
 
+/// A handler a function frame or `set --` proves (review of PR #13, round
+/// 2): the deferred trap reading and the here-string receiver see the value.
+/// Unknown handlers keep the policy above.
+#[test]
+fn proven_trap_and_stdin_handlers_are_judged() {
+    assert_both(
+        "deny",
+        &[
+            r#"echo() { trap "$*" EXIT; }; echo 'git reset --hard'"#,
+            r#"echo() { 2>/dev/null trap "$*" EXIT; }; echo 'git reset --hard'"#,
+            r#"set -- 'git reset --hard'; trap "$1" EXIT"#,
+            r#"f() { source /dev/stdin <<< "$1"; }; f 'git reset --hard'"#,
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"f() { trap "$*" EXIT; }; f 'echo done'"#,
+            r#"f() { trap "$*" EXIT; }; f "$x""#,
+        ],
+    );
+}
+
 /// A whole quoted or bare argument with a proven plain value (PR #2 "Not
 /// covered", fixed upstream in 18687c83): the second deny-only reading.
 #[test]

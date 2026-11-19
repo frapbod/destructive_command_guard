@@ -18541,16 +18541,15 @@ fn evaluate_command_in_dialect_union(
         let unknown_names = nested_command_depth == 0;
         let views = posix_proven_variable_view(command, deadline, unknown_names).and_then(|view| {
             let arguments = posix_proven_argument_view(command, deadline, unknown_names)?;
-            Ok(frames
-                .into_iter()
-                .chain(view)
-                .chain(arguments)
-                .fold(Vec::new(), |mut views, candidate| {
+            Ok(frames.into_iter().chain(view).chain(arguments).fold(
+                Vec::new(),
+                |mut views, candidate| {
                     if !views.contains(&candidate) {
                         views.push(candidate);
                     }
                     views
-                }))
+                },
+            ))
         });
         // An unfinished view is never proof that the command is safe.
         match views {
@@ -55144,6 +55143,10 @@ mod tests {
             ),
             ("x=git; f() { \"$@\"; }; f \"$x\" reset --hard", true),
             ("x='git reset --hard'; bash <<< \"$x\"", true),
+            (
+                "echo() { trap \"$*\" EXIT; }; echo 'git reset --hard'",
+                true,
+            ),
             ("f() { \"$@\"; }; f ls", false),
             ("f() { \"$*\"; }; f git reset --hard", false),
             ("f() { \"$@\"; }; f 'git reset --hard'", false),
