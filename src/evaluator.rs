@@ -4286,9 +4286,13 @@ fn msys_native_argument(decoded: &str) -> Option<&str> {
 /// included, so under [`NativeArgv::Msys`] a decoded word that starts with
 /// `//` (after leading blanks) loses one `/`: `cmd //c powershell //c ...`
 /// reaches powershell.exe as `/c`. A word with a single leading `/` stays as
-/// written. Git Bash makes it a path, which the verbatim reading of the same
-/// word covers as well or better (a host that reads `/x` as a switch is
-/// judged on that switch either way). A single word that holds the whole
+/// written, although Git Bash makes it a path. This misses a value switch:
+/// in `cmd //c powershell /ep 'x;git reset --hard'` the verbatim
+/// reading takes `x;git` as the value of `/ep`, while under Git Bash
+/// powershell.exe receives a path, which starts the command string, so the
+/// command runs and dcg allows it. That spelling is an accepted risk (the
+/// command must be glued to the value with `;`), recorded in PR #29; it has
+/// no code unless a real occurrence turns up. A single word that holds the whole
 /// nested command (`cmd //c "powershell //c ..."`) starts with no `/`, so
 /// Git Bash and this reading leave its inner `//c` alone.
 fn decoded_launcher_tail(
@@ -4479,79 +4483,81 @@ fn powershell_host_option(
         }
         return windows_powershell_switch(&name);
     }
-    if !name.is_empty() && "command".starts_with(&name) {
-        return PowerShellHostOption::Command;
-    }
-    if !name.is_empty() && "encodedcommand".starts_with(&name) {
-        return PowerShellHostOption::EncodedCommand;
-    }
+    core_powershell_switch(&name)
+}
 
-    const NO_VALUE: &[&str] = &[
-        "help",
-        "interactive",
-        "login",
-        "mta",
-        "noexit",
-        "nologo",
-        "noninteractive",
-        "noprofile",
-        "noprofileloadtime",
-        "sshservermode",
-        "sta",
+/// Reads a lower-case switch name (prefix and repeated dash removed) the
+/// way pwsh (PowerShell 6 and later) does.
+///
+/// The table is pwsh's switch list in the order it tries them, each alias
+/// with its shortest accepted spelling: `ParseHelper` and `MatchSwitch` in
+/// `CommandLineParameterParser.cs`, the same list at tags v7.5.4 through
+/// v7.7.0 (v7.4.0 and v7.5.0 lack the three Windows-only V2 socket entries),
+/// release build only. A name matches the first entry it is a prefix of and
+/// is at least as long as that entry's minimum, so `-NoP` is NoProfile,
+/// `-in` is Interactive, `-w` is WindowStyle and `-cu` matches nothing.
+/// Short aliases such as `-wd`, `-ep`, `-ec`, `-of`, `-if` and `-cwa` are
+/// their own entries. pwsh reads any of them after `/` too and keeps
+/// parsing, so `pwsh /wd x -c "..."` runs the -Command (measured with pwsh
+/// 7.5.0 on Linux). A name that matches nothing makes pwsh read the argument
+/// as the script path; callers fail closed on it when it is dashed.
+///
+/// The Windows-only entries (`v2socketservermode`, `token`, `utctimestamp`,
+/// `removeworkingdirectorytrailingcharacter`) are kept: on Linux and macOS
+/// pwsh reads them as a script path, which runs no inline command either.
+/// The server modes, `-CommandWithArgs` and `-EncodedArguments` are
+/// `Unmodeled`: pwsh reads them, and dcg does not model what they run.
+/// `-Version` stops pwsh's parse and starts nothing; it stays a value
+/// option, which judges at least what pwsh would.
+fn core_powershell_switch(name: &str) -> PowerShellHostOption {
+    use PowerShellHostOption::{Command, EncodedCommand, File, NoValue, Unknown, Unmodeled, Value};
+    const SWITCHES: &[(&str, usize, PowerShellHostOption)] = &[
+        ("version", 1, Value),
+        ("help", 1, NoValue),
+        ("?", 1, NoValue),
+        ("login", 1, NoValue),
+        ("noexit", 3, NoValue),
+        ("noprofile", 3, NoValue),
+        ("nologo", 3, NoValue),
+        ("noninteractive", 4, NoValue),
+        ("socketservermode", 2, Unmodeled),
+        ("v2socketservermode", 4, Unmodeled),
+        ("servermode", 1, Unmodeled),
+        ("namedpipeservermode", 3, Unmodeled),
+        ("sshservermode", 4, Unmodeled),
+        ("noprofileloadtime", 17, NoValue),
+        ("interactive", 1, NoValue),
+        ("configurationfile", 17, Value),
+        ("configurationname", 6, Value),
+        ("custompipename", 3, Value),
+        ("commandwithargs", 15, Unmodeled),
+        ("cwa", 3, Unmodeled),
+        ("command", 1, Command),
+        ("windowstyle", 1, Value),
+        ("file", 1, File),
+        ("outputformat", 1, Value),
+        ("of", 1, Value),
+        ("inputformat", 3, Value),
+        ("if", 2, Value),
+        ("executionpolicy", 2, Value),
+        ("ep", 2, Value),
+        ("encodedcommand", 1, EncodedCommand),
+        ("ec", 1, EncodedCommand),
+        ("encodedarguments", 8, Unmodeled),
+        ("ea", 2, Unmodeled),
+        ("settingsfile", 8, Value),
+        ("sta", 3, NoValue),
+        ("mta", 3, NoValue),
+        ("workingdirectory", 2, Value),
+        ("wd", 2, Value),
+        ("removeworkingdirectorytrailingcharacter", 39, NoValue),
+        ("token", 2, Value),
+        ("utctimestamp", 3, Value),
     ];
-    if NO_VALUE.iter().any(|option| *option == name) {
-        return PowerShellHostOption::NoValue;
-    }
-
-    const VALUE: &[&str] = &[
-        "configurationfile",
-        "configurationname",
-        "custompipename",
-        "executionpolicy",
-        "inputformat",
-        "outputformat",
-        "settingsfile",
-        "version",
-        "windowstyle",
-        "workingdirectory",
-    ];
-    if VALUE.iter().any(|option| *option == name) {
-        return PowerShellHostOption::Value;
-    }
-
-    // `-File` takes a value like the VALUE options but ENDS host-option
-    // parsing, so it needs its own category. It resolves through the same
-    // unique-prefix pool below rather than an unconditional
-    // `"file".starts_with(name)` arm: `-f` is unambiguous only for as long as
-    // no other f-prefixed host option exists, and that is the pool's job to
-    // decide, not this function's to assume.
-    const FILE: &[&str] = &["file"];
-    if FILE.iter().any(|option| *option == name) {
-        return PowerShellHostOption::File;
-    }
-
-    // Native PowerShell host parameters accept case-insensitive unique
-    // prefixes. Count names rather than result categories: for example,
-    // `-NoP` is ambiguous between NoProfile and NoProfileLoadTime in current
-    // pwsh and must not be guessed, even though both options take no value.
-    let mut matches = NO_VALUE
+    SWITCHES
         .iter()
-        .map(|name| (*name, PowerShellHostOption::NoValue))
-        .chain(
-            VALUE
-                .iter()
-                .map(|name| (*name, PowerShellHostOption::Value)),
-        )
-        .chain(FILE.iter().map(|name| (*name, PowerShellHostOption::File)))
-        .filter(|(option, _)| option.starts_with(name.as_str()));
-    let Some((_, option)) = matches.next() else {
-        return PowerShellHostOption::Unknown;
-    };
-    if matches.next().is_some() {
-        PowerShellHostOption::Unknown
-    } else {
-        option
-    }
+        .find(|(switch, minimum, _)| name.len() >= *minimum && switch.starts_with(name))
+        .map_or(Unknown, |(_, _, option)| *option)
 }
 
 fn launcher_executable_name(raw: &str, dialect: ShellDialect) -> Option<String> {
@@ -5971,6 +5977,254 @@ fn parse_windows_launcher_segment(
     )
 }
 
+/// An outer-shell redirect found in one raw word of a launcher segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OuterRedirect {
+    /// Bytes before the operator that stay a program argument; 0 when the
+    /// whole word is the redirect (`2>/dev/null`, as opposed to
+    /// `/wd>/dev/null`, where `/wd` is still an argument).
+    argument_len: usize,
+    /// The operator stands alone (`>`, `2>`, `>&`), so the next word is its
+    /// target.
+    takes_next_word: bool,
+}
+
+/// End of the bracketed group that opens at `open` (`(` or `{`), or the end
+/// of the word when it does not close there.
+fn posix_group_end(bytes: &[u8], open: usize) -> usize {
+    let (opener, closer) = if bytes[open] == b'{' {
+        (b'{', b'}')
+    } else {
+        (b'(', b')')
+    };
+    let mut depth = 0usize;
+    for (index, &byte) in bytes.iter().enumerate().skip(open) {
+        if byte == opener {
+            depth += 1;
+        } else if byte == closer {
+            depth -= 1;
+            if depth == 0 {
+                return index + 1;
+            }
+        }
+    }
+    bytes.len()
+}
+
+/// The first `<` or `>` in a raw POSIX word that is a redirect operator: not
+/// quoted, not backslash-escaped, not inside `$(...)`, `${...}` or a
+/// backtick substitution, and not a process substitution (`<(...)`).
+fn posix_unquoted_redirect_operator(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        index = match byte {
+            b'\\' => index + 2,
+            b'\'' => bytes[index + 1..]
+                .iter()
+                .position(|&next| next == b'\'')
+                .map_or(bytes.len(), |at| index + at + 2),
+            b'"' => {
+                let mut cursor = index + 1;
+                while let Some(&next) = bytes.get(cursor) {
+                    if next == b'"' {
+                        break;
+                    }
+                    cursor += if next == b'\\' { 2 } else { 1 };
+                }
+                cursor + 1
+            }
+            b'`' => bytes[index + 1..]
+                .iter()
+                .position(|&next| next == b'`')
+                .map_or(bytes.len(), |at| index + at + 2),
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                posix_group_end(bytes, index + 1)
+            }
+            b'<' | b'>' if bytes.get(index + 1) == Some(&b'(') => posix_group_end(bytes, index + 1),
+            b'<' | b'>' => return Some(index),
+            _ => index + 1,
+        };
+    }
+    None
+}
+
+/// The first `<` or `>` in a raw Cmd word that is a redirect operator: not
+/// inside double quotes and not escaped with `^`.
+fn cmd_unquoted_redirect_operator(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    let mut quoted = false;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'^' if !quoted => index += 1,
+            b'<' | b'>' if !quoted => return Some(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Where an outer-shell redirect starts in one raw word, by the outer
+/// dialect's redirect grammar. The outer shell performs it and removes it
+/// before the launched program starts, wherever it stands on the line, so it
+/// is never one of that program's arguments: `pwsh -nop 2>/dev/null /c '...'`
+/// runs the `/c` command (measured with bash 5.2 and pwsh 7.5 as the outer
+/// shell).
+///
+/// - POSIX: `[n]>`, `>>`, `>|`, `<`, `<>`, `[n]>&m`, `&>`, `{name}>` and the
+///   rest of the family, unquoted, at the start of a word or after other
+///   text (`/wd>/dev/null` gives the program `/wd`, measured).
+/// - PowerShell: `>`, `>>`, `n>`, `n>>`, `n>&1` and `*>` for streams 1-6 and
+///   `*`, only at the start of a word: `/wd>$null`, `7>$null` and
+///   `x2>$null` are arguments (measured). `<` is reserved: the line is a
+///   parse error and runs nothing, so the word is left in place.
+/// - Cmd: `[n]>`, `>>`, `<` and `n>&m`, outside double quotes and not
+///   `^`-escaped, at the start of a word or after other text. Whether cmd
+///   reads a digit glued to the end of an argument (`x2>nul`) as the handle
+///   is not modeled: the argument keeps it.
+fn outer_redirect_in_word(raw: &str, dialect: ShellDialect) -> Option<OuterRedirect> {
+    match dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            let at = posix_unquoted_redirect_operator(raw)?;
+            // A descriptor number, `{name}` or `&` before the operator
+            // belongs to the redirect (`2>`, `{fd}>`, `&>`).
+            let whole = crate::heredoc::word_token_starts_local_redirect(raw)
+                && !raw[..at].contains(['<', '>']);
+            let start = if whole { 0 } else { at };
+            Some(OuterRedirect {
+                argument_len: start,
+                takes_next_word: crate::heredoc::redirect_operator_takes_next_word(&raw[start..]),
+            })
+        }
+        ShellDialect::PowerShell => {
+            let operator = raw
+                .strip_prefix(['1', '2', '3', '4', '5', '6', '*'])
+                .unwrap_or(raw);
+            operator.starts_with('>').then_some(OuterRedirect {
+                argument_len: 0,
+                takes_next_word: matches!(operator, ">" | ">>"),
+            })
+        }
+        ShellDialect::Cmd => {
+            let at = cmd_unquoted_redirect_operator(raw)?;
+            let handle = &raw[..at];
+            let whole =
+                handle.is_empty() || (handle.len() == 1 && handle.as_bytes()[0].is_ascii_digit());
+            Some(OuterRedirect {
+                argument_len: if whole { 0 } else { at },
+                takes_next_word: matches!(&raw[at..], ">" | ">>" | "<"),
+            })
+        }
+    }
+}
+
+/// The raw words a launcher segment hands its program, or `None` when the
+/// segment holds a command separator (it is not one simple command).
+///
+/// Outer-shell redirects and a lone operator's target are removed by
+/// [`outer_redirect_in_word`]. The tokenizers end a word at `&` and `|`, so
+/// a descriptor duplication (`2>&1`, `>& file`) and a POSIX clobbering
+/// redirect (`>|file`) arrive as a redirect word, a separator glued to it and
+/// a target word; that separator belongs to the redirect, not to the line.
+/// The redirect itself is judged by the ordinary outer passes
+/// ([`segment_has_outer_redirect`]).
+fn launcher_argv<'a>(
+    segment: &'a str,
+    tokens: &crate::normalize::NormalizeTokens,
+    dialect: ShellDialect,
+) -> Option<Vec<&'a str>> {
+    launcher_argv_and_redirects(segment, tokens, dialect).map(|(words, _)| words)
+}
+
+/// [`launcher_argv`], also returning each removed redirect from its
+/// operator on (`2>/dev/null`, `<` of `< file`, `>/dev/null` of
+/// `/wd>/dev/null`).
+fn launcher_argv_and_redirects<'a>(
+    segment: &'a str,
+    tokens: &crate::normalize::NormalizeTokens,
+    dialect: ShellDialect,
+) -> Option<(Vec<&'a str>, Vec<&'a str>)> {
+    let mut words = Vec::with_capacity(tokens.len());
+    let mut redirects = Vec::new();
+    let mut skip_target = false;
+    // End and text of the previous token when it was a redirect that ends
+    // in its operator.
+    let mut open_redirect: Option<(usize, &str)> = None;
+    for token in tokens {
+        let text = token.text(segment)?;
+        let previous = open_redirect.take();
+        if token.kind == NormalizeTokenKind::Separator {
+            let duplication = previous.is_some_and(|(end, redirect)| {
+                end == token.byte_range.start
+                    && match text {
+                        "&" => true,
+                        "|" => {
+                            matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+                                && redirect.ends_with('>')
+                                && !redirect.ends_with("&>")
+                        }
+                        _ => false,
+                    }
+            });
+            if !duplication {
+                return None;
+            }
+            skip_target = true;
+            continue;
+        }
+        if std::mem::take(&mut skip_target) {
+            continue;
+        }
+        let Some(redirect) = outer_redirect_in_word(text, dialect) else {
+            words.push(text);
+            continue;
+        };
+        if redirect.argument_len > 0 {
+            words.push(&text[..redirect.argument_len]);
+        }
+        redirects.push(&text[redirect.argument_len..]);
+        skip_target = redirect.takes_next_word;
+        if text.ends_with(['>', '<']) {
+            open_redirect = Some((token.byte_range.end, text));
+        }
+    }
+    Some((words, redirects))
+}
+
+/// The executable and arguments of one POSIX simple command, with the outer
+/// shell's redirects removed on the raw words by [`launcher_argv`]'s grammar
+/// (quote-aware: `pwsh -wd '2>x' <(...)` keeps `2>x` as the `-wd` value;
+/// glued-aware: `pwsh /ep>/dev/null Bypass <(...)` gives pwsh `/ep`), and
+/// whether one of those redirects replaces stdin. Wrappers, assignments and
+/// `exec` are then read by [`command_tokens`]. `None` when the command is not
+/// one simple command.
+fn posix_command_tokens_without_redirects(command: &str) -> Option<(String, Vec<String>, bool)> {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let (words, redirects) = launcher_argv_and_redirects(command, &tokens, ShellDialect::Posix)?;
+    let stdin_redirect = redirects.iter().any(|redirect| {
+        matches!(
+            classify_shell_positional(redirect),
+            ShellPositional::StdinReassignRedirect { .. }
+        )
+    });
+    let (executable, args) = command_tokens(&words.join(" "))?;
+    Some((executable, args, stdin_redirect))
+}
+
+/// Whether any word of `segment` carries an outer-shell redirect, which
+/// [`launcher_argv`] removes from the launched program's arguments.
+fn segment_has_outer_redirect(segment: &str, dialect: ShellDialect) -> bool {
+    segment.contains(['<', '>'])
+        && tokenize_for_shell_dialect(segment, dialect)
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .filter_map(|token| token.text(segment))
+            .any(|word| outer_redirect_in_word(word, dialect).is_some())
+}
+
 /// One launcher segment under one reading of the arguments the launched
 /// program receives ([`NativeArgv`]). `expansions` applies to a `cmd /c` /
 /// `cmd /k` payload.
@@ -6042,17 +6296,9 @@ fn parse_windows_launcher_segment_as(
         .then(|| segment.replace('\r', "\u{1}"));
     let tokens =
         tokenize_for_shell_dialect(cr_as_word_byte.as_deref().unwrap_or(segment), outer_dialect);
-    if tokens
-        .iter()
-        .any(|token| token.kind == NormalizeTokenKind::Separator)
-    {
+    let Some(words) = launcher_argv(segment, &tokens, outer_dialect) else {
         return WindowsLauncherParse::NotLauncher;
-    }
-    let words: Vec<&str> = tokens
-        .iter()
-        .filter(|token| token.kind == NormalizeTokenKind::Word)
-        .filter_map(|token| token.text(segment))
-        .collect();
+    };
     let Some(executable) = words
         .first()
         .and_then(|raw| launcher_executable_name(raw, outer_dialect))
@@ -6342,7 +6588,10 @@ fn windows_launcher_envelopes(
                     }
                 }
             }
-            ordinary_reading |= !launcher_reading;
+            // The outer shell performs a redirect the launcher's argv no
+            // longer shows (`pwsh -c Get-Date > /dev/sda`), so the ordinary
+            // outer passes judge that segment as well.
+            ordinary_reading |= !launcher_reading || segment_has_outer_redirect(segment, candidate);
         }
         // Unknown-mode parsing is a conservative union of viable shell
         // interpretations. A valid envelope in one dialect cannot make an
@@ -9521,12 +9770,41 @@ fn either_pipeline_reading(
 
 /// Whether a PowerShell host started in a pipeline runs its stdin, under
 /// both readings of its arguments ([`NativeArgv`]): the argv comes from a
-/// POSIX-shaped view and the outer shell may be Git Bash.
+/// POSIX-shaped view and the outer shell may be Git Bash. `args` holds no
+/// outer-shell redirect: the callers remove them on the raw words
+/// ([`posix_command_tokens_without_redirects`], and [`partition_stage_argv`]
+/// for the Cmd and PowerShell dialects).
 fn powershell_pipeline_input_mode(args: &[String], host: PowerShellHost) -> PipelineShellInputMode {
     either_pipeline_reading(
         powershell_pipeline_input_mode_as(args, host, NativeArgv::Verbatim),
         powershell_pipeline_input_mode_as(args, host, NativeArgv::Msys),
     )
+}
+
+/// A PowerShell host in a POSIX pipeline stage or before `< <(...)`. The
+/// outer shell's redirects are not the host's arguments: `pwsh -nop
+/// 2>/dev/null` still runs its stdin, and `pwsh -wd '2>x'` (quoted) has
+/// `2>x` as its `-wd` value. A stdin redirect replaces the pipe with a
+/// source dcg cannot read, as for a POSIX shell consumer. `None` when the
+/// stage does not start a PowerShell host.
+fn posix_powershell_pipeline_input_mode(
+    command: &str,
+    executable: &str,
+) -> Option<PipelineShellInputMode> {
+    let names_host = matches!(executable, "powershell" | "pwsh");
+    if !names_host && !command.contains(['<', '>']) {
+        return None;
+    }
+    match posix_command_tokens_without_redirects(command) {
+        Some((host, args, stdin_redirect)) if matches!(host.as_str(), "powershell" | "pwsh") => {
+            Some(if stdin_redirect {
+                PipelineShellInputMode::Unverified
+            } else {
+                powershell_pipeline_input_mode(&args, PowerShellHost::from_executable(&host))
+            })
+        }
+        _ => names_host.then_some(PipelineShellInputMode::Unverified),
+    }
 }
 
 fn powershell_pipeline_input_mode_as(
@@ -10116,8 +10394,8 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
         }
         return parallel_pipeline_input_mode(&args);
     }
-    if matches!(executable.as_str(), "powershell" | "pwsh") {
-        return powershell_pipeline_input_mode(&args, PowerShellHost::from_executable(&executable));
+    if let Some(mode) = posix_powershell_pipeline_input_mode(command, &executable) {
+        return mode;
     }
     if executable == "cmd" {
         return cmd_pipeline_input_mode(&args);
@@ -10805,6 +11083,87 @@ fn parallel_process_substitution_input_mode(
     Some(parallel_pipeline_input_mode(&filtered))
 }
 
+/// Whether a PowerShell host runs a process-substitution file (`marker`
+/// stands for its `/dev/fd/N` path) as source, under one reading of its
+/// arguments ([`NativeArgv`]). The arguments are read with the shared switch
+/// table ([`powershell_host_option`]), so every spelling of a switch counts.
+///
+/// A File switch in any spelling (`-f`, `/f`, `-File`) whose value is the
+/// marker runs the file as a script, and so does a first non-switch argument
+/// for pwsh, which reads it as the -File script. Measured with pwsh 7.5.0 on
+/// Linux: `pwsh -f <(...)`, `pwsh -File <(...)`, `pwsh <(...)` and `pwsh
+/// -NoProfile <(...)` each run the substituted text. Windows PowerShell 5.1
+/// starts the command string at its first non-switch argument instead, so
+/// there that argument opens a -Command tail. A -Command tail that holds the
+/// marker, alone or inside a word, becomes command text naming the file,
+/// which dcg does not follow, so it fails closed: `pwsh -c
+/// 'iex ([IO.File]::ReadAllText("'<(...)'"))'` runs the substituted text
+/// (measured), while `pwsh -c <(...)` runs nothing. pwsh keeps parsing after
+/// `-EncodedCommand <value>`, so a later File or script argument is still
+/// read (`pwsh -ec <value> <(...)` runs the substituted text, measured).
+/// Unmodeled switches, unknown dashed switches and a missing value fail
+/// closed.
+fn powershell_process_substitution_input_mode(
+    args: &[String],
+    marker: &str,
+    host: PowerShellHost,
+    argv: NativeArgv,
+) -> PipelineShellInputMode {
+    let command_tail = |start: usize| {
+        if args[start..]
+            .iter()
+            .any(|argument| argument.contains(marker))
+        {
+            PipelineShellInputMode::Unverified
+        } else {
+            PipelineShellInputMode::DoesNotReadStdin
+        }
+    };
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index) {
+        match powershell_host_option(argument, host, ShellDialect::Posix, argv) {
+            PowerShellHostOption::File => {
+                return match args.get(index + 1) {
+                    Some(path) if path == marker => {
+                        PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
+                    }
+                    Some(_) => PipelineShellInputMode::DoesNotReadStdin,
+                    None => PipelineShellInputMode::Unverified,
+                };
+            }
+            PowerShellHostOption::Command => {
+                return if args.get(index + 1).is_some() {
+                    command_tail(index + 1)
+                } else {
+                    PipelineShellInputMode::Unverified
+                };
+            }
+            PowerShellHostOption::NoValue => index += 1,
+            PowerShellHostOption::OptionalValue => index += 2,
+            PowerShellHostOption::EncodedCommand | PowerShellHostOption::Value => {
+                if args.get(index + 1).is_none() {
+                    return PipelineShellInputMode::Unverified;
+                }
+                index += 2;
+            }
+            PowerShellHostOption::Unmodeled => return PipelineShellInputMode::Unverified,
+            PowerShellHostOption::Unknown => {
+                if powershell_argument_is_dashed(argument) {
+                    return PipelineShellInputMode::Unverified;
+                }
+                return match host {
+                    PowerShellHost::Core if argument == marker => {
+                        PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
+                    }
+                    PowerShellHost::Core => PipelineShellInputMode::DoesNotReadStdin,
+                    PowerShellHost::Windows => command_tail(index),
+                };
+            }
+        }
+    }
+    PipelineShellInputMode::DoesNotReadStdin
+}
+
 fn process_substitution_file_input_mode(command: &str, marker: &str) -> PipelineShellInputMode {
     if pipeline_wrapper_limit_reached(command) {
         return PipelineShellInputMode::Unverified;
@@ -10979,15 +11338,33 @@ fn process_substitution_file_input_mode(command: &str, marker: &str) -> Pipeline
             };
         }
     }
-    if matches!(executable.as_str(), "powershell" | "pwsh") {
-        return if args.windows(2).any(|pair| {
-            matches!(pair[0].to_ascii_lowercase().as_str(), "-file" | "-command")
-                && pair[1] == marker
-        }) {
-            PipelineShellInputMode::Unverified
-        } else {
-            PipelineShellInputMode::DoesNotReadStdin
-        };
+    // The outer shell's redirects are not pwsh's arguments, at a switch or
+    // a value position alike (`pwsh -wd 2>/dev/null x <(...)` runs the
+    // file). They are removed on the raw words, so a quoted `'2>x'` stays a
+    // value and `/ep>/dev/null` gives pwsh `/ep`. The marker is no redirect.
+    let names_host = matches!(executable.as_str(), "powershell" | "pwsh");
+    if names_host || command.contains(['<', '>']) {
+        match posix_command_tokens_without_redirects(command) {
+            Some((host, args, _)) if matches!(host.as_str(), "powershell" | "pwsh") => {
+                let host = PowerShellHost::from_executable(&host);
+                return either_pipeline_reading(
+                    powershell_process_substitution_input_mode(
+                        &args,
+                        marker,
+                        host,
+                        NativeArgv::Verbatim,
+                    ),
+                    powershell_process_substitution_input_mode(
+                        &args,
+                        marker,
+                        host,
+                        NativeArgv::Msys,
+                    ),
+                );
+            }
+            _ if names_host => return PipelineShellInputMode::Unverified,
+            _ => {}
+        }
     }
     if executable == "cmd"
         && args.windows(2).any(|pair| {
@@ -44720,6 +45097,148 @@ mod tests {
     }
 
     #[test]
+    fn launcher_argv_drops_outer_shell_redirects() {
+        use ShellDialect::{Cmd, Posix, PowerShell};
+        let cases: &[(&str, ShellDialect, Option<&[&str]>)] = &[
+            (
+                "pwsh -nop 2>/dev/null /c x",
+                Posix,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            ("2>/dev/null pwsh /c x", Posix, Some(&["pwsh", "/c", "x"])),
+            (
+                "pwsh /wd > out.txt . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh -nop 2>&1 /c x",
+                Posix,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            (
+                "pwsh /wd >& out.txt . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd >|out.txt . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd>/dev/null . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd {fd}>/dev/null . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd '2>x' -c x",
+                Posix,
+                Some(&["pwsh", "/wd", "'2>x'", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd x\\>y -c x",
+                Posix,
+                Some(&["pwsh", "/wd", "x\\>y", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd \"a>b\"c -c x",
+                Posix,
+                Some(&["pwsh", "/wd", "\"a>b\"c", "-c", "x"]),
+            ),
+            ("pwsh -c x; git status", Posix, None),
+            ("pwsh -c x & git status", Posix, None),
+            (
+                "pwsh -nop 2>$null /c x",
+                PowerShell,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            (
+                "pwsh -nop 2>&1 /c x",
+                PowerShell,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            (
+                "pwsh -nop *> out.txt /c x",
+                PowerShell,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            (
+                "pwsh /wd 7>$null . -c x",
+                PowerShell,
+                Some(&["pwsh", "/wd", "7>$null", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd>$null . -c x",
+                PowerShell,
+                Some(&["pwsh", "/wd>$null", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd 2>nul x -c y",
+                Cmd,
+                Some(&["pwsh", "/wd", "x", "-c", "y"]),
+            ),
+            (
+                "pwsh /wd 2>&1 x -c y",
+                Cmd,
+                Some(&["pwsh", "/wd", "x", "-c", "y"]),
+            ),
+            (
+                "pwsh /wd x^>y -c y",
+                Cmd,
+                Some(&["pwsh", "/wd", "x^>y", "-c", "y"]),
+            ),
+            (
+                "pwsh /wd \"2>x\" -c y",
+                Cmd,
+                Some(&["pwsh", "/wd", "\"2>x\"", "-c", "y"]),
+            ),
+            ("cmd /c dir>out.txt", Cmd, Some(&["cmd", "/c", "dir"])),
+        ];
+        for &(segment, dialect, want) in cases {
+            let tokens = tokenize_for_shell_dialect(segment, dialect);
+            assert_eq!(
+                launcher_argv(segment, &tokens, dialect).as_deref(),
+                want,
+                "{dialect:?}: {segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_command_tokens_read_redirects_on_raw_words() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("pwsh -wd '2>x' M", &["-wd", "2>x", "M"], false),
+            ("pwsh /wd \">x\" M", &["/wd", ">x", "M"], false),
+            (
+                "pwsh /ep>/dev/null Bypass M",
+                &["/ep", "Bypass", "M"],
+                false,
+            ),
+            ("pwsh -f>/dev/null M", &["-f", "M"], false),
+            ("pwsh -wd 2>/dev/null x M", &["-wd", "x", "M"], false),
+            ("pwsh -nop 2>&1 -c x", &["-nop", "-c", "x"], false),
+            ("pwsh -nop < in.ps1", &["-nop"], true),
+            ("pwsh -nop 0<in.ps1", &["-nop"], true),
+            ("pwsh -nop 3<in.ps1", &["-nop"], false),
+            ("2>/dev/null env pwsh -c x", &["-c", "x"], false),
+        ];
+        for &(command, want, stdin) in cases {
+            let (executable, args, stdin_redirect) =
+                posix_command_tokens_without_redirects(command).expect(command);
+            assert_eq!(executable, "pwsh", "{command:?}");
+            assert_eq!(args, want, "{command:?}");
+            assert_eq!(stdin_redirect, stdin, "{command:?}");
+        }
+        assert!(posix_command_tokens_without_redirects("pwsh -c x; git status").is_none());
+    }
+
+    #[test]
     fn piped_shell_reads_stdin_through_output_redirects_and_stdin_devices() {
         use std::mem::discriminant;
         let reads = discriminant(&PipelineShellInputMode::ReadsStdin(
@@ -61550,8 +62069,8 @@ mod tests {
                 ShellDialect::PowerShell,
                 NativeArgv::Verbatim
             ),
-            PowerShellHostOption::Unknown,
-            "NoProfile and NoProfileLoadTime make -NoP ambiguous"
+            PowerShellHostOption::NoValue,
+            "pwsh tries NoProfile (minimum -nop) before NoProfileLoadTime"
         );
         assert_eq!(
             powershell_host_option(
@@ -61560,8 +62079,8 @@ mod tests {
                 ShellDialect::PowerShell,
                 NativeArgv::Verbatim
             ),
-            PowerShellHostOption::Unknown,
-            "WindowStyle and WorkingDirectory make -W ambiguous"
+            PowerShellHostOption::Value,
+            "pwsh tries WindowStyle (minimum -w) before WorkingDirectory (-wo)"
         );
         assert_eq!(
             powershell_host_option(
@@ -61677,19 +62196,20 @@ mod tests {
             (
                 "-SSHServerMode",
                 PowerShellHostOption::Unknown,
-                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unmodeled,
             ),
-            // 5.1 takes the first switch the name abbreviates to at least
-            // that switch's minimum length (`MatchSwitch`).
+            // Each host takes the first switch the name abbreviates to at
+            // least that switch's minimum length (`MatchSwitch`), from its
+            // own list (`windows_powershell_switch`, `core_powershell_switch`).
             (
                 "-NoP",
                 PowerShellHostOption::NoValue,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
             ),
             (
                 "-non",
                 PowerShellHostOption::Unknown,
-                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unknown,
             ),
             (
                 "-noni",
@@ -61699,7 +62219,7 @@ mod tests {
             (
                 "-W",
                 PowerShellHostOption::Value,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
             ),
             (
                 "-conf",
@@ -61709,22 +62229,22 @@ mod tests {
             (
                 "-Config",
                 PowerShellHostOption::Value,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
             ),
             (
                 "-i",
                 PowerShellHostOption::Value,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
             ),
             (
                 "-s",
                 PowerShellHostOption::Unmodeled,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Unmodeled,
             ),
             (
                 "-st",
                 PowerShellHostOption::NoValue,
-                PowerShellHostOption::NoValue,
+                PowerShellHostOption::Unknown,
             ),
             (
                 "-e",
@@ -61739,17 +62259,17 @@ mod tests {
             (
                 "-ep",
                 PowerShellHostOption::Value,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Value,
             ),
             (
                 "-ec",
                 PowerShellHostOption::EncodedCommand,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::EncodedCommand,
             ),
             (
                 "-ea",
                 PowerShellHostOption::Unmodeled,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::Unmodeled,
             ),
             (
                 "-v",
@@ -61759,7 +62279,7 @@ mod tests {
             (
                 "/?",
                 PowerShellHostOption::NoValue,
-                PowerShellHostOption::Unknown,
+                PowerShellHostOption::NoValue,
             ),
             (
                 "-PSConsoleFile",
@@ -61792,6 +62312,48 @@ mod tests {
                 windows,
                 "powershell {raw:?}"
             );
+            assert_eq!(
+                powershell_host_option(
+                    raw,
+                    PowerShellHost::Core,
+                    ShellDialect::PowerShell,
+                    NativeArgv::Verbatim
+                ),
+                core,
+                "pwsh {raw:?}"
+            );
+        }
+        // pwsh's short aliases are their own entries, and pwsh reads them
+        // after `/` too (`pwsh /wd x -c "..."` runs the -Command, measured
+        // with pwsh 7.5.0); names below an entry's minimum match nothing.
+        for (raw, core) in [
+            ("/wd", PowerShellHostOption::Value),
+            ("/wo", PowerShellHostOption::Value),
+            ("/ep", PowerShellHostOption::Value),
+            ("/ec", PowerShellHostOption::EncodedCommand),
+            ("/e", PowerShellHostOption::EncodedCommand),
+            ("/of", PowerShellHostOption::Value),
+            ("/if", PowerShellHostOption::Value),
+            ("/in", PowerShellHostOption::NoValue),
+            ("/inp", PowerShellHostOption::Value),
+            ("/cus", PowerShellHostOption::Value),
+            ("/settings", PowerShellHostOption::Value),
+            ("/to", PowerShellHostOption::Value),
+            ("/utc", PowerShellHostOption::Value),
+            ("/cwa", PowerShellHostOption::Unmodeled),
+            ("/CommandWithArgs", PowerShellHostOption::Unmodeled),
+            ("/so", PowerShellHostOption::Unmodeled),
+            ("/v2so", PowerShellHostOption::Unmodeled),
+            ("/nam", PowerShellHostOption::Unmodeled),
+            ("/sshs", PowerShellHostOption::Unmodeled),
+            ("/encodeda", PowerShellHostOption::Unmodeled),
+            ("/noprofileloadtime", PowerShellHostOption::NoValue),
+            ("/noprofilel", PowerShellHostOption::Unknown),
+            ("/cu", PowerShellHostOption::Unknown),
+            ("/m", PowerShellHostOption::Unknown),
+            ("-settingsf", PowerShellHostOption::Value),
+            ("-sett", PowerShellHostOption::Unknown),
+        ] {
             assert_eq!(
                 powershell_host_option(
                     raw,
@@ -62171,9 +62733,6 @@ mod tests {
             r#"cmd /c "echo %DCG_DYNAMIC%""#.to_string(),
             "call %DCG_DYNAMIC%".to_string(),
             "@%DCG_DYNAMIC%".to_string(),
-            // -NoP is ambiguous in pwsh (NoProfile, NoProfileLoadTime); in
-            // Windows PowerShell 5.1 it is NoProfile.
-            "pwsh -NoP -Command 'Write-Output ok'".to_string(),
             "powershell -WorkingDirectory C:\\ -Command 'Write-Output ok'".to_string(),
             "powershell -DefinitelyUnknown 'Write-Output ok'".to_string(),
             // A script read from stdin is no more inspectable than
