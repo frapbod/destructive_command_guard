@@ -548,6 +548,18 @@ const HARMLESS: &[&str] = &[
     "$ExecutionContext.InvokeCommand.{InvokeScript}('git status')",
     "$x=[IO.File]; $x::Create('a.txt').Dispose()",
     "[scriptblock]::Create('git status').Invoke()",
+    // Twins of the round 1 review rows, and `new` taken as a value on a
+    // type held in a value, which is an ordinary constructor.
+    "[scriptblock]::@'\nCreate\n'@('git status').Invoke()",
+    "[scriptblock]::@('Create')('git status').Invoke()",
+    "([scriptblock])::Create('git status').Invoke()",
+    "$a='git status'; ([IO.Path])::Combine($a, 'b') | Out-Null",
+    "$a=@([IO.Path]); $a[0]::Combine('git status','b') | Out-Null",
+    "$ExecutionContext.InvokeCommand.@'\nInvokeScript\n'@('git status')",
+    "$ExecutionContext.InvokeCommand.@('InvokeScript')('git status')",
+    "[powershell]::Create().@\"\nAddScript\n\"@('git status').Invoke()",
+    "$t=[Text.StringBuilder]; $f = $t::new; $f.Invoke().Append('x') | Out-Null",
+    "$t=[scriptblock]; $f = $t::new; $f.OverloadDefinitions | Out-Null",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
