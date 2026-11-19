@@ -4841,6 +4841,10 @@ fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> Normaliz
     let mut tokens = NormalizeTokens::new();
     let mut i = 0;
     let mut braces = BraceLookup::default();
+    // Where a `#` right after a `(` or `)` stays in a word (`x=(1 2)#`,
+    // `ls *(#)`); see [`crate::context::PosixParens`].
+    let mut parens = crate::context::PosixParens::default();
+    let mut word_continues_at = None;
 
     while i < len {
         if posix_comments {
@@ -4854,7 +4858,7 @@ fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> Normaliz
             break;
         }
 
-        if posix_comments && bytes[i] == b'#' {
+        if posix_comments && bytes[i] == b'#' && word_continues_at != Some(i) {
             while i < len && bytes[i] != b'\n' {
                 i += 1;
             }
@@ -4877,6 +4881,16 @@ fn tokenize_normalization_inner(command: &str, posix_comments: bool) -> Normaliz
         }
 
         if let Some(end) = consume_separator_token(bytes, i, len, &mut tokens) {
+            if posix_comments {
+                let word_follows = match bytes[i] {
+                    b'(' => parens.open(bytes, i),
+                    b')' => parens.close(),
+                    _ => true,
+                };
+                if !word_follows {
+                    word_continues_at = Some(end);
+                }
+            }
             i = end;
             continue;
         }

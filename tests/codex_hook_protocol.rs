@@ -3845,6 +3845,23 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         "echo \"${y:- #}\"; git reset --hard",
         // dash reads `'` in `\"${…}\"` as a plain character.
         "echo \"${y:-it's}\"; git reset --hard",
+        // A word starts after the `)` of a subshell, `(( ))`, a `for (( ))`
+        // header or a case pattern, so the `#` there opens a comment.
+        "(( 1 ))#it's\ngit reset --hard",
+        "((1))#it's\ngit reset --hard",
+        "(( 1 ))#\"\ngit reset --hard",
+        "(( 1 ))#it's\r\ngit reset --hard",
+        "if (( 1 ))#it's\nthen git reset --hard; fi",
+        "for ((i=0;i<1;i++))#it's\ndo git reset --hard; done",
+        "(cd /tmp)#it's\ngit push --force origin main",
+        "(git status)#it's\ngit reset --hard",
+        "(true)#it's\ngit reset --hard",
+        "case x in x)#it's\ngit push --force origin main;; esac",
+        // After the `)` of an array assignment the word goes on: `#` is data.
+        "x=(1 2)#; git reset --hard",
+        // zsh reads `#` after a case-pattern or glob `(` as data.
+        "case x in (#) ;; esac; git reset --hard",
+        "ls *(#); git reset --hard",
     ] {
         let codex = run_hook_raw(&multiline_payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -3870,6 +3887,8 @@ fn posix_leading_comment_with_quote_does_not_hide_next_git_line() {
         "echo ${y:- a} #; git reset --hard",
         "x=${y:-\"a #\"} #it's\ngit status",
         "echo \"${y:-\" #\"}\" #it's\ngit status",
+        "(( 1 ))#it's\ngit status",
+        "(ls)#it's\ngit status",
     ] {
         let codex = run_hook_raw(&multiline_payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

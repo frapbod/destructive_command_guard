@@ -4432,6 +4432,7 @@ fn collect_command_segments<'a>(
     let mut word_start = true;
     // End of the `${…}` the scan is inside, or 0 (see `ParameterExpansion`).
     let mut expansion = ParameterExpansion::default();
+    let mut parens = crate::context::PosixParens::default();
 
     while i < end {
         let b = bytes[i];
@@ -4553,7 +4554,7 @@ fn collect_command_segments<'a>(
             continue;
         }
 
-        word_start = !expansion.contains(i) && posix_word_follows(bytes, i);
+        word_start = !expansion.contains(i) && posix_word_follows(bytes, i, &mut parens);
         let split_width: Option<usize> = if b == b';' || b == b'\n' {
             Some(1)
         } else if b == b'&' {
@@ -4665,6 +4666,7 @@ fn collect_quoted_shell_separator_offsets(
     let mut in_double = false;
     let mut word_start = true;
     let mut expansion = ParameterExpansion::default();
+    let mut parens = crate::context::PosixParens::default();
 
     while i < end {
         let b = bytes[i];
@@ -4764,7 +4766,7 @@ fn collect_quoted_shell_separator_offsets(
                 offsets.push(i);
             }
         } else {
-            word_start = !expansion.contains(i) && posix_word_follows(bytes, i);
+            word_start = !expansion.contains(i) && posix_word_follows(bytes, i, &mut parens);
         }
         i += 1;
     }
@@ -4809,15 +4811,24 @@ impl ParameterExpansion {
 }
 
 /// Whether a word may start right after the unquoted, unescaped byte at
-/// `index`: after a blank (space or tab), a newline, or the operators the
-/// segmenter splits on, plus `(`. So a `#` there opens a comment.
+/// `index`: after a blank (space or tab), a newline, the operators the
+/// segmenter splits on, and a `(` or `)` as [`crate::context::PosixParens`]
+/// reads them. So a `#` there opens a comment.
 ///
-/// Every other byte keeps the scan inside a word (`$((1))#`, `a\ #`, `x=1#`),
-/// where bash reads `#` as data. A missed comment only over-blocks; a false
-/// one hides the rest of the line, so this list stays narrow.
-fn posix_word_follows(bytes: &[u8], index: usize) -> bool {
+/// Every other byte keeps the scan inside a word (`$((1))#`, `a\\ #`, `x=1#`),
+/// where bash reads `#` as data. Both mistakes can hide a command: a false
+/// comment hides the rest of its line, and a missed one reads a quote in it
+/// as a string that hides the lines after it. So every scanner that reads
+/// comments shares this list and the paren rule.
+fn posix_word_follows(
+    bytes: &[u8],
+    index: usize,
+    parens: &mut crate::context::PosixParens,
+) -> bool {
     match bytes[index] {
-        b' ' | b'\t' | b'\n' | b';' | b'(' => true,
+        b' ' | b'\t' | b'\n' | b';' => true,
+        b'(' => parens.open(bytes, index),
+        b')' => parens.close(),
         b'&' => !is_redirection_ampersand(bytes, index),
         b'|' => !is_force_clobber_pipe(bytes, index),
         _ => false,
