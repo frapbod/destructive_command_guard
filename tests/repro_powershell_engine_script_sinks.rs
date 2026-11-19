@@ -4,6 +4,7 @@
 //! `[powershell]::Create().AddScript`, a runspace's `CreatePipeline` and
 //! `CreateNestedPipeline`, a `Runspaces.Command` built with `isScript`,
 //! `Parser::ParseInput`, and the `$( … )` inside `ExpandString`'s text.
+//! `[scriptblock]::Create` is read the same way, by any spelling.
 //! dcg read their string argument as data, so
 //! `$ExecutionContext.InvokeCommand.InvokeScript("git reset --hard")` passed
 //! in the PowerShell dialect.
@@ -328,6 +329,50 @@ const RUNS_IT: &[&str] = &[
     "if (($ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard') -eq $null) { 'n' }",
     "@($ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ArgumentList 'git reset --hard') -match 'x'",
     "($c = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', $true) -ne $null; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // `[scriptblock]::Create` by another spelling of the name (quoted,
+    // computed, a script block's text, `.Invoke`, the method taken as a
+    // value), of the type, or with the type held in a value (card
+    // t_222650ea; runner p/t1.out, t2.out). `.{Name}` names other engine
+    // methods too.
+    "[scriptblock]::Create.Invoke('git reset --hard').Invoke()",
+    "$f=[scriptblock]::Create; $f.Invoke('git reset --hard').Invoke()",
+    "[scriptblock]::'Create'('git reset --hard').Invoke()",
+    "[scriptblock]::(\"Cre\"+\"ate\")('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $t::Create('git reset --hard').Invoke()",
+    "[scriptblock]::\"Create\"('git reset --hard').Invoke()",
+    "$n='Create'; [scriptblock]::$n('git reset --hard').Invoke()",
+    "[Management.Automation.ScriptBlock]::Create('git reset --hard').Invoke()",
+    "using namespace System.Management.Automation\n[ScriptBlock]::Create('git reset --hard').Invoke()",
+    "([type]'scriptblock')::Create('git reset --hard').Invoke()",
+    "[scriptblock]::Create.Invoke(('git ' + 'reset --hard')).Invoke()",
+    "[scriptblock]::'Create'.Invoke('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $t::'Create'('git reset --hard').Invoke()",
+    "$sb=[scriptblock]::(\"Create\")('git reset --hard'); & $sb",
+    "[scriptblock]::Create.Invoke('git reset --hard')|% Invoke",
+    "[System.Management.Automation.ScriptBlock, System.Management.Automation]::Create('git reset --hard').Invoke()",
+    "[scriptblock]::$('Create')('git reset --hard').Invoke()",
+    "[scriptblock]::Create.Invoke(\"git reset --hard\").InvokeReturnAsIs()",
+    "[scriptblock]::\n Create('git reset --hard').Invoke()",
+    "[scriptblock]::`\nCreate('git reset --hard').Invoke()",
+    "& ([scriptblock]::'Create'('git reset --hard'))",
+    "$t=[type]'scriptblock'; $t::Create('git reset --hard').Invoke()",
+    "$t='scriptblock' -as [type]; $t::Create('git reset --hard').Invoke()",
+    "[scriptblock]::Create.Invoke.Invoke('git reset --hard').Invoke()",
+    "$m=[scriptblock]::'Create'; & { $m.Invoke('git reset --hard').Invoke() }",
+    "[ScriptBlock]::CREATE.invoke('git reset --hard').Invoke()",
+    "[scriptblock]::{Create}('git reset --hard').Invoke()",
+    "[System.Management.Automation.ScriptBlock]::'Create'('git reset --hard') | % Invoke",
+    "$ExecutionContext.InvokeCommand.{InvokeScript}('git reset --hard')",
+    "[scriptblock]::{Create}.Invoke('git reset --hard').Invoke()",
+    "[powershell]::{Create}().AddScript('git reset --hard').Invoke()",
+    "[scriptblock]:: 'Create'('git reset --hard').Invoke()",
+    "[ScriptBlock]::('Create')('git reset --hard')|% Invoke",
+    "[scriptblock]::Create('git reset --hard').Ast.GetScriptBlock().Invoke()",
+    "[System.Management.Automation.ScriptBlock]::Create.Invoke('git reset --hard') | % Invoke",
+    "$x=[scriptblock]; ($x)::Create('git reset --hard').Invoke()",
+    "[scriptblock]::Create.Invoke(@('git reset --hard')).Invoke()",
+    "([scriptblock]::Create).Invoke('git reset --hard').Invoke()",
+    "[scriptblock]::'Create'.Invoke.Invoke('git reset --hard').Invoke()",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
@@ -460,6 +505,25 @@ const HARMLESS: &[&str] = &[
     "Get-ChildItem | ForEach-Object { $_ | % Name }",
     "if (($ExecutionContext.InvokeCommand | % InvokeScript 'git status') -eq $null) { 'n' }",
     "$h = @{ n = (Get-ChildItem | % Name) -join ',' }; $h.n",
+    // Their `git status` twins, other types' `Create`, a script block name
+    // with blank space, and text naming the method (card t_222650ea).
+    "[scriptblock]::Create.Invoke('git status').Invoke()",
+    "[scriptblock]::'Create'('git status').Invoke()",
+    "$t=[scriptblock]; $t::Create('git status').Invoke()",
+    "[scriptblock]::(\"Cre\"+\"ate\")('git status').Invoke()",
+    "$n='Create'; [scriptblock]::$n('git status').Invoke()",
+    "[scriptblock]::Create.Invoke('Write-Output ok').Invoke()",
+    "$x = [IO.File]::Create('a.txt'); $x.Dispose()",
+    "Write-Output \"[scriptblock]::'Create'('git reset --hard')\"",
+    "Write-Output '[scriptblock]::Create.Invoke(\"git reset --hard\")'",
+    "[Management.Automation.ScriptBlock]::Create('git status').Invoke()",
+    "[System.Management.Automation.ScriptBlock, System.Management.Automation]::Create('git status').Invoke()",
+    "[scriptblock]::'Create'.Invoke('git status').Invoke()",
+    "[scriptblock]::Create.Invoke(\"git status\").InvokeReturnAsIs()",
+    "[System.IO.Directory]::CreateDirectory('x') | Out-Null",
+    "[powershell]::Create().AddCommand('Get-Date').Invoke() | Out-Null",
+    "[scriptblock]::{Create}('git status').Invoke()",
+    "$ExecutionContext.InvokeCommand.{InvokeScript}('git status')",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -514,6 +578,16 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // twin (review round 9): Unknown denies these on base 53c84977 too.
     "\"Files: $((Get-ChildItem | % Name) -join ', ')\"",
     "$c=New-Object System.Management.Automation.Runspaces.Command('git status', $true); $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // Another type's `Create`, `Create` that is not a static member, and
+    // script block names that are not `Create` (card t_222650ea): Unknown
+    // denies these on base 6740afcb too.
+    "[IO.File]::Create('git reset --hard').Dispose()",
+    "[Text.Encoding]::UTF8.GetBytes('git reset --hard').Length",
+    "$t=[scriptblock]; $t.Create('git reset --hard').Invoke()",
+    "[scriptblock]::{ Create }('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.{ InvokeScript }('git reset --hard')",
+    "[scriptblock]::{Cre`ate}('git reset --hard').Invoke()",
+    "[scriptblock]::{$n}('git reset --hard').Invoke()",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {

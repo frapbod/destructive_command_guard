@@ -7841,7 +7841,6 @@ const SINK_ANALYSIS_BOUNDS_RULE: &str = "heredoc.shell.analysis-bounds";
 /// Same pack as its sibling above: both say "analysis could not complete".
 const INCOMPLETE_ANALYSIS_RULE: &str = "heredoc.shell.incomplete-analysis";
 const POWERSHELL_IEX_RULE: &str = "heredoc.powershell.invoke-expression-dynamic";
-const POWERSHELL_SCRIPTBLOCK_RULE: &str = "heredoc.powershell.scriptblock-dynamic";
 const POWERSHELL_ENGINE_SCRIPT_RULE: &str = "heredoc.powershell.engine-script-dynamic";
 /// A PowerShell/cmd launcher assembled through escaping, control prefixes, or
 /// dynamic expansion that the envelope parser cannot statically verify
@@ -12013,78 +12012,6 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
     None
 }
 
-fn find_powershell_scriptblock_type_literal(command: &str, start: usize) -> Option<(usize, usize)> {
-    // One pass: each `[` is paired with the first `]` after it, which is
-    // shared by every `[` before that `]`, so it is found once; and a `[`
-    // with another `[` before its `]` holds a `[` in its name and is skipped
-    // without copying it. A run of unclosed `[` (`[[[…`, 60 KB) otherwise
-    // rescanned the rest of the command at each one.
-    let mut type_start = find_powershell_code_marker(command, "[", start)?;
-    let mut close: Option<usize> = None;
-    loop {
-        if close.is_none_or(|close| close <= type_start) {
-            // No `]` after this `[` means none after any later one either.
-            close = Some(type_start + 1 + command.get(type_start + 1..)?.find(']')?);
-        }
-        let close_at = close?;
-        let following = find_powershell_code_marker(command, "[", type_start + 1);
-        if following.is_none_or(|next| next > close_at) {
-            let normalized: String = command[type_start + 1..close_at]
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect();
-            if normalized.eq_ignore_ascii_case("scriptblock")
-                || normalized.eq_ignore_ascii_case("system.management.automation.scriptblock")
-            {
-                return Some((type_start, close_at + 1));
-            }
-        }
-        type_start = following?;
-    }
-}
-
-fn find_powershell_scriptblock_create(command: &str, start: usize) -> Option<(usize, usize)> {
-    let mut search_start = start;
-    while search_start < command.len() {
-        let (type_start, type_end) =
-            find_powershell_scriptblock_type_literal(command, search_start)?;
-        let mut index = type_end;
-        while command
-            .as_bytes()
-            .get(index)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            index += 1;
-        }
-        if command.as_bytes().get(index..index + 2) != Some(b"::") {
-            search_start = type_start + 1;
-            continue;
-        }
-        index += 2;
-        while command
-            .as_bytes()
-            .get(index)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            index += 1;
-        }
-        let Some(candidate) = command.get(index..index + "create".len()) else {
-            search_start = type_start + 1;
-            continue;
-        };
-        if candidate.eq_ignore_ascii_case("create")
-            && command
-                .as_bytes()
-                .get(index + "create".len())
-                .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(')
-        {
-            return Some((type_start, index + "create".len()));
-        }
-        search_start = type_start + 1;
-    }
-    None
-}
-
 fn local_powershell_prefix(prefix: &str) -> &str {
     prefix.rsplit([';', '\n', '|']).next().unwrap_or(prefix)
 }
@@ -12224,57 +12151,6 @@ fn powershell_brace_opener(command: &str, open: usize) -> PowerShellBraceOpener 
     }
 }
 
-/// `[scriptblock]::Create(…)` builds a block from a string. Like a literal
-/// block ([`powershell_script_block_bodies`]), the result can run anywhere
-/// later, so its source is judged where it is built.
-fn collect_powershell_scriptblock_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
-    let mut search_start = 0usize;
-    while let Some((marker_start, marker_end)) =
-        find_powershell_scriptblock_create(command, search_start)
-    {
-        if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
-            sinks.push(ExecutableTextSink::Unverified {
-                rule: SINK_ANALYSIS_BOUNDS_RULE,
-                reason: "command contains too many executable text sinks for bounded analysis",
-            });
-            return;
-        }
-        let mut open = marker_end;
-        while command
-            .as_bytes()
-            .get(open)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            open += 1;
-        }
-        if command.as_bytes().get(open) != Some(&b'(') {
-            search_start = open.max(marker_start + 1);
-            continue;
-        }
-        let Ok(close) = find_powershell_subexpression_close(command, open + 1) else {
-            sinks.push(ExecutableTextSink::Unverified {
-                rule: POWERSHELL_SCRIPTBLOCK_RULE,
-                reason: "ScriptBlock.Create has unbalanced source syntax",
-            });
-            return;
-        };
-        let expression = &command[open + 1..close];
-        match parse_static_powershell_source(expression) {
-            Ok(source) => sinks.push(ExecutableTextSink::Payload {
-                source,
-                dialect: ShellDialect::PowerShell,
-                context: "a ScriptBlock built from a string can run its PowerShell source",
-                nonlocal_filesystem: false,
-            }),
-            Err(()) => sinks.push(ExecutableTextSink::Unverified {
-                rule: POWERSHELL_SCRIPTBLOCK_RULE,
-                reason: "a ScriptBlock is built from source that dcg cannot statically verify",
-            }),
-        }
-        search_start = close + 1;
-    }
-}
-
 /// PowerShell engine methods that run their first argument, a string, as
 /// script: `InvokeScript` and `NewScriptBlock` of `$ExecutionContext.
 /// InvokeCommand` (also `$ExecutionContext.SessionState.InvokeCommand`),
@@ -12301,13 +12177,31 @@ const POWERSHELL_ENGINE_SCRIPT_METHODS: [&str; 6] = [
 /// matched by its last name segment, since `using namespace` can shorten it.
 const POWERSHELL_SCRIPT_COMMAND_TYPE: &str = "command";
 
-/// The sink a constructed type selects: [`POWERSHELL_SCRIPT_COMMAND_TYPE`]
-/// runs script, another named type does not, and a type that is not a static
-/// name (`$t`, `([type]$n)`, or no visible name) may be that type. A type
-/// literal or parenthesized type (`([…Command])`) names the type inside it,
-/// and an assembly qualification (`…Command, System.Management.Automation`,
-/// from the first `,` outside brackets) is not part of the name.
-fn powershell_constructed_type_sink(type_name: Option<&str>) -> Option<PowerShellEngineSink> {
+/// `[scriptblock]::Create` builds a block from its first argument, which can
+/// run anywhere later, so the source is judged where the block is built.
+/// `[scriptblock]` is the accelerator for the full name, matched by its last
+/// segment like [`POWERSHELL_SCRIPT_COMMAND_TYPE`].
+const POWERSHELL_SCRIPTBLOCK_TYPE: &str = "scriptblock";
+
+/// The static methods that run script only on one type, and that type:
+/// `[…Runspaces.Command]::new` and `[scriptblock]::Create`.
+const POWERSHELL_TYPED_SCRIPT_METHODS: [(&str, &str); 2] = [
+    ("new", POWERSHELL_SCRIPT_COMMAND_TYPE),
+    ("create", POWERSHELL_SCRIPTBLOCK_TYPE),
+];
+
+/// The sink a type selects for a method that runs script only on
+/// `script_type` ([`POWERSHELL_TYPED_SCRIPT_METHODS`], or `New-Object` of
+/// [`POWERSHELL_SCRIPT_COMMAND_TYPE`]): that type runs script, another named
+/// type does not, and a type that is not a static name (`$t`, `([type]$n)`,
+/// or no visible name) may be that type. A type literal or parenthesized type
+/// (`([…Command])`) names the type inside it, and an assembly qualification
+/// (`…Command, System.Management.Automation`, from the first `,` outside
+/// brackets) is not part of the name.
+fn powershell_typed_method_sink(
+    type_name: Option<&str>,
+    script_type: &str,
+) -> Option<PowerShellEngineSink> {
     let Some(mut name) = type_name.map(str::trim) else {
         return Some(PowerShellEngineSink::AnyMethod);
     };
@@ -12347,9 +12241,10 @@ fn powershell_constructed_type_sink(type_name: Option<&str>) -> Option<PowerShel
     }
     name.rsplit('.')
         .next()
-        .is_some_and(|last| last.eq_ignore_ascii_case(POWERSHELL_SCRIPT_COMMAND_TYPE))
+        .is_some_and(|last| last.trim().eq_ignore_ascii_case(script_type))
         .then_some(PowerShellEngineSink::Script)
 }
+
 
 /// The first constructor argument that one argument value supplies when the
 /// call spreads an array into the argument list (`New-Object … -ArgumentList
@@ -12426,9 +12321,10 @@ const MAX_POWERSHELL_ENGINE_SCRIPT_CALLS: usize = 4 * MAX_EXECUTABLE_TEXT_SINKS;
 /// The member name that follows the `.` (or `?.`) ending at `after_dot`, and
 /// the byte after its spelling. PowerShell allows blank space and line
 /// breaks after the dot and spells the name bare, quoted (`.'InvokeScript'`),
-/// as a parenthesized expression (`.("Invoke" + "Script")`) or as a variable
-/// or subexpression (`.$n`, `.${n}`, `.$('x')`). A name whose value is not
-/// static is `None`: it may be any method.
+/// as a parenthesized expression (`.("Invoke" + "Script")`), as a script
+/// block's text (`.{InvokeScript}`) or as a variable or subexpression (`.$n`,
+/// `.${n}`, `.$('x')`). A name whose value is not static is `None`: it may be
+/// any method.
 fn powershell_member_name_after_dot(
     command: &str,
     after_dot: usize,
@@ -12490,6 +12386,12 @@ fn powershell_member_name_after_dot(
             let close = find_powershell_subexpression_close(bounded, start + 1).ok()?;
             let name = parse_static_powershell_source(&bounded[start + 1..close]).ok();
             Some((name, close + 1))
+        }
+        // A script block names the member by its text, unchanged
+        // (`.{InvokeScript}`; `.{ InvokeScript }` names ` InvokeScript `).
+        b'{' => {
+            let close = find_powershell_script_block_close(bounded, start + 1)?;
+            Some((Some(bounded[start + 1..close].to_string()), close + 1))
         }
         b'$' => match bytes.get(start + 1) {
             Some(b'(') => {
@@ -12675,8 +12577,9 @@ fn powershell_method_invocation(rest: &str, method: &str) -> bool {
 }
 
 /// Engine methods that run a string as PowerShell script
-/// ([`POWERSHELL_ENGINE_SCRIPT_METHODS`], and `ExpandString`'s `$( … )`),
-/// called as `.Name(…)`, through the `.ForEach('Name', …)` intrinsic, or
+/// ([`POWERSHELL_ENGINE_SCRIPT_METHODS`], [`POWERSHELL_TYPED_SCRIPT_METHODS`]
+/// on their type, and `ExpandString`'s `$( … )`), called as `.Name(…)` or
+/// `::Name(…)` with any spelling of the name, through the `.ForEach('Name', …)` intrinsic, or
 /// through `ForEach-Object Name …` ([`collect_powershell_member_cmdlet_sinks`]).
 /// A static first argument is judged as the source it runs; any other
 /// argument, or a reference to the method that is not a call here
@@ -12708,14 +12611,27 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
             && name
                 .as_deref()
                 .is_some_and(|name| name.eq_ignore_ascii_case("foreach"));
-        // `[…Runspaces.Command]::new('…', $true)`; a type held in a value
-        // (`$t::new(…)`) may be that type.
-        let constructor = is_static
-            && name
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case("new"));
-        let sink = if constructor {
-            powershell_constructed_type_sink(powershell_type_literal_before(command, dot))
+        // `[…Runspaces.Command]::new('…', $true)` and
+        // `[scriptblock]::Create('…')`; a type held in a value (`$t::new(…)`,
+        // `$t::Create(…)`) may be that type.
+        let script_type = name.as_deref().filter(|_| is_static).and_then(|name| {
+            POWERSHELL_TYPED_SCRIPT_METHODS
+                .iter()
+                .find(|(method, _)| name.eq_ignore_ascii_case(method))
+                .map(|(_, script_type)| *script_type)
+        });
+        let constructor = script_type == Some(POWERSHELL_SCRIPT_COMMAND_TYPE);
+        let type_before = || powershell_type_literal_before(command, dot);
+        let sink = if let Some(script_type) = script_type {
+            powershell_typed_method_sink(type_before(), script_type)
+        } else if is_static
+            && name.is_none()
+            && powershell_typed_method_sink(type_before(), POWERSHELL_SCRIPTBLOCK_TYPE)
+                == Some(PowerShellEngineSink::Script)
+        {
+            // `Create` is the ScriptBlock type's own static method, so a
+            // name that is not static (`[scriptblock]::$n(…)`) is taken as it.
+            Some(PowerShellEngineSink::Script)
         } else {
             powershell_engine_sink_for_name(name.as_deref())
                 .or_else(|| intrinsic_foreach.then_some(PowerShellEngineSink::AnyMethod))
@@ -12730,7 +12646,10 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
             after_name += ".invoke".len();
         }
         let called = command.as_bytes().get(after_name) == Some(&b'(');
-        if sink == PowerShellEngineSink::AnyMethod && !called {
+        // A method whose name is not static and is not called here is
+        // mostly an ordinary member; a typed script method on a type dcg
+        // cannot name (`$f = $t::Create`) may be the script one.
+        if sink == PowerShellEngineSink::AnyMethod && !called && script_type.is_none() {
             continue;
         }
         // Each call reads its argument list once; the bound keeps nested or
@@ -12849,7 +12768,7 @@ fn powershell_group_value(
 /// hold blanks and commas, so its words are not read one by one: a member
 /// name is the group's static string value, and a type is that value or the
 /// type expression itself (`[…Command, System.Management.Automation]`), which
-/// [`powershell_constructed_type_sink`] reads. `None` is a name that is not
+/// [`powershell_typed_method_sink`] reads. `None` is a name that is not
 /// static.
 fn powershell_group_name(
     cmdlet: PowerShellMemberCmdlet,
@@ -13671,7 +13590,9 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                 powershell_member_pattern_sink(name.as_deref())
             }
             // A type name that is not static may be that type.
-            PowerShellMemberCmdlet::NewObject => powershell_constructed_type_sink(name.as_deref()),
+            PowerShellMemberCmdlet::NewObject => {
+                powershell_typed_method_sink(name.as_deref(), POWERSHELL_SCRIPT_COMMAND_TYPE)
+            }
         };
         let Some(sink) = sink else {
             continue;
@@ -14899,7 +14820,6 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
-        collect_powershell_scriptblock_sinks(command, &mut sinks);
         collect_powershell_engine_script_sinks(command, &mut sinks);
         collect_powershell_member_cmdlet_sinks(command, &mut sinks);
     }
@@ -16472,10 +16392,6 @@ fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
         return true;
     }
 
-    if find_powershell_scriptblock_create(command, 0).is_some() {
-        return true;
-    }
-
     // Interpreter spellings beyond the trigger grammar, such as an internally
     // quoted executable, can still reach a launcher refusal or recursive
     // inspection before the deferred lookup (issue #599).
@@ -16504,6 +16420,7 @@ fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
         "eval ",
         "iex ",
         "invoke-expression",
+        "scriptblock",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -67694,46 +67611,6 @@ mod tests {
         }
     }
 
-    /// Fifth review: the `[scriptblock]` type-literal search rescanned the rest
-    /// of the command at every unclosed `[`, and copied the text up to a
-    /// shared `]` at every `[` before it; both are one pass now.
-    #[test]
-    fn scriptblock_type_literal_search_is_linear_and_keeps_its_answers() {
-        for (command, expected) in [
-            ("[scriptblock]::Create('x')", Some((0, 13))),
-            ("[ScriptBlock ]::Create('x')", Some((0, 14))),
-            ("[[scriptblock]", Some((1, 14))),
-            ("[a[scriptblock]", Some((2, 15))),
-            (
-                "[a] [System.Management.Automation.ScriptBlock]",
-                Some((4, 46)),
-            ),
-            ("'[scriptblock]' [x]", None),
-            ("[scriptblock", None),
-            ("[x] [y]", None),
-            ("", None),
-        ] {
-            assert_eq!(
-                find_powershell_scriptblock_type_literal(command, 0),
-                expected,
-                "{command:?}"
-            );
-        }
-        let started = std::time::Instant::now();
-        for command in [
-            "[".repeat(200_000),
-            format!("{}]", "[".repeat(200_000)),
-            format!("{}]", "[ ".repeat(100_000)),
-        ] {
-            assert_eq!(find_powershell_scriptblock_type_literal(&command, 0), None);
-        }
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
     /// Engine methods that run script text: each spelling of the member name
     /// is found, the first argument is the source, and a long run of `.(`,
     /// `.'`, blank space or type brackets is read in one bounded pass.
@@ -67814,6 +67691,32 @@ mod tests {
                 vec![POWERSHELL_ENGINE_SCRIPT_RULE],
             ),
             ("$x.ExpandString('a \"@ b')", vec!["@\"\na \"@ b\n\"@"]),
+            // `[scriptblock]::Create` by any spelling of the name, on the
+            // type by any spelling or held in a value.
+            ("[scriptblock]::Create('a')", vec!["a"]),
+            ("[ScriptBlock ]:: 'Create'('a')", vec!["a"]),
+            ("[scriptblock]::(\"Cre\" + \"ate\")('a')", vec!["a"]),
+            ("[scriptblock]::{Create}('a')", vec!["a"]),
+            ("[a.ScriptBlock, a.b]::Create.Invoke('a')", vec!["a"]),
+            ("$t::Create('a')", vec!["a"]),
+            ("$t::Create($a)", vec![]),
+            ("[scriptblock]::$n('a')", vec!["a"]),
+            ("[scriptblock]::$n($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            ("$f = $t::Create", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            ("[IO.File]::$n($a)", vec![]),
+            (
+                "[scriptblock]::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "$f = [scriptblock]::'Create'",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("[IO.File]::Create('a')", vec![]),
+            ("[powershell]::Create()", vec![]),
+            ("[scriptblock]::{ Create }('a')", vec![]),
+            ("$x.{InvokeScript}('a')", vec!["a"]),
+            ("$x.{ InvokeScript }('a')", vec![]),
         ] {
             assert_eq!(sources(command), expected, "{command:?}");
         }
@@ -67827,6 +67730,9 @@ mod tests {
             "$x.$n(".repeat(20_000),
             format!("{}]::new('a', 1)", "[".repeat(200_000)),
             "]::new('a', 1)".repeat(20_000),
+            format!("{}scriptblock]::Create('a')", "[".repeat(200_000)),
+            "[scriptblock]::{".repeat(50_000),
+            ".{".repeat(100_000),
             ".`\n".repeat(100_000),
             format!(
                 "[Command]::new.Invoke({}a{})",
