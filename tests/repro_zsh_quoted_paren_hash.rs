@@ -5,6 +5,10 @@
 //! `git reset --hard` for `ls (a")" #); git reset --hard`, while bash, sh,
 //! dash and pwsh run nothing. dcg used to count that quoted `)`, read the
 //! `#` as a comment and allow the line.
+//!
+//! zsh also reads a `<(…)`, `>(…)` or word-start `=(…)` body with its full
+//! parser (a `)` in a comment there closes nothing) and ends an unquoted
+//! `${…}` only at its matching `}`.
 
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
@@ -214,6 +218,26 @@ fn a_quoted_paren_in_a_group_is_read_in_payloads_and_after_comments() {
     assert!(misses.is_empty(), "allowed:\n{}", misses.join("\n"));
 }
 
+/// zsh reads a `<(…)` or `>(…)` body with its full parser, so a `)` in a
+/// comment there closes nothing, and it ends an unquoted `${…}` only at its
+/// matching `}`: the group stays open and the `#` after it is data.
+#[test]
+fn process_substitution_comments_and_nested_braces_do_not_close_a_group() {
+    let misses = expect_everywhere(
+        &strings(&[
+            "ls (a<(: #)\n) #); git reset --hard",
+            "ls (a>(: #)\n) #); git reset --hard",
+            r"ls (a${x:-{})} #); git reset --hard",
+            r"ls (a${x:-{} )} #); git reset --hard",
+            r#"ls (a"${x:-{})}" #); git reset --hard"#,
+        ]),
+        &POSIX,
+        "Bash",
+        EvaluationDecision::Deny,
+    );
+    assert!(misses.is_empty(), "allowed:\n{}", misses.join("\n"));
+}
+
 /// A comment outside every group is read as before, and a `#` read as data
 /// inside a group hides nothing on the next line.
 #[test]
@@ -226,6 +250,11 @@ fn comments_outside_groups_stay_comments() {
             "echo $(date) # git reset --hard",
             r#"echo $(echo ")") # git reset --hard"#,
             r#"echo ")" # git reset --hard"#,
+            // A comment in a process substitution body stays a comment.
+            "diff <(git log --format='%h)' # it's\n) b",
+            "cat <(echo \")\" # it's\n)",
+            "tee >(grep \")\" # it's\n) < f",
+            "cat =(echo \")\" # it's\n)",
         ]),
         &POSIX,
         "Bash",

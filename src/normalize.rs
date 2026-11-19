@@ -7004,7 +7004,9 @@ pub(crate) fn powershell_line_breaks_as_line_feeds(command: &str) -> Option<Stri
 ///   zero. A quoted `(` only adds spellings here, but a quoted `)` ends the
 ///   count early.
 /// - The second reads quotes as zsh does (see [`quoted_paren_hashes`]), so
-///   a `)` in quotes, `$'…'`, a backquote or `${…}` closes nothing:
+///   a `)` in quotes, `$'…'`, a backquote or `${…}` (to its matching `}`)
+///   closes nothing, and a comment in a `$(…)`, `<(…)` or `>(…)` body
+///   stays a comment:
 ///   `ls (a")" #); git reset --hard`, `ls (a${x%)} #); git reset --hard` and
 ///   `case x in (a")" #) ;; esac; git reset --hard` run `git reset --hard`
 ///   in zsh 5.9 (measured with `scripts/shell-truth`).
@@ -7058,11 +7060,14 @@ pub(crate) fn paren_hashes_as_data(command: &str) -> Option<String> {
 /// What [`quoted_paren_hashes`] is inside of.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ParenHashFrame {
-    /// Command text (the whole command, or a `$(…)` or `$((…))` body), with
-    /// the parentheses open in it.
+    /// Command text (the whole command, or the body of a `$(…)`, `$((…))`
+    /// or process substitution), with the parentheses open in it.
     Commands(usize),
+    /// An unquoted `${…}`, with the `{` open in it: zsh ends it only at its
+    /// matching `}`.
+    Braces(usize),
     /// Quoted text that ends at this byte: a double-quoted string (`"`), a
-    /// backquoted command (`` ` ``) or a `${…}` (`}`).
+    /// backquoted command (`` ` ``) or a `${…}` in double quotes (`}`).
     Quoted(Quoted),
 }
 
@@ -7071,15 +7076,19 @@ enum ParenHashFrame {
 /// right after a `)`, reading quotes as zsh does.
 ///
 /// Quoted text is read by [`quote_opens`]: a `)` in `'…'`, `$'…'`, `"…"`, a
-/// backquoted command or `${…}` closes nothing. A `$(…)` or `$((…))` body
-/// is command text with its own count, which its closing `)` ends. Any
-/// other `#` at a token start in command text starts a comment to its line
-/// end, whose quotes open nothing; a spelled `#` is data, as in the
-/// spelling. So this scan spells a `#` in a `$(…)` body only while a `(` is
-/// open in that body, where the first scan spells it too unless a quoted
-/// `)` ended its count early: it adds no `#` in a comment that only the
-/// `$(` keeps open. Known limit, shared with dcg's other readers: the `)`
-/// that ends a `case` pattern in a `$(…)` ends the body there.
+/// backquoted command or `${…}` closes nothing. zsh ends an unquoted `${…}`
+/// at its matching `}` (it counts the `{` and `}` in it; in double quotes it
+/// does not), so `ls (a${x:-{})} #); git reset --hard` runs the `git`. A
+/// `$(…)` or `$((…))` body, and the body of a process substitution (`<(…)`,
+/// `>(…)`, or `=(…)` at a word start; see [`process_substitution_body`]), is
+/// command text with its own count, which its closing `)` ends. Any other
+/// `#` at a token start in command text starts a comment to its line end,
+/// whose quotes open nothing; a spelled `#` is data, as in the spelling. So
+/// this scan spells a `#` in such a body only while a `(` is open in that
+/// body, where the first scan spells it too unless a quoted `)` ended its
+/// count early: it adds no `#` in a comment that only the body keeps open.
+/// Known limit, shared with dcg's other readers: the `)` that ends a `case`
+/// pattern in such a body ends the body there.
 fn quoted_paren_hashes(
     bytes: &[u8],
     bodies: &[std::ops::Range<usize>],
@@ -7104,24 +7113,30 @@ fn quoted_paren_hashes(
         };
         let context = match top {
             ParenHashFrame::Commands(_) => None,
+            ParenHashFrame::Braces(_) => Some(Quoted::Braces { quoted: false }),
             ParenHashFrame::Quoted(quoted) => Some(quoted),
         };
-        match quote_opens(bytes, i, context) {
+        let opened = match quote_opens(bytes, i, context) {
             Some(QuoteOpen::Skip(past)) => {
                 i = past;
                 continue;
             }
             Some(QuoteOpen::Push(Quoted::Parens(_), body)) => {
-                frames.push(ParenHashFrame::Commands(0));
-                i = body;
-                continue;
+                Some((ParenHashFrame::Commands(0), body))
             }
-            Some(QuoteOpen::Push(quoted, body)) => {
-                frames.push(ParenHashFrame::Quoted(quoted));
-                i = body;
-                continue;
+            Some(QuoteOpen::Push(Quoted::Braces { quoted: false }, body)) => {
+                Some((ParenHashFrame::Braces(0), body))
             }
-            None => {}
+            Some(QuoteOpen::Push(quoted, body)) => Some((ParenHashFrame::Quoted(quoted), body)),
+            None if matches!(top, ParenHashFrame::Commands(_)) => {
+                process_substitution_body(bytes, i).map(|body| (ParenHashFrame::Commands(0), body))
+            }
+            None => None,
+        };
+        if let Some((frame, body)) = opened {
+            frames.push(frame);
+            i = body;
+            continue;
         }
         match (top, bytes[i]) {
             (ParenHashFrame::Commands(open), b'(') => {
@@ -7133,8 +7148,7 @@ fn quoted_paren_hashes(
                 frames.push(ParenHashFrame::Commands(open - 1));
             }
             (ParenHashFrame::Commands(_), b')') => {
-                // The `)` of a `$(…)` body; a stray one at the top closes
-                // nothing.
+                // The `)` of a body; a stray one at the top closes nothing.
                 if frames.len() > 1 {
                     frames.pop();
                 }
@@ -7148,7 +7162,16 @@ fn quoted_paren_hashes(
                     continue;
                 }
             }
-            (ParenHashFrame::Quoted(Quoted::Double), b'"')
+            (ParenHashFrame::Braces(open), b'{') => {
+                frames.pop();
+                frames.push(ParenHashFrame::Braces(open + 1));
+            }
+            (ParenHashFrame::Braces(open), b'}') if open > 0 => {
+                frames.pop();
+                frames.push(ParenHashFrame::Braces(open - 1));
+            }
+            (ParenHashFrame::Braces(_), b'}')
+            | (ParenHashFrame::Quoted(Quoted::Double), b'"')
             | (ParenHashFrame::Quoted(Quoted::Backquote), b'`')
             | (ParenHashFrame::Quoted(Quoted::Braces { .. }), b'}') => {
                 frames.pop();
@@ -7156,6 +7179,25 @@ fn quoted_paren_hashes(
             _ => {}
         }
         i += 1;
+    }
+}
+
+/// Index of the body of the zsh process substitution that starts at `i`, if
+/// one does: `<(…)` and `>(…)` anywhere in command text, and `=(…)` at a
+/// word start. zsh reads such a body with its full parser, as it reads a
+/// `$(…)` body, so a `)` in a comment there closes nothing.
+fn process_substitution_body(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i + 1) != Some(&b'(') {
+        return None;
+    }
+    let starts_word = || {
+        byte_before(bytes, i, 0)
+            .is_none_or(|before| matches!(before, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|'))
+    };
+    match bytes[i] {
+        b'<' | b'>' => Some(i + 2),
+        b'=' if starts_word() => Some(i + 2),
+        _ => None,
     }
 }
 
@@ -9992,6 +10034,24 @@ mod tests {
             ),
             ("echo $(echo \")\") # x", None),
             ("x=$(git log --format='%h)' # it's\n)", None),
+            // A process substitution body is command text of its own too.
+            ("diff <(git log --format='%h)' # it's\n) b", None),
+            ("cat <(echo \")\" # it's\n)", None),
+            ("tee >(grep \")\" # it's\n) < f", None),
+            ("cat =(echo \")\" # it's\n)", None),
+            (
+                "ls (a<(: #)\n) #); x",
+                Some("ls (a<(: _)\n) _); x"),
+            ),
+            (
+                "ls (a>(: #)\n) #); x",
+                Some("ls (a>(: _)\n) _); x"),
+            ),
+            // zsh ends an unquoted `${…}` at its matching `}`, a quoted one
+            // at its first.
+            ("ls (a${x:-{})} #); x", Some("ls (a${x:-{})} _); x")),
+            ("ls (a${x:-{} )} #); x", Some("ls (a${x:-{} )} _); x")),
+            ("ls (a\"${x:-{})}\" #); x", Some("ls (a\"${x:-{})}\" _); x")),
         ] {
             assert_eq!(
                 paren_hashes_as_data(command).as_deref(),
@@ -10056,6 +10116,8 @@ mod tests {
             format!("ls ( '{} #", "(".repeat(60_000)),
             format!("ls ( `{} #", "\\`".repeat(30_000)),
             format!("ls ( {}", "# it's\n(".repeat(10_000)),
+            format!("ls ( {} #", "<(".repeat(30_000)),
+            format!("ls ( ${{x:-{} #", "{".repeat(60_000)),
         ] {
             let _ = paren_hashes_as_data(&command);
         }
