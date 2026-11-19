@@ -8,8 +8,15 @@
 //! - In a shell source the command starts (`bash -c '"$X" reset --hard'`,
 //!   a heredoc body, an ssh payload): the view ran only for the command as
 //!   sent, so the child's own unknown names were read as literal text,
-//!   while `"$X" reset --hard` sent directly is denied. A name the parent
-//!   shell binds before the source stays the parent's.
+//!   while `"$X" reset --hard` sent directly is denied. The same held for
+//!   an eval body and for source a shell reads from a pipe.
+//! - A name the parent shell binds without exporting it is unset in the
+//!   child (`V=x; bash -c 'gi"${V}"t reset --hard'` runs `git`), so the
+//!   child reads it empty; one the parent may export is unknown there.
+//! - ANSI-C and locale quotes (`$'gi'${V}$'t'`) and references that keep
+//!   part of the value (`${V#x}`, `${V/x/}`) glue the same way, and the
+//!   command name may follow a subshell's `(`, a function declaration, a
+//!   case arm or a `$(` in an assignment.
 
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_at_path_in_dialect;
 use destructive_command_guard::normalize::ShellDialect;
@@ -176,6 +183,14 @@ fn unknown_values_glued_between_quoted_text_are_read_unsplit_too() {
             r"cd /tmp && 'gi'${V}'t' reset --hard",
             r"'r'${V}'m' -rf /",
             r"IFS=; 'gi'${V}'t' reset --hard",
+            r"$'gi'${V}$'t' reset --hard",
+            r#"$"gi"${V}$"t" reset --hard"#,
+            r"'gi'${V#x}'t' reset --hard",
+            r"'gi'${V%x}'t' reset --hard",
+            r"'gi'${V/x/}'t' reset --hard",
+            r#"gi"${V#x}"t reset --hard"#,
+            r#"'gi'"${V#x}"'t' reset --hard"#,
+            r"gi${V/x/}t reset --hard",
         ],
         &POSIX,
         EvaluationDecision::Deny,
@@ -212,12 +227,74 @@ fn a_child_shells_own_unknown_names_are_read_like_the_commands() {
     assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
 }
 
+/// A name the parent shell binds without exporting it is unset in the child
+/// shell; one exported from a group or subshell is the child's unknown.
+#[test]
+fn a_name_the_parent_does_not_export_is_unset_in_the_child() {
+    let misses = misses(
+        &[
+            r#"V=x; /bin/bash -c 'gi"${V}"t reset --hard'"#,
+            r#"V=x; bash -c "'gi'\${V}'t' reset --hard""#,
+            "V=; bash <<'EOF'\n'gi'${V}'t' reset --hard\nEOF",
+            r#"read V; bash -c 'gi"${V}"t reset --hard'"#,
+            r#"for V in a; do :; done; bash -c 'gi"${V}"t reset --hard'"#,
+            r#"(export X=git; bash -c '"$X" reset --hard')"#,
+            r#"{ export X=git; bash -c '"$X" reset --hard'; }"#,
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    );
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
+/// An eval body runs in this shell and a shell reading a pipe is a child:
+/// both get the unknown-name view.
+#[test]
+fn eval_bodies_and_piped_shell_source_read_unknown_names() {
+    let misses = misses(
+        &[
+            r#"eval '"$X" reset --hard'"#,
+            r#"eval "'gi'\${V}'t' reset --hard""#,
+            r"X=' '; eval 'git${X}reset${X}--hard'",
+            r#"echo '"$X" reset --hard' | sh"#,
+            r#"printf '%s\n' "'gi'\${V}'t' reset --hard" | sh"#,
+            r#"X=git; export X; echo '"$X" reset --hard' | /bin/sh"#,
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    );
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
+/// The command name after syntax that opens a body, and in a command
+/// substitution an assignment runs.
+#[test]
+fn command_names_after_body_syntax_read_unknown_names() {
+    let misses = misses(
+        &[
+            r#"( "$X" reset --hard )"#,
+            r#"("$X" reset --hard)"#,
+            r"('gi'${V}'t' reset --hard)",
+            r"( git${X}reset${X}--hard )",
+            r"echo ok && ( 'gi'${V}'t' reset --hard )",
+            r"x=$('gi'${V}'t' reset --hard)",
+            r#"f() { "$X" reset --hard; }; f"#,
+            r"f() { 'gi'${V}'t' reset --hard; }; f",
+            r#"case a in a) "$X" reset --hard;; esac"#,
+            r#"bash -c 'f() { "$X" reset --hard; }; f'"#,
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    );
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
 /// Harmless commands with the same shapes stay allowed, and a name the
-/// parent binds before the source is the parent's (decided in
+/// parent binds without exporting it is empty in the child (decided in
 /// `repro_variable_field_splitting::values_the_shell_does_not_use_there_are_not_read`).
 #[test]
 fn harmless_unknown_command_names_stay_allowed() {
-    let misses = misses(
+    let mut found = misses(
         &[
             r"'git'${V}'status'",
             r#""gi"${V}"t" status"#,
@@ -229,9 +306,26 @@ fn harmless_unknown_command_names_stay_allowed() {
             "bash <<'EOF'\n\"$EDITOR\" notes.txt\nEOF",
             "X=' '; bash <<'EOF'\ngit${X}reset${X}--hard\nEOF",
             r#"X=git bash -c '"$X" status'"#,
+            r#"X=git; bash -c '"$X" reset --hard'"#,
+            r"X=' '; echo 'git${X}reset${X}--hard' | bash",
+            r"'gi'${V#x}'t' status",
+            r#"( "$X" status )"#,
+            r"x=$('ec'${V}'ho' hi)",
+            r#"f() { "$EDITOR" notes.txt; }; f"#,
+            r#"case a in a) "$X" status;; esac"#,
+            r#"eval '"$X" status'"#,
+            r#"echo '"$EDITOR" notes.txt' | sh"#,
         ],
         &POSIX,
         EvaluationDecision::Allow,
     );
-    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+    // The Unknown dialect's Windows filesystem reading denies a `$'…'`
+    // command word as unresolved syntax (on the base too), so this one is
+    // checked as POSIX only.
+    found.extend(misses(
+        &[r"$'ec'${V}$'ho' hi"],
+        &[ShellDialect::Posix],
+        EvaluationDecision::Allow,
+    ));
+    assert!(found.is_empty(), "misses:\n{}", found.join("\n"));
 }
