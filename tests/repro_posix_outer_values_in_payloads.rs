@@ -450,3 +450,43 @@ fn outer_redirections_beside_a_cmd_payload_are_not_cmd_values() {
     ));
     assert!(found.is_empty(), "misses:\n{}", found.join("\n"));
 }
+
+/// A `<(…)` / `>(…)` process substitution is not the outer shell's
+/// redirection: bash puts a path in its place and hands cmd that path plus
+/// the rest of the word. Measured with Linux bash (fake `cmd.exe`):
+/// `cmd.exe /c echo x<(true)$X` hands cmd `echo x/dev/fd/63` and the value,
+/// and with `X='&rd /s /q C:\x'`, `cmd.exe /c echo <(true)$X` hands it
+/// `echo /dev/fd/63&rd /s /q C:\x`. With `shopt -s extglob`, `@(>)$X`
+/// hands cmd `@(>)` and the value. So the values after one still fail
+/// closed. Redirections that read or append stay allowed under the hook's
+/// default packs.
+#[test]
+fn process_substitutions_in_a_cmd_payload_are_not_outer_redirections() {
+    let mut found = misses(
+        &[
+            "cmd /c echo <(true)$X",
+            r#"cmd.exe /c echo x<(true)"$HOME""#,
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(true)$X",
+            "cmd.exe /c echo >(true)$X",
+            "cmd /c echo <(true)gi${X}t",
+            "cmd /c echo <(cat>f)$X",
+            "cmd /c echo 2>(true)$X",
+            "cmd /c echo ok>(cat>f)$X",
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo @(>)$X",
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    );
+    for command in [
+        "cmd /c ver <$in",
+        r#"cmd /c ver >>"$HOME/log""#,
+    ] {
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            let got = hook_decision(protocol, command);
+            if got != "allow" {
+                found.push(format!("{protocol:?}: {command:?} -> {got}"));
+            }
+        }
+    }
+    assert!(found.is_empty(), "misses:\n{}", found.join("\n"));
+}
