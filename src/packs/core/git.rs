@@ -749,9 +749,9 @@ fn posix_output_in_prefix_assignment(output: &str) -> bool {
         return false;
     };
     current.byte_range.end == output.len()
-        && current
-            .text(output)
-            .is_some_and(crate::normalize::is_env_assignment)
+        && current.text(output).is_some_and(|word| {
+            crate::normalize::is_env_assignment(word) || opens_assignment_subscript(word)
+        })
         && before.iter().all(|token| {
             token.text(output).is_some_and(|word| {
                 crate::normalize::is_env_assignment(word)
@@ -760,6 +760,19 @@ fn posix_output_in_prefix_assignment(output: &str) -> bool {
                     || word == "time"
             })
         })
+}
+
+/// Whether `word` starts with `NAME[`: text spliced there is in the
+/// subscript of an assignment word, which the shell does not split either,
+/// so `x[$(echo a b)]=c git reset --hard` runs `git`. Where no `]=` follows,
+/// the word is the command name either way, split or not.
+fn opens_assignment_subscript(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let name = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+        .count();
+    name > 0 && !bytes[0].is_ascii_digit() && bytes.get(name) == Some(&b'[')
 }
 
 /// Whether text spliced after `output` starts an unquoted shell word.
