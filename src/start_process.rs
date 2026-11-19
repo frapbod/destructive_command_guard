@@ -446,10 +446,13 @@ fn element_end(text: &str, at: usize) -> usize {
         Some(end) if bytes.get(at + 1) == Some(&b'{') => end,
         _ => at,
     };
-    // A bare word: quoted parts and escapes belong to it.
+    // A bare word: quoted parts and escapes belong to it, and so does a
+    // `<` or `>` glued to it (`o<x`, `o<#x#>`, `o>x`): PowerShell 7.5 reads
+    // that as text, not as a redirection, an operator or a comment.
     while index < bytes.len() {
+        let glued_angle = matches!(bytes[index], b'<' | b'>') && index > at;
         if horizontal_space_len(text, index).is_some()
-            || ends_statement(bytes, index)
+            || (ends_statement(bytes, index) && !glued_angle)
             || matches!(bytes[index], b',' | b'(' | b'{')
         {
             break;
@@ -2202,6 +2205,35 @@ mod tests {
         );
         // A call that does not bind with nothing glued still reads nothing.
         assert!(lines("Start-Process git reset --hard").is_empty());
+    }
+
+    /// Measured with PowerShell 7.5: a `<` or `>` glued to a bare word or a
+    /// variable is text (`o<x`, `o<#x#>`, `$c<#x`, `o>x`), so it neither
+    /// ends the arguments, nor redirects, nor opens a comment. After a member access or a string,
+    /// a glued `<#` still opens one.
+    #[test]
+    fn a_glued_less_than_stays_in_the_word() {
+        for spelling in [
+            "Start-Process -RedirectStandardOutput o<#x -FilePath git -ArgumentList reset,--hard #>",
+            "Start-Process -RedirectStandardOutput o<#x git reset,--hard #>",
+            "Start-Process -RedirectStandardOutput o<x -FilePath git -ArgumentList reset,--hard",
+            "Start-Process -RedirectStandardOutput $c<#x -FilePath git -ArgumentList reset,--hard #>",
+            "Start-Process -RedirectStandardOutput ${c}<#x -FilePath git -ArgumentList reset,--hard #>",
+            "Start-Process -RedirectStandardOutput $c.p<#x#> -FilePath git -ArgumentList reset,--hard",
+            "Start-Process -RedirectStandardOutput 'o'<#x#> -FilePath git -ArgumentList reset,--hard",
+            "Start-Process -RedirectStandardOutput o<#x#> git reset,--hard",
+            "Start-Process -RedirectStandardOutput o>x -FilePath git -ArgumentList reset,--hard",
+        ] {
+            assert_eq!(lines(spelling), program("git reset --hard"), "{spelling:?}");
+        }
+        assert_eq!(
+            lines("Start-Process -RedirectStandardOutput o<x -FilePath git -ArgumentList status"),
+            program("git status")
+        );
+        assert_ne!(
+            lines("Start-Process -FilePath git -ArgumentList reset<#x,--hard #>"),
+            program("git reset --hard")
+        );
     }
 
     /// A string cast in an expression keeps its strings.
