@@ -1369,6 +1369,33 @@ EOF
         "echo $((1 #)) '\n)) && git push --force origin main #'",
         "echo $((echo a #)) '\n)) ; git reset --hard #'",
         "x=a; echo $(( #x )) ; git reset --hard ; : $((\n))",
+        // After the name of `function NAME` and `coproc NAME`, Bash reads
+        // `{` and then an assignment word.
+        "function f { x[a b]=c git reset --hard; }; f",
+        "function f { x[1 + 1]=b git push --force origin main; }; f",
+        "function f\t{ y=1 x[a b]+=c git reset --hard; }",
+        "coproc c { x[a b]=c git reset --hard; }",
+        // A payload that watch and parallel hand to a shell.
+        "watch x[a b]=c git reset --hard",
+        "watch -n 1 x[1 + 1]=b git push --force origin main",
+        "parallel x[a b]=c git reset --hard ::: 1",
+        // A backslash-newline in the name or before the `=`, and a `$'…'`
+        // with an escaped quote before the subscript.
+        "x\\\n[a b]=c git reset --hard",
+        "x[a b]+\\\n=c git reset --hard",
+        "echo $'a\\'b'; x[a b]=c git reset --hard # '",
+        // A `#` inside a word, a `${…}` or a `$(…)` in double quotes starts
+        // no comment and opens no quote before the `$((`.
+        "echo \"$(echo '\"')\" $((1 #)) '\n)) ; git reset --hard #'",
+        "echo $(true)#x $((1 #)) '\n)) ; git reset --hard #'",
+        "echo ${x:- #} $((1 #)) '\n)) ; git reset --hard #'",
+        // A `$((` body whose parentheses do not balance once the comment is
+        // read runs as a command substitution, also in double quotes.
+        "echo $((1 #)) '\ngit reset --hard)) #'",
+        "echo $((1 #)) '\ngit push --force origin main)) #'",
+        "echo \"$((1 #))\ngit reset --hard))\"",
+        "x=\"$((1 #))\ngit reset --hard))\"",
+        "echo \"$((1 #)\ngit reset --hard))\"",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1432,6 +1459,14 @@ EOF
         "echo x # y[a b]=c\ngit status",
         "echo $((1 # one\n + 2)) ; git status",
         "echo $((16#ff)) $((2#101)) ; git status",
+        "function f { x[a b]=c git status; }; f",
+        "coproc c { x[a b]=c git status; }",
+        "watch x[a b]=c git status",
+        "x[a b]\\\n=c git status",
+        "echo \"$(echo '\"')\" $((1 + 2)) ; git status",
+        "echo $(true)#x ; git status",
+        "echo \"$((1 # c\n + 2))\" ; git status",
+        "echo \"$((16#ff))\" ; git status",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

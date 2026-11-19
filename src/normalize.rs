@@ -7313,111 +7313,343 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
 /// Bash 3.2 (macOS `/bin/bash` and `/bin/sh`) looks for the end of a `$((`
 /// body as it does for a `$(` body: a `#` that starts a word starts a
 /// comment to the end of the line, and a `)` or quote in it closes or opens
-/// nothing. Bash 5, zsh and dcg's shared readers read arithmetic there and
-/// no comment, so in `echo $((1 #)) '` LF `)) ; git reset --hard #'` they
-/// read `'` LF `)) ; git reset --hard #'` as one quoted word, where Bash
-/// 3.2 ends the body at the `))` on the second line and runs
-/// `git reset --hard`. Spelled: each byte of such a comment as `_`, so the
-/// shared readers end the body where Bash 3.2 does. A `#` after a word byte
-/// (`16#ff`, `$#`) starts no comment. Comments outside the bodies and
-/// heredoc bodies are passed over. The caller reads the spelling too and
-/// deny wins.
+/// nothing. Every Bash does so for a `$((` in double quotes. Bash 5, zsh and
+/// dcg's shared readers read arithmetic there and no comment, so in
+/// `echo $((1 #)) '` LF `)) ; git reset --hard #'` they read `'` LF
+/// `)) ; git reset --hard #'` as one quoted word, where Bash 3.2 ends the
+/// body at the `))` on the second line and runs `git reset --hard`.
 ///
-/// Length preserving (each byte of a whole comment becomes `_`), so every
-/// range in the view is the same range in `command`.
+/// Once it has the body, Bash reads it as arithmetic only when it is
+/// `(…)` and the parentheses between are balanced (`chk_arithsub` in its
+/// subst.c, which reads no comment); otherwise it runs the body as a
+/// command substitution: `echo $((1 #)) '` LF `git reset --hard)) #'` runs
+/// `git reset --hard`.
+///
+/// Spelled: each byte of such a comment as `_`, so the shared readers end
+/// the body where Bash does; and, for a body Bash runs as a command, the
+/// `(` that starts it and the `)` that closes that `(` as blanks, so the
+/// shared readers read `$( … )`, a command substitution, too. A `#` inside
+/// a word (`16#ff`, `$#`, `$(true)#x`) starts no comment. The scan passes
+/// over quotes, `$'…'`, `$(…)`, `${…}` and backquotes as the shell does and
+/// reads the `$((` bodies inside them too. Heredoc bodies are passed over.
+/// A command nested deeper than [`MAX_BASH32_NESTING`] is
+/// [`BashHashReading::Unread`]. The caller reads the spelling too and deny
+/// wins.
+///
+/// Length preserving (one ASCII byte for another), so every range in the
+/// view is the same range in `command`. Linear: each byte is read once.
 #[must_use]
 pub(crate) fn bash_arithmetic_comments(command: &str) -> Option<BashHashReading> {
     let bytes = command.as_bytes();
     memchr::memmem::find(bytes, b"$((")?;
     memchr::memchr(b'#', bytes)?;
-    let len = bytes.len();
-    let mut spelled: Option<Vec<u8>> = None;
-    let mut bodies = crate::context::undisputed_heredoc_body_ranges(command).into_iter();
-    let mut body = bodies.next();
-    let mut in_double = false;
-    let mut i = 0;
-    while i < len {
-        while body.as_ref().is_some_and(|body| body.end <= i) {
-            body = bodies.next();
-        }
-        if let Some(raw) = body.as_ref().filter(|body| body.start <= i) {
-            i = raw.end;
-            continue;
-        }
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'\'' if !in_double => {
-                i = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + 1 + at + 1);
-            }
-            b'"' => {
-                in_double = !in_double;
-                i += 1;
-            }
-            b'#' if !in_double && starts_bash32_comment(bytes, i) => {
-                i = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |at| i + at);
-            }
-            b'$' if bytes[i + 1..].starts_with(b"((") => {
-                i = bash32_body_end(bytes, i + 2, &mut spelled);
-            }
-            _ => i += 1,
-        }
+    let mut scan = Bash32Comments {
+        bytes,
+        limit: bytes.len(),
+        bodies: crate::context::undisputed_heredoc_body_ranges(command),
+        body: 0,
+        comments: 0,
+        nesting: 0,
+        too_deep: false,
+        spelled: None,
+    };
+    scan.command(0, false, false);
+    if scan.too_deep {
+        return Some(BashHashReading::Unread);
     }
-    // Whole comments, from an ASCII `#` to a newline or the end, became
-    // ASCII bytes.
-    spelled
+    // Only an ASCII byte changed into another ASCII byte.
+    scan.spelled
         .and_then(|spelled| String::from_utf8(spelled).ok())
         .map(BashHashReading::Spelled)
 }
 
-/// Whether a `#` at `at` starts a word, and so a comment.
-fn starts_bash32_comment(bytes: &[u8], at: usize) -> bool {
-    at == 0
-        || matches!(
-            bytes[at - 1],
-            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
-        )
+/// How deep [`bash_arithmetic_comments`] reads nested quotes and
+/// substitutions.
+const MAX_BASH32_NESTING: usize = 200;
+
+/// The scan of [`bash_arithmetic_comments`].
+struct Bash32Comments<'a> {
+    bytes: &'a [u8],
+    /// Where the text being read ends (the closing backquote of a
+    /// backquoted body, or the end).
+    limit: usize,
+    /// Heredoc bodies, passed over, and the first one not yet passed.
+    bodies: SmallVec<[Range<usize>; 8]>,
+    body: usize,
+    /// How many comments were spelled so far.
+    comments: usize,
+    nesting: usize,
+    too_deep: bool,
+    spelled: Option<Vec<u8>>,
 }
 
-/// The byte after the `)` that ends the `$(` body that starts at `from`, as
-/// Bash 3.2 reads it, or the end; each comment in it is spelled in
-/// `spelled`.
-fn bash32_body_end(bytes: &[u8], from: usize, spelled: &mut Option<Vec<u8>>) -> usize {
-    let len = bytes.len();
-    let mut depth = 1usize;
-    let mut i = from;
-    while i < len {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'\'' => {
-                i = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + 1 + at + 1);
+/// Where a command text read by [`Bash32Comments::command`] ended.
+struct CommandEnd {
+    /// The byte after the text (after the `)` that closes it, if any).
+    end: usize,
+    /// The `)` that closes it, if any.
+    closed: bool,
+    /// The `)` that closes the first group the text opens.
+    group_close: Option<usize>,
+}
+
+impl Bash32Comments<'_> {
+    /// `at`, or the end of the heredoc body that holds it.
+    fn past_body(&mut self, at: usize) -> usize {
+        while self
+            .bodies
+            .get(self.body)
+            .is_some_and(|body| body.end <= at)
+        {
+            self.body += 1;
+        }
+        match self.bodies.get(self.body) {
+            Some(body) if body.start <= at => body.end,
+            _ => at,
+        }
+    }
+
+    /// Run `read` one level deeper; past [`MAX_BASH32_NESTING`] stop the
+    /// scan.
+    fn nested<T>(&mut self, stop: T, read: impl FnOnce(&mut Self) -> T) -> T {
+        if self.too_deep || self.nesting >= MAX_BASH32_NESTING {
+            self.too_deep = true;
+            return stop;
+        }
+        self.nesting += 1;
+        let read = read(self);
+        self.nesting -= 1;
+        read
+    }
+
+    /// Command text from `from`: with `closes`, through the `)` that closes
+    /// a `(` before `from`. In a `$((` body (`arithmetic`) each comment is
+    /// spelled.
+    fn command(&mut self, from: usize, closes: bool, arithmetic: bool) -> CommandEnd {
+        let bytes = self.bytes;
+        let mut depth = 0usize;
+        let mut group_close = None;
+        let mut word_start = true;
+        let mut i = from;
+        while i < self.limit && !self.too_deep {
+            let past = self.past_body(i);
+            if past != i {
+                i = past;
+                word_start = true;
+                continue;
             }
-            b'"' => {
-                i += 1;
-                while i < len && bytes[i] != b'"' {
-                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+            match bytes[i] {
+                b'\\' => {
+                    // A backslash-newline is dropped: the word goes on.
+                    if bytes.get(i + 1) != Some(&b'\n') {
+                        word_start = false;
+                    }
+                    i += 2;
                 }
-                i += 1;
+                b'#' if word_start => {
+                    let end = memchr::memchr(b'\n', &bytes[i..self.limit])
+                        .map_or(self.limit, |at| i + at);
+                    if arithmetic {
+                        self.spelled.get_or_insert_with(|| bytes.to_vec())[i..end].fill(b'_');
+                        self.comments += 1;
+                    }
+                    i = end;
+                }
+                b'(' => {
+                    depth += 1;
+                    word_start = true;
+                    i += 1;
+                }
+                b')' => {
+                    word_start = true;
+                    if depth == 0 {
+                        if closes {
+                            return CommandEnd {
+                                end: i + 1,
+                                closed: true,
+                                group_close,
+                            };
+                        }
+                    } else {
+                        depth -= 1;
+                        if depth == 0 {
+                            group_close.get_or_insert(i);
+                        }
+                    }
+                    i += 1;
+                }
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' => {
+                    word_start = true;
+                    i += 1;
+                }
+                b'\'' => {
+                    word_start = false;
+                    i = memchr::memchr(b'\'', &bytes[i + 1..self.limit])
+                        .map_or(self.limit, |at| i + 1 + at + 1);
+                }
+                b'"' => {
+                    word_start = false;
+                    i = self.nested(self.limit, |scan| scan.double(i + 1));
+                }
+                b'`' => {
+                    word_start = false;
+                    i = self.nested(self.limit, |scan| scan.backquote(i + 1));
+                }
+                b'$' => {
+                    word_start = false;
+                    i = self.dollar(i, true);
+                }
+                _ => {
+                    word_start = false;
+                    i += 1;
+                }
             }
-            b'#' if starts_bash32_comment(bytes, i) => {
-                let end = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |at| i + at);
-                spelled.get_or_insert_with(|| bytes.to_vec())[i..end].fill(b'_');
-                i = end;
+        }
+        CommandEnd {
+            end: self.limit,
+            closed: false,
+            group_close,
+        }
+    }
+
+    /// Double-quoted text from `from`: the byte after its closing `"`.
+    fn double(&mut self, from: usize) -> usize {
+        let bytes = self.bytes;
+        let mut i = from;
+        while i < self.limit && !self.too_deep {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'"' => return i + 1,
+                b'`' => i = self.nested(self.limit, |scan| scan.backquote(i + 1)),
+                b'$' => i = self.dollar(i, false),
+                _ => i += 1,
             }
+        }
+        self.limit
+    }
+
+    /// The backquoted body from `from`: the byte after its closing
+    /// backquote. The body is command text.
+    fn backquote(&mut self, from: usize) -> usize {
+        let end = posix_backquote_end(&self.bytes[..self.limit], from);
+        let body_end = if end > from && self.bytes[end - 1] == b'`' {
+            end - 1
+        } else {
+            end
+        };
+        let limit = std::mem::replace(&mut self.limit, body_end);
+        self.command(from, false, false);
+        self.limit = limit;
+        end
+    }
+
+    /// The `${` body from `from`: the byte after its closing `}`. A `'` in
+    /// it is a quote only outside double quotes.
+    fn parameter(&mut self, from: usize, unquoted: bool) -> usize {
+        let bytes = self.bytes;
+        let mut depth = 0usize;
+        let mut i = from;
+        while i < self.limit && !self.too_deep {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'\'' if unquoted => {
+                    i = memchr::memchr(b'\'', &bytes[i + 1..self.limit])
+                        .map_or(self.limit, |at| i + 1 + at + 1);
+                }
+                b'"' => i = self.nested(self.limit, |scan| scan.double(i + 1)),
+                b'`' => i = self.nested(self.limit, |scan| scan.backquote(i + 1)),
+                b'$' => i = self.dollar(i, unquoted),
+                b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' => {
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                    depth -= 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        self.limit
+    }
+
+    /// The `$` at `i`: the byte after the expansion or quote it starts.
+    fn dollar(&mut self, i: usize, unquoted: bool) -> usize {
+        let bytes = self.bytes;
+        match bytes.get(i + 1) {
+            Some(b'(') if bytes.get(i + 2) == Some(&b'(') => {
+                self.nested(self.limit, |scan| scan.arithmetic(i))
+            }
+            Some(b'(') => self.nested(self.limit, |scan| scan.command(i + 2, true, false).end),
+            Some(b'{') => self.nested(self.limit, |scan| scan.parameter(i + 2, unquoted)),
+            Some(b'\'') if unquoted && crate::context::ansi_c_quote_starts_at(bytes, i) => {
+                crate::context::skip_ansi_c_quoted(&bytes[..self.limit], i + 2)
+            }
+            _ => i + 1,
+        }
+    }
+
+    /// The `$((` at `i`: the byte after the `)` that ends its body.
+    fn arithmetic(&mut self, i: usize) -> usize {
+        let comments = self.comments;
+        let read = self.command(i + 2, true, true);
+        if read.closed
+            && self.comments != comments
+            && let Some(group_close) = read.group_close
+            && !bash_reads_arithmetic(&self.bytes[i + 2..read.end - 1])
+        {
+            // Bash runs `(…)…` as a command substitution.
+            let view = self.spelled.get_or_insert_with(|| self.bytes.to_vec());
+            view[i + 2] = b' ';
+            view[group_close] = b' ';
+        }
+        read.end
+    }
+}
+
+/// Whether Bash reads the body of a `$((`, from its second `(` to the `)`
+/// before the closing one, as arithmetic: `(…)` with balanced parentheses
+/// between (`chk_arithsub` in Bash's subst.c).
+fn bash_reads_arithmetic(body: &[u8]) -> bool {
+    let Some(inner) = body
+        .strip_prefix(b"(")
+        .and_then(|body| body.strip_suffix(b")"))
+    else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < inner.len() {
+        match inner[i] {
             b'(' => {
                 depth += 1;
                 i += 1;
             }
             b')' => {
-                depth -= 1;
+                let Some(less) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = less;
                 i += 1;
-                if depth == 0 {
-                    return i;
+            }
+            b'\\' => i += 2,
+            b'\'' => {
+                i = memchr::memchr(b'\'', &inner[i + 1..]).map_or(inner.len(), |at| i + 1 + at + 1);
+            }
+            b'"' => {
+                i += 1;
+                while i < inner.len() && inner[i] != b'"' {
+                    i += if inner[i] == b'\\' { 2 } else { 1 };
                 }
+                i += 1;
             }
             _ => i += 1,
         }
     }
-    len
+    depth == 0
 }
 
 /// The Bash reading of the bracketed words in `command` that dcg's shared
@@ -7482,6 +7714,11 @@ pub(crate) fn bash_bracket_words(command: &str) -> Option<BashHashReading> {
                 i = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + 1 + at + 1);
                 continue;
             }
+            // `$'…'` ends at a `'` that no backslash escapes (`$'a\'b'`).
+            b'$' if !in_double && crate::context::ansi_c_quote_starts_at(bytes, i) => {
+                i = crate::context::skip_ansi_c_quoted(bytes, i + 2);
+                continue;
+            }
             b'"' => {
                 in_double = !in_double;
                 i += 1;
@@ -7515,9 +7752,15 @@ pub(crate) fn bash_bracket_words(command: &str) -> Option<BashHashReading> {
             i = opener + 1;
             continue;
         };
+        // The shell drops a backslash-newline before it reads the `=`
+        // (`x[a b]\` LF `=c`, `x[a b]+\` LF `=c`).
         let assigns = bytes[opener - 1] == b'$' || {
-            let after = &bytes[close + 1..];
-            after.starts_with(b"=") || after.starts_with(b"+=")
+            let after = past_line_continuations(bytes, close + 1);
+            match bytes.get(after) {
+                Some(b'=') => true,
+                Some(b'+') => bytes.get(past_line_continuations(bytes, after + 1)) == Some(&b'='),
+                _ => false,
+            }
         };
         if !assigns {
             i = opener + 1;
@@ -7554,6 +7797,9 @@ struct AssignmentWords {
     redirect_target: bool,
     /// The last word was `time`, whose options keep the position.
     after_time: bool,
+    /// The last word was `function` or `coproc`: the name after it is one
+    /// after which a reserved word (`{`) and an assignment word may stand.
+    before_name: bool,
 }
 
 impl AssignmentWords {
@@ -7563,6 +7809,7 @@ impl AssignmentWords {
             acceptable: true,
             redirect_target: false,
             after_time: false,
+            before_name: false,
         }
     }
 
@@ -7595,6 +7842,7 @@ impl AssignmentWords {
                 self.acceptable = true;
                 self.redirect_target = false;
                 self.after_time = false;
+                self.before_name = false;
                 Some(i + 1)
             }
             _ => None,
@@ -7630,29 +7878,37 @@ impl AssignmentWords {
         if std::mem::take(&mut self.redirect_target) {
             return;
         }
-        let word = &bytes[start..at];
+        let word = without_line_continuations(&bytes[start..at]);
+        let word = word.as_ref();
         let after_time = std::mem::take(&mut self.after_time);
-        self.acceptable = self.acceptable
-            && (std::str::from_utf8(word).is_ok_and(is_env_assignment)
-                || matches!(
-                    word,
-                    b"if"
-                        | b"then"
-                        | b"else"
-                        | b"elif"
-                        | b"while"
-                        | b"until"
-                        | b"do"
-                        | b"done"
-                        | b"fi"
-                        | b"esac"
-                        | b"{"
-                        | b"}"
-                        | b"!"
-                        | b"time"
-                        | b"coproc"
-                )
-                || (after_time && word.starts_with(b"-")));
+        let after_name = std::mem::take(&mut self.before_name);
+        let was_acceptable = self.acceptable;
+        // Bash reads a reserved word, and so an assignment word, after the
+        // NAME of `function NAME` and `coproc NAME` (`reserved_word_acceptable`
+        // in its parse.y): `function f { x[a b]=c git …; }`.
+        self.before_name = was_acceptable && matches!(word, b"function" | b"coproc");
+        self.acceptable = after_name
+            || (was_acceptable
+                && (std::str::from_utf8(word).is_ok_and(is_env_assignment)
+                    || matches!(
+                        word,
+                        b"if"
+                            | b"then"
+                            | b"else"
+                            | b"elif"
+                            | b"while"
+                            | b"until"
+                            | b"do"
+                            | b"done"
+                            | b"fi"
+                            | b"esac"
+                            | b"{"
+                            | b"}"
+                            | b"!"
+                            | b"time"
+                            | b"coproc"
+                    )
+                    || (after_time && word.starts_with(b"-"))));
         self.after_time = self.acceptable && (word == b"time" || after_time);
     }
 
@@ -7662,13 +7918,36 @@ impl AssignmentWords {
         self.acceptable
             && !self.redirect_target
             && self.word.is_some_and(|start| {
-                start < at
-                    && (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_')
-                    && bytes[start + 1..at]
+                let name = without_line_continuations(&bytes[start..at]);
+                name.first()
+                    .is_some_and(|first| first.is_ascii_alphabetic() || *first == b'_')
+                    && name
                         .iter()
                         .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
             })
     }
+}
+
+/// `word` with each `\` LF pair (a line continuation, which the shell drops
+/// before it reads words) removed.
+fn without_line_continuations(word: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !word.windows(2).any(|pair| pair == b"\\\n") {
+        return std::borrow::Cow::Borrowed(word);
+    }
+    let mut kept = Vec::with_capacity(word.len());
+    let mut i = 0;
+    while i < word.len() {
+        if word[i] == b'\\' {
+            if word.get(i + 1) != Some(&b'\n') {
+                kept.extend_from_slice(&word[i..(i + 2).min(word.len())]);
+            }
+            i += 2;
+        } else {
+            kept.push(word[i]);
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(kept)
 }
 
 /// The `]` that closes a bracket opened before `from`, and the blanks
@@ -7694,6 +7973,9 @@ fn bracket_word_close(
             }
             b'\'' => {
                 i = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + 1 + at + 1);
+            }
+            b'$' if crate::context::ansi_c_quote_starts_at(bytes, i) => {
+                i = crate::context::skip_ansi_c_quoted(bytes, i + 2);
             }
             b'"' => {
                 i += 1;
@@ -9208,6 +9490,24 @@ mod tests {
                 "if ! x[a_b]=c git; then :; fi",
             ),
             ("time -p x[a b]=c git", "time -p x[a_b]=c git"),
+            // After the name of `function NAME` and `coproc NAME`.
+            (
+                "function f { x[a b]=c git; }",
+                "function f { x[a_b]=c git; }",
+            ),
+            (
+                "coproc c { x[1 + 1]=b git; }",
+                "coproc c { x[1_+_1]=b git; }",
+            ),
+            // A backslash-newline in the name or before the `=`.
+            ("x\\\n[a b]=c git", "x\\\n[a_b]=c git"),
+            ("x[a b]\\\n=c git", "x[a_b]\\\n=c git"),
+            ("x[a b]+\\\n=c git", "x[a_b]+\\\n=c git"),
+            // `$'…'` ends at a `'` that no backslash escapes.
+            (
+                "echo $'a\\'b'; x[a b]=c git # '",
+                "echo $'a\\'b'; x[a_b]=c git # '",
+            ),
         ] {
             assert_eq!(spelled(command), view, "{command:?}");
         }
@@ -9227,6 +9527,8 @@ mod tests {
             "[ -f x ] && echo ok",
             "x[a\n] git",
             "echo [a b]=c",
+            "echo function f { x[a b]=c git; }",
+            "x\\\n[a b] git",
         ] {
             assert_eq!(bash_bracket_words(unchanged), None, "{unchanged:?}");
         }
@@ -9240,32 +9542,68 @@ mod tests {
             other => panic!("{command:?}: {other:?}"),
         };
         for (command, view) in [
+            // Bodies whose parentheses do not balance once the comment is
+            // read run as command substitutions.
             (
                 "echo $((1 #)) '\n)) ; git reset --hard #'",
-                "echo $((1 _____\n)) ; git reset --hard #'",
+                "echo $( 1 _____\n ) ; git reset --hard #'",
             ),
             (
                 "x=$((1 #)) '\n)) git reset --hard #'",
-                "x=$((1 _____\n)) git reset --hard #'",
+                "x=$( 1 _____\n ) git reset --hard #'",
             ),
             (
                 "echo $((1+(2 #))) '\n))) ; git",
-                "echo $((1+(2 ______\n))) ; git",
+                "echo $( 1+(2 ______\n) ) ; git",
             ),
+            (
+                "echo $((1 #)) '\ngit reset --hard)) #'",
+                "echo $( 1 _____\ngit reset --hard ) #'",
+            ),
+            (
+                "echo \"$((1 #))\ngit reset --hard))\"",
+                "echo \"$( 1 ___\ngit reset --hard )\"",
+            ),
+            // Quotes, substitutions and `${…}` before the body.
+            (
+                "echo \"$(echo '\"')\" $((1 #)) '\n)) ; git",
+                "echo \"$(echo '\"')\" $( 1 _____\n ) ; git",
+            ),
+            (
+                "echo $(true)#x $((1 #)) '\n)) ; git",
+                "echo $(true)#x $( 1 _____\n ) ; git",
+            ),
+            (
+                "echo ${x:- #} $((1 #)) '\n)) ; git",
+                "echo ${x:- #} $( 1 _____\n ) ; git",
+            ),
+            (
+                "echo $'\\'' $((1 #)) '\n)) ; git",
+                "echo $'\\'' $( 1 _____\n ) ; git",
+            ),
+            // Not closed, or still arithmetic: only the comment.
             ("echo \"$((1 #))\"", "echo \"$((1 ____"),
             ("echo $((1 # one\n + 2))", "echo $((1 _____\n + 2))"),
+            ("echo \"$((1 # one\n + 2))\"", "echo \"$((1 _____\n + 2))\""),
         ] {
             assert_eq!(spelled(command), view, "{command:?}");
         }
         for unchanged in [
             "echo $((16#ff)) $((2#101)) $(($#))",
             "echo $((1 + 2)) # $((1 #))",
+            "echo $(true)#x $((1 + 2))",
+            "echo \"$((16#ff))\" '#'",
             "echo '$((1 #))'",
             "cat <<'EOF'\n$((1 #))\nEOF",
             "git status # x",
         ] {
             assert_eq!(bash_arithmetic_comments(unchanged), None, "{unchanged:?}");
         }
+        let deep = "$(".repeat(MAX_BASH32_NESTING + 1) + "$((1 #))";
+        assert_eq!(
+            bash_arithmetic_comments(&deep),
+            Some(BashHashReading::Unread)
+        );
     }
 
     #[test]

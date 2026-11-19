@@ -222,9 +222,10 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     // `env -S`, split it into argv), so they are inline-script wrappers like
     // `sh -c`. Superset of `command_string_runner_payloads`, which validates;
     // as for ssh, only a quote or `$` makes the payload invisible to raw
-    // matching.
+    // matching, or a `[`: Bash reads `x[a b]=c` as one assignment word
+    // (`watch x[a b]=c git reset --hard`, see `bash_bracket_words`).
     // A name split by quoting (`w\atch`) is `names_a_runner_through_quoting`.
-    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
+    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)['"]?\s(?:[^\n;|&]|[<>]&)*['"$\[]"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();

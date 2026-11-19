@@ -41184,12 +41184,17 @@ fn evaluate_heredoc(
             // reset --hard'`. The whole body, read by the evaluator, gets its
             // Bash reading too (see `bash_hashes_as_data`), and so does a
             // `#` in or after a parenthesis that it may misread as a comment
-            // (see `paren_hashes_as_data`), and a `${` opener it may misread
-            // (see `bash_parameter_openers`).
+            // (see `paren_hashes_as_data`), a `${` opener it may misread
+            // (see `bash_parameter_openers`), blanks inside one bracketed
+            // word (`watch x[a b]=c git reset --hard`, see
+            // `bash_bracket_words`) and a Bash 3.2 comment in a `$((` body
+            // (see `bash_arithmetic_comments`).
             let bash_data_hash = per_command_pass
                 && !destination_source_context
                 && (crate::normalize::paren_hashes_as_data(&content.content).is_some()
                     || crate::normalize::bash_parameter_openers(&content.content).is_some()
+                    || crate::normalize::bash_bracket_words(&content.content).is_some()
+                    || crate::normalize::bash_arithmetic_comments(&content.content).is_some()
                     || [false, true].into_iter().any(|extglob| {
                         crate::normalize::bash_hashes_as_data(&content.content, extglob).is_some()
                     }));
