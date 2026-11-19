@@ -377,6 +377,12 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "$ExecutionContext.InvokeCommand | % InvokeScript $c<# ; git reset --hard #>",
         "$ExecutionContext.InvokeCommand | % InvokeScript 2>$null<# ; git reset --hard #> 'git status'",
         "New-Object System.Management.Automation.Runspaces.Command a<#; $p=[powershell]::Create(); [void]$p.AddScript('git reset --hard'); $p.Invoke() #>",
+        // In Start-Process arguments (PR #36's parameter binder).
+        "Start-Process -RedirectStandardOutput o<#x -FilePath git -ArgumentList reset,--hard #>",
+        "Start-Process -Wait -RedirectStandardOutput o<#x git reset,--hard #>",
+        "Start-Process -Wait -RedirectStandardOutput $c<#x -FilePath git -ArgumentList reset,--hard #>",
+        "Start-Process -Wait -RedirectStandardOutput ${c}<#x -FilePath git -ArgumentList reset,--hard #>",
+        "Start-Process -Wait -RedirectStandardOutput o<x -FilePath git -ArgumentList reset,--hard",
     ];
     let harmless = [
         "Write-Output $c#'\ngit reset --hard\n#'",
@@ -398,6 +404,9 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "Write-Output a <# ; & {git reset --hard} #>",
         "$c <#x#> = 1; & {git status}",
         "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' <# ; git reset --hard #>",
+        "Start-Process -Wait -RedirectStandardOutput o<#x -FilePath git -ArgumentList status #>",
+        "Start-Process -Wait -RedirectStandardOutput o<#x git status #>",
+        "Start-Process -Wait -RedirectStandardOutput o<x -FilePath git -ArgumentList status",
         // Not listed: `… InvokeScript 'git status'<# ; git reset --hard #>`.
         // pwsh runs only `git status`, but the engine-script reader keeps its
         // older deny for a string with text glued after it; that denial is
