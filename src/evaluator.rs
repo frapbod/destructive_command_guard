@@ -33427,8 +33427,46 @@ fn shell_maintained_posix_variable(name: &str) -> bool {
 /// and the `command`/`builtin` wrappers all still run the mutating word in
 /// the parent shell (v0.9.1 review false negative — `while read f; …` was
 /// invisible to the first-word hazard scan).
+///
+/// Words are read with the POSIX tokenizer, as the shell reads them: a
+/// prefix word keeps its quoted, escaped and expanded blanks
+/// (`x="a b"`, `x=${y:- a}`, `x=$(echo a b)`), so its second half is not
+/// mistaken for the command word.
 fn hazard_first_word(segment: &str) -> Cow<'_, str> {
-    let mut words = segment.split_ascii_whitespace();
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    // The tokenizer ends a word at the `&` of `2>&1` and the `|` of `>|f`;
+    // the shell reads one redirection there, so join them back.
+    let mut ranges: Vec<Range<usize>> = Vec::with_capacity(tokens.len());
+    let mut index = 0usize;
+    while let Some(token) = tokens.get(index) {
+        let mut range = token.byte_range.clone();
+        index += 1;
+        if token.kind == NormalizeTokenKind::Word
+            && token
+                .text(segment)
+                .is_some_and(|text| text.ends_with(['<', '>']))
+            && let Some(operator) = tokens.get(index)
+            && operator.byte_range.start == range.end
+            && matches!(operator.text(segment), Some("&" | "|"))
+        {
+            range.end = operator.byte_range.end;
+            index += 1;
+            if let Some(target) = tokens.get(index)
+                && target.kind == NormalizeTokenKind::Word
+                && target.byte_range.start == range.end
+            {
+                range.end = target.byte_range.end;
+                index += 1;
+            }
+        }
+        ranges.push(range);
+    }
+    let mut words = ranges.into_iter().filter_map(|range| {
+        // A newline only ends a line of a compound body; any other
+        // separator (`(`) is returned as is, which names no mutator.
+        let text = segment.get(range)?;
+        (text != "\n").then_some(text)
+    });
     loop {
         match words.next() {
             Some(
@@ -44132,6 +44170,47 @@ mod tests {
             hazard_first_word("printf -v p /etc"),
             Cow::Borrowed(_)
         ));
+    }
+
+    /// A prefix word keeps every blank the shell keeps in it.
+    ///
+    /// Regression: the scan split on whitespace, so in
+    /// `x=${y:- a} printf -v d …` it skipped `x=${y:-` and reported `a}`.
+    /// The rebinding of `d` went unseen and its old proven value stood. The
+    /// tokenizer splits `2>&1` and `>|f` at the `&` and `|`; they still read
+    /// as one redirection.
+    #[test]
+    // Shell text: clippy takes `${y:- a}` for a format argument.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn hazard_first_word_reads_prefix_words_as_the_shell_does() {
+        for segment in [
+            "x=${y:- a} printf -v d %s x",
+            "x=${y:- } printf -v d %s x",
+            "z=1 x=${y:- a} printf -v d %s x",
+            "x=${y:-${z:- a}} printf -v d %s x",
+            "x=\"${y:- a}\" printf -v d %s x",
+            "x=\"a b\" printf -v d %s x",
+            "x='a b' printf -v d %s x",
+            "x=a\\ b printf -v d %s x",
+            "x=$(echo a b) printf -v d %s x",
+            "x=$((1 + 2)) printf -v d %s x",
+            "x=`echo a b` printf -v d %s x",
+            "x=1 \\\n printf -v d %s x",
+            "2>&1 printf -v d %s x",
+            ">|/tmp/f printf -v d %s x",
+            "2>&- printf -v d %s x",
+            "{ x=${y:- a} printf -v d %s x",
+        ] {
+            assert_eq!(
+                hazard_first_word(segment),
+                "printf",
+                "segment {segment:?} must dispatch to the printf arm"
+            );
+        }
+        assert_eq!(hazard_first_word("x=${y:- a} read d"), "read");
+        assert_eq!(hazard_first_word("x=\"a b\" . ./f"), ".");
+        assert_eq!(hazard_first_word("x=${y:- a} echo hi"), "echo");
+        assert_eq!(hazard_first_word("x=${y:- a}"), "");
     }
 
     /// GitHub #422: only `printf -v NAME` binds a shell variable. Treating
