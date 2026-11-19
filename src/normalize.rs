@@ -6574,9 +6574,7 @@ fn bash_hashes_as_data_within(
 pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
     let bytes = command.as_bytes();
     let len = bytes.len();
-    if memchr::memchr(b'{', bytes).is_none() {
-        return None;
-    }
+    memchr::memchr(b'{', bytes)?;
     let next = |at: usize| past_line_continuations(bytes, at);
     let mut budget = 16 * len + 4096;
     // The end of each `${` looked up so far, read the Bash way and the dash
