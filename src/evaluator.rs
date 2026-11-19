@@ -17558,6 +17558,45 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             }
         }
     }
+    // The shell removes a line continuation before it reads tokens, so Bash
+    // and zsh read `$\`LF`'` as `$'`: `echo $\`LF`'a\'' ; git reset --hard #'`
+    // runs `git reset --hard`. The scanners see an ANSI-C string only when
+    // the `$` stands right before the `'`. When a continuation splits them,
+    // read the command again with the continuations moved in front of the
+    // `$` (see `dollar_quotes_across_line_continuations`), through this
+    // whole function, so the readings here and below apply to the joined
+    // `$'` too; that copy has no such split left, so it is not read a third
+    // time. Deny wins. What the user authorized as written stays
+    // authorized, and the copy spends no allow-once grant.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && !crate::context::PlainDollarQuoteReading::active()
+        && let Some(spelled) = crate::context::dollar_quotes_across_line_continuations(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                &spelled,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        adopt_alternate_reading(&mut result, alternate, command);
+    }
     // Bash reads `$'…'` as an ANSI-C string, which `\'` does not close.
     // PowerShell (the shell Codex runs on Windows) and dash (`/bin/sh` on
     // Debian, so any `sh -c`) read `$'` as a literal `$` and a plain quote.

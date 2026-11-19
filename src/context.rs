@@ -4302,6 +4302,66 @@ pub(crate) fn dollar_quote_readings_differ(command: &str) -> bool {
     })
 }
 
+/// `command` with each line continuation that stands between a run of `$`
+/// and a `'` moved in front of that run; `None` when there is none.
+///
+/// The shell removes a line continuation (a `\` LF pair) before it reads
+/// tokens, so Bash and zsh read `echo $\` LF `'a\'' ; git reset --hard #'`
+/// as `echo $'a\''`: an ANSI-C string, in which `\'` is an escaped quote,
+/// then `git reset --hard` and a comment. [`ansi_c_quote_starts_at`], and
+/// every scanner that asks it, needs the `$` right before the `'`, so they
+/// read the plain string `'a\'` and the rest as quoted text. With the
+/// continuations moved (`echo \` LF `$'a\'' …`) the shell reads the same
+/// command, and the scanners see the `$'` as the shell does. The whole run
+/// moves, so `$\` LF `$'` still reads as `$$` (the process ID) and a plain
+/// quote. A `\` escapes the byte after it, so an escaped `$` never starts a
+/// run and stays after its backslash.
+///
+/// The scan reads raw bytes without quote context: a run inside quotes, a
+/// comment or a quoted heredoc body moves too. Moving bytes there changes
+/// nothing a shell runs, but it can give the scanners another reading of
+/// the text after it; the caller only adds denials from this copy.
+///
+/// Length preserving (bytes trade places), so every range in the copy is
+/// the same range in `command`.
+#[must_use]
+pub(crate) fn dollar_quotes_across_line_continuations(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    memchr::memmem::find(bytes, b"\\\n")?;
+    let mut spelled: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'$' => {
+                let (mut end, mut breaks) = (i, 0);
+                loop {
+                    match (bytes.get(end), bytes.get(end + 1)) {
+                        (Some(b'$'), _) => end += 1,
+                        (Some(b'\\'), Some(b'\n')) => {
+                            breaks += 1;
+                            end += 2;
+                        }
+                        _ => break,
+                    }
+                }
+                if breaks > 0 && bytes.get(end) == Some(&b'\'') {
+                    let spelled = spelled.get_or_insert_with(|| bytes.to_vec());
+                    let dollars = i + 2 * breaks;
+                    for at in (i..dollars).step_by(2) {
+                        spelled[at..at + 2].copy_from_slice(b"\\\n");
+                    }
+                    spelled[dollars..end].fill(b'$');
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    // Only ASCII bytes traded places.
+    spelled.and_then(|spelled| String::from_utf8(spelled).ok())
+}
+
 /// While alive, every scanner reads `$'` as a literal `$` and a plain quote,
 /// as PowerShell and dash do (see [`ansi_c_quote_starts_at`]).
 pub(crate) struct PlainDollarQuoteReading {
@@ -4479,6 +4539,59 @@ mod tests {
         }
         assert!(!PlainDollarQuoteReading::active());
         assert_eq!(opens("echo $'a'"), [5]);
+    }
+
+    /// A line continuation between a run of `$` and a `'` moves in front of
+    /// the run, so the run stands right before the quote, as the shell
+    /// reads it once the continuation is removed.
+    #[test]
+    fn dollar_quotes_join_across_line_continuations() {
+        let joined = |command: &str| dollar_quotes_across_line_continuations(command);
+        assert_eq!(
+            joined("echo $\\\n'a\\'' ; git reset --hard #'").as_deref(),
+            Some("echo \\\n$'a\\'' ; git reset --hard #'")
+        );
+        assert_eq!(
+            joined("echo $\\\n\\\n'a'").as_deref(),
+            Some("echo \\\n\\\n$'a'")
+        );
+        // The whole run moves: `$$` before the quote stays the process ID,
+        // and `$$$` stays the process ID followed by `$'`.
+        assert_eq!(joined("echo $\\\n$'a'").as_deref(), Some("echo \\\n$$'a'"));
+        assert_eq!(
+            joined("echo $$\\\n$\\\n'a'").as_deref(),
+            Some("echo \\\n\\\n$$$'a'")
+        );
+        // An escaped `$` stays after its backslash.
+        assert_eq!(joined("echo \\$\\\n'a'"), None);
+        assert_eq!(
+            joined("echo \\$\\\n$\\\n'a'").as_deref(),
+            Some("echo \\$\\\n\\\n$'a'")
+        );
+        assert_eq!(
+            joined("echo \\\\$\\\n'a'").as_deref(),
+            Some("echo \\\\\\\n$'a'")
+        );
+        for command in [
+            "echo $'a\\'b'",
+            "echo $\\\n\"a\"",
+            "echo $\\\n{x}",
+            "echo $\\\nx'a'",
+            "echo $\\\r\n'a'",
+            "echo \\\n'a'",
+            "git status",
+        ] {
+            assert_eq!(joined(command), None, "{command:?}");
+        }
+        for command in [
+            "echo $\\\n'a\\'' ; git reset --hard #'",
+            "echo $\\\n$'a'",
+            "echo \\\\$\\\n'a'",
+        ] {
+            let spelled = joined(command).unwrap();
+            assert_eq!(spelled.len(), command.len());
+            assert_eq!(joined(&spelled), None, "{spelled:?}");
+        }
     }
 
     /// The interpreter search behind an inline-code flag reads each word of a
