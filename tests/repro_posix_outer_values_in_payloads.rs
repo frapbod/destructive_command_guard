@@ -484,6 +484,18 @@ fn process_substitutions_in_a_cmd_payload_are_not_outer_redirections() {
             r"X='&rd /s /q C:\x'; cmd.exe /c echo <(case x in x) echo>f;; esac)$X",
             r#"cmd.exe /c echo <(case x in x) echo>f;; esac)"$HOME""#,
             "cmd.exe /c echo <(case x in x) echo>f;; esac)$X",
+            // Nor a `)` in an ANSI-C string or in backquotes (Linux bash,
+            // Mac bash 5 and zsh hand cmd the path plus the value).
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(echo $'\')'>f)$X",
+            r"cmd.exe /c echo <(echo $'\')'>f)$X",
+            r#"cmd.exe /c echo <(echo $'\')'>f)"$HOME""#,
+            r"cmd /c echo >(echo $'\')'>f)$X",
+            r"cmd /c echo <(echo $'a\')b'>f)$X",
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(echo `echo )`; echo >f)$X",
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(echo `case x in x) echo y;; esac`>f)$X",
+            // The same ends a command substitution's value.
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo $(echo $'\')'>f)$X",
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo $(echo `echo )`; echo >f)$X",
         ],
         &POSIX,
         EvaluationDecision::Deny,

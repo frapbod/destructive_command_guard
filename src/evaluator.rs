@@ -62387,6 +62387,19 @@ mod tests {
                 &["cmd", "/c", "echo", "<(case x in x) echo>f;; esac)$X"][..],
                 "echo <(case x in x) echo>f;; esac)%DCG_POSIX_VALUE%",
             ),
+            // Nor at a `)` in an ANSI-C string or in backquotes.
+            (
+                &["cmd", "/c", "echo", r"<(echo $'\')'>f)$X"][..],
+                r"echo <(echo $'\')'>f)%DCG_POSIX_VALUE%",
+            ),
+            (
+                &["cmd", "/c", "echo", "<(echo `echo )`; echo >f)$X"][..],
+                "echo <(echo %DCG_POSIX_VALUE%; echo >f)%DCG_POSIX_VALUE%",
+            ),
+            (
+                &["cmd", "/c", "echo", r"$(echo $'\')'>f)$X"][..],
+                "echo %DCG_POSIX_VALUE%%DCG_POSIX_VALUE%",
+            ),
         ] {
             assert_eq!(tail(words).as_deref(), Some(payload), "{words:?}");
         }
