@@ -8368,9 +8368,7 @@ enum ValueByte<'a> {
 /// whose value holds a quoted command substitution in an array subscript
 /// spelled again with that substitution unquoted; `None` when there is none.
 fn requote_array_reference_substitutions(command: &str, bodies: &[Range<usize>]) -> Option<String> {
-    if memchr::memchr(b'[', command.as_bytes()).is_none() {
-        return None;
-    }
+    memchr::memchr(b'[', command.as_bytes())?;
     let mut output: Option<String> = None;
     let mut copied = 0usize;
     for range in posix_command_word_ranges(command) {
@@ -10204,7 +10202,7 @@ mod tests {
             ),
             (
                 "x[a\\[\\$\\(git\\ reset\\ --hard\\)\\]]=1",
-                "x['a['$(git reset --hard)']']=1",
+                "x[a'['$(git reset --hard)']']=1",
             ),
             (
                 "declare 'x[$(git reset --hard)]=1'",
