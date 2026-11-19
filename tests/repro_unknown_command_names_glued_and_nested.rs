@@ -12,9 +12,10 @@
 //!   an eval body and for source a shell reads from a pipe.
 //! - A name the parent shell binds without exporting it is unset in the
 //!   child (`V=x; bash -c 'gi"${V}"t reset --hard'` runs `git`), so the
-//!   child reads it empty; one the parent may export is unknown there.
+//!   child reads it empty; one the command may export, however spelled, or
+//!   one a source the parent runs itself reads (`.`, `source`), is unknown.
 //! - ANSI-C and locale quotes (`$'gi'${V}$'t'`) and references that keep
-//!   part of the value (`${V#x}`, `${V/x/}`) glue the same way, and the
+//!   part of the value (`${V#x}`, `${V/x/}`, `${V:0}`, `${V:=git}`) glue the same way, and the
 //!   command name may follow a subshell's `(`, a function declaration, a
 //!   case arm or a `$(` in an assignment.
 
@@ -191,6 +192,16 @@ fn unknown_values_glued_between_quoted_text_are_read_unsplit_too() {
             r#"gi"${V#x}"t reset --hard"#,
             r#"'gi'"${V#x}"'t' reset --hard"#,
             r"gi${V/x/}t reset --hard",
+            // Any operator with plain text keeps some text of the value, an
+            // assigned default its word.
+            r#""${V:=git}" reset --hard"#,
+            r#""${V=git}" reset --hard"#,
+            r"'gi'${V:=}'t' reset --hard",
+            r"'gi'${V=}'t' reset --hard",
+            r"'gi'${V:0}'t' reset --hard",
+            r#"gi"${V:0:9}"t reset --hard"#,
+            r"'gi'${V@L}'t' reset --hard",
+            r"'gi'${V,,}'t' reset --hard",
         ],
         &POSIX,
         EvaluationDecision::Deny,
@@ -228,7 +239,10 @@ fn a_child_shells_own_unknown_names_are_read_like_the_commands() {
 }
 
 /// A name the parent shell binds without exporting it is unset in the child
-/// shell; one exported from a group or subshell is the child's unknown.
+/// shell. That needs proof the child cannot see it: wherever and however the
+/// command may export it (a prefix, quotes, `set` flags, the consumer's own
+/// assignment, a shell around the parent), or when the parent runs the
+/// source itself (`.`, `source`), the name is unknown.
 #[test]
 fn a_name_the_parent_does_not_export_is_unset_in_the_child() {
     let misses = misses(
@@ -240,6 +254,19 @@ fn a_name_the_parent_does_not_export_is_unset_in_the_child() {
             r#"for V in a; do :; done; bash -c 'gi"${V}"t reset --hard'"#,
             r#"(export X=git; bash -c '"$X" reset --hard')"#,
             r#"{ export X=git; bash -c '"$X" reset --hard'; }"#,
+            r#"X=git; builtin export X; bash -c "\"\$X\" reset --hard $PWD""#,
+            r#"X=git; command export X; bash -c '"$X" reset --hard'"#,
+            r#"X=git; export "X"; bash -c "\"\$X\" reset --hard $PWD""#,
+            r#"set -ea; X=git; bash -c "\"\$X\" reset --hard $PWD""#,
+            r#"set -ua; X=git; bash -c '"$X" reset --hard'"#,
+            r#"X=git; E=export; $E X; bash -c '"$X" reset --hard'"#,
+            r#"X=git; echo '"$X" reset --hard' | X=$X sh"#,
+            r#"X=git; echo '"$X" reset --hard' | env X=git sh"#,
+            r#"X=git; echo '"$X" reset --hard'; export X; echo '"$X" reset --hard' | sh"#,
+            r#"export X=x; bash -c 'X=git; bash -c "\"\$X\" reset --hard"'"#,
+            "X=git; . /dev/stdin <<EOF\n\"\\$X\" reset --hard $PWD\nEOF",
+            "X=git; source /dev/stdin <<EOF\n\"\\$X\" reset --hard $PWD\nEOF",
+            r#"X=git; . <(echo '"$X" reset --hard')"#,
         ],
         &POSIX,
         EvaluationDecision::Deny,
@@ -307,6 +334,9 @@ fn harmless_unknown_command_names_stay_allowed() {
             "X=' '; bash <<'EOF'\ngit${X}reset${X}--hard\nEOF",
             r#"X=git bash -c '"$X" status'"#,
             r#"X=git; bash -c '"$X" reset --hard'"#,
+            r#"X=git; bash -c "\"\$X\" reset --hard $PWD""#,
+            r#"X=git; echo '"$X" reset --hard' | sh"#,
+            r#"set -e; X=git; bash -c '"$X" reset --hard'"#,
             r"X=' '; echo 'git${X}reset${X}--hard' | bash",
             r"'gi'${V#x}'t' status",
             r#"( "$X" status )"#,

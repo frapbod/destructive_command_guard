@@ -15652,22 +15652,27 @@ fn evaluate_executable_text_sinks(
         // judged one level down. Read its views here, as deny-only whole
         // readings, one more level down. An eval body runs in this shell: a
         // name this command binds before it is the binding proof's. Any
-        // other POSIX source runs in a child shell (a pipe, a heredoc's
-        // output): a name this command binds before the source without
-        // exporting it is unset there. When the source is not found as
-        // written in the command, every name it does not bind is unknown.
+        // other POSIX source is read as a child shell's (a pipe, a heredoc's
+        // output): a name this command binds before the source is unset
+        // there only when `ChildEnvironmentProof` shows the child cannot see
+        // it. A source run in this shell by `source` or `.` fails that
+        // proof, so its names are unknown. The text before the first copy of
+        // the source is a prefix of the text before the sink, so it can only
+        // prove fewer names bound (unknown, not unset); when the source is
+        // not found as written, every name it does not bind is unknown.
         if dialect == ShellDialect::Posix && result.allowlist_override.is_none() {
             let before = command
                 .find(source.as_str())
                 .map_or("", |at| &command[..at]);
             let scope = if context == POSIX_EVAL_SINK_CONTEXT {
                 UnknownNameScope {
-                    parent: "",
                     same_shell: before,
+                    ..UnknownNameScope::default()
                 }
             } else {
                 UnknownNameScope {
                     parent: before,
+                    command,
                     same_shell: "",
                 }
             };
@@ -20762,6 +20767,7 @@ fn posix_proven_variable_view(
     } else {
         Vec::new()
     };
+    let child_environment = unknown_names.map(|scope| ChildEnvironmentProof::new(scope.command));
     // (start, end, its readings: the first, then alternates)
     let mut spliced: Vec<(usize, usize, Vec<String>)> = Vec::new();
     let mut copied = 0usize;
@@ -20886,12 +20892,19 @@ fn posix_proven_variable_view(
                 None
             };
             let readings = unknown_names
-                .map(|scope| {
+                .zip(child_environment.as_ref())
+                .map(|(scope, proof)| {
                     posix_unknown_command_word_view(
                         resolved.as_deref().unwrap_or(segment),
                         &ifs,
                         |before, name| {
-                            posix_command_word_name_scope(&command[..start], scope, before, name)
+                            posix_command_word_name_scope(
+                                &command[..start],
+                                scope,
+                                proof,
+                                before,
+                                name,
+                            )
                         },
                     )
                 })
@@ -20963,8 +20976,11 @@ fn posix_proven_variable_view(
 struct UnknownNameScope<'a> {
     /// The parent shell's text before a child shell's source (`bash -c`, a
     /// heredoc body, a piped script): a name only it may bind is unset in
-    /// the child unless it may be exported.
+    /// the child when [`ChildEnvironmentProof`] proves the child cannot see
+    /// it.
     parent: &'a str,
+    /// The parent shell's whole text, which that proof reads.
+    command: &'a str,
     /// This shell's text before a source it runs itself (an eval body): a
     /// name it may bind is the binding proof's, as in the source.
     same_shell: &'a str,
@@ -20974,13 +20990,14 @@ struct UnknownNameScope<'a> {
 /// ([`CommandWordName`]). `earlier` is the source's text before the segment
 /// and `before` the segment's text before the word: a name either, or
 /// `scope.same_shell`, may bind is the command's own. Otherwise a name
-/// `scope.parent` may bind is unset in the child unless the parent may
-/// export it (`X=' '; bash <<'EOF'` with `git${X}reset${X}--hard` runs
-/// `gitreset--hard`). Any other name, and a special or positional
-/// parameter, is unknown.
+/// `scope.parent` may bind is unset in the child when `proof` shows the
+/// parent cannot hand it over (`X=' '; bash <<'EOF'` with
+/// `git${X}reset${X}--hard` runs `gitreset--hard`). Any other name, and a
+/// special or positional parameter, is unknown.
 fn posix_command_word_name_scope(
     earlier: &str,
     scope: UnknownNameScope<'_>,
+    proof: &ChildEnvironmentProof<'_>,
     before: &str,
     name: &str,
 ) -> CommandWordName {
@@ -20991,59 +21008,170 @@ fn posix_command_word_name_scope(
         || posix_text_may_bind_name(scope.same_shell, name)
     {
         CommandWordName::Bound
-    } else if posix_text_may_bind_name(scope.parent, name)
-        && !posix_parent_may_export_name(scope.parent, name)
-    {
+    } else if posix_text_may_bind_name(scope.parent, name) && !proof.may_export(name) {
         CommandWordName::Unset
     } else {
         CommandWordName::Unknown
     }
 }
 
-/// Whether the parent shell text before a child shell's source (`parent`,
-/// see [`posix_proven_variable_view`]) may hand `name` to the child in its
-/// environment: an assignment in front of the command that starts the child
-/// (`X=git bash -c …`, `env X=git bash -c …`), an `export`, `declare -x` or
-/// `typeset -x` that names it, or `set -a` / `allexport`. The child then reads
-/// a value the parent set, and the name is unknown to the child's reading,
-/// not the parent's. A plain assignment (`X=' '; bash <<'EOF'`) stays in the
-/// parent.
-fn posix_parent_may_export_name(parent: &str, name: &str) -> bool {
-    if parent.contains("set -a") || parent.contains("allexport") {
-        return true;
+/// Whether the shells around a child shell's source may hand a name to the
+/// child in its environment. [`CommandWordName::Unset`] needs proof that
+/// they cannot; anything this does not read keeps the name unknown, the
+/// reading it had without that rule.
+///
+/// The texts read are the parent shell's whole text and every command dcg is
+/// evaluating around it, since an enclosing shell may have exported the name
+/// first (`export X=x; bash -c 'X=git; bash -c …'`: the middle shell's `X`
+/// is exported). The environment the outermost command starts with is not
+/// visible here.
+///
+/// A text may export any name ([`posix_text_export_commands`] is `None`)
+/// when it can change what is exported by text this cannot read, or names an
+/// export builtin anywhere; otherwise it exports `name` only through an
+/// assignment word on a command (`X=git bash -c …`, `env X=git sh`,
+/// `| X=$X sh`), including the command that reads the source.
+struct ChildEnvironmentProof<'a> {
+    command: &'a str,
+    /// Per text: its commands, or `None` when it may export any name.
+    texts: std::cell::OnceCell<Vec<Option<Vec<String>>>>,
+    /// Names already proven: (name, may export).
+    names: std::cell::RefCell<Vec<(String, bool)>>,
+}
+
+impl<'a> ChildEnvironmentProof<'a> {
+    fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            texts: std::cell::OnceCell::new(),
+            names: std::cell::RefCell::new(Vec::new()),
+        }
     }
-    let ranges = command_segment_ranges(parent);
-    // The command that starts the child is the segment `parent` ends in:
-    // nothing but blanks follows it.
-    let launcher = ranges.last().and_then(|&(start, end)| {
-        parent
-            .get(end..)
-            .is_some_and(|rest| rest.trim().is_empty())
-            .then(|| parent.get(start..end))
-            .flatten()
-    });
-    if launcher.is_some_and(|launcher| segment_text_may_assign(launcher, name)) {
-        return true;
+
+    fn may_export(&self, name: &str) -> bool {
+        if let Some((_, known)) = self.names.borrow().iter().find(|(seen, _)| seen == name) {
+            return *known;
+        }
+        let texts = self.texts.get_or_init(|| {
+            let mut texts: Vec<String> = vec![self.command.to_string()];
+            let innermost = SAFE_PATTERN_SOURCE.with(|slot| slot.borrow().clone());
+            for current in std::iter::successors(innermost, |current| current.parent.clone()) {
+                if !texts.contains(&current.command) {
+                    texts.push(current.command.clone());
+                }
+            }
+            texts
+                .iter()
+                .map(|text| posix_text_export_commands(text))
+                .collect()
+        });
+        let exports = texts.iter().any(|commands| {
+            commands.as_ref().is_none_or(|commands| {
+                commands
+                    .iter()
+                    .any(|command| segment_text_may_assign(command, name))
+            })
+        });
+        self.names.borrow_mut().push((name.to_string(), exports));
+        exports
     }
-    ranges
-        .iter()
-        .filter_map(|&(start, end)| parent.get(start..end))
-        .any(|segment| {
-            // `(export X=…; …)`, `{ export X=…; }`, `then export X=…`.
-            let (statement, _) = crate::packs::core::git::command_after_posix_control_prefixes(
-                segment,
-                ShellDialect::Posix,
-            );
-            let mut words = statement.split_ascii_whitespace();
-            let exports = match words.next() {
-                Some("export") => true,
-                Some("declare" | "typeset" | "local" | "readonly") => words
-                    .clone()
-                    .any(|word| word.starts_with('-') && word.contains('x')),
-                _ => false,
-            };
-            exports && posix_text_may_bind_name(segment, name)
+}
+
+/// The commands of a shell text that run a program, for
+/// [`ChildEnvironmentProof`], or `None` when the text may export any name.
+///
+/// That is when, with quotes removed, it names an export builtin or option
+/// as a word anywhere (`export`, `declare`, `typeset`, `local`, `readonly`,
+/// `allexport`; also `BASH_ENV` and `ENV`, which make a child read a file),
+/// so prefixes (`builtin export X`), quoted spellings (`export "X"`), function
+/// bodies and trap or eval text are covered; or when a command outside a
+/// heredoc body runs text this cannot read: a name that is not plain text
+/// (`$E X`), `eval`, `source`, `.`, `trap`, `alias`, `enable`, or `set`
+/// with an option cluster holding `a` (`set -ea`) or an expansion.
+fn posix_text_export_commands(text: &str) -> Option<Vec<String>> {
+    let unquoted: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    let word_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'/' | b'.' | b'-');
+    let bytes = unquoted.as_bytes();
+    let names_word = |word: &str| {
+        unquoted.match_indices(word).any(|(at, _)| {
+            (at == 0 || !word_byte(bytes[at - 1]))
+                && bytes
+                    .get(at + word.len())
+                    .is_none_or(|byte| !word_byte(*byte))
         })
+    };
+    if [
+        "export",
+        "declare",
+        "typeset",
+        "local",
+        "readonly",
+        "allexport",
+        "BASH_ENV",
+        "ENV",
+    ]
+    .into_iter()
+    .any(names_word)
+    {
+        return None;
+    }
+    let bodies = deny_only_heredoc_bodies(text);
+    let plain = |byte: u8| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'[' | b']' | b':')
+    };
+    let mut commands = Vec::new();
+    for (start, end) in command_segment_ranges(text) {
+        if bodies
+            .iter()
+            .any(|(body, _)| body.start <= start && end <= body.end)
+        {
+            continue;
+        }
+        let segment = text.get(start..end)?;
+        let (body, _) = crate::packs::core::git::command_after_posix_control_prefixes(
+            segment,
+            ShellDialect::Posix,
+        );
+        if body
+            .bytes()
+            .all(|byte| byte.is_ascii_whitespace() || b"(){};&|!".contains(&byte))
+        {
+            continue;
+        }
+        let tokens = tokenize_for_shell_dialect(body, ShellDialect::Posix);
+        let range = posix_command_name_token(body, &tokens)?;
+        let word = body.get(range.clone())?;
+        if word_is_redirect_or_assignment_prefix(word) {
+            // Assignment words alone: the shell keeps them.
+            continue;
+        }
+        let program = dequoted_command_word(word);
+        if !program.bytes().all(plain) {
+            return None;
+        }
+        match program.rsplit('/').next().unwrap_or(&program) {
+            "eval" | "source" | "." | "trap" | "alias" | "enable" => return None,
+            "set" => {
+                let arguments = body.get(range.end..).unwrap_or_default();
+                let allexport = arguments.split_ascii_whitespace().any(|argument| {
+                    let argument = dequoted_command_word(argument);
+                    argument.contains(['$', '`'])
+                        || (argument.starts_with(['-', '+']) && argument.contains('a'))
+                });
+                if allexport {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        commands.push(segment.to_string());
+    }
+    Some(commands)
 }
 
 /// Upper bound on the words [`posix_unknown_command_word_view`] reads before
@@ -21119,11 +21247,12 @@ enum CommandWordReading {
 ///
 /// Literal text must be plain (letters, digits, `/._-+`), in any quotes
 /// including `$'…'` and `$"…"`, so the rendering cannot change its meaning;
-/// anything else (escapes, command substitution, other operators inside
-/// `${...}`) leaves the word as written. A reference that removes or
-/// replaces part of the value (`${V#x}`, `${V/x/}`) yields some text of the
-/// value, so its bare spelling is the plain reference (`${V}`) and it is
-/// empty with the name unset.
+/// anything else (escapes, command substitution, operator text inside
+/// `${...}` that is not plain) leaves the word as written. A reference with
+/// any other operator (`${V#x}`, `${V/x/}`, `${V:0}`, `${V:=git}`) yields
+/// some text of the value, so its bare spelling is the plain reference
+/// (`${V}`); with the name unset it is an assigned default's word, or
+/// empty.
 ///
 /// The command name may follow syntax that opens a body: a subshell, a
 /// group, a function declaration or a case arm
@@ -21141,25 +21270,16 @@ fn posix_unknown_command_word_view(
     posix_unknown_command_word_readings(segment, ifs, scope).unwrap_or_default()
 }
 
-/// [`posix_unknown_command_word_view`]; `None` when the word stays as
-/// written.
-fn posix_unknown_command_word_readings(
-    segment: &str,
-    ifs: &str,
-    scope: impl Fn(&str, &str) -> CommandWordName,
-) -> Option<Vec<String>> {
-    if !segment.contains('$') {
-        return None;
-    }
-    // Syntax that opens a body (`( … )`, `{ …; }`, `f() { …; }`, a case
-    // arm) comes before the command; the peeler also ends the command at a
-    // subshell's `)`.
-    let (body, offset) =
-        crate::packs::core::git::command_after_posix_control_prefixes(segment, ShellDialect::Posix);
-    // The command name is the last word that only wrappers, assignments,
-    // redirections and reserved words precede; a wrapper's option value
-    // (`sudo -u root "$X"`) is not one, though it may look like one.
-    let tokens = tokenize_for_shell_dialect(body, ShellDialect::Posix);
+/// The byte range in `body` (a segment after
+/// [`crate::packs::core::git::command_after_posix_control_prefixes`]) of its
+/// command name: the last word that only wrappers, assignments, redirections
+/// and reserved words precede. A wrapper's option value (`sudo -u root "$X"`)
+/// is not one, though it may look like one. In a segment of assignment words
+/// only, it is the last of them. `None` when no word qualifies.
+fn posix_command_name_token(
+    body: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Option<Range<usize>> {
     let mut word = None;
     let mut misses = 0usize;
     for token in tokens.iter().take(MAX_UNKNOWN_COMMAND_WORD_PREFIX) {
@@ -21178,7 +21298,26 @@ fn posix_unknown_command_word_readings(
             }
         }
     }
-    let range = word?;
+    word
+}
+
+/// [`posix_unknown_command_word_view`]; `None` when the word stays as
+/// written.
+fn posix_unknown_command_word_readings(
+    segment: &str,
+    ifs: &str,
+    scope: impl Fn(&str, &str) -> CommandWordName,
+) -> Option<Vec<String>> {
+    if !segment.contains('$') {
+        return None;
+    }
+    // Syntax that opens a body (`( … )`, `{ …; }`, `f() { …; }`, a case
+    // arm) comes before the command; the peeler also ends the command at a
+    // subshell's `)`.
+    let (body, offset) =
+        crate::packs::core::git::command_after_posix_control_prefixes(segment, ShellDialect::Posix);
+    let tokens = tokenize_for_shell_dialect(body, ShellDialect::Posix);
+    let range = posix_command_name_token(body, &tokens)?;
     let raw = body.get(range.clone())?;
     if !raw.contains('$') {
         return None;
@@ -21379,10 +21518,11 @@ fn posix_unknown_command_word_readings(
 /// A reference accepted by [`posix_unknown_reference_name`] as the packs
 /// should judge it with an unknown value (its bare spelling), and the text
 /// it expands to with its name unset. A default (`${X:-word}`, `${X-word}`)
-/// is its word then; an alternate (`${X:+word}`) is empty. A reference that
-/// removes or replaces part of the value (`${X#x}`, `${X/x/}`, `${X^}`)
+/// is its word then; an alternate (`${X:+word}`) is empty. Any other
+/// operator (`${X#x}`, `${X/x/}`, `${X^}`, `${X:0:2}`, `${X@L}`, and an
+/// assigned default `${X:=word}`, which is its word with the name unset)
 /// yields some text of the value, so its bare spelling is the plain
-/// reference, and it is empty with the name unset.
+/// reference; it is empty with the name unset.
 fn posix_reference_bare_and_unset(reference: &str) -> (String, &str) {
     let Some(inner) = reference
         .strip_prefix("${")
@@ -21408,6 +21548,12 @@ fn posix_reference_bare_and_unset(reference: &str) -> (String, &str) {
     {
         return (reference.to_string(), word);
     }
+    if let Some(word) = [":=", "="]
+        .iter()
+        .find_map(|prefix| operator.strip_prefix(prefix))
+    {
+        return (format!("${{{parameter}}}"), word);
+    }
     if operator.starts_with(":+") || operator.starts_with('+') {
         return (reference.to_string(), "");
     }
@@ -21415,11 +21561,12 @@ fn posix_reference_bare_and_unset(reference: &str) -> (String, &str) {
 }
 
 /// The variable a reference at the start of `text` reads and its length:
-/// `$NAME`, `${NAME}`, a default or alternate (`${NAME:-word}`,
-/// `${NAME+word}`) with a plain word, a part of the value (`${NAME#x}`,
-/// `${NAME%x}`, `${NAME/x/y}`, `${NAME^}`), or a positional or special parameter
-/// (`$1`, `"$@"`), whose name is returned as `""` (never proven). Anything
-/// else is `None`.
+/// `$NAME`, `${NAME}`, a default, assigned default or alternate
+/// (`${NAME:-word}`, `${NAME:=word}`, `${NAME+word}`) with a plain word, any
+/// other operator with plain text (`${NAME#x}`, `${NAME/x/y}`, `${NAME^}`,
+/// `${NAME:0:2}`, `${NAME@L}`), or a positional or special parameter (`$1`,
+/// `"$@"`), whose name is returned as `""` (never proven). Anything else
+/// (`${!NAME}`, `${#NAME}`, nested expansions) is `None`.
 fn posix_unknown_reference_name(text: &str) -> Option<(&str, usize)> {
     let identifier = |text: &str| {
         text.char_indices()
@@ -21440,9 +21587,10 @@ fn posix_unknown_reference_name(text: &str) -> Option<(&str, usize)> {
         } else {
             return None;
         };
-        // A default (`:-`, `-`) or alternate (`:+`, `+`) word is the text
-        // when the value does not give it, so either may be the field.
-        let word = [":-", "-", ":+", "+"]
+        // A default (`:-`, `-`), assigned default (`:=`, `=`) or alternate
+        // (`:+`, `+`) word is the text when the value does not give it, so
+        // either may be the field.
+        let word = [":-", "-", ":=", "=", ":+", "+"]
             .iter()
             .find_map(|operator| operator_text.strip_prefix(operator));
         let plain_word = |word: &str| {
@@ -21450,11 +21598,11 @@ fn posix_unknown_reference_name(text: &str) -> Option<(&str, usize)> {
                 c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ' ' | '\t')
             })
         };
-        // Removing or replacing part of the value, or changing its case,
-        // yields some text of the value: plain text only, so the closing
-        // brace found is the reference's own.
-        let value_text = operator_text.starts_with(['#', '%', '/', '^', ','])
-            && !operator_text.contains(['$', '`', '\'', '"', '\\', '{', '(']);
+        // Any other operator (`#`, `%`, `/`, `^`, `,`, `:N:M`, `@L`, `?`)
+        // yields some text of the value, or nothing: with plain operator
+        // text only, so the closing brace found is the reference's own.
+        let value_text = word.is_none()
+            && !operator_text.contains(['$', '`', '\'', '"', '\\', '{', '(', ' ', '\t']);
         if !(operator_text.is_empty() || value_text || word.is_some_and(plain_word)) {
             return None;
         }
@@ -41640,9 +41788,11 @@ fn evaluate_heredoc(
             // (`posix_proven_variable_view`); this source's own commands are
             // judged one level down. So read this source's unknown-name view
             // here, as deny-only whole readings. A name only the parent
-            // shell binds before this source, without exporting it, is unset
-            // in the child (`X=' '; bash <<'EOF'` with
-            // `git${X}reset${X}--hard` runs `gitreset--hard`).
+            // shell binds before this source is unset in the child when
+            // `ChildEnvironmentProof` shows the parent cannot hand it over
+            // (`X=' '; bash <<'EOF'` with `git${X}reset${X}--hard` runs
+            // `gitreset--hard`); a source the parent runs itself (`.
+            // /dev/stdin <<EOF`) fails that proof, so its names are unknown.
             // A value the parent shell substituted into this source is
             // spelled `${DCG_POSIX_VALUE}`, inside the child's single quotes
             // `'"${DCG_POSIX_VALUE}"'`
@@ -41652,6 +41802,7 @@ fn evaluate_heredoc(
             let unknown_name_views = if line_dialect == ShellDialect::Posix {
                 let scope = UnknownNameScope {
                     parent: command.get(..content.byte_range.start).unwrap_or(command),
+                    command,
                     same_shell: "",
                 };
                 match posix_proven_variable_view(&content.content, context.deadline, Some(scope)) {
@@ -46718,6 +46869,50 @@ mod tests {
                 r"bash -c ",
                 &[r"$X reset --hard"][..],
             ),
+            // Unset needs proof: any text that may export it leaves it
+            // unknown, however the export is spelled.
+            (
+                r#""$X" reset --hard"#,
+                r"X=git; builtin export X; bash -c ",
+                &[r"$X reset --hard"][..],
+            ),
+            (
+                r#""$X" reset --hard"#,
+                r#"X=git; export "X"; bash -c "#,
+                &[r"$X reset --hard"][..],
+            ),
+            (
+                r#""$X" reset --hard"#,
+                r"set -ea; X=git; bash -c ",
+                &[r"$X reset --hard"][..],
+            ),
+            (
+                r#""$X" reset --hard"#,
+                r"X=git; E=export; $E X; bash -c ",
+                &[r"$X reset --hard"][..],
+            ),
+            // A source the shell runs itself: no child, no proof.
+            (
+                r#""$X" reset --hard"#,
+                "X=git; . /dev/stdin <<EOF\n",
+                &[r"$X reset --hard"][..],
+            ),
+            // Any plain operator: the bare name, and with the name unset
+            // the assigned default or nothing.
+            (
+                r#""${V:=git}" reset --hard"#,
+                "",
+                &[r"${V} reset --hard", r"git reset --hard"][..],
+            ),
+            (
+                r"'gi'${V:0}'t' reset --hard",
+                "",
+                &[
+                    r"gi t reset --hard",
+                    r"gi${V}t reset --hard",
+                    r"git reset --hard",
+                ][..],
+            ),
         ] {
             assert_eq!(
                 posix_proven_variable_view(
@@ -46725,6 +46920,7 @@ mod tests {
                     None,
                     Some(UnknownNameScope {
                         parent,
+                        command: parent,
                         same_shell: "",
                     }),
                 )
