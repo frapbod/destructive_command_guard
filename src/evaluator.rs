@@ -36554,8 +36554,9 @@ fn resolve_proven_variables_in_segment_with_ifs(
                     // A bare command name that is not the same word bare
                     // (`runner=if; $runner tee "$f"` runs a program named
                     // `if`; `!` and `x=y` likewise) would turn a program into
-                    // grammar: keep the reference.
-                    if command_name && !posix_command_name_is_plain(field) {
+                    // grammar: keep the reference. Inside double quotes the
+                    // splice stays quoted (`"if"`), the same program.
+                    if command_name && !in_double_quote && !posix_command_name_is_plain(field) {
                         rest = keep(&mut out);
                         continue;
                     }
