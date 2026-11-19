@@ -62381,6 +62381,12 @@ mod tests {
                 &["cmd", "/c", "echo", "<(cat>f)$X"][..],
                 "echo <(cat>f)%DCG_POSIX_VALUE%",
             ),
+            // The substitution ends at the `)` the shell matches, not at a
+            // `case` pattern's `)`.
+            (
+                &["cmd", "/c", "echo", "<(case x in x) echo>f;; esac)$X"][..],
+                "echo <(case x in x) echo>f;; esac)%DCG_POSIX_VALUE%",
+            ),
         ] {
             assert_eq!(tail(words).as_deref(), Some(payload), "{words:?}");
         }

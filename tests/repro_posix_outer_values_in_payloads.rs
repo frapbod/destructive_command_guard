@@ -480,6 +480,10 @@ fn process_substitutions_in_a_cmd_payload_are_not_outer_redirections() {
             "cmd /c echo <(cat>f)$X",
             "cmd /c echo 2>(true)$X",
             "cmd /c echo ok>(cat>f)$X",
+            // A `case` pattern's `)` does not end the substitution.
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(case x in x) echo>f;; esac)$X",
+            r#"cmd.exe /c echo <(case x in x) echo>f;; esac)"$HOME""#,
+            "cmd.exe /c echo <(case x in x) echo>f;; esac)$X",
         ],
         &POSIX,
         EvaluationDecision::Deny,

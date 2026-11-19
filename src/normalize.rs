@@ -2470,10 +2470,11 @@ pub(crate) fn posix_word_value_ranges(raw: &str) -> Option<Vec<Range<usize>>> {
 /// receives it as an argument. A `<(…)` / `>(…)` process substitution is
 /// not a redirection: bash puts a path in its place and hands the program
 /// that path plus the rest of the word (`echo x<(true)$X` gives
-/// `x/dev/fd/63` and the value of `X`). A `<` or `>` inside it, or inside
-/// any other parentheses in the word, is not one either. `None` when the
-/// word has none, a parenthesis never closes, or its quoting is
-/// unterminated.
+/// `x/dev/fd/63` and the value of `X`). A `<` or `>` inside it, up to the
+/// `)` the shell matches (read as command text, so a `case` pattern's `)`
+/// does not end it), or inside any other parentheses in the word, is not
+/// one either. `None` when the word has none, a parenthesis never closes,
+/// or its quoting is unterminated.
 pub(crate) fn posix_word_redirection_start(raw: &str) -> Option<usize> {
     posix_word_scan(raw)?.redirection
 }
@@ -2488,6 +2489,8 @@ fn posix_word_scan(raw: &str) -> Option<PosixWordScan> {
     let mut ranges = Vec::new();
     let mut redirection = None;
     let mut parentheses = 0usize;
+    let mut substitution_end = 0usize;
+    let mut unclosed = false;
     let mut double = false;
     let mut index = 0usize;
     while index < bytes.len() {
@@ -2549,17 +2552,20 @@ fn posix_word_scan(raw: &str) -> Option<PosixWordScan> {
                 ranges.push(index..end);
                 index = end;
             }
-            b'<' | b'>' if !double => {
-                if parentheses == 0 && bytes.get(index + 1) != Some(&b'(') {
+            b'<' | b'>' if !double && index >= substitution_end => {
+                if bytes.get(index + 1) == Some(&b'(') {
+                    substitution_end = consume_shell_paren_construct(bytes, index + 2, bytes.len());
+                    unclosed |= substitution_end == bytes.len() && bytes.last() != Some(&b')');
+                } else if parentheses == 0 {
                     redirection.get_or_insert(index);
                 }
                 index += 1;
             }
-            b'(' if !double => {
+            b'(' if !double && index >= substitution_end => {
                 parentheses += 1;
                 index += 1;
             }
-            b')' if !double => {
+            b')' if !double && index >= substitution_end => {
                 parentheses = parentheses.saturating_sub(1);
                 index += 1;
             }
@@ -2568,7 +2574,7 @@ fn posix_word_scan(raw: &str) -> Option<PosixWordScan> {
     }
     (!double).then_some(PosixWordScan {
         values: ranges,
-        redirection: redirection.filter(|_| parentheses == 0),
+        redirection: redirection.filter(|_| parentheses == 0 && !unclosed),
     })
 }
 
