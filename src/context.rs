@@ -3418,10 +3418,35 @@ pub(crate) fn braced_parameter_span(
     closed.then_some(end)
 }
 
+/// [`braced_parameter_span`] that also reports, through `nested`, the end
+/// of each `${` it reads inside the expansion (`None` when that one does not
+/// close). A lookup that starts at one of those finds the same end, so a
+/// caller that looks up many `${` reads each byte once for a run of nested
+/// ones.
+pub(crate) fn braced_parameter_span_with_nested(
+    bytes: &[u8],
+    start: usize,
+    in_double_quotes: bool,
+    nested: impl FnMut(usize, Option<usize>),
+) -> Option<usize> {
+    let (end, _code, closed) =
+        consume_braced_parameter_core_with(bytes, start, in_double_quotes, nested);
+    closed.then_some(end)
+}
+
 fn consume_braced_parameter_core(
     bytes: &[u8],
     start: usize,
     single_quote_is_literal: bool,
+) -> (usize, bool, bool) {
+    consume_braced_parameter_core_with(bytes, start, single_quote_is_literal, |_, _| {})
+}
+
+fn consume_braced_parameter_core_with(
+    bytes: &[u8],
+    start: usize,
+    single_quote_is_literal: bool,
+    mut nested: impl FnMut(usize, Option<usize>),
 ) -> (usize, bool, bool) {
     let len = bytes.len();
     let command = bytes;
@@ -3430,11 +3455,14 @@ fn consume_braced_parameter_core(
 
     let mut i = start + 2;
     let mut depth = 1usize;
+    // The `$` of each nested `${` still open.
+    let mut open: SmallVec<[usize; 8]> = SmallVec::new();
     let mut has_inline_code = false;
     while i < len {
         match bytes[i] {
             b'\\' => i = (i + 2).min(len),
             b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                open.push(i);
                 depth += 1;
                 i += 2;
             }
@@ -3445,6 +3473,9 @@ fn consume_braced_parameter_core(
                 depth -= 1;
                 if depth == 0 {
                     return (i, has_inline_code, true);
+                }
+                if let Some(opener) = open.pop() {
+                    nested(opener, Some(i));
                 }
             }
             b'\'' if single_quote_is_literal => i += 1,
@@ -3486,6 +3517,9 @@ fn consume_braced_parameter_core(
             }
             _ => i += 1,
         }
+    }
+    for opener in open {
+        nested(opener, None);
     }
     (len, has_inline_code, false)
 }
@@ -3634,9 +3668,23 @@ pub(crate) fn heredoc_body_layouts(command: &str) -> SmallVec<[SmallVec<[Heredoc
 /// leaves out only these: text one shell reads as a body may be commands to
 /// another.
 pub(crate) fn undisputed_heredoc_body_ranges(command: &str) -> SmallVec<[Range<usize>; 8]> {
+    undisputed_body_ranges(command, |_| true)
+}
+
+/// [`undisputed_heredoc_body_ranges`] for the bodies whose delimiter is
+/// quoted: raw text in which no shell expands anything.
+pub(crate) fn undisputed_quoted_heredoc_body_ranges(command: &str) -> SmallVec<[Range<usize>; 8]> {
+    undisputed_body_ranges(command, |body| body.quoted)
+}
+
+fn undisputed_body_ranges(
+    command: &str,
+    keep: impl Fn(&HeredocBody) -> bool,
+) -> SmallVec<[Range<usize>; 8]> {
     let ranges = |rules| -> SmallVec<[Range<usize>; 8]> {
         let mut ranges: SmallVec<[Range<usize>; 8]> = heredoc_body_ranges(command, rules)
             .into_iter()
+            .filter(|body| keep(body))
             .map(|body| body.range)
             .collect();
         ranges.sort_by_key(|range| range.start);
@@ -3676,6 +3724,8 @@ pub(crate) struct HeredocBody {
     /// The terminator's lines, when it is a line joined across
     /// backslash-newlines (see [`shell_parse_source`]).
     pub(crate) joined_terminator: Option<Range<usize>>,
+    /// Its delimiter is quoted, so the shell expands nothing in it.
+    pub(crate) quoted: bool,
 }
 
 /// A heredoc whose operator has been read and whose body starts on the line
@@ -3994,6 +4044,7 @@ impl HeredocScanner<'_> {
                     range: body_start..end,
                     top_level,
                     joined_terminator,
+                    quoted: !heredoc.continues_lines,
                 });
             }
             if end >= len {

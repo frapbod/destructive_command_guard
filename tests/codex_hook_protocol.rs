@@ -1030,6 +1030,7 @@ fn bash_parameter_openers_hide_no_later_git_command() {
         ("echo \\$${ git reset --hard; }", "ask"),
         ("echo $$${ git reset --hard; }", "ask"),
         ("echo ${ : # \"\n}; git status\n# \"", "ask"),
+        ("cat <<EOF\n${ git reset --hard; }\nEOF", "ask"),
         ("echo \"${y:-'}\" #'}\"; git reset --hard", "ask"),
         (
             "echo \"${y:-'}\" #'}\" && git push --force origin main",
@@ -1054,6 +1055,7 @@ fn bash_parameter_openers_hide_no_later_git_command() {
         "x=${y:- a} git status",
         "y=1 x=${y:- #} git status",
         "echo ${x:-a b} # git reset --hard",
+        "cat <<'EOF'\n${ git reset --hard; }\nEOF",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

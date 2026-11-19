@@ -6558,11 +6558,15 @@ fn bash_hashes_as_data_within(
 ///
 /// The scan reads the raw bytes without quote context: a `\` escapes the
 /// next byte, and a `\`LF pair (a line continuation) is passed over between
-/// the bytes it tests. So an opener inside single quotes or a heredoc body
-/// counts too, which can only fail closed where the shell runs nothing;
-/// a wrong reading here only adds a reading, as deny wins. Each `${` looks up
-/// its end twice; a command whose lookups would read more than 16 times its
-/// length (plus 4 KiB) is Unread.
+/// the bytes it tests. So an opener inside single quotes counts too, which
+/// can only fail closed where the shell runs nothing; a wrong reading here
+/// only adds a reading, as deny wins. Heredoc bodies with a quoted delimiter
+/// are raw text to every shell and passed over (see
+/// [`crate::context::undisputed_quoted_heredoc_body_ranges`]); an unquoted
+/// body expands `${ …; }` too. Each `${` looks up
+/// its end both ways; a lookup also notes the ends of the `${` nested in it,
+/// so a run of nested ones is read once. A command whose lookups would read
+/// more than 16 times its length (plus 4 KiB) is Unread.
 ///
 /// Length preserving (one ASCII byte for another), so every range in the
 /// view is the same range in `command`.
@@ -6575,9 +6579,21 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
     }
     let next = |at: usize| past_line_continuations(bytes, at);
     let mut budget = 16 * len + 4096;
+    // The end of each `${` looked up so far, read the Bash way and the dash
+    // way; a lookup notes the ends of the `${` nested in it too.
+    let mut ends: [std::collections::HashMap<usize, Option<usize>>; 2] = Default::default();
     let mut spelled: Option<Vec<u8>> = None;
+    let mut bodies = crate::context::undisputed_quoted_heredoc_body_ranges(command).into_iter();
+    let mut body = bodies.next();
     let mut i = 0;
     while i < len {
+        while body.as_ref().is_some_and(|body| body.end <= i) {
+            body = bodies.next();
+        }
+        if let Some(raw) = body.as_ref().filter(|body| body.start <= i) {
+            i = raw.end;
+            continue;
+        }
         match bytes[i] {
             b'\\' => i += 2,
             b'$' => {
@@ -6599,11 +6615,24 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
                             return Some(BashHashReading::Unread);
                         }
                         if after == i + 1 {
-                            let bash = crate::context::braced_parameter_span(bytes, i, false);
-                            let dash = crate::context::braced_parameter_span(bytes, i, true);
-                            let read = bash.unwrap_or(len) + dash.unwrap_or(len) - 2 * i;
-                            match budget.checked_sub(read) {
-                                Some(left) if bash == dash => budget = left,
+                            let mut end = |dash: bool| -> Option<Option<usize>> {
+                                let ends = &mut ends[usize::from(dash)];
+                                if let Some(end) = ends.get(&i) {
+                                    return Some(*end);
+                                }
+                                let end = crate::context::braced_parameter_span_with_nested(
+                                    bytes,
+                                    i,
+                                    dash,
+                                    |opener, end| {
+                                        ends.insert(opener, end);
+                                    },
+                                );
+                                budget = budget.checked_sub(end.unwrap_or(len) - i)?;
+                                Some(end)
+                            };
+                            match (end(false), end(true)) {
+                                (Some(bash), Some(dash)) if bash == dash => {}
                                 _ => return Some(BashHashReading::Unread),
                             }
                         }
@@ -8073,6 +8102,11 @@ mod tests {
             );
         }
         assert_eq!(bash_parameter_openers("echo $$ {x}"), None);
+        // A body with a quoted delimiter is raw text to every shell.
+        assert_eq!(
+            bash_parameter_openers("cat <<'EOF'\n${ git reset --hard; }\nEOF\ngit status"),
+            None
+        );
         assert_eq!(spelled("echo $${x}").as_deref(), Some("echo $$_x}"));
         assert_eq!(bash_parameter_openers("echo \"${y:-'a'}\""), None);
         for command in [
@@ -8089,6 +8123,8 @@ mod tests {
             "echo \"${y:-'}\" #'}\"; git reset --hard",
             "echo \"${y:-'}\" #'}\" && git push --force origin main",
             "echo \"${y#'}\"; git reset --hard; : '}\"",
+            "cat <<EOF\n${ git reset --hard; }\nEOF",
+            "cat <<'EOF'\nEOF\necho ${ git reset --hard; }",
         ] {
             assert_eq!(
                 bash_parameter_openers(command),
@@ -8096,14 +8132,25 @@ mod tests {
                 "{command:?}"
             );
         }
-        // A run of unclosed `${` costs one budget, then has no reading.
-        let unclosed = "echo ${x".repeat(4_000);
-        let started = std::time::Instant::now();
-        assert_eq!(
-            bash_parameter_openers(&unclosed),
-            Some(BashHashReading::Unread)
-        );
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // A run of nested unclosed `${` is read once, and both readings
+        // agree on it; a dispute after it is still found.
+        for body in ["${".repeat(30_000), "echo ${x ".repeat(8_000)] {
+            let started = std::time::Instant::now();
+            let command = format!("cat <<'EOF' > notes.txt\n{body}\nEOF\ngit status");
+            assert_eq!(bash_parameter_openers(&command), None);
+            let command = format!("{body}\necho \"${{y:-'}}\" #'}}\"; git reset --hard");
+            assert_eq!(
+                bash_parameter_openers(&command),
+                Some(BashHashReading::Unread)
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        }
+        // Lookups that share fewer reads stay within the budget's time.
+        for unit in ["'${'", "\"${\"", "x\"${\"'"] {
+            let started = std::time::Instant::now();
+            let _ = bash_parameter_openers(&unit.repeat(8_000));
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        }
     }
 
     /// The spelling of [`bash_hashes_as_data`]; it must read the command.
