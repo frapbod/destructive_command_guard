@@ -639,6 +639,11 @@ const HARMLESS: &[&str] = &[
     "$ExecutionContext.InvokeCommand.@\"\n$(\"InvokeScript\")\n\"@('git status')",
     "[scriptblock]<#c#>::Create('git status').Invoke()",
     "$ExecutionContext.InvokeCommand.\"$(\"InvokeScript\")\"('git status')",
+    // Bareword text that names an engine method is not a member taken as a
+    // value (review round 4; runner p5/w-truth.out).
+    "Write-Output InvokeCommand.InvokeScript",
+    "Write-Output Widget::Create",
+    "Write-Output a.b.InvokeScript; git status",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
