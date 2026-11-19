@@ -13465,7 +13465,7 @@ fn powershell_separator_outside_groups(command: &str, start: usize, separators: 
                     .map_or(bytes.len(), |newline| index + newline);
                 continue;
             }
-            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+            b'<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 index = skip_powershell_block_comment(command, index);
                 continue;
             }
@@ -13697,7 +13697,7 @@ fn skip_powershell_blank_and_comments(text: &str, start: usize) -> usize {
     while let Some(character) = text.get(index..).and_then(|rest| rest.chars().next()) {
         match character {
             '`' if matches!(bytes.get(index + 1), Some(b'\n' | b'\r')) => index += 2,
-            '<' if bytes.get(index + 1) == Some(&b'#') => {
+            '<' if crate::normalize::powershell_block_comment_opens_at(bytes, index) => {
                 index = skip_powershell_block_comment(text, index);
             }
             '#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
