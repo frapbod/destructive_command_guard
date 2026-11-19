@@ -1599,16 +1599,16 @@ fn quoted_arithmetic_substitutions_hide_no_command() {
         "b='['; c=']'; q='$(git reset --hard)'; y=a$b$q$c; echo $((y))",
         "b='['; y=a$b'$(git reset --hard)]'; echo $((y))",
         r#"b='['; q='$(git reset --hard)'; let "a$b$q]""#,
-        r#"y=$'a\x5b$(git reset --hard)]'; echo $((y))"#,
-        r#"y=$'a\133$(git reset --hard)]'; echo $((y))"#,
-        r#"y=$'a\x5b$(git reset --hard)]'; let y"#,
-        r#"y=$'a\x5b$(git reset --hard)\x5d'; echo $((y))"#,
-        r#"y=$'a[\x24\x28git reset --hard\x29]'; x[y]=1"#,
-        r#"y=$'a[\x60git reset --hard\x60]'; x[y]=1"#,
-        r#"y=$'a[\x24\x28git reset --hard\x29]'; let y"#,
-        r#"y=$'a[\x24\x28git reset --hard\x29]'; [[ y -eq 1 ]]"#,
-        r#"x[$'a[\x24\x28git reset --hard\x29]']=1"#,
-        r#"y=$'a[\x24\x28git reset --hard\x29]'; echo $[y]"#,
+        r"y=$'a\x5b$(git reset --hard)]'; echo $((y))",
+        r"y=$'a\133$(git reset --hard)]'; echo $((y))",
+        r"y=$'a\x5b$(git reset --hard)]'; let y",
+        r"y=$'a\x5b$(git reset --hard)\x5d'; echo $((y))",
+        r"y=$'a[\x24\x28git reset --hard\x29]'; x[y]=1",
+        r"y=$'a[\x60git reset --hard\x60]'; x[y]=1",
+        r"y=$'a[\x24\x28git reset --hard\x29]'; let y",
+        r"y=$'a[\x24\x28git reset --hard\x29]'; [[ y -eq 1 ]]",
+        r"x[$'a[\x24\x28git reset --hard\x29]']=1",
+        r"y=$'a[\x24\x28git reset --hard\x29]'; echo $[y]",
         "printf -v y 'a[%s]' '$(git reset --hard)'; echo $((y))",
         "y=$(printf 'a[%s]' '$(git reset --hard)'); echo $((y))",
         "set -- a{'[$(git reset --hard)]',x}; echo $(($1))",
@@ -1618,10 +1618,13 @@ fn quoted_arithmetic_substitutions_hide_no_command() {
         "arr=('[$(git reset --hard)]'); y=a${arr[0]}; echo $((y))",
         r#"y=${x:-"a[\$(git reset --hard)]"}; echo $((y))"#,
         // An escaped substitution in an arithmetic span (Bash 3.2).
-        r#"echo $(( a[\$(git reset --hard)] ))"#,
-        r#"echo $[ a[\$(git reset --hard)] ]"#,
+        r"echo $(( a[\$(git reset --hard)] ))",
+        r"echo $[ a[\$(git reset --hard)] ]",
         r#"echo $(( a["\$(git reset --hard)"] ))"#,
         r#"echo "$(( a[\$(git reset --hard)] ))""#,
+        // An option that makes a builtin evaluate a name, quoted or not.
+        r#"q='$(git reset --hard)'; printf '-v' "a[$q]" x"#,
+        r#"q='$(git reset --hard)'; [ ! -v "a[$q]" ]"#,
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1641,6 +1644,10 @@ fn quoted_arithmetic_substitutions_hide_no_command() {
         r#"q='$(git reset --hard)'; echo "$q""#,
         r#"y=a; y+='$(git reset --hard)'; echo "$y""#,
         "b='['; q='$(git reset --hard)'; echo a$b$q]",
+        // `printf` and `[` without the option that evaluates a name.
+        "printf '%s' '$(git reset --hard)'",
+        "[ -n '$(git reset --hard)' ]",
+        "wait; test -n '$(git reset --hard)'",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

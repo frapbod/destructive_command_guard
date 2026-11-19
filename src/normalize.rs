@@ -8233,17 +8233,38 @@ pub(crate) fn bash_arithmetic_quotes(command: &str) -> Option<BashHashReading> {
 /// evaluates a name or a value as arithmetic, wherever the word is: a sink
 /// of [`bash_arithmetic_quotes`] besides the arithmetic spans. A quote
 /// does not end the word, so quoted data such as `b='['` names none.
+/// `printf`, `test`, `[` and `wait` evaluate a name only through an option
+/// (`printf -v`, `test -v`, `wait -p`), so without it they are no sink:
+/// `printf '%s' '$(git reset --hard)'` prints the text. The option may be
+/// quoted, as the shell removes its quotes.
 fn names_arithmetic_sink(command: &str) -> bool {
-    const SINKS: [&str; 13] = [
-        "let", "declare", "typeset", "local", "export", "readonly", "read", "printf", "test", "[",
-        "[[", "getopts", "wait",
+    const SINKS: [&str; 9] = [
+        "let", "declare", "typeset", "local", "export", "readonly", "read", "[[", "getopts",
     ];
-    command.contains("${!")
-        || command
-            .split(|ch: char| {
-                ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '`')
-            })
-            .any(|word| SINKS.contains(&word))
+    if command.contains("${!") {
+        return true;
+    }
+    let words: Vec<&str> = command
+        .split(|ch: char| {
+            ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '`')
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let unquoted = |word: &str| word.replace(['\'', '"', '\\'], "");
+    words.iter().enumerate().any(|(at, word)| {
+        let later = &words[at + 1..];
+        match *word {
+            "printf" => later
+                .first()
+                .is_some_and(|next| unquoted(next).starts_with("-v")),
+            "test" | "[" => later.iter().any(|next| unquoted(next) == "-v"),
+            "wait" => later.iter().any(|next| {
+                let next = unquoted(next);
+                next.starts_with('-') && next.contains('p')
+            }),
+            word => SINKS.contains(&word),
+        }
+    })
 }
 
 /// Whether the byte before `at` ends a word, so a word starts at `at`.
