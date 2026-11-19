@@ -1488,6 +1488,85 @@ EOF
     }
 }
 
+/// Bash evaluates quoted text again as arithmetic, where an array
+/// reference's subscript is expanded, and Bash 5 reads a `'` in `$((…))` and
+/// the other arithmetic spans as a plain character: each command here runs
+/// `git` in sandboxed bash 3.2, 5.2 or 5.3 (zsh and dash for some), while dcg
+/// read the quoted substitution as data.
+#[test]
+fn quoted_arithmetic_substitutions_hide_no_command() {
+    let payload = |command: &str, codex: bool| {
+        let mut payload = serde_json::json!({
+            "session_id": "sess-arith-quotes",
+            "cwd": "/tmp/test-workdir",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_use_id": "call_arith_quotes",
+        });
+        if codex {
+            payload["turn_id"] = serde_json::json!("turn-arith-quotes");
+        }
+        payload.to_string().into_bytes()
+    };
+    for command in [
+        "x['a[$(git reset --hard)]']=1",
+        "x['a[`git reset --hard`]']=1",
+        r#"x["a[\$(git reset --hard)]"]=1"#,
+        "x[$'a[$(git reset --hard)]']=1",
+        r"x[a\[\$\(git\ reset\ --hard\)\]]=1",
+        "x['$(git reset --hard)']=1",
+        "x['a[$(git reset --hard)]']+=1",
+        "x['1+a[$(git push --force origin main)]']=1",
+        "declare x['a[$(git reset --hard)]']=1",
+        "declare 'x[$(git reset --hard)]=1'",
+        "printf -v 'x[$(git reset --hard)]' %s 1",
+        "read 'x[a[$(git reset --hard)]]' <<< 1",
+        "test -v 'x[a[$(git reset --hard)]]'",
+        "ref='a[$(git reset --hard)]'; echo ${!ref}",
+        "echo $(( '$(git reset --hard)' ))",
+        "echo \"$(( 'a[$(git reset --hard)]' ))\"",
+        "(( '$(git reset --hard)' ))",
+        "for (( i='a[$(git reset --hard)]'; 0; )); do :; done",
+        "echo $[ 'a[$(git reset --hard)]' ]",
+        "let 'y=a[$(git reset --hard)]'",
+        "declare -i y='a[$(git reset --hard)]'",
+        "[[ 'a[$(git reset --hard)]' -eq 1 ]]",
+        "x=abc; echo ${x:'$(git reset --hard)'}",
+        "echo ${x['$(git reset --hard)']}",
+        "y='a[$(git reset --hard)]'; echo $((y))",
+        r#"y="a[\$(git reset --hard)]"; [[ $y -eq 1 ]]"#,
+        "y=a'[$(git reset --hard)]'; x[y]=1",
+        r"y=$'a[\x24(git reset --hard)]'; echo $((y))",
+        "read y <<< 'a[$(git reset --hard)]'; echo $((y))",
+        "set -- 'a[$(git reset --hard)]'; echo $(($1))",
+        "y='a[$(rm -rf ~)]'; echo $((y))",
+        "echo \"$(y='a[$(git reset --hard)]'; echo $((y)))\"",
+        r#"eval "x['a[\$(git reset --hard)]']=1""#,
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(!claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+    for command in [
+        "x['a[$(git status)]']=1",
+        "y='a[$(date)]'; echo $((y))",
+        "echo $(( '$(echo 1)' ))",
+        "y='$(git reset --hard)'; echo $((y))",
+        "echo ${x:-'$(git reset --hard)'}",
+        "x['1']=1; git status",
+        r#"y="a[\$x]"; echo $((y))"#,
+        "(( '1 + 2' ))",
+        "echo $(( 1 + 2 ))",
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+}
+
 #[test]
 fn vscode_copilot_terminal_tool_variants_block_destructive_commands() {
     for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {

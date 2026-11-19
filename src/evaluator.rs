@@ -18120,11 +18120,13 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // a `{` after `$$`, a Bash 5.3 `${ …; }`, and a `'` in a double-quoted
     // `${…}`. The fifth is the same for the blanks Bash reads inside one
     // word in a `$[…]` or an assignment subscript (see
-    // `bash_bracket_words`). The last is the same for a comment that Bash
+    // `bash_bracket_words`). The sixth is the same for a comment that Bash
     // 3.2 reads in a `$((…))` body, or after an escaped blank in a `$(…)`
-    // body (see `bash32_comments`).
+    // body (see `bash32_comments`). The last reads quoted text that Bash
+    // evaluates again as arithmetic with its command substitutions unquoted
+    // (see `bash_arithmetic_quotes`); it alone may change the length.
     let mut bash_spelling: Option<String> = None;
-    for reading_kind in 0..6 {
+    for reading_kind in 0..7 {
         if result.decision != EvaluationDecision::Allow
             || result.bypass_method == Some(BypassMethod::AllowOnce)
             || !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
@@ -18141,7 +18143,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             2 => None,
             3 => crate::normalize::bash_parameter_openers(command),
             4 => crate::normalize::bash_bracket_words(command),
-            _ => crate::normalize::bash32_comments(command),
+            5 => crate::normalize::bash32_comments(command),
+            _ => crate::normalize::bash_arithmetic_quotes(command),
         };
         let Some(reading) = reading else {
             continue;
@@ -18187,14 +18190,23 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         if adopt {
             drop(alternate_scope);
             result = alternate;
-            // The spelling is length preserving: show the command's own text.
-            if let Some(info) = result.pattern_info.as_mut()
-                && let Some(span) = info.matched_span.as_ref()
-                && span.end <= command.len()
-                && command.is_char_boundary(span.start)
-                && command.is_char_boundary(span.end)
-            {
-                info.matched_text_preview = Some(extract_match_preview(command, span));
+            let same_length = !matches!(
+                &reading,
+                crate::normalize::BashHashReading::Spelled(spelled) if spelled.len() != command.len()
+            );
+            // A length-preserving spelling: show the command's own text.
+            if let Some(info) = result.pattern_info.as_mut() {
+                if !same_length {
+                    // A requoted spelling: its offsets are not the command's.
+                    info.matched_span = None;
+                    info.matched_text_preview = None;
+                } else if let Some(span) = info.matched_span.as_ref()
+                    && span.end <= command.len()
+                    && command.is_char_boundary(span.start)
+                    && command.is_char_boundary(span.end)
+                {
+                    info.matched_text_preview = Some(extract_match_preview(command, span));
+                }
             }
         } else {
             alternate_scope.discard();

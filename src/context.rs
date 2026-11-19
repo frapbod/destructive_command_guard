@@ -4011,7 +4011,7 @@ pub(crate) fn shell_parse_source(command: &str) -> Cow<'_, str> {
 /// Index past the `]` closing the `$[…]` arithmetic whose text starts at
 /// `start`, where a `<<` is a shift (bash and zsh), or the input length when
 /// none does: the shell reads on for it and reports a syntax error.
-fn bracket_arithmetic_end(bytes: &[u8], start: usize) -> usize {
+pub(crate) fn bracket_arithmetic_end(bytes: &[u8], start: usize) -> usize {
     let mut depth = 0usize;
     let mut i = start;
     while i < bytes.len() {
