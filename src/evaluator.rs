@@ -69113,7 +69113,11 @@ mod cmd_switch_quote_tests {
     #[test]
     fn switches_after_a_word_that_is_not_a_switch_are_still_read() {
         for (segment, dialect, payload) in [
-            ("cmd foo /c git reset --hard", ShellDialect::PowerShell, "git reset --hard"),
+            (
+                "cmd foo /c git reset --hard",
+                ShellDialect::PowerShell,
+                "git reset --hard",
+            ),
             ("cmd foo /K dir", ShellDialect::PowerShell, "dir"),
             ("cmd /d foo /c ver", ShellDialect::Posix, "ver"),
             ("cmd 2>nul /c dir", ShellDialect::Cmd, "dir"),
