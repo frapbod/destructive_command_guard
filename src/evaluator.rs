@@ -55385,12 +55385,26 @@ mod tests {
         let view = |command: &str| crate::heredoc::shell_function_frame_view(command);
         assert_eq!(
             view("f() { \"$@\"; }; f git reset --hard").as_deref(),
-            Some("f() { \"$@\"; }; ( set -- git reset --hard;  \"$@\"; \n)")
+            Some("f() { \"$@\"; };  ( set -- git reset --hard;  \"$@\"; \n)")
         );
         assert_eq!(
             view("f() ( \"$@\" ); f a").as_deref(),
-            Some("f() ( \"$@\" ); ( set -- a; ( \"$@\" )\n)")
+            Some("f() ( \"$@\" );  ( set -- a; ( \"$@\" )\n)")
         );
+        // A call in a subshell, after `time`, and with assignment words.
+        assert_eq!(
+            view("f() { \"$@\"; }; (f a)").as_deref(),
+            Some("f() { \"$@\"; }; ( ( set -- a;  \"$@\"; \n))")
+        );
+        assert_eq!(
+            view("f() { \"$@\"; }; time -p f a").as_deref(),
+            Some("f() { \"$@\"; };  ( set -- a;  \"$@\"; \n)")
+        );
+        assert_eq!(
+            view("f() { \"$@\"; }; X=1 f a").as_deref(),
+            Some("f() { \"$@\"; };  ( X=1; set -- a;  \"$@\"; \n)")
+        );
+        assert_eq!(view("f() { \"$@\"; }; >/dev/null f a"), None);
         // Not yet defined, defined in a child shell, removed, or no expansion.
         assert_eq!(view("f a; f() { \"$@\"; }"), None);
         assert_eq!(view("( f() { \"$@\"; } ); f a"), None);
