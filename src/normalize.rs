@@ -5335,7 +5335,10 @@ fn mask_powershell_braced_variable_name(
         return len;
     };
     let name = i + 2..end - 1;
-    if bytes[name.clone()].iter().any(|byte| matches!(byte, b'\'' | b'"')) {
+    if bytes[name.clone()]
+        .iter()
+        .any(|byte| matches!(byte, b'\'' | b'"'))
+    {
         masked.get_or_insert_with(|| bytes.to_vec())[name].fill(b'_');
     }
     end
@@ -10630,8 +10633,14 @@ mod tests {
         // A name that holds a quote is spelled `_`, bare or in an
         // expandable string, through the first unescaped `}`.
         for (command, view) in [
-            ("${a'b} = 1; git reset --hard", "${___} = 1; git reset --hard"),
-            ("\"${a\"b}\"; git reset --hard", "\"${___}\"; git reset --hard"),
+            (
+                "${a'b} = 1; git reset --hard",
+                "${___} = 1; git reset --hard",
+            ),
+            (
+                "\"${a\"b}\"; git reset --hard",
+                "\"${___}\"; git reset --hard",
+            ),
             ("${a`}'b}; x", "${_____}; x"),
             ("${x:- it's}; x", "${________}; x"),
             ("$$${a'b}; x", "$$${___}; x"),
