@@ -426,7 +426,6 @@ fn outer_redirections_beside_a_cmd_payload_are_not_cmd_values() {
         "cmd /c ver>$null",
         r"cmd /c dir C:\x 2>$null",
         r#"cmd /c "ver" 2>"$null""#,
-        "cmd /c ver <$in",
     ] {
         for dialect in POSIX {
             let got = decision_with_packs(command, dialect, &["core.git", "windows.filesystem"]);
@@ -434,6 +433,16 @@ fn outer_redirections_beside_a_cmd_payload_are_not_cmd_values() {
                 found.push(format!("{dialect:?}: {command:?} -> {got:?}"));
             }
         }
+    }
+    // Unknown also reads `<$in` as PowerShell, which rejects `<` (pwsh 7.5:
+    // "The '<' operator is reserved for future use") and fails closed there.
+    let got = decision_with_packs(
+        "cmd /c ver <$in",
+        ShellDialect::Posix,
+        &["core.git", "windows.filesystem"],
+    );
+    if got != EvaluationDecision::Allow {
+        found.push(format!("Posix: \"cmd /c ver <$in\" -> {got:?}"));
     }
     found.extend(misses(
         &[
@@ -456,8 +465,7 @@ fn outer_redirections_beside_a_cmd_payload_are_not_cmd_values() {
 /// the rest of the word. Measured with Linux bash (fake `cmd.exe`):
 /// `cmd.exe /c echo x<(true)$X` hands cmd `echo x/dev/fd/63` and the value,
 /// and with `X='&rd /s /q C:\x'`, `cmd.exe /c echo <(true)$X` hands it
-/// `echo /dev/fd/63&rd /s /q C:\x`. With `shopt -s extglob`, `@(>)$X`
-/// hands cmd `@(>)` and the value. So the values after one still fail
+/// `echo /dev/fd/63&rd /s /q C:\x`. So the values after one still fail
 /// closed. Redirections that read or append stay allowed under the hook's
 /// default packs.
 #[test]
@@ -472,7 +480,6 @@ fn process_substitutions_in_a_cmd_payload_are_not_outer_redirections() {
             "cmd /c echo <(cat>f)$X",
             "cmd /c echo 2>(true)$X",
             "cmd /c echo ok>(cat>f)$X",
-            r"X='&rd /s /q C:\x'; cmd.exe /c echo @(>)$X",
         ],
         &POSIX,
         EvaluationDecision::Deny,

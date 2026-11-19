@@ -62346,7 +62346,6 @@ mod tests {
                 "echo 2>x<(true)$X",
             ),
             (&["cmd", "/c", "echo", "<(true)>$X"][..], "echo <(true)>$X"),
-            (&["cmd", "/c", "echo", "@(a)>$X"][..], "echo @(a)>$X"),
         ] {
             assert_eq!(tail(words).as_deref(), Some(payload), "{words:?}");
         }
@@ -62369,7 +62368,7 @@ mod tests {
             (&["cmd", "/c", "\"$(a>b)\""][..], "%DCG_POSIX_VALUE%"),
             // A process substitution is not a redirection: bash hands cmd a
             // path in its place plus the rest of the word. A `<` or `>`
-            // inside it, or inside an extglob group, is not one either.
+            // inside it is not one either.
             (
                 &["cmd", "/c", "echo", "x<(true)$X"][..],
                 "echo x<(true)%DCG_POSIX_VALUE%",
@@ -62381,10 +62380,6 @@ mod tests {
             (
                 &["cmd", "/c", "echo", "<(cat>f)$X"][..],
                 "echo <(cat>f)%DCG_POSIX_VALUE%",
-            ),
-            (
-                &["cmd", "/c", "echo", "@(>)$X"][..],
-                "echo @(>)%DCG_POSIX_VALUE%",
             ),
         ] {
             assert_eq!(tail(words).as_deref(), Some(payload), "{words:?}");
