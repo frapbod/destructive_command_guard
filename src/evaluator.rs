@@ -21022,15 +21022,17 @@ fn posix_command_word_name_scope(
 ///
 /// The proof decides only whether the name's field break is read: an unset
 /// name keeps its bare spelling as well. So a way of exporting that this
-/// does not read (zsh's `setopt ALL_EXPORT`, `env 'X=git'`, a name already
-/// in the environment) loses only the split reading of a value that holds a
-/// blank, never the bare one the packs judge.
+/// does not read (an rc file, a file sourced earlier) loses only the split
+/// reading of a value that holds a blank, never the bare one the packs
+/// judge.
 ///
-/// The texts read are the parent shell's whole text and every command dcg is
-/// evaluating around it, since an enclosing shell may have exported the name
-/// first (`export X=x; bash -c 'X=git; bash -c …'`: the middle shell's `X`
-/// is exported). The environment the outermost command starts with is not
-/// visible here.
+/// A name in dcg's own process environment may be exported: dcg runs in the
+/// agent's environment, which the shell inherits and exports on (`HOME=' '`
+/// then `bash <<EOF` with `git\${HOME}reset\${HOME}--hard`: the child sees
+/// `HOME`). The texts read are the parent shell's whole text and every
+/// command dcg is evaluating around it, since an enclosing shell may have
+/// exported the name first (`export X=x; bash -c 'X=git; bash -c …'`: the
+/// middle shell's `X` is exported).
 ///
 /// A text may export any name ([`posix_text_export_commands`] is `None`)
 /// when it can change what is exported by text this cannot read, or names an
@@ -21057,6 +21059,10 @@ impl<'a> ChildEnvironmentProof<'a> {
     fn may_export(&self, name: &str) -> bool {
         if let Some((_, known)) = self.names.borrow().iter().find(|(seen, _)| seen == name) {
             return *known;
+        }
+        if std::env::var_os(name).is_some() {
+            self.names.borrow_mut().push((name.to_string(), true));
+            return true;
         }
         let texts = self.texts.get_or_init(|| {
             let mut texts: Vec<String> = vec![self.command.to_string()];

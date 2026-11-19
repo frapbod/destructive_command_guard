@@ -14,9 +14,10 @@
 //!   child (`V=x; bash -c 'gi"${V}"t reset --hard'` runs `git`), so the
 //!   child reads it empty as well as bare; one the command may export,
 //!   however spelled, or one a source the parent runs itself reads (`.`,
-//!   `source`), is unknown. The proof of unset only drops the field break,
-//!   so an export it misses (`setopt ALL_EXPORT`, `env 'X=git'`, a name
-//!   already in the environment) still leaves the bare reading.
+//!   `source`), is unknown, and so is a name in dcg's own environment
+//!   (`HOME`), which the shell exports. The proof of unset only drops the
+//!   field break, so an export it cannot see (an rc file) still leaves the
+//!   bare reading.
 //! - ANSI-C and locale quotes (`$'gi'${V}$'t'`) and references that keep
 //!   part of the value (`${V#x}`, `${V/x/}`, `${V:0}`, `${V:=git}`) glue the same way, and the
 //!   command name may follow a subshell's `(`, a function declaration, a
@@ -283,6 +284,10 @@ fn a_name_the_parent_does_not_export_is_unset_in_the_child() {
             r"setopt ALL_EXPORT; X=' '; bash -c 'git${X}reset${X}--hard'",
             r"set -o allexport; X=' '; bash -c 'git${X}reset${X}--hard'",
             r"X=1; env 'X= ' bash -c 'git${X}reset${X}--hard'",
+            // A name in dcg's environment is exported to the child: it keeps
+            // the split (all four shells run `git reset --hard`).
+            r#"HOME=' '; bash -c "git\${HOME}reset\${HOME}--hard $PWD""#,
+            "HOME=' '; bash <<EOF\ngit\\${HOME}reset\\${HOME}--hard $PWD\nEOF",
         ],
         &POSIX,
         EvaluationDecision::Deny,
