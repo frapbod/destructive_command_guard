@@ -595,6 +595,53 @@ fn unnamed_programs_are_judged_as_the_direct_call() {
     );
 }
 
+/// Review round 5: a shell reading of a program dcg cannot name is given
+/// only where that shell's own reader reaches command text (an exact `/c`
+/// or `/k`; `-Command`, a decodable `-EncodedCommand` or a command string),
+/// so it denies only for what the shell would run, never because its
+/// reader failed closed on an installer's switches. A derived program name
+/// is read as the same literal program.
+#[test]
+fn shell_readings_need_the_shell_to_run_code() {
+    assert_everywhere_with(
+        &[
+            "Start-Process \"$env:TEMP\\setup.exe\" -ArgumentList '/configure','config.xml' -Wait",
+            "Start-Process \"$env:TEMP\\setup.exe\" '/configure config.xml'",
+            "Start-Process $setup.FullName -ArgumentList '/configure','C:\\odt\\config.xml' -Wait",
+            "Start-Process \"$env:TEMP\\app-setup.exe\" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS' -Wait",
+            "Start-Process \"$env:TEMP\\app-setup.exe\" -ArgumentList '/SILENT','/COMPONENTS=main' -Wait",
+            "Start-Process $installer.FullName -ArgumentList '/S','/RESTARTAPPLICATIONS'",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '/quiet','/Config','C:\\x.xml'",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '/S','/KEEPSETTINGS'",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '/repair' -Wait",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '/reset'",
+            "Start-Process $exe.FullName -ArgumentList '/R'",
+            "Start-Process \"$env:ProgramFiles\\nodejs\\node.exe\" -ArgumentList '-e','console.log(1)' -NoNewWindow",
+            "Start-Process $node.FullName -ArgumentList '-e','console.log(1)'",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '-ec','production'",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '-enc','utf8','in.txt'",
+            "Start-Process \"$env:ProgramFiles\\App\\app.exe\" -ArgumentList '-s','file.txt'",
+            "Start-Process \"$env:LOCALAPPDATA\\Programs\\app\\app.exe\" -ArgumentList '/k','--verbose'",
+            "Start-Process $exe.FullName -ArgumentList '/S','/C','dir'",
+        ],
+        EvaluationDecision::Allow,
+        &WIDE_PACKS,
+    );
+    assert_everywhere(
+        &[
+            "Start-Process $exe -ArgumentList '-NoProfile','-Command','git reset --hard'",
+            "$x='git reset --hard'; Start-Process $env:ComSpec -ArgumentList '/c',$x",
+            "Start-Process $env:ComSpec '/Q /C git reset --hard'",
+            "Start-Process $ps.FullName -ArgumentList '-EncodedCommand','ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA='",
+            "Start-Process ('git ')?.Trim() reset,--hard",
+            "Start-Process (' git')?.Trim() reset,--hard",
+            "Start-Process ('C:\\Program Files\\Git\\cmd\\git.exe')?.Trim() reset,--hard",
+            "Start-Process ('C:\\Program Files\\Git\\cmd\\git.exe').Trim() -ArgumentList 'reset','--hard'",
+        ],
+        EvaluationDecision::Deny,
+    );
+}
+
 /// Review round 4: PowerShell 7.5 reads a dash word whose name is followed
 /// directly by a quote as one plain word (`-r'f x'` reached rm as `-rf x`
 /// and `-C'. reset --hard'` reached git as `-C. reset --hard`), not as a

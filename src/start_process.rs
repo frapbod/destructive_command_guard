@@ -1173,8 +1173,9 @@ fn is_computed_program(text: &str, value: &Value) -> bool {
 }
 
 /// A program name taken from the literal parts of a program dcg cannot
-/// read whole: the one string a member access or index applies to
-/// (`('git')?.Trim()` names `git`), or the last path part of an
+/// read whole: the one string a member access or index applies to, blanks
+/// around it trimmed (`('git ')?.Trim()` names `git`,
+/// `('C:\Program Files\Git\cmd\git.exe').Trim()` that path), or the last path part of an
 /// expandable string or word (`"$env:ProgramFiles\Git\cmd\git.exe"` names
 /// `git.exe`).
 fn derived_program(text: &str, value: &Value) -> Option<String> {
@@ -1186,10 +1187,10 @@ fn derived_program(text: &str, value: &Value) -> Option<String> {
     };
     let raw = text.get(element.clone())?.trim();
     if let Some(strings) = derived_strings(raw) {
+        // Read as the same literal program (a path with blanks included);
+        // `.Trim()` and the like make surrounding blanks likely to go.
         return match strings.as_slice() {
-            [name] if !name.is_empty() && !name.chars().any(char::is_whitespace) => {
-                Some(name.clone())
-            }
+            [name] if !name.trim().is_empty() => Some(name.trim().to_string()),
             _ => None,
         };
     }
@@ -1206,33 +1207,19 @@ fn derived_program(text: &str, value: &Value) -> Option<String> {
     .then(|| tail.to_string())
 }
 
-/// Whether a line, as cmd.exe reads it, runs a command: only `/C`, `/K`
-/// and `/R` take command text (`/S/C` is two switches). Any word with
-/// such a switch counts, wherever it stands.
-fn cmd_runs_command(argv: &[String]) -> bool {
-    argv.iter().any(|word| {
-        word.starts_with('/')
-            && word.split('/').skip(1).any(|switch| {
-                switch
-                    .chars()
-                    .next()
-                    .is_some_and(|first| matches!(first.to_ascii_lowercase(), 'c' | 'k' | 'r'))
-            })
-    })
-}
-
 /// The lines of a call whose program dcg cannot name (a variable, an
 /// expression, an expandable string).
 ///
-/// - It may be a shell, when the line invokes that shell's command reader
-///   by the shell's own rules: cmd with `/C`, `/K` or `/R`; PowerShell with
-///   `-Command`, `-EncodedCommand` or a command string
+/// - It may be a shell, when that shell's own reader reaches its command
+///   text: cmd at an exact `/C` or `/K` past switches that run nothing
+///   ([`crate::evaluator::cmd_host_may_run_inline`]); PowerShell at
+///   `-Command`, an `-EncodedCommand` that decodes, or a command string
 ///   ([`crate::evaluator::powershell_host_may_run_inline`]); sh always
 ///   (its reading allows a script name or an option it does not know).
-///   A cmd or PowerShell switch
-///   reading fails closed on options it does not know, so reading every
-///   line as every shell would deny `Start-Process $exe -ArgumentList '/S'`
-///   and other installs that the same direct call allows.
+///   The cmd and PowerShell readers fail closed on a switch they do not
+///   know, so a reading given past one would deny an install
+///   (`'/S'`, `'/configure'`, `'-e','console.log(1)'`) because of its
+///   argv, not because of code a shell runs; the same direct call allows.
 /// - A program computed by an expression is read as the same program
 ///   called directly, as written (`Start-Process $i.FullName '/S'` as
 ///   `& $i.FullName /S`): never stricter than the direct call, and as
@@ -1248,7 +1235,7 @@ fn unnamed_program_lines(text: &str, program: &Value, arguments: &Value) -> Vec<
             continue;
         };
         let invokes = match shell {
-            "cmd" => cmd_runs_command(&windows_argv(&joined)),
+            "cmd" => crate::evaluator::cmd_host_may_run_inline(&windows_argv(&joined)),
             "powershell" => {
                 crate::evaluator::powershell_host_may_run_inline(&windows_argv(&joined), |word| {
                     word.contains(DYNAMIC_ARGUMENT)
@@ -2003,6 +1990,28 @@ mod tests {
                 "{spelling:?}"
             );
         }
+        // A derived name is read as the same literal program: blanks
+        // around it trimmed, a path with blanks kept whole.
+        for spelling in [
+            "Start-Process ('git ')?.Trim() reset,--hard",
+            "Start-Process (' git')?.Trim() reset,--hard",
+        ] {
+            assert!(
+                lines(spelling).contains(&"& git reset --hard".to_string()),
+                "{spelling:?}"
+            );
+        }
+        for spelling in [
+            "Start-Process ('C:\\Program Files\\Git\\cmd\\git.exe')?.Trim() reset,--hard",
+            "Start-Process ('C:\\Program Files\\Git\\cmd\\git.exe').Trim() -ArgumentList 'reset','--hard'",
+        ] {
+            assert!(
+                lines(spelling)
+                    .contains(&"& 'C:\\Program Files\\Git\\cmd\\git.exe' reset --hard".to_string()),
+                "{spelling:?}: {:?}",
+                lines(spelling)
+            );
+        }
         assert_eq!(
             lines(
                 "Start-Process \"$env:ProgramFiles\\Git\\cmd\\git.exe\" -ArgumentList 'reset','--hard'"
@@ -2072,17 +2081,63 @@ mod tests {
         );
     }
 
-    /// A cmd.exe line runs a command only after `/C`, `/K` or `/R`.
+    /// A cmd.exe line runs a command only at an exact `/C` or `/K` reached
+    /// past switches that run nothing; a PowerShell line only at `-Command`,
+    /// a decodable `-EncodedCommand` or a 5.1 command string.
     #[test]
-    fn cmd_command_switches() {
+    fn shell_command_gates() {
         let argv = |line: &str| windows_argv(line);
-        assert!(cmd_runs_command(&argv("/c git reset --hard")));
-        assert!(cmd_runs_command(&argv("/S /K dir")));
-        assert!(cmd_runs_command(&argv("/s/c dir")));
-        assert!(cmd_runs_command(&argv("/R dir")));
-        assert!(!cmd_runs_command(&argv("/S /D=C:\\Tools")));
-        assert!(!cmd_runs_command(&argv("/quiet /norestart")));
-        assert!(!cmd_runs_command(&argv("--install -c x")));
+        let cmd = |line: &str| crate::evaluator::cmd_host_may_run_inline(&argv(line));
+        assert!(cmd("/c git reset --hard"));
+        assert!(cmd("/S /K dir"));
+        assert!(cmd("/Q /C git reset --hard"));
+        assert!(cmd("/d /e:on /v:off /c dir"));
+        for line in [
+            "/S /D=C:\\Tools",
+            "/quiet /norestart",
+            "--install -c x",
+            "/configure config.xml",
+            "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+            "/SILENT /COMPONENTS=main",
+            "/S /RESTARTAPPLICATIONS",
+            "/quiet /Config C:\\x.xml",
+            "/S /KEEPSETTINGS",
+            "/repair",
+            "/reset",
+            "/R",
+            "/s/c dir",
+            "/d %DCG_START_PROCESS_ARGUMENT%",
+            "",
+        ] {
+            assert!(!cmd(line), "{line:?}");
+        }
+        let unknown = |word: &str| word.contains(DYNAMIC_ARGUMENT);
+        let ps =
+            |line: &str| crate::evaluator::powershell_host_may_run_inline(&argv(line), unknown);
+        assert!(ps("-NoProfile -Command git"));
+        assert!(ps("-c print(1)"));
+        assert!(ps("-EncodedCommand ZwBpAHQAIABzAHQAYQB0AHUAcwA="));
+        assert!(ps("-enc DCG_START_PROCESS_ARGUMENT"));
+        assert!(ps("git reset --hard"));
+        for line in [
+            "-e console.log(1)",
+            "-ec production",
+            "-enc utf8 in.txt",
+            "-EncodedCommand",
+            "-s",
+            "-s file.txt",
+            "-imp file.txt",
+            "-ImportSystemModules -c git",
+            "/S /C dir",
+            "/S",
+            "--install",
+            "-y",
+            "-p 8080",
+            "-File build.ps1",
+            "DCG_START_PROCESS_ARGUMENT",
+        ] {
+            assert!(!ps(line), "{line:?}");
+        }
     }
 
     /// Measured with PowerShell 7.5: a quote right after a parameter name
