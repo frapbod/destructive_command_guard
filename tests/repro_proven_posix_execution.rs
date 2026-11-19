@@ -245,3 +245,67 @@ fn proven_plain_argument_values_are_judged() {
         ],
     );
 }
+
+/// Implementation review of PR #15: a positional change that is prefixed,
+/// quoted, conditional or in a loop around the use proves nothing, so the
+/// unknown command word is judged as on the base. Each row runs Git in Bash.
+#[test]
+fn unread_positional_changes_leave_parameters_unknown() {
+    assert_both(
+        "deny",
+        &[
+            r#"set -- ls; builtin set -- git; "$1" reset --hard"#,
+            r#"set -- ls; command set -- git; "$1" reset --hard"#,
+            r#"set -- ls; \set -- git; "$1" reset --hard"#,
+            r#"set -- ls; 'set' -- git; "$1" reset --hard"#,
+            r#"set -- ls; X=1 set -- git; "$1" reset --hard"#,
+            r#"set -- ls; >/dev/null set -- git; "$1" reset --hard"#,
+            r#"set -- ls; command eval "set -- git"; "$1" reset --hard"#,
+            r#"set -- ls; builtin eval "set -- git"; "$1" reset --hard"#,
+            r#"set -- ls; builtin source ./x; "$1" reset --hard"#,
+            r#"set -- git; [ -n "$Y" ] && set -- ls; "$1" reset --hard"#,
+            r#"set -- git; if [ -n "$Y" ]; then set -- ls; fi; "$1" reset --hard"#,
+            r#"set -- git; case "$Y" in a) set -- ls;; esac; "$1" reset --hard"#,
+            r#"set -- git; while false; do set -- ls; done; "$1" reset --hard"#,
+            r#"set -- git; for i in $Y; do set -- ls; done; "$1" reset --hard"#,
+            r#"set -- x git; [ -n "$Y" ] && shift; "$2" reset --hard"#,
+            r#"set -- x x git; for i in 1 2; do shift; done; "$1" reset --hard"#,
+            r#"set -- ls git; for i in 1 2; do "$1" reset --hard; shift; done"#,
+            r#"set -- ls; for i in 1 2; do "$1" reset --hard; set -- git; done"#,
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"set -- git; set -- ls; "$1" reset --hard"#,
+            r#"set -- git; { set -- ls; }; "$1" reset --hard"#,
+            r#"set -- ls; for i in 1 2; do "$1" -la; done"#,
+        ],
+    );
+}
+
+/// Call sites from the same review: a call in a subshell, after `time` or
+/// with assignment words runs the body, and `cmd="$*"` copies the joined
+/// parameters.
+#[test]
+fn calls_in_subshells_after_time_and_with_assignments_are_judged() {
+    assert_both(
+        "deny",
+        &[
+            r#"f() { "$@"; }; (f git reset --hard)"#,
+            r#"f() { "$@"; }; time f git reset --hard"#,
+            r#"f() { "$@"; }; X=1 f git reset --hard"#,
+            r#"f() { local cmd="$*"; $cmd; }; f git reset --hard"#,
+            r#"run() { cmd="$*"; $cmd; }; run git reset --hard"#,
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            r#"f() { "$@"; }; (f ls -la)"#,
+            r#"f() { "$@"; }; time f make"#,
+            r#"f() { "$@"; }; X=1 f ls"#,
+            r#"f() { local cmd="$*"; $cmd; }; f ls -la"#,
+        ],
+    );
+}

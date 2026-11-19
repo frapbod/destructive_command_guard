@@ -35586,10 +35586,13 @@ fn posix_set_positional_words<'a, 'w>(words: &'w [&'a str]) -> PositionalSet<'a,
 /// parameters, before any `set`, are unknown. That includes a function body,
 /// whose parameters are its call's words: [`crate::heredoc::shell_function_frame_view`]
 /// spells each call as `( set -- WORDS; BODY )` so this proof reads them.
-/// A `set` or `shift` in a child shell does not reach `point`; one in a
-/// branch is a value the shell may hold, as with variables. After `eval`,
-/// `source`, `.` or a `set`/`shift` it cannot read, they are unknown until
-/// the next `set`.
+/// A `set` or `shift` in a child shell does not reach `point`. One is read
+/// only when it runs once, every time, before `point`: spelled plainly
+/// ([`crate::heredoc::shell_positional_events`]), outside any branch, and
+/// not in a loop that also runs `point`. Any other change (one that may not
+/// run or may run again, `eval`, `source`, `.`, a prefixed or computed
+/// command word) leaves them unknown until the next such `set`, and a
+/// change after `point` in a loop around it leaves them unknown there.
 ///
 /// Each word is read where the `set` ran: a literal, a copy of a parameter
 /// of the frame before it (`set -- "$@"`, up to `copy_depth` frames), or a
@@ -35601,8 +35604,6 @@ fn positional_fields_at(
     point: usize,
     copy_depth: usize,
 ) -> Option<Vec<PositionalField>> {
-    let index = deny_only_segment_index(source, segment_ranges);
-    let scopes = index.scopes()?;
     let definitions = crate::heredoc::shell_function_definitions(source);
     let frame = |offset: usize| {
         definitions
@@ -35611,37 +35612,46 @@ fn positional_fields_at(
             .min_by_key(|definition| definition.len())
     };
     let use_frame = frame(point);
+    let events = crate::heredoc::shell_positional_events(source)?;
     // (where the binding `set` starts, its words)
     let mut bound: Option<(usize, Vec<&str>)> = None;
-    for (range, steps) in &scopes.statements {
-        if range.start >= point {
-            break;
-        }
-        if range.end > point {
-            continue;
-        }
-        let text = source.get(range.clone())?.trim();
-        let first = text
-            .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
-            .next()
-            .unwrap_or_default();
-        if !matches!(first, "set" | "shift" | "eval" | "source" | ".")
+    for event in &events {
+        let range = &event.range;
+        if range.contains(&point)
             || frame(range.start) != use_frame
-            || crate::heredoc::shell_scope_at(steps, point) == crate::heredoc::ShellScope::Child
+            || crate::heredoc::shell_scope_at(&event.steps, point)
+                == crate::heredoc::ShellScope::Child
         {
             continue;
         }
         if deny_only_deadline_exceeded() {
             return None;
         }
+        let repeats = crate::heredoc::shell_scope_repeats_around(&event.steps, point);
+        if range.start >= point {
+            // A change later in a loop that runs `point` again reaches it
+            // on the next pass.
+            if repeats {
+                return None;
+            }
+            continue;
+        }
+        // Only a change that runs once, every time, before `point` is read;
+        // any other leaves the parameters unknown until the next such `set`.
+        let once = !repeats
+            && crate::heredoc::shell_scope_at(&event.steps, point)
+                == crate::heredoc::ShellScope::Always;
+        let text = source.get(range.clone())?.trim();
         let words = split_assignment_words(text);
-        match (first, words.as_deref()) {
-            ("set", Some(words)) => match posix_set_positional_words(words) {
-                PositionalSet::Bind(set) => bound = Some((range.start, set.to_vec())),
-                PositionalSet::Unchanged => {}
-                PositionalSet::Unknown => bound = None,
-            },
-            ("shift", Some([_, count @ ..])) => {
+        match (event.change, words.as_deref()) {
+            (crate::heredoc::PositionalChange::Set, Some(words)) if once => {
+                match posix_set_positional_words(words) {
+                    PositionalSet::Bind(set) => bound = Some((range.start, set.to_vec())),
+                    PositionalSet::Unchanged => {}
+                    PositionalSet::Unknown => bound = None,
+                }
+            }
+            (crate::heredoc::PositionalChange::Shift, Some([_, count @ ..])) if once => {
                 let count = match count {
                     [] => 1,
                     [count] => match count.parse::<usize>() {
@@ -35947,6 +35957,40 @@ fn deny_only_assignment_value(
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
         .unwrap_or(raw);
+    // `a="$*"` joins the parameters on the first IFS character.
+    if raw.starts_with('"')
+        && let Some((
+            PositionalReference::All {
+                star: true,
+                from,
+                count,
+            },
+            _,
+            consumed,
+        )) = positional_reference_at(token)
+        && consumed == token.len()
+    {
+        let ifs = deny_only_value_at(
+            source,
+            segment_ranges,
+            assignment_start,
+            earlier_words,
+            "IFS",
+            copy_depth - 1,
+        )?;
+        let separator = ifs.chars().next().map(String::from).unwrap_or_default();
+        let values =
+            positional_fields_at(source, segment_ranges, assignment_start, copy_depth - 1)?
+                .into_iter()
+                .skip(from - 1)
+                .take(count.unwrap_or(usize::MAX))
+                .map(|field| match field {
+                    PositionalField::Literal(value) => Some(value),
+                    PositionalField::Word(_) => None,
+                })
+                .collect::<Option<Vec<String>>>()?;
+        return Some(values.join(&separator));
+    }
     // `a=$1` copies a positional parameter.
     if let Some((PositionalReference::One(_), name, consumed)) = positional_reference_at(token)
         && consumed == token.len()
@@ -55219,6 +55263,73 @@ mod tests {
             ("x=--hard; echo \"$x\"", false),
             ("f() { trap \"$1\" EXIT; }; f 'git reset --hard'", true),
             ("msg='git reset --hard'; git commit -m \"$msg\"", false),
+            // A positional change that is prefixed, quoted, conditional or
+            // looped leaves the parameters unknown, as on the base.
+            ("set -- ls; builtin set -- git; \"$1\" reset --hard", true),
+            ("set -- ls; command set -- git; \"$1\" reset --hard", true),
+            ("set -- ls; \\set -- git; \"$1\" reset --hard", true),
+            ("set -- ls; 'set' -- git; \"$1\" reset --hard", true),
+            ("set -- ls; X=1 set -- git; \"$1\" reset --hard", true),
+            (
+                "set -- ls; >/dev/null set -- git; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- ls; command eval \"set -- git\"; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- ls; builtin eval \"set -- git\"; \"$1\" reset --hard",
+                true,
+            ),
+            ("set -- ls; builtin source ./x; \"$1\" reset --hard", true),
+            (
+                "set -- git; [ -n \"$Y\" ] && set -- ls; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- git; if [ -n \"$Y\" ]; then set -- ls; fi; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- git; case \"$Y\" in a) set -- ls;; esac; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- git; while false; do set -- ls; done; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- git; for i in $Y; do set -- ls; done; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- x git; [ -n \"$Y\" ] && shift; \"$2\" reset --hard",
+                true,
+            ),
+            (
+                "set -- x x git; for i in 1 2; do shift; done; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- ls git; for i in 1 2; do \"$1\" reset --hard; shift; done",
+                true,
+            ),
+            (
+                "set -- ls; for i in 1 2; do \"$1\" reset --hard; set -- git; done",
+                true,
+            ),
+            ("set -- git; set -- ls; \"$1\" reset --hard", false),
+            ("set -- git; { set -- ls; }; \"$1\" reset --hard", false),
+            // Calls in a subshell, after `time`, with assignment words, and
+            // a `"$*"` copy.
+            ("f() { \"$@\"; }; (f git reset --hard)", true),
+            ("f() { \"$@\"; }; time f git reset --hard", true),
+            ("f() { \"$@\"; }; X=1 f git reset --hard", true),
+            ("f() { local cmd=\"$*\"; $cmd; }; f git reset --hard", true),
+            ("f() { \"$@\"; }; (f ls -la)", false),
+            ("f() { \"$@\"; }; X=1 f ls", false),
+            ("f() { local cmd=\"$*\"; $cmd; }; f ls -la", false),
         ];
         // A plain value is spliced only where the segment ends fully literal;
         // beside a word that stays unresolved the first view keeps the role.

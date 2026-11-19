@@ -9189,6 +9189,11 @@ pub(crate) enum ShellScope {
 pub(crate) struct ShellScopeStep {
     range: std::ops::Range<usize>,
     scope: ShellScope,
+    /// A loop: what it covers may run again after a later point in it.
+    repeats: bool,
+    /// A child shell or a function body: it starts its own positional
+    /// parameters, and a loop around it does not carry them over.
+    frame: bool,
 }
 
 /// The constructs around `node`, innermost first.
@@ -9202,9 +9207,12 @@ fn shell_scope_steps<D: ast_grep_core::Doc>(
             steps.push(ShellScopeStep {
                 range: current.range(),
                 scope: ShellScope::Child,
+                repeats: false,
+                frame: true,
             });
         }
-        let step = match parent.kind().as_ref() {
+        let parent_kind = parent.kind();
+        let step = match parent_kind.as_ref() {
             "program" => break,
             "compound_statement" => None,
             "redirected_statement"
@@ -9229,7 +9237,15 @@ fn shell_scope_steps<D: ast_grep_core::Doc>(
             _ => Some((parent.range(), ShellScope::Conditional)),
         };
         if let Some((range, scope)) = step {
-            steps.push(ShellScopeStep { range, scope });
+            steps.push(ShellScopeStep {
+                range,
+                scope,
+                repeats: matches!(
+                    parent_kind.as_ref(),
+                    "for_statement" | "c_style_for_statement" | "while_statement"
+                ),
+                frame: scope == ShellScope::Child || parent_kind.as_ref() == "function_definition",
+            });
         }
         current = parent;
     }
@@ -9248,6 +9264,22 @@ pub(crate) fn shell_scope_at(steps: &[ShellScopeStep], point: usize) -> ShellSco
         }
     }
     scope
+}
+
+/// Whether a statement with constructs `steps` sits in a loop that also
+/// runs `point` and may run the statement again after it, in the same
+/// shell and function frame: the innermost construct both share that is a
+/// loop or a frame decides.
+pub(crate) fn shell_scope_repeats_around(steps: &[ShellScopeStep], point: usize) -> bool {
+    for step in steps.iter().filter(|step| step.range.contains(&point)) {
+        if step.frame {
+            return false;
+        }
+        if step.repeats {
+            return true;
+        }
+    }
+    false
 }
 
 /// The statements of a POSIX command, for the deny-only proofs.
@@ -9519,6 +9551,125 @@ pub(crate) fn shell_function_definitions(command: &str) -> Vec<std::ops::Range<u
         .unwrap_or_default()
 }
 
+/// How a statement may change the positional parameters of its shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PositionalChange {
+    /// `set`, spelled plainly as the statement's first word: the caller
+    /// reads its words.
+    Set,
+    /// `shift`, spelled plainly as the statement's first word.
+    Shift,
+    /// A change not read here: `set` or `shift` behind quoting or a prefix
+    /// (assignment or redirection words, `builtin`, `command`, `time`),
+    /// `eval`, `source`, `.`, a computed command word, or words that cannot
+    /// be read.
+    Unknown,
+}
+
+/// A statement that may change the positional parameters, for the
+/// deny-only positional proof.
+pub(crate) struct PositionalEvent {
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) steps: Vec<ShellScopeStep>,
+    pub(crate) change: PositionalChange,
+}
+
+/// The command word that runs in a simple command's dequoted `tokens`,
+/// after the words that only prefix it: assignments, redirections, and
+/// `builtin`, `command` and `time` with their options. `None` when it runs
+/// nothing (`command -v`) or has no command word.
+fn positional_command_word(tokens: &[String]) -> Option<(usize, &str)> {
+    let mut index = 0;
+    while let Some(word) = tokens.get(index).map(String::as_str) {
+        let operator = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
+        let operator_len = [
+            "&>>", "<<<", "<<-", ">>", ">&", ">|", "<<", "<>", "<&", "&>", ">", "<",
+        ]
+        .iter()
+        .find(|op| operator.starts_with(**op))
+        .map(|op| op.len());
+        if let Some(len) = operator_len {
+            // `> file` names its target in the next word.
+            index += if operator.len() == len { 2 } else { 1 };
+            continue;
+        }
+        if is_shell_env_assignment(word) {
+            index += 1;
+            continue;
+        }
+        match word {
+            "command" | "builtin" | "time" => {
+                index += 1;
+                while let Some(option) = tokens.get(index).map(String::as_str) {
+                    match option {
+                        "-v" | "-V" if word == "command" => return None,
+                        "-p" | "--" => index += 1,
+                        _ => break,
+                    }
+                }
+            }
+            _ => return Some((index, word)),
+        }
+    }
+    None
+}
+
+/// What running the command word `word` may do to the positional
+/// parameters, before reading how it is spelled.
+fn positional_change_of_word(word: &str) -> Option<PositionalChange> {
+    match word {
+        "set" => Some(PositionalChange::Set),
+        "shift" => Some(PositionalChange::Shift),
+        "eval" | "source" | "." => Some(PositionalChange::Unknown),
+        _ if word.contains(['$', '`']) => Some(PositionalChange::Unknown),
+        _ => None,
+    }
+}
+
+/// The statements of `command` that may change positional parameters, in
+/// source order, or `None` when the parser could not read all of it. A
+/// `set` or `shift` is [`PositionalChange::Set`] or
+/// [`PositionalChange::Shift`] only when its own unquoted name starts the
+/// statement; any other spelling that runs it is
+/// [`PositionalChange::Unknown`].
+pub(crate) fn shell_positional_events(command: &str) -> Option<Vec<PositionalEvent>> {
+    let events = shell_shadow_events(command);
+    let events = events.as_ref().as_ref()?;
+    let mut out = Vec::new();
+    for event in events {
+        let change = match &event.kind {
+            ShadowEventKind::Unreadable => PositionalChange::Unknown,
+            ShadowEventKind::Words(tokens) => {
+                let Some((index, word)) = positional_command_word(tokens) else {
+                    continue;
+                };
+                let Some(change) = positional_change_of_word(word) else {
+                    continue;
+                };
+                let text = command.get(event.range.clone())?;
+                let plain = index == 0
+                    && text.strip_prefix(word).is_some_and(|rest| {
+                        rest.chars()
+                            .next()
+                            .is_none_or(|ch| ch.is_ascii_whitespace() || ch == ';')
+                    });
+                if plain {
+                    change
+                } else {
+                    PositionalChange::Unknown
+                }
+            }
+            _ => continue,
+        };
+        out.push(PositionalEvent {
+            range: event.range.clone(),
+            steps: event.steps.clone(),
+            change,
+        });
+    }
+    Some(out)
+}
+
 /// `command` with each call of a function it defines replaced by the body
 /// that call runs, in a frame that binds the call's words as positional
 /// parameters: `f() { "$@"; }; f git reset --hard` reads as
@@ -9531,9 +9682,10 @@ pub(crate) fn shell_function_definitions(command: &str) -> Vec<std::ops::Range<u
 /// when its function does, and the frame for that call replaces it on the
 /// next reading. The call's words are taken as written, before any data
 /// masking of the command name (`echo() { "$@"; }; echo git reset --hard`).
-/// A call with assignment words, a body with no expansion and a definition
-/// the call cannot see (after it, in a child shell, removed) are left
-/// alone. `None` when nothing was replaced or the parse is incomplete.
+/// A call's assignment words (`X=1 f ARGS`) run first in the frame, and
+/// `time [-p] f ARGS` reads as the call it times. A call with a redirection
+/// before its name, a body with no expansion and a definition the call
+/// cannot see (after it, in a child shell, removed) are left alone. `None` when nothing was replaced or the parse is incomplete.
 pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
     if !command.contains('$') || !(command.contains("()") || command.contains("function")) {
         return None;
@@ -9564,12 +9716,50 @@ pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
         let Some(name) = node.field("name") else {
             continue;
         };
-        let name_range = name.range();
-        let name_text = name.text();
-        if name_range.start != call.start || !is_static_shell_name(name_text.as_ref()) {
+        // Assignment words before the name are in force while the body runs.
+        let mut prefix = String::new();
+        for child in node.children() {
+            if child.range().start >= name.range().start {
+                break;
+            }
+            match child.kind().as_ref() {
+                "variable_assignment" => {
+                    prefix.push_str(child.text().as_ref());
+                    prefix.push_str("; ");
+                }
+                _ if child.is_named() => {
+                    prefix.clear();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let mut name_range = name.range();
+        let mut name_text = name.text().into_owned();
+        if name_range.start != call.start && prefix.is_empty() {
             continue;
         }
-        let Some(body) = shell_function_body_before(command, call.start, name_text.as_ref()) else {
+        // `time [-p] f ARGS` runs the function `f`.
+        if name_text == "time" {
+            let rest = command.get(name_range.end..call.end)?;
+            let mut words = rest
+                .split_ascii_whitespace()
+                .map(|word| (word.as_ptr() as usize - rest.as_ptr() as usize, word));
+            let mut word = words.next();
+            if word.is_some_and(|(_, word)| word == "-p") {
+                word = words.next();
+            }
+            let Some((offset, word)) = word else {
+                continue;
+            };
+            let start = name_range.end + offset;
+            name_range = start..start + word.len();
+            name_text = word.to_string();
+        }
+        if !is_static_shell_name(&name_text) {
+            continue;
+        }
+        let Some(body) = shell_function_body_before(command, call.start, &name_text) else {
             continue;
         };
         let body = command.get(body)?;
@@ -9581,7 +9771,8 @@ pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
             .and_then(|inner| inner.strip_suffix('}'))
             .unwrap_or(body);
         let arguments = command.get(name_range.end..call.end)?;
-        frames.push((call, format!("( set --{arguments}; {body}\n)")));
+        // A space keeps `(` after `(` or `$(` from reading as `((`.
+        frames.push((call, format!(" ( {prefix}set --{arguments}; {body}\n)")));
     }
     if frames.is_empty() {
         return None;
@@ -9660,8 +9851,9 @@ fn read_shell_shadow_events(command: &str) -> Option<Vec<ShadowEvent>> {
             "command" | "declaration_command" | "unset_command" => {
                 match shell_words::split(text.as_ref()) {
                     Ok(tokens) => {
-                        let relevant =
-                            effective_shell_command(&tokens).is_some_and(|(_, command)| {
+                        let relevant = positional_command_word(&tokens)
+                            .is_some_and(|(_, word)| positional_change_of_word(word).is_some())
+                            || effective_shell_command(&tokens).is_some_and(|(_, command)| {
                                 shell_word_has_runtime_expansion(command)
                                     || matches!(
                                         command,
