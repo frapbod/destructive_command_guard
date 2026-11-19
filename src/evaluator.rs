@@ -21037,6 +21037,14 @@ fn posix_proven_view(
         let Some(resolved) = resolved else {
             continue;
         };
+        // A plain value spliced beside a word that stays unresolved
+        // (`cp "$unknown" "$f"`, `runner='x=y'; $runner tee "$f"`) is judged
+        // by literal rules that fail closed on that word, while the first
+        // view's variable-aware analyses know its role. This view adds a
+        // candidate only where the splice leaves the segment fully literal.
+        if arguments && posix_text_has_live_expansion(&resolved) {
+            continue;
+        }
         let program = hazard_first_word(&resolved).into_owned();
         spliced.push((start, end, resolved, program));
         copied = end;
@@ -35488,6 +35496,39 @@ fn positional_reference_at(tail: &str) -> Option<(PositionalReference, Range<usi
     }
 }
 
+/// Whether `text` still holds a parameter, command or arithmetic expansion
+/// outside single quotes: `$NAME`, `${…}`, `$(…)`, `$1`, `$@`, a backquote.
+/// `$'…'` is a quote, not an expansion; escaped bytes are literal.
+fn posix_text_has_live_expansion(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut double = false;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'\\' => index += 1,
+            b'\'' if !double => match bytes[index + 1..].iter().position(|b| *b == b'\'') {
+                Some(close) => index += close + 1,
+                None => return false,
+            },
+            b'"' => double = !double,
+            b'`' => return true,
+            b'$' if bytes.get(index + 1).is_some_and(|next| {
+                next.is_ascii_alphanumeric()
+                    || matches!(
+                        next,
+                        b'_' | b'{' | b'(' | b'@' | b'*' | b'#' | b'?' | b'$' | b'!' | b'-'
+                    )
+            }) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
 /// Whether `text` spells a positional parameter reference anywhere.
 fn posix_text_has_positional_reference(text: &str) -> bool {
     text.match_indices('$').any(|(index, _)| {
@@ -36508,6 +36549,14 @@ fn resolve_proven_variables_in_segment_with_ifs(
                         in_double_quote = false;
                         rest = &tail[consumed + 1..];
                         substituted = true;
+                        continue;
+                    }
+                    // A bare command name that is not the same word bare
+                    // (`runner=if; $runner tee "$f"` runs a program named
+                    // `if`; `!` and `x=y` likewise) would turn a program into
+                    // grammar: keep the reference.
+                    if command_name && !posix_command_name_is_plain(field) {
+                        rest = keep(&mut out);
                         continue;
                     }
                 }
@@ -55161,6 +55210,25 @@ mod tests {
             ("x=--soft; git reset \"$x\"", false),
             ("x=--hard; echo \"$x\"", false),
         ];
+        // A plain value is spliced only where the segment ends fully literal;
+        // beside a word that stays unresolved the first view keeps the role.
+        for (command, view) in [
+            (
+                "x=--hard; git reset \"$x\"",
+                Some("x=--hard; git reset --hard"),
+            ),
+            ("f=/etc/sudoers; sudo -- cp \"$unknown\" \"$f\"", None),
+            ("runner='x=y'; f=/etc/sudoers; $runner tee \"$f\"", None),
+            ("runner=if; f=/etc/sudoers; $runner tee \"$f\"", None),
+        ] {
+            assert_eq!(
+                posix_proven_argument_view(command, None, true)
+                    .expect("bounded view")
+                    .as_deref(),
+                view,
+                "{command:?}"
+            );
+        }
         for index in [None, keyword_index.as_ref()] {
             for (command, denied) in cases {
                 let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
