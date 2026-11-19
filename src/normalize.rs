@@ -10039,14 +10039,8 @@ mod tests {
             ("cat <(echo \")\" # it's\n)", None),
             ("tee >(grep \")\" # it's\n) < f", None),
             ("cat =(echo \")\" # it's\n)", None),
-            (
-                "ls (a<(: #)\n) #); x",
-                Some("ls (a<(: _)\n) _); x"),
-            ),
-            (
-                "ls (a>(: #)\n) #); x",
-                Some("ls (a>(: _)\n) _); x"),
-            ),
+            ("ls (a<(: #)\n) #); x", Some("ls (a<(: _)\n) _); x")),
+            ("ls (a>(: #)\n) #); x", Some("ls (a>(: _)\n) _); x")),
             // zsh ends an unquoted `${…}` at its matching `}`, a quoted one
             // at its first.
             ("ls (a${x:-{})} #); x", Some("ls (a${x:-{})} _); x")),
