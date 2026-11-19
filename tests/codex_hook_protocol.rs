@@ -1543,6 +1543,50 @@ fn quoted_arithmetic_substitutions_hide_no_command() {
         "y='a[$(rm -rf ~)]'; echo $((y))",
         "echo \"$(y='a[$(git reset --hard)]'; echo $((y)))\"",
         r#"eval "x['a[\$(git reset --hard)]']=1""#,
+        // The array reference put together from other words.
+        "q='$(git reset --hard)'; echo $((a[$q]))",
+        "q='$(git reset --hard)'; x[a[$q]]=1",
+        "q='$(git reset --hard)'; [[ a[$q] -eq 1 ]]",
+        "q='$(git reset --hard)'; (( a[$q] ))",
+        r#"q='$(git reset --hard)'; let "a[$q]""#,
+        r#"q='$(git reset --hard)'; y="a[$q]"; echo $((y))"#,
+        r#"q='$(git reset --hard)'; y="a[$q]"; echo $(($y))"#,
+        r#"q='$(git reset --hard)'; y="a[$q]"; echo ${!y}"#,
+        r#"p=a; y="$p"'[$(git reset --hard)]'; echo $((y))"#,
+        "p=a; y=${p}'[$(git reset --hard)]'; echo $((y))",
+        "y='[$(git reset --hard)]'; echo $((a$y))",
+        "p='a['; q='$(git reset --hard)]'; y=$p$q; echo $((y))",
+        "set -- '$(git reset --hard)'; echo $((a[$1]))",
+        r"q=\$\(git\ reset\ --hard\); echo $((a[$q]))",
+        r#"q='$(git reset --hard)'; declare -i y; y="a[$q]""#,
+        "q='$(git reset --hard)'; x=abc; echo ${x:a[$q]}",
+        "q='$(git reset --hard)'; echo ${x[a[$q]]}",
+        "q='$(git reset --hard)'; declare x[$q]=1",
+        r#"q='$(git reset --hard)'; printf -v "a[$q]" x"#,
+        "q='$(git reset --hard)'; f() { local x[$q]=1; }; f",
+        // The subscript ends where Bash's does.
+        r#"y='a["]"$(git reset --hard)]'; echo $((y))"#,
+        r"y='a[\]$(git reset --hard)]'; echo $((y))",
+        r#"y="a[']'\$(git reset --hard)]"; echo $((y))"#,
+        r#"y='a[0]+b["]"$(git reset --hard)]'; echo $((y))"#,
+        r#"y='a["$(git reset --hard)"]'; echo $((y))"#,
+        // Special-parameter offsets.
+        "set -- a b; echo ${@:'$(git reset --hard)'}",
+        "set -- a b; echo ${*:'$(git reset --hard)'}",
+        "set -- a b; echo ${@:'a[$(git reset --hard)]'}",
+        // An unquoted heredoc body expands.
+        "cat <<EOF\n$(( '$(git reset --hard)' ))\nEOF",
+        "set -- a b; cat <<EOF\n${@:'$(git reset --hard)'}\nEOF",
+        // Compound array elements.
+        "x=(['$(git reset --hard)']=1)",
+        "x+=(['$(git reset --hard)']=1)",
+        "declare -a x=(['$(git reset --hard)']=1)",
+        // An escape that does not decode.
+        "x['a[$(git reset --hard)]']=1\\",
+        r"y='a[$(git reset --hard)]+0'$'\uD800'; echo $((y))",
+        r"y='a[$(git reset --hard)]+0'$'\c'; echo $((y))",
+        r"y='a[$(git reset --hard)]+0'$'\xZ'; echo $((y))",
+        r"y='a[$(git reset --hard)]+0'$'\U7fffffff'; echo $((y))",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1559,6 +1603,12 @@ fn quoted_arithmetic_substitutions_hide_no_command() {
         r#"y="a[\$x]"; echo $((y))"#,
         "(( '1 + 2' ))",
         "echo $(( 1 + 2 ))",
+        // `$q`'s text is evaluated once and runs nothing.
+        "q='$(git reset --hard)'; x[$q]=1",
+        "q='$(git reset --hard)'; echo $(($q))",
+        r#"q='$(git reset --hard)'; echo "$q""#,
+        "q='$(git reset --hard)'; echo ${x:$q}",
+        "q='$(git reset --hard)'; declare -A m; m[$q]=1",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
