@@ -477,10 +477,7 @@ fn process_substitutions_in_a_cmd_payload_are_not_outer_redirections() {
         &POSIX,
         EvaluationDecision::Deny,
     );
-    for command in [
-        "cmd /c ver <$in",
-        r#"cmd /c ver >>"$HOME/log""#,
-    ] {
+    for command in ["cmd /c ver <$in", r#"cmd /c ver >>"$HOME/log""#] {
         for protocol in [Protocol::Claude, Protocol::Codex] {
             let got = hook_decision(protocol, command);
             if got != "allow" {

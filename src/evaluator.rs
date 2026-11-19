@@ -62341,7 +62341,10 @@ mod tests {
             ),
             (&["cmd", "/c", "ver", "2>&1"][..], "ver 2>&1"),
             // A process substitution after the operator is part of its target.
-            (&["cmd", "/c", "echo", "2>x<(true)$X"][..], "echo 2>x<(true)$X"),
+            (
+                &["cmd", "/c", "echo", "2>x<(true)$X"][..],
+                "echo 2>x<(true)$X",
+            ),
             (&["cmd", "/c", "echo", "<(true)>$X"][..], "echo <(true)>$X"),
             (&["cmd", "/c", "echo", "@(a)>$X"][..], "echo @(a)>$X"),
         ] {
