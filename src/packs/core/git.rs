@@ -5061,10 +5061,13 @@ fn exec_wrapper_payloads<'a>(
     command: &'a str,
     tokens: &[crate::normalize::NormalizeToken],
 ) -> Vec<&'a str> {
+    // Assignments before the wrapper only assign: `x=$(echo a) watch git …`
+    // runs `watch git …`.
     let words: Vec<(&str, usize)> = tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
         .filter_map(|token| Some((token.text(command)?, token.byte_range.start)))
+        .skip_while(|(word, _)| crate::normalize::is_env_assignment(word))
         .collect();
     let Some(&(first, _)) = words.first() else {
         return Vec::new();

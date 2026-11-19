@@ -3159,9 +3159,13 @@ fn consume_word_token(
                     }
                 }
             }
+            // A `$(…)`, `<(…)` or `>(…)` body is command text, read by the
+            // reader the tokenizer and the segmenter use: a `#` that starts a
+            // word starts a comment, so `echo $(echo a # )` LF `) ; git …` is
+            // not one echo argument through the `'` after the first `)`.
             b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
                 has_inline_code = true;
-                i = consume_dollar_paren(command, i);
+                i = crate::normalize::consume_shell_paren_construct(bytes, i + 2, len);
             }
             // `${x:- #}` is one word: a blank or a line end inside the braces
             // does not end it, so the `#` after one starts no comment.
@@ -3172,7 +3176,7 @@ fn consume_word_token(
             }
             b'<' | b'>' if i + 1 < len && bytes[i + 1] == b'(' => {
                 has_inline_code = true;
-                i = consume_process_substitution(command, i);
+                i = crate::normalize::consume_shell_paren_construct(bytes, i + 2, len);
             }
             b'`' => {
                 has_inline_code = true;
@@ -3198,71 +3202,6 @@ fn consume_word_token(
     }
 
     (i, has_inline_code)
-}
-
-#[must_use]
-fn consume_process_substitution(command: &str, start: usize) -> usize {
-    let bytes = command.as_bytes();
-    let len = bytes.len();
-
-    debug_assert!(matches!(bytes.get(start), Some(b'<' | b'>')));
-    debug_assert_eq!(bytes.get(start + 1), Some(&b'('));
-
-    let mut i = start + 2;
-    let mut depth: u32 = 1;
-
-    while i < len {
-        match bytes[i] {
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                if depth == 1 {
-                    return i + 1;
-                }
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            b'\\' => {
-                i = (i + 2).min(len);
-            }
-            b'\'' => {
-                i += 1;
-                while i < len && bytes[i] != b'\'' {
-                    i += 1;
-                }
-                if i < len {
-                    i += 1;
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < len {
-                    match bytes[i] {
-                        b'"' => {
-                            i += 1;
-                            break;
-                        }
-                        b'\\' => {
-                            i = (i + 2).min(len);
-                        }
-                        b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
-                            i = consume_dollar_paren_recursive(command, i, 1);
-                        }
-                        _ => {
-                            i += 1;
-                        }
-                    }
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    len
 }
 
 #[must_use]

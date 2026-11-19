@@ -1291,6 +1291,17 @@ EOF
         "x=$(echo a;\\\n#) '\n) git reset --hard #'",
         "cat <(echo a \\\n#) '\n) ; git reset --hard #'",
         "echo $(echo a \\\n\\\n#) '\n) ; git reset --hard #'",
+        // The output mask reads an echo or printf argument's `$(…)` body as
+        // command text too.
+        "echo $(echo a #) '\n) ; git reset --hard #'",
+        "printf %s $(echo a \\\n#) '\n) ; git reset --hard #'",
+        "echo $(echo a \\\n#) '\n)\ngit reset --hard #'",
+        "echo <(echo a #) '\n) ; git reset --hard #'",
+        // A modeled substitution in an assignment before a wrapper.
+        "x=$(echo a) watch git reset --hard",
+        "x=$(echo a b) xargs git reset --hard",
+        "x=`echo a b` xargs git reset --hard",
+        "x=$(echo a b) find . -exec git reset --hard \\;",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1314,6 +1325,8 @@ EOF
         "find . -name '*.rs' | xargs grep -l foo",
         "x[i=1]=a git status",
         "x=$(echo a \\\nb) git status",
+        "echo $(echo a # c\n) done",
+        "printf '%s\\n' $(ls) ; git status",
         "echo $[1 + 2]",
         "echo x[1 + 1]=a",
         "x=$(pwd) env git status",
