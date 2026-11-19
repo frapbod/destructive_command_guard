@@ -3345,6 +3345,11 @@ fn strip_prefixes_in_view<'a>(
             words = &words[1..];
             continue;
         }
+        // `function NAME { …`: the body's first command is the writer.
+        if source_syntax && text == "function" {
+            words = words.get(2..)?;
+            continue;
+        }
         let name = executable_name(first)?;
         if writer_kind(&name).is_some() {
             return Some(words);
