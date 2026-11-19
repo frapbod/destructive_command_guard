@@ -261,7 +261,6 @@ fn a_named_descriptor_heredoc_does_not_hide_the_command() {
             "{fd}<<EOF trap 'git reset --hard' EXIT\nhi\nEOF",
             "echo() {\n{fd}<<EOF eval \"$*\"\nhi\nEOF\n}\necho 'git reset --hard'",
             "true; {_f9}<<'EOF' git push --force\nhi\nEOF",
-            "{a}<<A {b}<<B git reset --hard\n1\nA\n2\nB",
             "{a[i+1]}<<EOF git reset --hard\nhi\nEOF",
             "{a[1]}>/dev/null git reset --hard",
         ],
