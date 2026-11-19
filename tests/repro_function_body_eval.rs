@@ -243,3 +243,39 @@ fn a_heredoc_operator_does_not_hide_eval_or_trap() {
         ],
     );
 }
+
+/// Bash reads a `{name}` glued to a heredoc operator (`{fd}<<EOF`, an array
+/// element too) as the variable that gets the heredoc's new descriptor, so
+/// the next word is the command word. With the heredoc's body on later
+/// lines, `{fd}` was left in the argv view as the command word and the
+/// command after it was not judged. Bash 4.1+ runs each of these.
+#[test]
+fn a_named_descriptor_heredoc_does_not_hide_the_command() {
+    assert_both(
+        "deny",
+        &[
+            "{fd}<<EOF git reset --hard\nhi\nEOF",
+            "{fd}<<EOF eval 'git reset --hard'\nhi\nEOF",
+            "x='git reset --hard'; {fd}<<EOF eval \"$x\"\nhi\nEOF",
+            "x='git reset --hard'; {fd}<<-EOF eval \"$x\"\n\thi\n\tEOF",
+            "{fd}<<EOF trap 'git reset --hard' EXIT\nhi\nEOF",
+            "echo() {\n{fd}<<EOF eval \"$*\"\nhi\nEOF\n}\necho 'git reset --hard'",
+            "true; {_f9}<<'EOF' git push --force\nhi\nEOF",
+            "{a[i+1]}<<EOF git reset --hard\nhi\nEOF",
+            "{a[1]}>/dev/null git reset --hard",
+        ],
+    );
+    assert_both(
+        "allow",
+        &[
+            "cat {fd}<<EOF\nhi\nEOF",
+            "echo {fd}<<EOF eval 'git reset --hard'\nhi\nEOF",
+            "{fd}<<EOF eval 'echo hi'\nhi\nEOF",
+            "{fd}<<EOF git status\nhi\nEOF",
+            "x{fd}<<EOF eval 'git reset --hard'\nhi\nEOF",
+            "x{fd}<<EOF git reset --hard\nhi\nEOF",
+            "{1fd}<<EOF git reset --hard\nhi\nEOF",
+            "{}<<EOF git reset --hard\nhi\nEOF",
+        ],
+    );
+}
