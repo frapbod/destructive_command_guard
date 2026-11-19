@@ -375,6 +375,26 @@ const RUNS_IT: &[&str] = &[
     "[scriptblock]::'Create'.Invoke.Invoke('git reset --hard').Invoke()",
     "$t=[scriptblock]; $f=$t::Create; $f.Invoke('git reset --hard').Invoke()",
     "$n='Create'; $t=[scriptblock]; $t::$n('git reset --hard').Invoke()",
+    // A here-string or array expression as the name, here and for the
+    // engine methods; a type literal held only by groups; a type in an
+    // index (review round 1; runner rv/truth.out, rv/truth2.out,
+    // p2/n-truth.out).
+    "[scriptblock]::@'\nCreate\n'@('git reset --hard').Invoke()",
+    "[scriptblock]::@\"\nCreate\n\"@('git reset --hard').Invoke()",
+    "[scriptblock]::@('Create')('git reset --hard').Invoke()",
+    "[scriptblock]::@('Cre'+'ate')('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $t::@'\nCreate\n'@('git reset --hard').Invoke()",
+    "[scriptblock]::@'\nCreate\n'@.Invoke('git reset --hard').Invoke()",
+    "$f=[scriptblock]::@('Create'); $f.Invoke('git reset --hard').Invoke()",
+    "$n='Create'; [scriptblock]::@\"\n$n\n\"@('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.@'\nInvokeScript\n'@('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.@('InvokeScript')('git reset --hard')",
+    "[powershell]::Create().@\"\nAddScript\n\"@('git reset --hard').Invoke()",
+    "$a='git reset --hard'; ([scriptblock])::Create($a).Invoke()",
+    "([scriptblock])::Create('git reset --hard').Invoke()",
+    "$a='git reset --hard'; ( ( [scriptblock] ) )::Create($a).Invoke()",
+    "$a='git reset --hard'; ([System.Management.Automation.ScriptBlock])::Create($a).Invoke()",
+    "$a=@([scriptblock]); $a[0]::Create('git reset --hard').Invoke()",
 ];
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.

@@ -12419,7 +12419,7 @@ fn powershell_member_name_after_dot(
         // An array expression names the member by its value, like a group
         // (`.@('InvokeScript')`; `.@('a', 'b')` is not a static name).
         b'(' | b'@' if bytes[start] == b'(' || bytes.get(start + 1) == Some(&b'(') => {
-            let open = if bytes[start] == b'(' { start } else { start + 1 };
+            let open = start + usize::from(bytes[start] == b'@');
             let close = find_powershell_subexpression_close(bounded, open + 1).ok()?;
             let name = parse_static_powershell_source(&bounded[open + 1..close]).ok();
             Some((name, close + 1))
@@ -67820,7 +67820,8 @@ mod tests {
             assert_eq!(sources(command), expected, "{command:?}");
         }
         let started = std::time::Instant::now();
-        for command in [
+        let mut timings = Vec::new();
+        for (index, command) in [
             ".(".repeat(100_000),
             ".'".repeat(100_000),
             format!("$x.{}InvokeScript('a')", " ".repeat(200_000)),
@@ -67833,7 +67834,7 @@ mod tests {
             "[scriptblock]::{".repeat(50_000),
             ".{".repeat(100_000),
             ".`\n".repeat(100_000),
-            ".@'\n".repeat(100_000),
+            "$x.@'\n'@".repeat(50_000),
             ".@(".repeat(100_000),
             format!("{}'\n'@('a')", "$x.@'\n".repeat(50_000)),
             format!(
@@ -67847,12 +67848,17 @@ mod tests {
                 "(".repeat(100_000),
                 ")".repeat(100_000)
             ),
-        ] {
-            let _ = sources(&command);
+        ]
+        .iter()
+        .enumerate()
+        {
+            let input_started = std::time::Instant::now();
+            let _ = sources(command);
+            timings.push((index, input_started.elapsed()));
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
+            "{:?}: {timings:?}",
             started.elapsed()
         );
     }
