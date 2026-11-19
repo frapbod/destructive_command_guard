@@ -6026,7 +6026,19 @@ fn launcher_argv<'a>(
     tokens: &crate::normalize::NormalizeTokens,
     dialect: ShellDialect,
 ) -> Option<Vec<&'a str>> {
+    launcher_argv_and_redirects(segment, tokens, dialect).map(|(words, _)| words)
+}
+
+/// [`launcher_argv`], also returning each removed redirect from its
+/// operator on (`2>/dev/null`, `<` of `< file`, `>/dev/null` of
+/// `/wd>/dev/null`).
+fn launcher_argv_and_redirects<'a>(
+    segment: &'a str,
+    tokens: &crate::normalize::NormalizeTokens,
+    dialect: ShellDialect,
+) -> Option<(Vec<&'a str>, Vec<&'a str>)> {
     let mut words = Vec::with_capacity(tokens.len());
+    let mut redirects = Vec::new();
     let mut skip_target = false;
     // End and text of the previous token when it was a redirect that ends
     // in its operator.
@@ -6063,12 +6075,33 @@ fn launcher_argv<'a>(
         if redirect.argument_len > 0 {
             words.push(&text[..redirect.argument_len]);
         }
+        redirects.push(&text[redirect.argument_len..]);
         skip_target = redirect.takes_next_word;
         if text.ends_with(['>', '<']) {
             open_redirect = Some((token.byte_range.end, text));
         }
     }
-    Some(words)
+    Some((words, redirects))
+}
+
+/// The executable and arguments of one POSIX simple command, with the outer
+/// shell's redirects removed on the raw words by [`launcher_argv`]'s grammar
+/// (quote-aware: `pwsh -wd '2>x' <(...)` keeps `2>x` as the `-wd` value;
+/// glued-aware: `pwsh /ep>/dev/null Bypass <(...)` gives pwsh `/ep`), and
+/// whether one of those redirects replaces stdin. Wrappers, assignments and
+/// `exec` are then read by [`command_tokens`]. `None` when the command is not
+/// one simple command.
+fn posix_command_tokens_without_redirects(command: &str) -> Option<(String, Vec<String>, bool)> {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let (words, redirects) = launcher_argv_and_redirects(command, &tokens, ShellDialect::Posix)?;
+    let stdin_redirect = redirects.iter().any(|redirect| {
+        matches!(
+            classify_shell_positional(redirect),
+            ShellPositional::StdinReassignRedirect { .. }
+        )
+    });
+    let (executable, args) = command_tokens(&words.join(" "))?;
+    Some((executable, args, stdin_redirect))
 }
 
 /// Whether any word of `segment` carries an outer-shell redirect, which
@@ -9627,19 +9660,41 @@ fn either_pipeline_reading(
 
 /// Whether a PowerShell host started in a pipeline runs its stdin, under
 /// both readings of its arguments ([`NativeArgv`]): the argv comes from a
-/// POSIX-shaped view and the outer shell may be Git Bash. The outer shell's
-/// redirects are not the host's arguments ([`partition_stage_argv`]): `pwsh
-/// -nop 2>/dev/null` still runs its stdin. A stdin redirect replaces the
-/// pipe with a source dcg cannot read, as for a POSIX shell consumer.
+/// POSIX-shaped view and the outer shell may be Git Bash. `args` holds no
+/// outer-shell redirect: the callers remove them on the raw words
+/// ([`posix_command_tokens_without_redirects`], and [`partition_stage_argv`]
+/// for the Cmd and PowerShell dialects).
 fn powershell_pipeline_input_mode(args: &[String], host: PowerShellHost) -> PipelineShellInputMode {
-    let (args, stdin_redirect) = partition_stage_argv(args);
-    if stdin_redirect {
-        return PipelineShellInputMode::Unverified;
-    }
     either_pipeline_reading(
-        powershell_pipeline_input_mode_as(&args, host, NativeArgv::Verbatim),
-        powershell_pipeline_input_mode_as(&args, host, NativeArgv::Msys),
+        powershell_pipeline_input_mode_as(args, host, NativeArgv::Verbatim),
+        powershell_pipeline_input_mode_as(args, host, NativeArgv::Msys),
     )
+}
+
+/// A PowerShell host in a POSIX pipeline stage or before `< <(...)`. The
+/// outer shell's redirects are not the host's arguments: `pwsh -nop
+/// 2>/dev/null` still runs its stdin, and `pwsh -wd '2>x'` (quoted) has
+/// `2>x` as its `-wd` value. A stdin redirect replaces the pipe with a
+/// source dcg cannot read, as for a POSIX shell consumer. `None` when the
+/// stage does not start a PowerShell host.
+fn posix_powershell_pipeline_input_mode(
+    command: &str,
+    executable: &str,
+) -> Option<PipelineShellInputMode> {
+    let names_host = matches!(executable, "powershell" | "pwsh");
+    if !names_host && !command.contains(['<', '>']) {
+        return None;
+    }
+    match posix_command_tokens_without_redirects(command) {
+        Some((host, args, stdin_redirect)) if matches!(host.as_str(), "powershell" | "pwsh") => {
+            Some(if stdin_redirect {
+                PipelineShellInputMode::Unverified
+            } else {
+                powershell_pipeline_input_mode(&args, PowerShellHost::from_executable(&host))
+            })
+        }
+        _ => names_host.then_some(PipelineShellInputMode::Unverified),
+    }
 }
 
 fn powershell_pipeline_input_mode_as(
@@ -10229,8 +10284,8 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
         }
         return parallel_pipeline_input_mode(&args);
     }
-    if matches!(executable.as_str(), "powershell" | "pwsh") {
-        return powershell_pipeline_input_mode(&args, PowerShellHost::from_executable(&executable));
+    if let Some(mode) = posix_powershell_pipeline_input_mode(command, &executable) {
+        return mode;
     }
     if executable == "cmd" {
         return cmd_pipeline_input_mode(&args);
@@ -11173,16 +11228,33 @@ fn process_substitution_file_input_mode(command: &str, marker: &str) -> Pipeline
             };
         }
     }
-    if matches!(executable.as_str(), "powershell" | "pwsh") {
-        let host = PowerShellHost::from_executable(&executable);
-        // The outer shell's redirects are not pwsh's arguments, at a switch
-        // or a value position alike (`pwsh -wd 2>/dev/null x <(...)` runs
-        // the file). The process-substitution marker is no redirect.
-        let (args, _) = partition_stage_argv(&args);
-        return either_pipeline_reading(
-            powershell_process_substitution_input_mode(&args, marker, host, NativeArgv::Verbatim),
-            powershell_process_substitution_input_mode(&args, marker, host, NativeArgv::Msys),
-        );
+    // The outer shell's redirects are not pwsh's arguments, at a switch or
+    // a value position alike (`pwsh -wd 2>/dev/null x <(...)` runs the
+    // file). They are removed on the raw words, so a quoted `'2>x'` stays a
+    // value and `/ep>/dev/null` gives pwsh `/ep`. The marker is no redirect.
+    let names_host = matches!(executable.as_str(), "powershell" | "pwsh");
+    if names_host || command.contains(['<', '>']) {
+        match posix_command_tokens_without_redirects(command) {
+            Some((host, args, _)) if matches!(host.as_str(), "powershell" | "pwsh") => {
+                let host = PowerShellHost::from_executable(&host);
+                return either_pipeline_reading(
+                    powershell_process_substitution_input_mode(
+                        &args,
+                        marker,
+                        host,
+                        NativeArgv::Verbatim,
+                    ),
+                    powershell_process_substitution_input_mode(
+                        &args,
+                        marker,
+                        host,
+                        NativeArgv::Msys,
+                    ),
+                );
+            }
+            _ if names_host => return PipelineShellInputMode::Unverified,
+            _ => {}
+        }
     }
     if executable == "cmd"
         && args.windows(2).any(|pair| {
@@ -45013,6 +45085,34 @@ mod tests {
                 "{dialect:?}: {segment:?}"
             );
         }
+    }
+
+    #[test]
+    fn posix_command_tokens_read_redirects_on_raw_words() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("pwsh -wd '2>x' M", &["-wd", "2>x", "M"], false),
+            ("pwsh /wd \">x\" M", &["/wd", ">x", "M"], false),
+            (
+                "pwsh /ep>/dev/null Bypass M",
+                &["/ep", "Bypass", "M"],
+                false,
+            ),
+            ("pwsh -f>/dev/null M", &["-f", "M"], false),
+            ("pwsh -wd 2>/dev/null x M", &["-wd", "x", "M"], false),
+            ("pwsh -nop 2>&1 -c x", &["-nop", "-c", "x"], false),
+            ("pwsh -nop < in.ps1", &["-nop"], true),
+            ("pwsh -nop 0<in.ps1", &["-nop"], true),
+            ("pwsh -nop 3<in.ps1", &["-nop"], false),
+            ("2>/dev/null env pwsh -c x", &["-c", "x"], false),
+        ];
+        for &(command, want, stdin) in cases {
+            let (executable, args, stdin_redirect) =
+                posix_command_tokens_without_redirects(command).expect(command);
+            assert_eq!(executable, "pwsh", "{command:?}");
+            assert_eq!(args, want, "{command:?}");
+            assert_eq!(stdin_redirect, stdin, "{command:?}");
+        }
+        assert!(posix_command_tokens_without_redirects("pwsh -c x; git status").is_none());
     }
 
     #[test]

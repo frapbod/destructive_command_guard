@@ -560,6 +560,21 @@ const PWSH_PROCESS_SUBSTITUTION_RUNS_IT: &[&str] = &[
     "pwsh /wd >| out.txt . -c \"git reset --hard\"",
     "pwsh /wd &>/dev/null . -c \"git reset --hard\"",
     "pwsh /wd {fd}>/dev/null . -c \"git reset --hard\"",
+    // Redirects are read on the raw words. A quoted redirect-shaped word is
+    // a switch value, and a redirect glued after a switch leaves the switch
+    // (measured: `-wd '2>x' <(...)`, `/wd '>x' <(...)`, `-wd '2>x' <
+    // <(...)`, `/ep>/dev/null Bypass <(...)`, `/wd>/dev/null . <(...)`,
+    // `-f>/dev/null <(...)`, `/f>/dev/null <(...)` and `/ep>/dev/null
+    // Bypass < <(...)` each ran the text).
+    "pwsh -wd '2>x' <(echo \"git reset --hard\")",
+    "pwsh -wd \"2>x\" <(echo \"git reset --hard\")",
+    "pwsh /wd '>x' <(echo \"git reset --hard\")",
+    "pwsh -wd '2>x' < <(echo \"git reset --hard\")",
+    "pwsh /ep>/dev/null Bypass <(echo \"git reset --hard\")",
+    "pwsh /wd>/dev/null . <(echo \"git reset --hard\")",
+    "pwsh -f>/dev/null <(echo \"git reset --hard\")",
+    "pwsh /f>/dev/null <(echo \"git reset --hard\")",
+    "pwsh /ep>/dev/null Bypass < <(echo \"git reset --hard\")",
 ];
 
 /// The substituted text is judged as PowerShell source, so a harmless one
@@ -572,6 +587,7 @@ const PWSH_PROCESS_SUBSTITUTION_HARMLESS: &[&str] = &[
     "pwsh /wd x -f <(echo Get-Date)",
     "pwsh -wd <(echo \"git reset --hard\") -c Get-Date",
     "pwsh -f <(echo Get-Date) 2>/dev/null",
+    "pwsh -wd '2>x' <(echo Get-Date)",
 ];
 
 /// Process substitution and these redirect spellings exist only in a POSIX
