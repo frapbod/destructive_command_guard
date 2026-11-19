@@ -17558,7 +17558,7 @@ ls"#,
             (
                 "python3 <<EOF\nos.system(\"'gi${x}t' \\$y\")\nEOF",
                 ScriptLanguage::Python,
-                format!("os.system(\"'gi{m}t' $y\")\n"),
+                format!("os.system(\"'gi{m}t' $y\")"),
             ),
             (
                 r#"ruby <<< "system(\"'gi$x'\")""#,
