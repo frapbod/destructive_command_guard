@@ -1345,11 +1345,30 @@ EOF
         "x[\n]=b git reset --hard",
         "x[a\n]=b git push --force origin main",
         "x=$[1 +\n 2] git reset --hard",
-        // A `$((` whose first `(` closes with a lone `)` is `$( (…) …)` to
-        // Bash 3.2 and zsh: command text, where `#` starts a comment.
+        // A `$((` whose first `(` closes with a lone `)` is `$( (…) …)`:
+        // command text, where `#` starts a comment.
         "echo $((echo a #) '\n)) ; git reset --hard #'",
         "x=$((echo a #) '\n)) git reset --hard #'",
         "echo $((echo a #) '\n)) && git push --force origin main #'",
+        // A subscript opens only where Bash reads an assignment word; an
+        // argument `a[1` does not join the lines up to a later `]`.
+        "echo a[1\nx[1 + 1]=b git reset --hard # ]",
+        "echo a[1\nx[1 + 1]=b git reset --hard\necho done ]",
+        "echo a[1\nx=$[1 + 2] git reset --hard # ]",
+        "grep -E a[1-9 f\nx[1 + 1]=b git reset --hard # ]",
+        "echo a[1; x[a b]=c git reset --hard # ]",
+        "echo a[1 && x[a b]=c git push --force origin main # ]",
+        "echo a[1\nx[1 + 1]=b git reset --hard ]=c",
+        "2>/dev/null x[a b]=c git reset --hard",
+        "time -p x[a b]=c git reset --hard",
+        // Bash 3.2 reads a `#` that starts a word in a `$((` body as a
+        // comment, and ends the body at the `))` after it.
+        "echo $((1 #)) '\n)) ; git reset --hard #'",
+        "x=$((1 #)) '\n)) git reset --hard #'",
+        "echo $((1+(2 #))) '\n))) ; git reset --hard #'",
+        "echo $((1 #)) '\n)) && git push --force origin main #'",
+        "echo $((echo a #)) '\n)) ; git reset --hard #'",
+        "x=a; echo $(( #x )) ; git reset --hard ; : $((\n))",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1409,6 +1428,10 @@ EOF
         "echo $( (echo a) ) ; git status",
         "echo $(( (1 + 2) * 3 )) ; git status",
         "x=$[1 +\n 2] git status",
+        "echo a[1\necho b]=c\ngit status",
+        "echo x # y[a b]=c\ngit status",
+        "echo $((1 # one\n + 2)) ; git status",
+        "echo $((16#ff)) $((2#101)) ; git status",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

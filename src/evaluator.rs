@@ -17960,11 +17960,12 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // The fourth reading is the same for the `${` openers that Bash reads
     // another way than the shared readers (see `bash_parameter_openers`):
     // a `{` after `$$`, a Bash 5.3 `${ …; }`, and a `'` in a double-quoted
-    // `${…}`. The last is the same for the blanks Bash reads inside one
+    // `${…}`. The fifth is the same for the blanks Bash reads inside one
     // word in a `$[…]` or an assignment subscript (see
-    // `bash_bracket_words`).
+    // `bash_bracket_words`). The last is the same for a comment that Bash
+    // 3.2 reads in a `$((…))` body (see `bash_arithmetic_comments`).
     let mut bash_spelling: Option<String> = None;
-    for reading_kind in 0..5 {
+    for reading_kind in 0..6 {
         if result.decision != EvaluationDecision::Allow
             || result.bypass_method == Some(BypassMethod::AllowOnce)
             || !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
@@ -17980,7 +17981,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             }
             2 => None,
             3 => crate::normalize::bash_parameter_openers(command),
-            _ => crate::normalize::bash_bracket_words(command),
+            4 => crate::normalize::bash_bracket_words(command),
+            _ => crate::normalize::bash_arithmetic_comments(command),
         };
         let Some(reading) = reading else {
             continue;
