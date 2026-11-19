@@ -69053,3 +69053,59 @@ mod windows_redirection_free_view_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod cmd_switch_quote_tests {
+    use super::*;
+
+    #[test]
+    fn a_leading_quote_and_the_last_quote_are_also_read_removed() {
+        for (payload, readings) in [
+            (r#""git reset --hard""#, &[r#""git reset --hard""#, "git reset --hard"][..]),
+            (r#"  "a b" c"#, &[r#""a b" c"#, "a b c"]),
+            (r#""a" "b & c""#, &[r#""a" "b & c""#, r#"a" "b & c"#]),
+            (r#""a b"#, &[r#""a b"#, "a b"]),
+            (r#"echo "a b""#, &[r#"echo "a b""#]),
+            ("ver", &["ver"]),
+        ] {
+            assert_eq!(cmd_switch_command_readings(payload), readings, "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_payload_gives_both_readings_as_envelopes() {
+        let WindowsLauncherParse::Envelopes(envelopes) = parse_windows_launcher_segment(
+            r#"cmd /c '"git reset --hard"'"#,
+            ShellDialect::PowerShell,
+            1024,
+        ) else {
+            panic!("expected two readings");
+        };
+        let commands: Vec<&str> = envelopes.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(commands, [r#""git reset --hard""#, "git reset --hard"]);
+    }
+
+    #[test]
+    fn run_switches_after_a_word_that_is_not_a_switch_fail_closed() {
+        for segment in [
+            "cmd foo /c git reset --hard",
+            "cmd foo /K dir",
+            "cmd foo/r dir",
+        ] {
+            assert!(
+                matches!(
+                    parse_windows_launcher_segment(segment, ShellDialect::PowerShell, 1024),
+                    WindowsLauncherParse::Unverified(_)
+                ),
+                "{segment:?}"
+            );
+        }
+        for segment in ["cmd foo", "cmd foo bar", "cmd /d foo"] {
+            assert_eq!(
+                parse_windows_launcher_segment(segment, ShellDialect::PowerShell, 1024),
+                WindowsLauncherParse::NotLauncher,
+                "{segment:?}"
+            );
+        }
+    }
+}
