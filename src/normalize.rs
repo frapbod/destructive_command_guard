@@ -1933,7 +1933,7 @@ pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usi
 /// `)) ; git reset --hard #'` runs `git` in Bash 3.2, Bash 5 and zsh. That
 /// lookup runs only when a comment or `case` would change the reading. It
 /// is not how Bash 3.2 ends an arithmetic body: Bash 3.2 reads a comment
-/// there too, which [`bash_arithmetic_comments`] reads. A `<(…)` or `>(…)`
+/// there too, which [`bash32_comments`] reads. A `<(…)` or `>(…)`
 /// body is always command text.
 pub(crate) struct CommandText {
     /// False for an arithmetic body; `None` for a `$((` body not yet
@@ -7307,12 +7307,14 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
         .map(BashHashReading::Spelled)
 }
 
-/// Bash 3.2's reading of the comments in `$((…))` bodies; `None` when
-/// there is none.
+/// Bash 3.2's reading of the comments in `$((…))` bodies, and of the
+/// comments that only Bash 3.2 reads in `$(…)`, `<(…)` and `>(…)` bodies;
+/// `None` when there is none.
 ///
 /// Bash 3.2 (macOS `/bin/bash` and `/bin/sh`) looks for the end of a `$((`
-/// body as it does for a `$(` body: a `#` that starts a word starts a
-/// comment to the end of the line, and a `)` or quote in it closes or opens
+/// body as it does for a `$(` body: a `#` after a blank starts a comment to
+/// the end of the line (dcg also starts one where a word starts after an
+/// operator, which only adds a reading), and a `)` or quote in it closes or opens
 /// nothing. Every Bash does so for a `$((` in double quotes. Bash 5, zsh and
 /// dcg's shared readers read arithmetic there and no comment, so in
 /// `echo $((1 #)) '` LF `)) ; git reset --hard #'` they read `'` LF
@@ -7325,24 +7327,40 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
 /// command substitution: `echo $((1 #)) '` LF `git reset --hard)) #'` runs
 /// `git reset --hard`.
 ///
-/// Spelled: each byte of such a comment as `_`, so the shared readers end
-/// the body where Bash does; and, for a body Bash runs as a command, the
-/// `(` that starts it and the `)` that closes that `(` as blanks, so the
-/// shared readers read `$( … )`, a command substitution, too. A `#` inside
-/// a word (`16#ff`, `$#`, `$(true)#x`) starts no comment. The scan passes
-/// over quotes, `$'…'`, `$(…)`, `${…}` and backquotes as the shell does and
-/// reads the `$((` bodies inside them too. Heredoc bodies are passed over.
-/// A command nested deeper than [`MAX_BASH32_NESTING`] is
-/// [`BashHashReading::Unread`]. The caller reads the spelling too and deny
-/// wins.
+/// In these bodies, and in `$(…)`, `<(…)` and `>(…)` bodies, Bash 3.2
+/// starts a comment at a `#` after any blank in the text it keeps, and it
+/// keeps an escaped blank (it drops only a backslash-newline). So
+/// `echo $((1 \ #)) '` LF `)) ; git reset --hard #'` and
+/// `echo $(echo \ #) '` LF `) ; git reset --hard #'` run `git` in Bash
+/// 3.2, where every other shell reads `\ #` as one word, as Bash 3.2 does
+/// at the top level and in backquotes.
+///
+/// Spelled: each byte of such a comment as `_` (in a `$(`, `<(` or `>(`
+/// body only a comment after an escaped blank; the shared readers read the
+/// others), so the shared readers end the body where Bash does; and, for a
+/// `$((` body Bash runs as a command, the `(` that starts it and the `)`
+/// that closes that `(` as blanks, so the shared readers read `$( … )`, a
+/// command substitution, too. A `#` inside a word (`16#ff`, `$#`,
+/// `$(true)#x`) starts no comment. The scan passes over quotes, `$'…'`,
+/// `$(…)`, `${…}` and backquotes as the shell does and reads the bodies
+/// inside them too. Heredoc bodies are passed over. A command nested deeper
+/// than [`MAX_BASH32_NESTING`] is [`BashHashReading::Unread`]. The caller
+/// reads the spelling too and deny wins.
 ///
 /// Length preserving (one ASCII byte for another), so every range in the
 /// view is the same range in `command`. Linear: each byte is read once.
 #[must_use]
-pub(crate) fn bash_arithmetic_comments(command: &str) -> Option<BashHashReading> {
+pub(crate) fn bash32_comments(command: &str) -> Option<BashHashReading> {
     let bytes = command.as_bytes();
-    memchr::memmem::find(bytes, b"$((")?;
     memchr::memchr(b'#', bytes)?;
+    let escaped_blank = || {
+        memchr::memchr_iter(b'\\', bytes).any(|at| matches!(bytes.get(at + 1), Some(b' ' | b'\t')))
+    };
+    if memchr::memmem::find(bytes, b"$((").is_none()
+        && (memchr::memchr(b'(', bytes).is_none() || !escaped_blank())
+    {
+        return None;
+    }
     let mut scan = Bash32Comments {
         bytes,
         limit: bytes.len(),
@@ -7363,11 +7381,11 @@ pub(crate) fn bash_arithmetic_comments(command: &str) -> Option<BashHashReading>
         .map(BashHashReading::Spelled)
 }
 
-/// How deep [`bash_arithmetic_comments`] reads nested quotes and
+/// How deep [`bash32_comments`] reads nested quotes and
 /// substitutions.
 const MAX_BASH32_NESTING: usize = 200;
 
-/// The scan of [`bash_arithmetic_comments`].
+/// The scan of [`bash32_comments`].
 struct Bash32Comments<'a> {
     bytes: &'a [u8],
     /// Where the text being read ends (the closing backquote of a
@@ -7423,15 +7441,19 @@ impl Bash32Comments<'_> {
     }
 
     /// Command text from `from`: with `closes`, through the `)` that closes
-    /// a `(` before `from`. In a `$((` body (`arithmetic`) each comment is
-    /// spelled.
+    /// a `(` before `from` (a `$(`, `$((`, `<(` or `>(` body). In a `$((`
+    /// body (`arithmetic`) each comment is spelled; in the others, each
+    /// comment that only Bash 3.2 reads.
     fn command(&mut self, from: usize, closes: bool, arithmetic: bool) -> CommandEnd {
         let bytes = self.bytes;
         let mut depth = 0usize;
         let mut group_close = None;
         let mut word_start = true;
+        // The blank before this byte is an escaped one.
+        let mut escaped_blank = false;
         let mut i = from;
         while i < self.limit && !self.too_deep {
+            let after_escaped_blank = std::mem::take(&mut escaped_blank);
             let past = self.past_body(i);
             if past != i {
                 i = past;
@@ -7440,20 +7462,40 @@ impl Bash32Comments<'_> {
             }
             match bytes[i] {
                 b'\\' => {
-                    // A backslash-newline is dropped: the word goes on.
-                    if bytes.get(i + 1) != Some(&b'\n') {
-                        word_start = false;
+                    match bytes.get(i + 1) {
+                        // A backslash-newline is dropped: the word goes on.
+                        Some(b'\n') => escaped_blank = after_escaped_blank,
+                        // In such a body Bash 3.2 starts a comment after
+                        // any blank in the text it keeps, and it keeps an
+                        // escaped one: `$((1 \ #))` and `$(echo \ #)` hold
+                        // a comment. Other shells, and Bash 3.2 at the top
+                        // level and in backquotes, read `\ #` as one word.
+                        Some(b' ' | b'\t') if closes => {
+                            word_start = true;
+                            escaped_blank = true;
+                        }
+                        _ => word_start = false,
                     }
                     i += 2;
                 }
                 b'#' if word_start => {
                     let end = memchr::memchr(b'\n', &bytes[i..self.limit])
                         .map_or(self.limit, |at| i + at);
-                    if arithmetic {
+                    if arithmetic || after_escaped_blank {
                         self.spelled.get_or_insert_with(|| bytes.to_vec())[i..end].fill(b'_');
-                        self.comments += 1;
+                        if arithmetic {
+                            self.comments += 1;
+                        }
                     }
                     i = end;
+                }
+                b'<' | b'>'
+                    if !arithmetic
+                        && bytes.get(i + 1) == Some(&b'(')
+                        && !matches!(bytes.get(i.wrapping_sub(1)), Some(b'<' | b'>')) =>
+                {
+                    word_start = false;
+                    i = self.nested(self.limit, |scan| scan.command(i + 2, true, false).end);
                 }
                 b'(' => {
                     depth += 1;
@@ -9536,8 +9578,8 @@ mod tests {
     }
 
     #[test]
-    fn bash_arithmetic_comments_spell_what_bash_3_2_reads_as_a_comment() {
-        let spelled = |command: &str| match bash_arithmetic_comments(command) {
+    fn bash32_comments_spell_what_bash_3_2_reads_as_a_comment() {
+        let spelled = |command: &str| match bash32_comments(command) {
             Some(BashHashReading::Spelled(spelled)) => spelled,
             other => panic!("{command:?}: {other:?}"),
         };
@@ -9581,6 +9623,35 @@ mod tests {
                 "echo $'\\'' $((1 #)) '\n)) ; git",
                 "echo $'\\'' $( 1 _____\n ) ; git",
             ),
+            // Bash 3.2 keeps an escaped blank in such a body, and a `#`
+            // after it starts a comment; in a `$(`, `<(` or `>(` body only
+            // that comment is spelled.
+            (
+                "echo $((1 \\ #)) '\n)) ; git reset --hard #'",
+                "echo $( 1 \\ _____\n ) ; git reset --hard #'",
+            ),
+            (
+                "echo $((1 \\\t#)) '\n)) ; git",
+                "echo $( 1 \\\t_____\n ) ; git",
+            ),
+            (
+                "echo $(echo \\ #) '\n) ; git reset --hard #'",
+                "echo $(echo \\ ____\n) ; git reset --hard #'",
+            ),
+            (
+                "x=$(echo a \\ \\\n#) '\n) git",
+                "x=$(echo a \\ \\\n____\n) git",
+            ),
+            ("cat <(echo \\ #) '\n) ; git", "cat <(echo \\ ____\n) ; git"),
+            (
+                "echo `echo $((1 \\ #)) '\n)) ; git`",
+                "echo `echo $( 1 \\ _____\n ) ; git`",
+            ),
+            // At the top level an escaped blank starts no comment.
+            (
+                "echo a\\ #x $((1 #)) '\n)) ; git",
+                "echo a\\ #x $( 1 _____\n ) ; git",
+            ),
             // Not closed, or still arithmetic: only the comment.
             ("echo \"$((1 #))\"", "echo \"$((1 ____"),
             ("echo $((1 # one\n + 2))", "echo $((1 _____\n + 2))"),
@@ -9596,14 +9667,14 @@ mod tests {
             "echo '$((1 #))'",
             "cat <<'EOF'\n$((1 #))\nEOF",
             "git status # x",
+            "echo $(echo a # x\n) ; echo a\\ #x",
+            "echo $(printf '%s' a\\ b) # x",
+            "echo `echo \\ #`",
         ] {
-            assert_eq!(bash_arithmetic_comments(unchanged), None, "{unchanged:?}");
+            assert_eq!(bash32_comments(unchanged), None, "{unchanged:?}");
         }
         let deep = "$(".repeat(MAX_BASH32_NESTING + 1) + "$((1 #))";
-        assert_eq!(
-            bash_arithmetic_comments(&deep),
-            Some(BashHashReading::Unread)
-        );
+        assert_eq!(bash32_comments(&deep), Some(BashHashReading::Unread));
     }
 
     #[test]

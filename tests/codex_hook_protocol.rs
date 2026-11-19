@@ -1396,6 +1396,16 @@ EOF
         "echo \"$((1 #))\ngit reset --hard))\"",
         "x=\"$((1 #))\ngit reset --hard))\"",
         "echo \"$((1 #)\ngit reset --hard))\"",
+        // Bash 3.2 keeps an escaped blank in a `$((`, `$(` or `<(` body, and
+        // a `#` after it starts a comment there.
+        "echo $((1 \\ #)) '\n)) ; git reset --hard #'",
+        "x=$((1 \\ #)) '\n)) git reset --hard #'",
+        "echo $((1 \\\t#)) '\n)) ; git reset --hard #'",
+        "echo $((1 \\ #)) '\n)) && git push --force origin main #'",
+        "echo $(echo \\ #) '\n) ; git reset --hard #'",
+        "x=$(echo \\ #) '\n) git reset --hard #'",
+        "cat <(echo \\ #) '\n) ; git reset --hard #'",
+        "echo a\\ #x $((1 #)) '\n)) ; git reset --hard #'",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1467,6 +1477,9 @@ EOF
         "echo $(true)#x ; git status",
         "echo \"$((1 # c\n + 2))\" ; git status",
         "echo \"$((16#ff))\" ; git status",
+        "echo $((1 \\ # c\n + 2)) ; git status",
+        "echo $(echo \\ # c\n) ; git status",
+        "echo $(printf '%s' a\\ b) ; git status",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

@@ -17963,7 +17963,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // `${…}`. The fifth is the same for the blanks Bash reads inside one
     // word in a `$[…]` or an assignment subscript (see
     // `bash_bracket_words`). The last is the same for a comment that Bash
-    // 3.2 reads in a `$((…))` body (see `bash_arithmetic_comments`).
+    // 3.2 reads in a `$((…))` body, or after an escaped blank in a `$(…)`
+    // body (see `bash32_comments`).
     let mut bash_spelling: Option<String> = None;
     for reading_kind in 0..6 {
         if result.decision != EvaluationDecision::Allow
@@ -17982,7 +17983,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             2 => None,
             3 => crate::normalize::bash_parameter_openers(command),
             4 => crate::normalize::bash_bracket_words(command),
-            _ => crate::normalize::bash_arithmetic_comments(command),
+            _ => crate::normalize::bash32_comments(command),
         };
         let Some(reading) = reading else {
             continue;
@@ -41187,14 +41188,14 @@ fn evaluate_heredoc(
             // (see `paren_hashes_as_data`), a `${` opener it may misread
             // (see `bash_parameter_openers`), blanks inside one bracketed
             // word (`watch x[a b]=c git reset --hard`, see
-            // `bash_bracket_words`) and a Bash 3.2 comment in a `$((` body
-            // (see `bash_arithmetic_comments`).
+            // `bash_bracket_words`) and a Bash 3.2 comment in a `$((` or
+            // `$(` body (see `bash32_comments`).
             let bash_data_hash = per_command_pass
                 && !destination_source_context
                 && (crate::normalize::paren_hashes_as_data(&content.content).is_some()
                     || crate::normalize::bash_parameter_openers(&content.content).is_some()
                     || crate::normalize::bash_bracket_words(&content.content).is_some()
-                    || crate::normalize::bash_arithmetic_comments(&content.content).is_some()
+                    || crate::normalize::bash32_comments(&content.content).is_some()
                     || [false, true].into_iter().any(|extglob| {
                         crate::normalize::bash_hashes_as_data(&content.content, extglob).is_some()
                     }));
