@@ -17228,6 +17228,102 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         };
         adopt_alternate_reading(&mut result, alternate, command);
     }
+    // PowerShell continues a statement on the next line after a line that
+    // ends with an operator or a backtick: `'git reset' +<LF>' --hard' | iex`
+    // runs the reset. The shared readers end a statement at every line break
+    // outside brackets, so they judge each line by itself. When the command
+    // may be PowerShell, read it again as PowerShell with those line breaks
+    // (and the comments before them) spelled as blanks (see
+    // `powershell_continued_lines_joined`), through this whole function, so
+    // the other readings below apply to the joined statement too; that
+    // spelling has no such line break left, so it is not read a third time.
+    // The joined lines are PowerShell's, so they are read as PowerShell: a
+    // POSIX shell does not join them. In the Unknown dialect, when
+    // PowerShell already rejects the text as written (syntax it cannot
+    // parse, which Unknown tolerates, or a launcher it cannot verify), a
+    // PowerShell denial of the spelling is no news; the spelling is then
+    // judged as Unknown judges such text, as the assignment views below are.
+    // It only adds denials: text it cannot read keeps the original verdict,
+    // and running out of time still fails closed. No allow-once grant is
+    // spent, as for the readings above.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        )
+        && let Some(joined) = crate::normalize::powershell_continued_lines_joined(command)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        let read = |text: &str, dialect: ShellDialect| {
+            if deadline_exceeded(deadline) {
+                return EvaluationResult::indeterminate_due_to_budget();
+            }
+            let _allow_once_scope = AllowOnceSuppressionScope::enter();
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                text,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        // The copy's incomplete analyses count only if its result is used.
+        let mut alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+        let mut alternate = read(&joined, ShellDialect::PowerShell);
+        if shell_dialect == ShellDialect::Unknown
+            && alternate.decision == EvaluationDecision::Deny
+            && !deadline_exceeded(deadline)
+        {
+            let probe = crate::packs::regex_engine::RegexEvaluationScope::enter();
+            let as_written = {
+                let _allow_once_scope = AllowOnceSuppressionScope::enter();
+                evaluate_command_in_dialect_union(
+                    command,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    None,
+                    project_path,
+                    deadline,
+                    ShellDialect::PowerShell,
+                    nested_command_depth,
+                    inherited_automated_stdin,
+                )
+                .decision
+            };
+            probe.discard();
+            if as_written != EvaluationDecision::Allow {
+                alternate_scope.discard();
+                alternate_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+                alternate = read(&joined, ShellDialect::Unknown);
+            }
+        }
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny => true,
+            EvaluationDecision::Indeterminate => deadline_exceeded(deadline),
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            drop(alternate_scope);
+            adopt_alternate_reading(&mut result, alternate, command);
+        } else {
+            alternate_scope.discard();
+        }
+    }
     // A backtick escape such as `` `n `` or `` `r `` is a control character in
     // a PowerShell double-quoted string and bare word, so a nested
     // `powershell -Command "echo a`ngit reset --hard"` runs the reset as a new
