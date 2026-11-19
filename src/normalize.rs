@@ -6539,7 +6539,12 @@ fn bash_hashes_as_data_within(
 ///   that no `}` closes, and some of them then read the rest of the input
 ///   as part of it. Spelled: each such `{` as `_`, so no reader sees an
 ///   opener there. A run of `$` pairs from its left end, as the shell reads
-///   it: after `$$$` the `{` does open an expansion.
+///   it: after `$$$` the `{` does open an expansion. Bash 3.2 (also macOS
+///   `/bin/sh`) still reads a `${` at the second `$` when it looks for the
+///   `"` that ends a double-quoted word, so the quote dispute below is
+///   checked there too (`echo "$${y:-'}" #'}"; git reset --hard` runs
+///   `git reset --hard` in Bash 3.2), and a line continuation between the
+///   pair and the `{` is Unread like one between `$` and `{`.
 /// - Bash 5.3 reads `${` followed by a blank or `|` as a command
 ///   substitution (`${ cmd; }`, `${| cmd; }`), which ends at a `}` in
 ///   command position and holds command text with its own quotes and
@@ -6586,6 +6591,27 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
     // The end of each `${` looked up so far, read the Bash way and the dash
     // way; a lookup notes the ends of the `${` nested in it too.
     let mut ends: [std::collections::HashMap<usize, Option<usize>>; 2] = Default::default();
+    // Whether the `${` at `opener` ends at another place read the Bash way
+    // than read the dash way, or the lookups would read past the budget.
+    let mut disputed = |opener: usize| -> bool {
+        let mut end = |dash: bool| -> Option<Option<usize>> {
+            let ends = &mut ends[usize::from(dash)];
+            if let Some(end) = ends.get(&opener) {
+                return Some(*end);
+            }
+            let end = crate::context::braced_parameter_span_with_nested(
+                bytes,
+                opener,
+                dash,
+                |nested, end| {
+                    ends.insert(nested, end);
+                },
+            );
+            budget = budget.checked_sub(end.unwrap_or(len) - opener)?;
+            Some(end)
+        };
+        !matches!((end(false), end(true)), (Some(bash), Some(dash)) if bash == dash)
+    };
     let mut spelled: Option<Vec<u8>> = None;
     let mut bodies = crate::context::undisputed_quoted_heredoc_body_ranges(command).into_iter();
     let mut body = bodies.next();
@@ -6607,6 +6633,15 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
                     Some(b'$') => {
                         let brace = next(after + 1);
                         if bytes.get(brace) == Some(&b'{') {
+                            // Bash 3.2 reads a `${` at the second `$` when
+                            // it looks for the end of a double-quoted word,
+                            // so the Bash and dash ends must agree there too
+                            // (see below), and a line continuation before
+                            // the `{` hides that dispute as it does after
+                            // a lone `$`.
+                            if brace != after + 1 || disputed(after) {
+                                return Some(BashHashReading::Unread);
+                            }
                             spelled.get_or_insert_with(|| bytes.to_vec())[brace] = b'_';
                         }
                         i = after + 1;
@@ -6622,28 +6657,8 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
                         // drops it and reads `${`, but the end lookups (and
                         // the nested-`${` reads of every other reader) need
                         // the two bytes side by side. Unread.
-                        if after != i + 1 {
+                        if after != i + 1 || disputed(i) {
                             return Some(BashHashReading::Unread);
-                        }
-                        let mut end = |dash: bool| -> Option<Option<usize>> {
-                            let ends = &mut ends[usize::from(dash)];
-                            if let Some(end) = ends.get(&i) {
-                                return Some(*end);
-                            }
-                            let end = crate::context::braced_parameter_span_with_nested(
-                                bytes,
-                                i,
-                                dash,
-                                |opener, end| {
-                                    ends.insert(opener, end);
-                                },
-                            );
-                            budget = budget.checked_sub(end.unwrap_or(len) - i)?;
-                            Some(end)
-                        };
-                        match (end(false), end(true)) {
-                            (Some(bash), Some(dash)) if bash == dash => {}
-                            _ => return Some(BashHashReading::Unread),
                         }
                         i = after + 1;
                     }
@@ -8117,6 +8132,10 @@ mod tests {
             None
         );
         assert_eq!(spelled("echo $${x}").as_deref(), Some("echo $$_x}"));
+        assert_eq!(
+            spelled("echo \"$${HOME}\"; git status").as_deref(),
+            Some("echo \"$$_HOME}\"; git status")
+        );
         assert_eq!(bash_parameter_openers("echo \"${y:-'a'}\""), None);
         for command in [
             "echo ${ : # \"\n}; git reset --hard\n# \"",
@@ -8138,6 +8157,12 @@ mod tests {
             "echo \"$\\\n\\\n{y:-'}\" #'}\"; git reset --hard",
             "x=\"$\\\n{y:-'}\" #'}\"; git reset --hard",
             "echo ${y:-$\\\n{z}} #}; git reset --hard",
+            // Bash 3.2 reads the `${` at the second `$` of `$$` in this
+            // dispute, also behind a line continuation.
+            "echo \"$${y:-'}\" #'}\"; git reset --hard",
+            "echo \"$${y:-'}\" #'}\" && git push --force origin main",
+            "x=\"$${y:-'}\" #'}\"; git reset --hard",
+            "echo \"$$\\\n{y:-'}\" #'}\"; git reset --hard",
             "cat <<EOF\n${ git reset --hard; }\nEOF",
             "cat <<'EOF'\nEOF\necho ${ git reset --hard; }",
         ] {
@@ -8161,7 +8186,7 @@ mod tests {
             assert!(started.elapsed() < std::time::Duration::from_secs(2));
         }
         // Lookups that share fewer reads stay within the budget's time.
-        for unit in ["'${'", "\"${\"", "x\"${\"'"] {
+        for unit in ["'${'", "\"${\"", "x\"${\"'", "\"$${'"] {
             let started = std::time::Instant::now();
             let _ = bash_parameter_openers(&unit.repeat(8_000));
             assert!(started.elapsed() < std::time::Duration::from_secs(2));

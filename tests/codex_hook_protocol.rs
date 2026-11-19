@@ -1047,6 +1047,15 @@ fn bash_parameter_openers_hide_no_later_git_command() {
         ),
         ("echo \"$\\\n\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
         ("x=\"$\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
+        // The same dispute at the second `$` of `$$` (Bash 3.2 reads a `${`
+        // there inside double quotes).
+        ("echo \"$${y:-'}\" #'}\"; git reset --hard", "ask"),
+        (
+            "echo \"$${y:-'}\" #'}\" && git push --force origin main",
+            "ask",
+        ),
+        ("x=\"$${y:-'}\" #'}\"; git reset --hard", "ask"),
+        ("echo \"$$\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
         // The assignment-prefix forms that merged PR #12 already denies.
         ("x=${y:- a} git reset --hard", "deny"),
         ("x=${y:- } git reset --hard", "deny"),
@@ -1060,6 +1069,10 @@ fn bash_parameter_openers_hide_no_later_git_command() {
     for command in [
         "echo $${ ; git status",
         "echo $${x}; git status",
+        "echo \"$${HOME}\"; git status",
+        "mkdir -p /tmp/x$${RANDOM}",
+        "echo \"pid: $$\" {a,b}",
+        "echo $\\\n${ ; git status",
         "echo $$; git status # git reset --hard",
         "echo \"${y:-'a'}\" # git reset --hard",
         "x=${y:- a} git status",
