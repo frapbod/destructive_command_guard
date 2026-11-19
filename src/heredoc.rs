@@ -629,7 +629,7 @@ fn blank_local_redirects(command: &str) -> Option<String> {
 }
 
 /// [`blank_local_redirects`], and with `heredoc_operators` also each heredoc
-/// operator (`<<`, `<<-`, descriptor digits included) with its delimiter
+/// operator (`<<`, `<<-`, descriptor prefix included) with its delimiter
 /// word, whether or not its body follows in `command`.
 fn blank_redirect_words(command: &str, heredoc_operators: bool) -> Option<String> {
     let bytes = command.as_bytes();
@@ -696,19 +696,7 @@ fn blank_redirect_words(command: &str, heredoc_operators: bool) -> Option<String
                     .flatten();
                 match heredoc {
                     Some((delimiter_end, ..)) => {
-                        let mut start = index;
-                        while start > 0 && bytes[start - 1].is_ascii_digit() {
-                            start -= 1;
-                        }
-                        if start > 0
-                            && start < index
-                            && !matches!(
-                                bytes[start - 1],
-                                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
-                            )
-                        {
-                            start = index;
-                        }
+                        let start = heredoc_operator_start(bytes, index);
                         view.get_or_insert_with(|| bytes.to_vec())[start..delimiter_end].fill(b' ');
                         delimiter_end
                     }
@@ -755,24 +743,7 @@ fn comment_end(bytes: &[u8], start: usize, backquoted: bool) -> usize {
 /// [`blank_local_redirects`]), target included, or `None`.
 fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
     let len = bytes.len();
-    let mut index = start;
-    if bytes[index] == b'{' {
-        // `{name}`: stop at the first byte that is not part of a name, so a
-        // run of `{` is not rescanned to its end at each one.
-        let name = bytes[index + 1..]
-            .iter()
-            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
-            .count();
-        let close = index + 1 + name;
-        if name == 0 || bytes[index + 1].is_ascii_digit() || bytes.get(close) != Some(&b'}') {
-            return None;
-        }
-        index = close + 1;
-    } else {
-        while index < len && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-    }
+    let mut index = descriptor_prefix_end(bytes, start);
     let rest = &bytes[index..];
     let operator = if rest.starts_with(b"&>>") || rest.starts_with(b"<<<") {
         3
@@ -815,6 +786,80 @@ fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
         };
     }
     (index > target_start).then_some(index)
+}
+
+/// End of the descriptor prefix of a redirect operator that starts at
+/// `start`, or `start` when there is none: descriptor digits (`2>`, `10<<`),
+/// or a `{name}` in which Bash stores the descriptor it opens (`{fd}<<EOF`,
+/// `{a[i+1]}>log`). Bash reads a brace word glued to an operator that way
+/// when the name is an identifier or an array element with a non-empty
+/// subscript (`legal_identifier`, `valid_array_reference` in its parse.y);
+/// any other brace word (`{1x}`, `{}`, `{a[]}`, `{a[1]x}`) stays a word.
+fn descriptor_prefix_end(bytes: &[u8], start: usize) -> usize {
+    let len = bytes.len();
+    if bytes.get(start) != Some(&b'{') {
+        return start
+            + bytes[start..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+    }
+    // Stop at the first byte that is not part of a name, so a run of `{` is
+    // not rescanned to its end at each one.
+    let name = bytes[start + 1..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+        .count();
+    if name == 0 || bytes[start + 1].is_ascii_digit() {
+        return start;
+    }
+    let mut index = start + 1 + name;
+    if bytes.get(index) == Some(&b'[') && bytes.get(index + 1) != Some(&b']') {
+        // The subscript runs to its matching `]` (`{a[b[1]]}`, `{a[${i}]}`);
+        // a blank or an operator ends the word before it.
+        let mut depth = 0usize;
+        while index < len {
+            match bytes[index] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' => {
+                    return start;
+                }
+                _ => {}
+            }
+            index += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    if bytes.get(index) == Some(&b'}') {
+        index + 1
+    } else {
+        start
+    }
+}
+
+/// Start of the heredoc operator at `operator` with its descriptor prefix
+/// (see [`descriptor_prefix_end`]): the prefix belongs to the operator only
+/// when it is the whole word before it (`3<<EOF`, `{fd}<<EOF`), not the end
+/// of a longer word (`x{fd}<<EOF` is the word `x{fd}` and a heredoc).
+fn heredoc_operator_start(bytes: &[u8], operator: usize) -> usize {
+    // A prefix holds no blank or operator, so the scan back stops at most
+    // at the previous one (a word's earlier `<<` ends its delimiter).
+    let stop = bytes[..operator].iter().rposition(|byte| {
+        matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+        )
+    });
+    let word_start = stop.map_or(0, |at| at + 1);
+    if stop.is_some_and(|at| matches!(bytes[at], b'<' | b'>'))
+        || descriptor_prefix_end(bytes, word_start) != operator
+    {
+        return operator;
+    }
+    word_start
 }
 
 /// The argv view of a POSIX command: every redirection its shell performs is
@@ -872,7 +917,7 @@ pub(crate) fn command_words_view(command: &str) -> Option<String> {
 }
 
 /// The byte ranges [`redirection_free_view`] blanks for each heredoc: the
-/// operator with its descriptor digits and delimiter word, and the body
+/// operator with its descriptor prefix and delimiter word, and the body
 /// through the terminator line (newlines included, so the body cannot leave
 /// a run of empty commands behind; the newline ending the terminator line
 /// stays). The terminator line is checked to be the delimiter rather than
@@ -903,20 +948,7 @@ fn heredoc_redirection_spans(command: &str) -> Vec<Range<usize>> {
         else {
             continue;
         };
-        let mut operator_start = heredoc.operator_start;
-        let mut digits = operator_start;
-        while digits > 0 && bytes[digits - 1].is_ascii_digit() {
-            digits -= 1;
-        }
-        if digits < operator_start
-            && (digits == 0
-                || matches!(
-                    bytes[digits - 1],
-                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
-                ))
-        {
-            operator_start = digits;
-        }
+        let operator_start = heredoc_operator_start(bytes, heredoc.operator_start);
         if body_start > body_end || body_end > command.len() || body_start < delimiter_end {
             continue;
         }
@@ -4225,43 +4257,13 @@ fn names_interpreter_as_written(command: &str, needle: &str) -> bool {
 /// means the glyph is data, not syntax, so only a bare operator counts.
 fn word_token_starts_local_redirect(text: &str) -> bool {
     let bytes = text.as_bytes();
-    let mut index = redirect_descriptor_prefix_len(text);
-    if index == 0 {
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-        }
-    }
+    let index = descriptor_prefix_end(bytes, 0);
     match bytes.get(index) {
         Some(b'>' | b'<') => true,
         // `&>`/`&>>` (bash) redirect both streams; `&` alone is a separator
         // and never reaches this function as part of a Word.
         Some(b'&') if index == 0 => bytes.get(1) == Some(&b'>'),
         _ => false,
-    }
-}
-
-/// Length of a `{name}` descriptor-variable prefix (`{fd}>file`, bash 4.1+),
-/// or 0. It allocates a descriptor and stores its number in `name`; like a
-/// numbered descriptor it belongs to the redirect, not to the argv.
-fn redirect_descriptor_prefix_len(text: &str) -> usize {
-    let Some(rest) = text.strip_prefix('{') else {
-        return 0;
-    };
-    let Some(close) = rest.find('}') else {
-        return 0;
-    };
-    let name = &rest[..close];
-    let valid = name
-        .bytes()
-        .next()
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-    if valid && matches!(rest.as_bytes().get(close + 1), Some(b'>' | b'<')) {
-        close + 2
-    } else {
-        0
     }
 }
 
@@ -7018,12 +7020,7 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
 /// target: `2>` and `>&` do, while `2>&1`, `>&-` and `<&0` carry their target
 /// already, so the word after them is the command (`2>&1 watch '…'`).
 fn redirect_operator_takes_next_word(text: &str) -> bool {
-    let named = redirect_descriptor_prefix_len(text);
-    let operator = if named > 0 {
-        &text[named..]
-    } else {
-        text.trim_start_matches(|ch: char| ch.is_ascii_digit())
-    };
+    let operator = &text[descriptor_prefix_end(text.as_bytes(), 0)..];
     !operator.is_empty()
         && operator
             .bytes()
@@ -25319,6 +25316,9 @@ EOF";
             ("a 2>&1 >&- 3<&0- b", Some("a                b")),
             ("a &>l &>>l >|l <>l b", Some("a                  b")),
             ("a {fd}>l {9x}>l b", Some("a        {9x}   b")),
+            // An array element names the descriptor too; an empty subscript
+            // makes a word.
+            ("a {a[i+1]}>l {a[]}>l b", Some("a            {a[]}   b")),
             ("a>l b", Some("a   b")),
             ("a 2>\"x y\" b", Some("a         b")),
             ("echo 'x > y' \"a <b\"", None),
@@ -25378,8 +25378,6 @@ EOF";
         }
     }
 
-    /// The argv view blanks every redirection the shell performs, heredocs
-    /// whole, and nothing else, at unchanged byte offsets.
     #[test]
     fn command_words_view_blanks_heredoc_operators_without_their_bodies() {
         for (command, expected) in [
@@ -25391,6 +25389,16 @@ EOF";
             ("2>/dev/null <<EOF eval x", Some("                  eval x")),
             ("command <<EOF eval x", Some("command       eval x")),
             ("cat<<EOF", Some("cat     ")),
+            // A named descriptor (`{name}`, an array element too) belongs to
+            // the operator when it is the whole word before it.
+            ("{fd}<<EOF eval x", Some("          eval x")),
+            (
+                "{a[i+1]}<<-EOF trap x EXIT",
+                Some("               trap x EXIT"),
+            ),
+            ("a;{_f}<< 'EOF' eval x", Some("a;             eval x")),
+            ("x{fd}<<EOF eval x", Some("x{fd}      eval x")),
+            ("{1x}<<EOF eval x", Some("{1x}      eval x")),
             // A whole heredoc stays blanked as `redirection_free_view` does.
             ("<<EOF eval x\nhi\nEOF", Some("      eval x\n      ")),
             // A here-string, a quoted operator and no redirection at all.
@@ -25406,6 +25414,8 @@ EOF";
         }
     }
 
+    /// The argv view blanks every redirection the shell performs, heredocs
+    /// whole, and nothing else, at unchanged byte offsets.
     #[test]
     fn redirection_free_view_blanks_every_redirection() {
         for (command, expected) in [
@@ -25429,6 +25439,18 @@ EOF";
             (
                 "cat 3<<-X\n\tbody\n\tX\nls",
                 Some("cat      \n        \nls"),
+            ),
+            (
+                "{fd}<<EOF git reset\nhi\nEOF",
+                Some("          git reset\n      "),
+            ),
+            (
+                "x{fd}<<EOF git reset\nhi\nEOF",
+                Some("x{fd}      git reset\n      "),
+            ),
+            (
+                "{a[1]}>/dev/null git reset",
+                Some("                 git reset"),
             ),
             // The parse reports only the first heredoc of a line; a heredoc it
             // does not report stays as written, still a heredoc in the view.
