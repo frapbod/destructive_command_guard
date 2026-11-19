@@ -5867,6 +5867,221 @@ fn parse_windows_launcher_segment(
     )
 }
 
+/// An outer-shell redirect found in one raw word of a launcher segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OuterRedirect {
+    /// Bytes before the operator that stay a program argument; 0 when the
+    /// whole word is the redirect (`2>/dev/null`, as opposed to
+    /// `/wd>/dev/null`, where `/wd` is still an argument).
+    argument_len: usize,
+    /// The operator stands alone (`>`, `2>`, `>&`), so the next word is its
+    /// target.
+    takes_next_word: bool,
+}
+
+/// End of the bracketed group that opens at `open` (`(` or `{`), or the end
+/// of the word when it does not close there.
+fn posix_group_end(bytes: &[u8], open: usize) -> usize {
+    let (opener, closer) = if bytes[open] == b'{' {
+        (b'{', b'}')
+    } else {
+        (b'(', b')')
+    };
+    let mut depth = 0usize;
+    for (index, &byte) in bytes.iter().enumerate().skip(open) {
+        if byte == opener {
+            depth += 1;
+        } else if byte == closer {
+            depth -= 1;
+            if depth == 0 {
+                return index + 1;
+            }
+        }
+    }
+    bytes.len()
+}
+
+/// The first `<` or `>` in a raw POSIX word that is a redirect operator: not
+/// quoted, not backslash-escaped, not inside `$(...)`, `${...}` or a
+/// backtick substitution, and not a process substitution (`<(...)`).
+fn posix_unquoted_redirect_operator(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        index = match byte {
+            b'\\' => index + 2,
+            b'\'' => bytes[index + 1..]
+                .iter()
+                .position(|&next| next == b'\'')
+                .map_or(bytes.len(), |at| index + at + 2),
+            b'"' => {
+                let mut cursor = index + 1;
+                while let Some(&next) = bytes.get(cursor) {
+                    if next == b'"' {
+                        break;
+                    }
+                    cursor += if next == b'\\' { 2 } else { 1 };
+                }
+                cursor + 1
+            }
+            b'`' => bytes[index + 1..]
+                .iter()
+                .position(|&next| next == b'`')
+                .map_or(bytes.len(), |at| index + at + 2),
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                posix_group_end(bytes, index + 1)
+            }
+            b'<' | b'>' if bytes.get(index + 1) == Some(&b'(') => posix_group_end(bytes, index + 1),
+            b'<' | b'>' => return Some(index),
+            _ => index + 1,
+        };
+    }
+    None
+}
+
+/// The first `<` or `>` in a raw Cmd word that is a redirect operator: not
+/// inside double quotes and not escaped with `^`.
+fn cmd_unquoted_redirect_operator(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    let mut quoted = false;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'^' if !quoted => index += 1,
+            b'<' | b'>' if !quoted => return Some(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Where an outer-shell redirect starts in one raw word, by the outer
+/// dialect's redirect grammar. The outer shell performs it and removes it
+/// before the launched program starts, wherever it stands on the line, so it
+/// is never one of that program's arguments: `pwsh -nop 2>/dev/null /c '...'`
+/// runs the `/c` command (measured with bash 5.2 and pwsh 7.5 as the outer
+/// shell).
+///
+/// - POSIX: `[n]>`, `>>`, `>|`, `<`, `<>`, `[n]>&m`, `&>`, `{name}>` and the
+///   rest of the family, unquoted, at the start of a word or after other
+///   text (`/wd>/dev/null` gives the program `/wd`, measured).
+/// - PowerShell: `>`, `>>`, `n>`, `n>>`, `n>&1` and `*>` for streams 1-6 and
+///   `*`, only at the start of a word: `/wd>$null`, `7>$null` and
+///   `x2>$null` are arguments (measured). `<` is reserved: the line is a
+///   parse error and runs nothing, so the word is left in place.
+/// - Cmd: `[n]>`, `>>`, `<` and `n>&m`, outside double quotes and not
+///   `^`-escaped, at the start of a word or after other text. Whether cmd
+///   reads a digit glued to the end of an argument (`x2>nul`) as the handle
+///   is not modeled: the argument keeps it.
+fn outer_redirect_in_word(raw: &str, dialect: ShellDialect) -> Option<OuterRedirect> {
+    match dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            let at = posix_unquoted_redirect_operator(raw)?;
+            // A descriptor number, `{name}` or `&` before the operator
+            // belongs to the redirect (`2>`, `{fd}>`, `&>`).
+            let whole = crate::heredoc::word_token_starts_local_redirect(raw)
+                && !raw[..at].contains(['<', '>']);
+            let start = if whole { 0 } else { at };
+            Some(OuterRedirect {
+                argument_len: start,
+                takes_next_word: crate::heredoc::redirect_operator_takes_next_word(&raw[start..]),
+            })
+        }
+        ShellDialect::PowerShell => {
+            let operator = raw
+                .strip_prefix(['1', '2', '3', '4', '5', '6', '*'])
+                .unwrap_or(raw);
+            operator.starts_with('>').then_some(OuterRedirect {
+                argument_len: 0,
+                takes_next_word: matches!(operator, ">" | ">>"),
+            })
+        }
+        ShellDialect::Cmd => {
+            let at = cmd_unquoted_redirect_operator(raw)?;
+            let handle = &raw[..at];
+            let whole =
+                handle.is_empty() || (handle.len() == 1 && handle.as_bytes()[0].is_ascii_digit());
+            Some(OuterRedirect {
+                argument_len: if whole { 0 } else { at },
+                takes_next_word: matches!(&raw[at..], ">" | ">>" | "<"),
+            })
+        }
+    }
+}
+
+/// The raw words a launcher segment hands its program, or `None` when the
+/// segment holds a command separator (it is not one simple command).
+///
+/// Outer-shell redirects and a lone operator's target are removed by
+/// [`outer_redirect_in_word`]. The tokenizers end a word at `&` and `|`, so
+/// a descriptor duplication (`2>&1`, `>& file`) and a POSIX clobbering
+/// redirect (`>|file`) arrive as a redirect word, a separator glued to it and
+/// a target word; that separator belongs to the redirect, not to the line.
+/// The redirect itself is judged by the ordinary outer passes
+/// ([`segment_has_outer_redirect`]).
+fn launcher_argv<'a>(
+    segment: &'a str,
+    tokens: &crate::normalize::NormalizeTokens,
+    dialect: ShellDialect,
+) -> Option<Vec<&'a str>> {
+    let mut words = Vec::with_capacity(tokens.len());
+    let mut skip_target = false;
+    // End and text of the previous token when it was a redirect that ends
+    // in its operator.
+    let mut open_redirect: Option<(usize, &str)> = None;
+    for token in tokens {
+        let text = token.text(segment)?;
+        let previous = open_redirect.take();
+        if token.kind == NormalizeTokenKind::Separator {
+            let duplication = previous.is_some_and(|(end, redirect)| {
+                end == token.byte_range.start
+                    && match text {
+                        "&" => true,
+                        "|" => {
+                            matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+                                && redirect.ends_with('>')
+                                && !redirect.ends_with("&>")
+                        }
+                        _ => false,
+                    }
+            });
+            if !duplication {
+                return None;
+            }
+            skip_target = true;
+            continue;
+        }
+        if std::mem::take(&mut skip_target) {
+            continue;
+        }
+        let Some(redirect) = outer_redirect_in_word(text, dialect) else {
+            words.push(text);
+            continue;
+        };
+        if redirect.argument_len > 0 {
+            words.push(&text[..redirect.argument_len]);
+        }
+        skip_target = redirect.takes_next_word;
+        if text.ends_with(['>', '<']) {
+            open_redirect = Some((token.byte_range.end, text));
+        }
+    }
+    Some(words)
+}
+
+/// Whether any word of `segment` carries an outer-shell redirect, which
+/// [`launcher_argv`] removes from the launched program's arguments.
+fn segment_has_outer_redirect(segment: &str, dialect: ShellDialect) -> bool {
+    segment.contains(['<', '>'])
+        && tokenize_for_shell_dialect(segment, dialect)
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .filter_map(|token| token.text(segment))
+            .any(|word| outer_redirect_in_word(word, dialect).is_some())
+}
+
 /// One launcher segment under one reading of the arguments the launched
 /// program receives ([`NativeArgv`]). `expansions` applies to a `cmd /c` /
 /// `cmd /k` payload.
@@ -5938,17 +6153,9 @@ fn parse_windows_launcher_segment_as(
         .then(|| segment.replace('\r', "\u{1}"));
     let tokens =
         tokenize_for_shell_dialect(cr_as_word_byte.as_deref().unwrap_or(segment), outer_dialect);
-    if tokens
-        .iter()
-        .any(|token| token.kind == NormalizeTokenKind::Separator)
-    {
+    let Some(words) = launcher_argv(segment, &tokens, outer_dialect) else {
         return WindowsLauncherParse::NotLauncher;
-    }
-    let words: Vec<&str> = tokens
-        .iter()
-        .filter(|token| token.kind == NormalizeTokenKind::Word)
-        .filter_map(|token| token.text(segment))
-        .collect();
+    };
     let Some(executable) = words
         .first()
         .and_then(|raw| launcher_executable_name(raw, outer_dialect))
@@ -6238,7 +6445,10 @@ fn windows_launcher_envelopes(
                     }
                 }
             }
-            ordinary_reading |= !launcher_reading;
+            // The outer shell performs a redirect the launcher's argv no
+            // longer shows (`pwsh -c Get-Date > /dev/sda`), so the ordinary
+            // outer passes judge that segment as well.
+            ordinary_reading |= !launcher_reading || segment_has_outer_redirect(segment, candidate);
         }
         // Unknown-mode parsing is a conservative union of viable shell
         // interpretations. A valid envelope in one dialect cannot make an
@@ -9417,11 +9627,18 @@ fn either_pipeline_reading(
 
 /// Whether a PowerShell host started in a pipeline runs its stdin, under
 /// both readings of its arguments ([`NativeArgv`]): the argv comes from a
-/// POSIX-shaped view and the outer shell may be Git Bash.
+/// POSIX-shaped view and the outer shell may be Git Bash. The outer shell's
+/// redirects are not the host's arguments ([`partition_stage_argv`]): `pwsh
+/// -nop 2>/dev/null` still runs its stdin. A stdin redirect replaces the
+/// pipe with a source dcg cannot read, as for a POSIX shell consumer.
 fn powershell_pipeline_input_mode(args: &[String], host: PowerShellHost) -> PipelineShellInputMode {
+    let (args, stdin_redirect) = partition_stage_argv(args);
+    if stdin_redirect {
+        return PipelineShellInputMode::Unverified;
+    }
     either_pipeline_reading(
-        powershell_pipeline_input_mode_as(args, host, NativeArgv::Verbatim),
-        powershell_pipeline_input_mode_as(args, host, NativeArgv::Msys),
+        powershell_pipeline_input_mode_as(&args, host, NativeArgv::Verbatim),
+        powershell_pipeline_input_mode_as(&args, host, NativeArgv::Msys),
     )
 }
 
@@ -10739,15 +10956,6 @@ fn powershell_process_substitution_input_mode(
     };
     let mut index = 0usize;
     while let Some(argument) = args.get(index) {
-        // A redirect word (`2>/dev/null`) belongs to the outer shell, not
-        // to pwsh's argv, as in the POSIX shell branch.
-        if argument != marker
-            && let Some(next) =
-                skip_redirect_token(classify_shell_positional(argument), index, args.len())
-        {
-            index = next;
-            continue;
-        }
         match powershell_host_option(argument, host, ShellDialect::Posix, argv) {
             PowerShellHostOption::File => {
                 return match args.get(index + 1) {
@@ -10967,6 +11175,10 @@ fn process_substitution_file_input_mode(command: &str, marker: &str) -> Pipeline
     }
     if matches!(executable.as_str(), "powershell" | "pwsh") {
         let host = PowerShellHost::from_executable(&executable);
+        // The outer shell's redirects are not pwsh's arguments, at a switch
+        // or a value position alike (`pwsh -wd 2>/dev/null x <(...)` runs
+        // the file). The process-substitution marker is no redirect.
+        let (args, _) = partition_stage_argv(&args);
         return either_pipeline_reading(
             powershell_process_substitution_input_mode(&args, marker, host, NativeArgv::Verbatim),
             powershell_process_substitution_input_mode(&args, marker, host, NativeArgv::Msys),
@@ -44686,6 +44898,120 @@ mod tests {
             ("2<other", OtherRedirectGlued),
         ] {
             assert_eq!(classify_shell_positional(tok), want, "token {tok:?}");
+        }
+    }
+
+    #[test]
+    fn launcher_argv_drops_outer_shell_redirects() {
+        use ShellDialect::{Cmd, Posix, PowerShell};
+        let cases: &[(&str, ShellDialect, Option<&[&str]>)] = &[
+            (
+                "pwsh -nop 2>/dev/null /c x",
+                Posix,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            ("2>/dev/null pwsh /c x", Posix, Some(&["pwsh", "/c", "x"])),
+            (
+                "pwsh /wd > out.txt . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh -nop 2>&1 /c x",
+                Posix,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            (
+                "pwsh /wd >& out.txt . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd >|out.txt . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd>/dev/null . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd {fd}>/dev/null . -c x",
+                Posix,
+                Some(&["pwsh", "/wd", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd '2>x' -c x",
+                Posix,
+                Some(&["pwsh", "/wd", "'2>x'", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd x\\>y -c x",
+                Posix,
+                Some(&["pwsh", "/wd", "x\\>y", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd \"a>b\"c -c x",
+                Posix,
+                Some(&["pwsh", "/wd", "\"a>b\"c", "-c", "x"]),
+            ),
+            ("pwsh -c x; git status", Posix, None),
+            ("pwsh -c x & git status", Posix, None),
+            (
+                "pwsh -nop 2>$null /c x",
+                PowerShell,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            (
+                "pwsh -nop 2>&1 /c x",
+                PowerShell,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            (
+                "pwsh -nop *> out.txt /c x",
+                PowerShell,
+                Some(&["pwsh", "-nop", "/c", "x"]),
+            ),
+            (
+                "pwsh /wd 7>$null . -c x",
+                PowerShell,
+                Some(&["pwsh", "/wd", "7>$null", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd>$null . -c x",
+                PowerShell,
+                Some(&["pwsh", "/wd>$null", ".", "-c", "x"]),
+            ),
+            (
+                "pwsh /wd 2>nul x -c y",
+                Cmd,
+                Some(&["pwsh", "/wd", "x", "-c", "y"]),
+            ),
+            (
+                "pwsh /wd 2>&1 x -c y",
+                Cmd,
+                Some(&["pwsh", "/wd", "x", "-c", "y"]),
+            ),
+            (
+                "pwsh /wd x^>y -c y",
+                Cmd,
+                Some(&["pwsh", "/wd", "x^>y", "-c", "y"]),
+            ),
+            (
+                "pwsh /wd \"2>x\" -c y",
+                Cmd,
+                Some(&["pwsh", "/wd", "\"2>x\"", "-c", "y"]),
+            ),
+            ("cmd /c dir>out.txt", Cmd, Some(&["cmd", "/c", "dir"])),
+        ];
+        for &(segment, dialect, want) in cases {
+            let tokens = tokenize_for_shell_dialect(segment, dialect);
+            assert_eq!(
+                launcher_argv(segment, &tokens, dialect).as_deref(),
+                want,
+                "{dialect:?}: {segment:?}"
+            );
         }
     }
 

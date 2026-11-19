@@ -430,6 +430,23 @@ const PWSH_RUNS_IT: &[&str] = &[
     "pwsh /sshs -c \"git reset --hard\"",
     // Piped input reaches the -Command -.
     "echo \"git reset --hard\" | pwsh /wd x -c -",
+    // The outer shell removes its redirects before pwsh starts, wherever
+    // they stand, so they are no switch, switch value or script path
+    // (measured with bash 5.2 and pwsh 7.5 as the outer shell:
+    // `pwsh -nop 2>/dev/null /c`, `/wd 2>/dev/null .`, `/ep 2>/dev/null
+    // Bypass`, `-nop > out.txt /c`, `-nop 2>&1 /c` and `/wd 2>&1 .` each ran
+    // the command). cmd removes `2>nul` the same way (documented).
+    "pwsh -nop 2>/dev/null /c \"git reset --hard\"",
+    "pwsh 2>/dev/null /c \"git reset --hard\"",
+    "pwsh /wd 2>/dev/null x -c \"git reset --hard\"",
+    "pwsh /wd x 2>/dev/null -c \"git reset --hard\"",
+    "pwsh /wd >/dev/null x -c \"git reset --hard\"",
+    "pwsh /ep 2>/dev/null Bypass -c \"git reset --hard\"",
+    "pwsh /ec 2>/dev/null ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=",
+    "pwsh -nop 2>&1 /c \"git reset --hard\"",
+    "pwsh -nop 2>nul /c \"git reset --hard\"",
+    "pwsh -nop 2> out.txt /c \"git reset --hard\"",
+    "cmd /c pwsh /wd 2>nul x -c \"git reset --hard\"",
 ];
 
 /// Ordinary pwsh launches stay allowed, including abbreviations dcg used to
@@ -449,6 +466,11 @@ const PWSH_HARMLESS: &[&str] = &[
     "pwsh /ec RwBlAHQALQBEAGEAdABlAA==",
     "pwsh /of text /if text -c \"Get-Date\"",
     "pwsh /?",
+    "pwsh -nop 2>/dev/null -c Get-Date",
+    "pwsh /wd x 2>/dev/null -c Get-Date",
+    "pwsh -NoProfile -File ./b.ps1 2>/dev/null",
+    // A quoted operator is an argument.
+    "pwsh /wd '2>x' -c Get-Date",
 ];
 
 /// Both hook formats, under the PowerShell and the Bash tool labels.
@@ -518,6 +540,26 @@ const PWSH_PROCESS_SUBSTITUTION_RUNS_IT: &[&str] = &[
     "pwsh -ec RwBlAHQALQBEAGEAdABlAA== <(echo \"git reset --hard\")",
     "pwsh -c 'iex ([IO.File]::ReadAllText(\"'<(echo \"git reset --hard\")'\"))'",
     "powershell -File <(echo \"git reset --hard\")",
+    // Outer-shell redirects at a switch or value position (measured:
+    // `-f 2>/dev/null <(...)`, `-f > out.txt <(...)`, `-wd 2>/dev/null x
+    // <(...)` and `-nop 2>/dev/null < <(...)` each ran the text).
+    "pwsh -wd 2>/dev/null x <(echo \"git reset --hard\")",
+    "pwsh -wd 2>/dev/null x -f <(echo \"git reset --hard\")",
+    "pwsh -f 2>/dev/null <(echo \"git reset --hard\")",
+    "pwsh -f > out.txt <(echo \"git reset --hard\")",
+    "pwsh -File >/dev/null <(echo \"git reset --hard\")",
+    "pwsh -nop -f 2>&1 <(echo \"git reset --hard\")",
+    "pwsh -nop 2>/dev/null < <(echo \"git reset --hard\")",
+    "pwsh -ep Bypass 2>/dev/null < <(echo \"git reset --hard\")",
+    "pwsh 2>/dev/null < <(echo \"git reset --hard\")",
+    // A POSIX redirect glued to an argument leaves the argument
+    // (`/wd>/dev/null` reaches pwsh as `/wd`), and the rest of bash's
+    // redirect family (measured).
+    "pwsh /wd>/dev/null x -c \"git reset --hard\"",
+    "pwsh /nop>/dev/null /c \"git reset --hard\"",
+    "pwsh /wd >| out.txt . -c \"git reset --hard\"",
+    "pwsh /wd &>/dev/null . -c \"git reset --hard\"",
+    "pwsh /wd {fd}>/dev/null . -c \"git reset --hard\"",
 ];
 
 /// The substituted text is judged as PowerShell source, so a harmless one
@@ -529,10 +571,12 @@ const PWSH_PROCESS_SUBSTITUTION_HARMLESS: &[&str] = &[
     "pwsh <(echo Get-Date)",
     "pwsh /wd x -f <(echo Get-Date)",
     "pwsh -wd <(echo \"git reset --hard\") -c Get-Date",
+    "pwsh -f <(echo Get-Date) 2>/dev/null",
 ];
 
-/// Process substitution exists only in a POSIX outer shell, so the Bash tool
-/// label in both hook formats, and the Unknown and POSIX dialects.
+/// Process substitution and these redirect spellings exist only in a POSIX
+/// outer shell, so the Bash tool label in both hook formats, and the Unknown
+/// and POSIX dialects.
 #[test]
 fn hooks_read_pwsh_process_substitution_files() {
     for protocol in [Protocol::Claude, Protocol::Codex] {
@@ -570,5 +614,55 @@ fn posix_dialects_read_pwsh_process_substitution_files() {
                 "{dialect:?}: {command:?}"
             );
         }
+    }
+}
+
+/// PowerShell's own redirects, at the start of a word only, for streams 1-6
+/// and `*`. Measured with pwsh 7.5 as the outer shell: `pwsh -nop 2>$null
+/// /c`, `-nop *>$null /c` and `/wd 3>$null .` ran the command, while
+/// `/wd 7>$null .` and `/wd>$null .` gave pwsh the arguments `7>` and `/wd>`
+/// and ran nothing.
+const PWSH_POWERSHELL_REDIRECT_RUNS_IT: &[&str] = &[
+    "pwsh -nop 2>$null /c \"git reset --hard\"",
+    "pwsh -nop *>$null /c \"git reset --hard\"",
+    "pwsh /wd 3>$null . -c \"git reset --hard\"",
+];
+
+const PWSH_POWERSHELL_REDIRECT_HARMLESS: &[&str] = &[
+    "pwsh /wd 7>$null . -c \"git reset --hard\"",
+    "pwsh /wd>$null . -c \"git reset --hard\"",
+];
+
+#[test]
+fn powershell_outer_shell_redirects_are_not_pwsh_arguments() {
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in PWSH_POWERSHELL_REDIRECT_RUNS_IT {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+        for command in PWSH_POWERSHELL_REDIRECT_HARMLESS {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+    for command in PWSH_POWERSHELL_REDIRECT_RUNS_IT {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Deny,
+            "{command:?}"
+        );
+    }
+    for command in PWSH_POWERSHELL_REDIRECT_HARMLESS {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Allow,
+            "{command:?}"
+        );
     }
 }

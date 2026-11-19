@@ -3939,7 +3939,7 @@ fn names_interpreter_as_written(command: &str, needle: &str) -> bool {
 /// The normalizer keeps `>` inside words, so a redirect reaches the token
 /// stream as a Word rather than a Separator. A quoted or escaped leading byte
 /// means the glyph is data, not syntax, so only a bare operator counts.
-fn word_token_starts_local_redirect(text: &str) -> bool {
+pub(crate) fn word_token_starts_local_redirect(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut index = redirect_descriptor_prefix_len(text);
     if index == 0 {
@@ -6704,7 +6704,7 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
 /// Whether a bare redirect operator word takes the following word as its
 /// target: `2>` and `>&` do, while `2>&1`, `>&-` and `<&0` carry their target
 /// already, so the word after them is the command (`2>&1 watch '…'`).
-fn redirect_operator_takes_next_word(text: &str) -> bool {
+pub(crate) fn redirect_operator_takes_next_word(text: &str) -> bool {
     let named = redirect_descriptor_prefix_len(text);
     let operator = if named > 0 {
         &text[named..]
