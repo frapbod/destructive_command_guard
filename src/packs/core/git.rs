@@ -1073,32 +1073,6 @@ fn sole_posix_branch_name_query(command: &str) -> bool {
     )
 }
 
-fn decoded_words_execute_git(words: &[String]) -> bool {
-    for word in words {
-        if crate::normalize::is_env_assignment(word)
-            || matches!(word.as_str(), "exec" | "time" | "nohup" | "!")
-        {
-            continue;
-        }
-        let Some(mut executable) = word.rsplit(['/', '\\']).next() else {
-            return false;
-        };
-        if executable
-            .get(executable.len().saturating_sub(4)..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
-        {
-            executable = executable
-                .get(..executable.len().saturating_sub(4))
-                .unwrap_or(executable);
-        }
-        return executable.eq_ignore_ascii_case("git")
-            || CORE_GIT_DASHED_BUILTINS
-                .iter()
-                .any(|(bare, _, _)| executable.eq_ignore_ascii_case(bare));
-    }
-    false
-}
-
 fn next_posix_prefix_token(
     segment: &str,
     tokens: &[crate::normalize::NormalizeToken],
@@ -5493,10 +5467,12 @@ fn syntax_views_with_split_words(
     if words.is_empty() {
         return None;
     }
-    if resolved_substitutions.is_some() && !decoded_words_execute_git(&words) {
+    if resolved_substitutions.is_some() && !command_executes_git_in_dialect(command, dialect) {
         // Command-substitution output is argv data; it is not parsed again as
         // shell source. Do not let an `echo "$(printf 'git reset --hard')"`
         // data argument become a synthetic Git invocation in the regex view.
+        // The executable reading looks through wrappers that run their argv
+        // (`x=$(echo a) watch git reset --hard`), as on the unresolved path.
         return Some(vec!["__dcg_non_git_command__".to_string()]);
     }
 
