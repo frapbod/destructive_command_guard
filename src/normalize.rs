@@ -1921,9 +1921,12 @@ pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usi
 /// optional `(` before one) ends the pattern, not the substitution. So
 /// `x=$(echo a # )` LF `) printf …` and `x=$(case a in a) echo;; esac)
 /// printf …` are each one word before `printf`, in bash 4 and later, dash
-/// and zsh. Bash 3.2 ends both at the first `)` and then reports a syntax
-/// error, so it runs nothing of the line. An arithmetic body (`$((…))`)
-/// has neither.
+/// and zsh. Bash 3.2 reads the comment the same way, but it ends a body at
+/// the `)` of a `case` pattern: `x=$(case a in a) git reset --hard` runs
+/// `git reset --hard` there. dcg reads that body as unclosed, which fails
+/// closed. A backslash-newline is dropped before words are read, so it
+/// neither ends nor starts one. An arithmetic body (`$((…))`) has none of
+/// this.
 pub(crate) struct CommandText {
     /// False for an arithmetic body.
     active: bool,
@@ -1982,6 +1985,11 @@ impl CommandText {
             return CommandTextStep::Read;
         }
         let byte = bytes[i];
+        // The shell drops a backslash-newline before it reads words, so it
+        // neither ends nor starts one: `a \` LF `#)` starts a comment.
+        if byte == b'\\' && bytes.get(i + 1) == Some(&b'\n') {
+            return CommandTextStep::Continue(i + 2);
+        }
         if byte == b'#' && self.at_word_start {
             let end = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |at| i + at);
             return CommandTextStep::Continue(end);
@@ -5309,21 +5317,62 @@ pub fn consume_separator_token(
 #[inline]
 #[must_use]
 pub fn is_env_assignment(word: &str) -> bool {
-    let Some((lhs, _value)) = word.split_once('=') else {
+    let bytes = word.as_bytes();
+    if !bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
         return false;
-    };
-    let lhs = lhs.strip_suffix('+').unwrap_or(lhs);
-    let name = lhs.split_once('[').map_or(lhs, |(name, subscript)| {
-        if subscript.len() <= 1 || !subscript.ends_with(']') {
-            return "";
+    }
+    let mut i = 1 + bytes[1..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+        .count();
+    // A subscript ends at the `]` that closes it, as bash's `skipsubscript`
+    // reads it: an `=` inside (`x[i=1]=a`, `x["a=b"]=a`) is not the one that
+    // assigns.
+    if bytes.get(i) == Some(&b'[') {
+        let Some(close) = subscript_end(bytes, i) else {
+            return false;
+        };
+        if close == i + 1 {
+            return false;
         }
-        name
-    });
-    let mut bytes = name.bytes();
-    bytes
-        .next()
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        i = close + 1;
+    }
+    if bytes.get(i) == Some(&b'+') {
+        i += 1;
+    }
+    bytes.get(i) == Some(&b'=')
+}
+
+/// The index of the `]` that closes the subscript whose `[` is at `open`:
+/// brackets nest, and quotes and backslashes hide a `]`.
+fn subscript_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'\'' => i += memchr::memchr(b'\'', &bytes[i + 1..])? + 1,
+            b'"' => {
+                i += 1;
+                while bytes.get(i)? != &b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8620,9 +8669,8 @@ mod tests {
         );
     }
 
-    /// `$$` is one parameter, so a `{` after it opens nothing and is spelled;
-    /// a Bash 5.3 `${ …; }` and a `'` that ends a double-quoted `${…}` at
-    /// another place for Bash than for dash have no reading.
+    /// Bash reads `$[…]` and a subscript before `=` as one word, blanks
+    /// included; each blank there is spelled.
     #[test]
     fn bash_bracket_words_spell_blanks_bash_reads_in_one_word() {
         let spelled = |command: &str| match bash_bracket_words(command) {
@@ -8664,6 +8712,19 @@ mod tests {
         };
         let command = "x=$(echo a # )\n) printf";
         assert_eq!(&command[..end(command)], "x=$(echo a # )\n)");
+        // The shell drops a backslash-newline first, so the `#` after it
+        // starts a comment.
+        for command in [
+            "x=$(echo a \\\n#) '\n) git reset --hard #'",
+            "x=$(echo a;\\\n#) '\n) git reset --hard #'",
+            "x=$(echo a \\\n\\\n#) '\n) git reset --hard #'",
+        ] {
+            assert_eq!(
+                &command[..end(command)],
+                &command[..command.find("\n) ").expect("close") + 2],
+                "{command:?}"
+            );
+        }
         let command = "x=$(case a in a) echo a b;; esac) printf";
         assert_eq!(
             &command[..end(command)],
@@ -8680,12 +8741,37 @@ mod tests {
             ("x=$(echo case a in a) git", "x=$(echo case a in a)"),
             ("x=$(echo a#b) git", "x=$(echo a#b)"),
             ("x=$((1 # 2)) git", "x=$((1 # 2))"),
+            // A backslash-newline inside a word keeps the `#` in it.
+            ("x=$(echo a\\\n#) git", "x=$(echo a\\\n#)"),
             (
                 "x=$(cat <<EOF\ncase a in\nEOF\n); git",
                 "x=$(cat <<EOF\ncase a in\nEOF\n)",
             ),
         ] {
             assert_eq!(&command[..end(command)], through, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn env_assignments_end_their_subscript_at_its_closing_bracket() {
+        for word in [
+            "x=1",
+            "_x+=1",
+            "x[1]=a",
+            "x[i=1]=a",
+            "x[\"a=b\"]=a",
+            "x['a]b']=a",
+            "x[i+=1]+=a",
+            "x[i==1]=a",
+            "x[a[1]]=b",
+            "x[$(pwd)]=a",
+        ] {
+            assert!(is_env_assignment(word), "{word:?}");
+        }
+        for word in [
+            "=a", "1x=a", "x", "x[]=a", "x[1]", "x[1]b=c", "x[a]]=b", "x[1=a", "x+1=a", "-x=1",
+        ] {
+            assert!(!is_env_assignment(word), "{word:?}");
         }
     }
 
@@ -8702,6 +8788,9 @@ mod tests {
         assert!(posix_simple_command_words("echo 'a").is_err());
     }
 
+    /// `$$` is one parameter, so a `{` after it opens nothing and is spelled;
+    /// a Bash 5.3 `${ …; }` and a `'` that ends a double-quoted `${…}` at
+    /// another place for Bash than for dash have no reading.
     #[test]
     fn bash_parameter_openers_reads_dollar_pairs_funsubs_and_quote_disputes() {
         let spelled = |command: &str| match bash_parameter_openers(command) {

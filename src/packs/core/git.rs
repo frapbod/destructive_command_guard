@@ -887,8 +887,10 @@ impl SymbolicPosixWord {
     /// substitution (`x=$(pwd)`, `x=$((1 + 2))`): that is still an
     /// assignment, not the command name. The name must be literal.
     fn is_assignment(&self) -> bool {
+        // The name ends at `[`, `+=` or `=`; a subscript may hold a
+        // substitution (`x[$(pwd)]=a`), as a value may.
         crate::normalize::is_env_assignment(&self.text)
-            && self.text.split_once('=').is_some_and(|(name, _)| {
+            && self.text.split(['[', '+', '=']).next().is_some_and(|name| {
                 !name.contains(POSIX_DYNAMIC_QUOTED) && !name.contains(POSIX_DYNAMIC_UNQUOTED)
             })
     }
@@ -1679,7 +1681,7 @@ fn semantic_git_executable_index(
     None
 }
 
-fn symbolic_posix_may_execute_git(command: &str) -> bool {
+fn symbolic_posix_may_execute_git(command: &str, depth: usize) -> bool {
     // `strip_wrapper_prefixes` keeps an assignment whose value holds a
     // substitution (`x=$(pwd) env git …`), as the substitution runs; here it
     // only assigns, so peel it too and strip the wrappers behind it.
@@ -1693,6 +1695,21 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
         current = std::borrow::Cow::Owned(stripped.normalized.into_owned());
     }
     let command = current.as_ref();
+    // The literal reading looks through `xargs`, `watch`, `parallel` and
+    // `find -exec`; this reading must too, or a substitution anywhere in the
+    // command (`x=$(pwd) xargs git reset --hard`,
+    // `find . -exec git reset --hard $(pwd) \;`) hides the Git they run.
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let payloads = exec_wrapper_payloads(command, &tokens);
+    if !payloads.is_empty() && depth >= MAX_EXEC_WRAPPER_DEPTH {
+        return true;
+    }
+    if payloads
+        .iter()
+        .any(|payload| command_executes_git_in_dialect_at(payload, ShellDialect::Posix, depth + 1))
+    {
+        return true;
+    }
     let Ok(view) = posix_substitution_view(command) else {
         return true;
     };
@@ -4962,7 +4979,7 @@ fn command_executes_git_in_dialect_at(command: &str, dialect: ShellDialect, dept
                 resolved.as_str()
             }
             Ok(None) => command,
-            Err(()) => return symbolic_posix_may_execute_git(command),
+            Err(()) => return symbolic_posix_may_execute_git(command, depth),
         }
     } else {
         command
