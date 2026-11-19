@@ -4883,9 +4883,18 @@ fn find_matching_command_substitution(cmd: &str, start: usize, end: usize) -> Op
     let mut in_single = false;
     let mut in_ansi_c = false;
     let mut in_double = false;
+    // A comment or a `case` pattern in the body closes nothing.
+    let mut text = crate::normalize::CommandText::new(bytes, start);
 
     while i < end {
         let b = bytes[i];
+        if !in_single
+            && !in_double
+            && let crate::normalize::CommandTextStep::Continue(next) = text.step(&bytes[..end], i)
+        {
+            i = next;
+            continue;
+        }
 
         if !in_single && !in_double && crate::context::ansi_c_quote_starts_at(bytes, i) {
             in_single = true;

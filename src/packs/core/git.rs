@@ -606,7 +606,7 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
                     command.get(index + 2..close).ok_or(())?,
                     !in_double && posix_output_at_word_start(&output),
                 ) {
-                    Ok(rendered) => output.push_str(&rendered),
+                    Ok(rendered) => push_static_output(&mut output, &rendered, in_double),
                     Err(()) => {
                         output.push_str(if in_double {
                             POSIX_DYNAMIC_QUOTED
@@ -625,7 +625,7 @@ pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitution
                     command.get(index + 1..close).ok_or(())?,
                     !in_double && posix_output_at_word_start(&output),
                 ) {
-                    Ok(rendered) => output.push_str(&rendered),
+                    Ok(rendered) => push_static_output(&mut output, &rendered, in_double),
                     Err(()) => {
                         output.push_str(if in_double {
                             POSIX_DYNAMIC_QUOTED
@@ -703,6 +703,52 @@ pub(crate) fn find_posix_substitution_close(
         }
     }
     Err(())
+}
+
+/// Splice the output of a modeled substitution after `output`.
+///
+/// Unquoted output is split into fields at its blanks, except in the value
+/// of an assignment word before the command name: the shell does not split
+/// an assignment value, so `x=$(echo a b) git reset --hard` assigns `a b`
+/// to `x` and runs `git`. There the output is spliced in double quotes,
+/// which keep it one word; its alphabet holds nothing active inside them.
+fn push_static_output(output: &mut String, rendered: &str, in_double: bool) {
+    if !in_double
+        && rendered.bytes().any(|byte| byte.is_ascii_whitespace())
+        && posix_output_in_prefix_assignment(output)
+    {
+        output.push('"');
+        output.push_str(rendered);
+        output.push('"');
+    } else {
+        output.push_str(rendered);
+    }
+}
+
+/// Whether text spliced after `output` is part of an assignment word that
+/// only assignments, redirections and reserved words precede in its
+/// command: the words the shell reads before the command name.
+fn posix_output_in_prefix_assignment(output: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(output, ShellDialect::Posix);
+    let start = tokens
+        .iter()
+        .rposition(|token| token.kind == NormalizeTokenKind::Separator)
+        .map_or(0, |separator| separator + 1);
+    let Some((current, before)) = tokens[start..].split_last() else {
+        return false;
+    };
+    current.byte_range.end == output.len()
+        && current
+            .text(output)
+            .is_some_and(crate::normalize::is_env_assignment)
+        && before.iter().all(|token| {
+            token.text(output).is_some_and(|word| {
+                crate::normalize::is_env_assignment(word)
+                    || word.contains(['<', '>'])
+                    || crate::context::is_shell_command_prefix_reserved_word(word)
+                    || word == "time"
+            })
+        })
 }
 
 /// Whether text spliced after `output` starts an unquoted shell word.
@@ -790,7 +836,8 @@ fn render_static_producer_body(body: &str, word_start: bool) -> Result<String, (
     // The accepted output alphabet contains no characters that are active
     // inside POSIX double quotes, so it can be inserted verbatim there. In an
     // unquoted word, literal whitespace intentionally reproduces field
-    // splitting while the restricted alphabet prevents shell re-parsing.
+    // splitting while the restricted alphabet prevents shell re-parsing
+    // (an assignment value is not split; see `push_static_output`).
     Ok(rendered.to_string())
 }
 
@@ -834,6 +881,16 @@ impl SymbolicPosixWord {
 
     fn is_dynamic(&self) -> bool {
         self.text.contains(POSIX_DYNAMIC_QUOTED) || self.text.contains(POSIX_DYNAMIC_UNQUOTED)
+    }
+
+    /// Whether the word is a `NAME=value` assignment. Its value may hold a
+    /// substitution (`x=$(pwd)`, `x=$((1 + 2))`): that is still an
+    /// assignment, not the command name. The name must be literal.
+    fn is_assignment(&self) -> bool {
+        crate::normalize::is_env_assignment(&self.text)
+            && self.text.split_once('=').is_some_and(|(name, _)| {
+                !name.contains(POSIX_DYNAMIC_QUOTED) && !name.contains(POSIX_DYNAMIC_UNQUOTED)
+            })
     }
 
     /// Whether the word carries any literal bytes at all. A word made up
@@ -1603,14 +1660,39 @@ fn semantic_git_executable_index(
             index += 1;
             continue;
         }
+        // `builtin command git …` runs Git: `command` is a builtin, and
+        // `command` without `-v`/`-V` runs the word after its options.
+        if !word.dynamic && matches!(word.decoded.as_str(), "builtin" | "command") {
+            let query = word.decoded == "command";
+            index += 1;
+            while let Some(option) = words.get(index).filter(|option| !option.dynamic) {
+                match option.decoded.as_str() {
+                    "-p" | "--" => index += 1,
+                    "-v" | "-V" if query => return None,
+                    _ => break,
+                }
+            }
+            continue;
+        }
         return git_semantic_word_is_git_executable(word, dialect).then_some(index);
     }
     None
 }
 
 fn symbolic_posix_may_execute_git(command: &str) -> bool {
-    let stripped = crate::normalize::strip_wrapper_prefixes(command);
-    let command = stripped.normalized.as_ref();
+    // `strip_wrapper_prefixes` keeps an assignment whose value holds a
+    // substitution (`x=$(pwd) env git …`), as the substitution runs; here it
+    // only assigns, so peel it too and strip the wrappers behind it.
+    let mut current = std::borrow::Cow::Borrowed(command);
+    for _ in 0..8 {
+        let peeled = posix_after_assignment_words(&current);
+        let stripped = crate::normalize::strip_wrapper_prefixes(peeled);
+        if stripped.normalized.as_ref() == current.as_ref() {
+            break;
+        }
+        current = std::borrow::Cow::Owned(stripped.normalized.into_owned());
+    }
+    let command = current.as_ref();
     let Ok(view) = posix_substitution_view(command) else {
         return true;
     };
@@ -1620,10 +1702,16 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
     let mut scan_all_remaining = false;
     for word in words {
         if !scan_all_remaining {
+            if word.is_assignment() {
+                continue;
+            }
             if let Some(exact) = word.exact() {
-                if crate::normalize::is_env_assignment(exact)
-                    || matches!(exact, "exec" | "time" | "nohup" | "!")
-                {
+                // `builtin command git …` runs Git (`command -v` reads no
+                // further: its `-v` is no Git word).
+                if matches!(
+                    exact,
+                    "exec" | "time" | "nohup" | "!" | "builtin" | "command" | "-p"
+                ) {
                     continue;
                 }
             }
@@ -1672,6 +1760,21 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
         return false;
     }
     false
+}
+
+/// `command` past its leading assignment words, whatever their values hold.
+fn posix_after_assignment_words(command: &str) -> &str {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    for token in &tokens {
+        let assigns = token.kind == NormalizeTokenKind::Word
+            && token
+                .text(command)
+                .is_some_and(crate::normalize::is_env_assignment);
+        if !assigns {
+            return &command[token.byte_range.start..];
+        }
+    }
+    ""
 }
 
 #[derive(Debug, Clone)]
@@ -9728,6 +9831,48 @@ git x",
                 "{command:?} must be recognised as executing git"
             );
         }
+    }
+
+    /// An assignment word before the command name assigns, whatever its value
+    /// holds, and the shell does not split its value: in
+    /// `x=$(echo a b) git reset --hard` the command is `git`, not `b`.
+    #[test]
+    fn prefix_assignments_with_substitutions_leave_git_the_command() {
+        for command in [
+            "x=$(pwd) git reset --hard",
+            "x=$(echo a b) git reset --hard",
+            "x=`echo a b` git reset --hard",
+            "x=$((1 + 2)) git reset --hard",
+            "x=\"$(pwd)\" git reset --hard",
+            "x=$(date +%s) y=1 git reset --hard",
+            "x+=$(echo a b) git reset --hard",
+            "x=$(pwd) env git reset --hard",
+            "x=$(pwd) command git reset --hard",
+            "env x=$(pwd) git reset --hard",
+            "builtin command git reset --hard",
+            "x=1 builtin command git reset --hard",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command:?} must be recognised as executing git"
+            );
+        }
+        for command in [
+            "x=$(echo a b) ls -la",
+            "x=$(pwd) env ls",
+            "command -v git",
+            "$(echo a)=1 ls",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command:?} runs no git"
+            );
+        }
+        // Outside an assignment value, the output is still split.
+        let view = posix_substitution_view("echo $(echo a b) x=$(echo c d)").expect("view");
+        assert_eq!(view.command, "echo a b x=c d");
+        let view = posix_substitution_view("x=$(echo a b) y=a$(echo c d) git").expect("view");
+        assert_eq!(view.command, "x=\"a b\" y=a\"c d\" git");
     }
 
     /// End-to-end parity: each dashed spelling must reach the same rule id the
