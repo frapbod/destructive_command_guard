@@ -12245,7 +12245,6 @@ fn powershell_typed_method_sink(
         .then_some(PowerShellEngineSink::Script)
 }
 
-
 /// The first constructor argument that one argument value supplies when the
 /// call spreads an array into the argument list (`New-Object … -ArgumentList
 /// $a`, `[T]::new.Invoke($a)`). `Ok(None)` is one static value, which fills
@@ -12579,8 +12578,9 @@ fn powershell_method_invocation(rest: &str, method: &str) -> bool {
 /// Engine methods that run a string as PowerShell script
 /// ([`POWERSHELL_ENGINE_SCRIPT_METHODS`], [`POWERSHELL_TYPED_SCRIPT_METHODS`]
 /// on their type, and `ExpandString`'s `$( … )`), called as `.Name(…)` or
-/// `::Name(…)` with any spelling of the name, through the `.ForEach('Name', …)` intrinsic, or
-/// through `ForEach-Object Name …` ([`collect_powershell_member_cmdlet_sinks`]).
+/// `::Name(…)` with any spelling of the name, through the `.ForEach('Name',
+/// …)` intrinsic, or through `ForEach-Object Name …`
+/// ([`collect_powershell_member_cmdlet_sinks`]).
 /// A static first argument is judged as the source it runs; any other
 /// argument, or a reference to the method that is not a call here
 /// (`$m = $ic.InvokeScript; $m.Invoke(…)`), cannot be verified. A member
