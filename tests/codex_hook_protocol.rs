@@ -1328,6 +1328,28 @@ EOF
         "x=\"$(echo a #)\" '\n)\" git reset --hard #'",
         "echo \"${y:-$(echo a #)}\" '\n)}\" ; git reset --hard #'",
         "echo ${y:-$(echo a #)} '\n)} ; git reset --hard #'",
+        // Substitution output in a subscript is part of the assignment
+        // word: the shell does not split it.
+        "x[$(echo a b)]=c git reset --hard",
+        "x[$(echo a b)]=c git push --force origin main",
+        "x[$(echo a b)]+=c git reset --hard",
+        "x[`echo a b`]=c git reset --hard",
+        "x[$(printf 'a b')]=c git reset --hard",
+        "x[$(printf 'a\tb')]=c git reset --hard",
+        "x[$(echo a b)]=c y=1 git reset --hard",
+        "true; x[$(echo a b)]=c git reset --hard",
+        "x[$(echo a b)]=c xargs git reset --hard",
+        // A newline in a subscript or `$[…]` is one word to Bash and zsh.
+        "x[a\n]=b git reset --hard",
+        "x[1 +\n1]=b git reset --hard",
+        "x[\n]=b git reset --hard",
+        "x[a\n]=b git push --force origin main",
+        "x=$[1 +\n 2] git reset --hard",
+        // A `$((` whose first `(` closes with a lone `)` is `$( (…) …)` to
+        // Bash 3.2 and zsh: command text, where `#` starts a comment.
+        "echo $((echo a #) '\n)) ; git reset --hard #'",
+        "x=$((echo a #) '\n)) git reset --hard #'",
+        "echo $((echo a #) '\n)) && git push --force origin main #'",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1381,6 +1403,12 @@ case a in
 EOF
 ); git status",
         "echo $(case a in a) echo x;; esac); git status",
+        "x[$(echo a b)]=c git status",
+        "x[a\n]=b git status",
+        "echo $((1 + 2)) ; git status",
+        "echo $( (echo a) ) ; git status",
+        "echo $(( (1 + 2) * 3 )) ; git status",
+        "x=$[1 +\n 2] git status",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");

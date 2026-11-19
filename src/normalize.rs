@@ -1926,10 +1926,19 @@ pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usi
 /// `git reset --hard` there. dcg reads that body as unclosed, which fails
 /// closed. A backslash-newline is dropped before words are read, so it
 /// neither ends nor starts one. An arithmetic body (`$((…))`) has none of
-/// this.
+/// this. A body that starts with `(` after `$(` is arithmetic only when the
+/// `)` that closes that `(` is followed at once by another `)`, as Bash 3.2
+/// and zsh decide it (`context::arithmetic_end`); otherwise they read
+/// `$( (…) …)`, a subshell in command text, where `#) '` starts a comment:
+/// `echo $((echo a #) '` LF `)) ; git reset --hard #'` runs `git` there.
+/// That lookup runs only when a comment or `case` would change the reading.
+/// A `<(…)` or `>(…)` body is always command text.
 pub(crate) struct CommandText {
-    /// False for an arithmetic body.
-    active: bool,
+    /// False for an arithmetic body; `None` for a `$((` body not yet
+    /// looked up.
+    active: Option<bool>,
+    /// Where the body starts.
+    start: usize,
     at_word_start: bool,
     word_start: Option<usize>,
     command_position: bool,
@@ -1967,8 +1976,12 @@ enum CaseState {
 impl CommandText {
     /// For a body that starts at `start`.
     pub(crate) fn new(bytes: &[u8], start: usize) -> Self {
+        let process_substitution = start
+            .checked_sub(2)
+            .is_some_and(|opener| matches!(bytes[opener], b'<' | b'>'));
         Self {
-            active: bytes.get(start) != Some(&b'('),
+            active: (process_substitution || bytes.get(start) != Some(&b'(')).then_some(true),
+            start,
             at_word_start: true,
             word_start: None,
             command_position: true,
@@ -1981,7 +1994,7 @@ impl CommandText {
     /// text, escapes and nested expansions are passed over by the caller
     /// after it reads their first byte here.
     pub(crate) fn step(&mut self, bytes: &[u8], i: usize) -> CommandTextStep {
-        if !self.active {
+        if self.active == Some(false) {
             return CommandTextStep::Read;
         }
         let byte = bytes[i];
@@ -1990,7 +2003,7 @@ impl CommandText {
         if byte == b'\\' && bytes.get(i + 1) == Some(&b'\n') {
             return CommandTextStep::Continue(i + 2);
         }
-        if byte == b'#' && self.at_word_start {
+        if byte == b'#' && self.at_word_start && self.reads_commands(bytes) {
             let end = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |at| i + at);
             return CommandTextStep::Continue(end);
         }
@@ -2065,7 +2078,11 @@ impl CommandText {
             _ if command_position && word == b"esac" && !self.cases.is_empty() => {
                 self.cases.pop();
             }
-            _ if command_position && word == b"case" && !self.heredoc => {
+            _ if command_position
+                && word == b"case"
+                && !self.heredoc
+                && self.reads_commands(bytes) =>
+            {
                 self.cases.push(CaseState::Subject);
             }
             _ if command_position
@@ -2087,6 +2104,15 @@ impl CommandText {
             }
             _ => {}
         }
+    }
+
+    /// Whether the body is command text, looking up a `$((` body's reading
+    /// the first time it matters.
+    fn reads_commands(&mut self, bytes: &[u8]) -> bool {
+        let start = self.start;
+        *self
+            .active
+            .get_or_insert_with(|| crate::context::arithmetic_end(bytes, start + 1).is_none())
     }
 }
 
@@ -7289,12 +7315,14 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
 ///   assignment word, so `x[1 + 1]=a git reset --hard` runs it too.
 ///
 /// dash and the shared readers read `x=$[1`, `+` and `2]` (or `x[1`, `+`
-/// and `1]=a`) as three words, so the command name is `+`. Spelled: each
-/// blank (space or tab) in such brackets, outside quotes and substitutions,
-/// as `_`, which no reader splits at. The caller reads the spelling too and
-/// deny wins, so where dash does split, the command as written still
-/// answers. Brackets that do not close on their line, and a subscript that
-/// no `=` or `+=` follows, are left alone. Heredoc bodies with a quoted
+/// and `1]=a`) as three words, so the command name is `+`. Bash and zsh
+/// read a newline in the brackets the same way (`x[a` LF `]=b git …` and
+/// `x=$[1 +` LF `2] git …` run `git`). Spelled: each blank (space, tab or
+/// newline) in such brackets, outside quotes and substitutions, as `_`,
+/// which no reader splits at. The caller reads the spelling too and deny
+/// wins, so where dash does split, the command as written still answers.
+/// Brackets that do not close, and a subscript that no `=` or `+=`
+/// follows, are left alone. Heredoc bodies with a quoted
 /// delimiter are raw text and passed over. A command whose bracket lookups
 /// would read more than 16 times its length (plus 4 KiB) is
 /// [`BashHashReading::Unread`].
@@ -7396,9 +7424,9 @@ fn assignment_name_ends_at(bytes: &[u8], at: usize) -> bool {
             ))
 }
 
-/// The `]` that closes a bracket opened before `from`, and the blanks the
-/// bracket holds outside quotes and substitutions; `None` when it does not
-/// close on its line, or when the lookup would read past `budget` (then
+/// The `]` that closes a bracket opened before `from`, and the blanks
+/// (newlines included) the bracket holds outside quotes and substitutions;
+/// `None` when it does not close, or when the lookup would read past `budget` (then
 /// `budget` is 0).
 fn bracket_word_close(
     bytes: &[u8],
@@ -7412,9 +7440,8 @@ fn bracket_word_close(
     while i < len {
         let start = i;
         match bytes[i] {
-            b'\n' => return None,
             b'\\' => i += 2,
-            b' ' | b'\t' => {
+            b' ' | b'\t' | b'\n' => {
                 blanks.push(i);
                 i += 1;
             }
@@ -8898,6 +8925,12 @@ mod tests {
             "x[1_+_1]=a git reset --hard"
         );
         assert_eq!(spelled("x[$i + 1]+=a git"), "x[$i_+_1]+=a git");
+        assert_eq!(spelled("x=$[1 +\n 2] git"), "x=$[1_+__2] git");
+        assert_eq!(
+            spelled("x[a\n]=b git reset --hard"),
+            "x[a_]=b git reset --hard"
+        );
+        assert_eq!(spelled("x[\n]=b git"), "x[_]=b git");
         assert_eq!(
             spelled("x=$[ a[1] + \"b c\" ] git"),
             "x=$[_a[1]_+_\"b c\"_] git"
@@ -8907,8 +8940,8 @@ mod tests {
             "echo x[1 + 1]",
             "echo '$[1 + 2]'",
             "echo \"$[1 + 2]\"",
-            "x=$[1 +\n 2] git",
             "[ -f x ] && echo ok",
+            "x[a\n] git",
             "echo [a b]=c",
         ] {
             assert_eq!(bash_bracket_words(unchanged), None, "{unchanged:?}");
@@ -8941,6 +8974,18 @@ mod tests {
         assert_eq!(
             &command[..end(command)],
             "x=$(case a in a) echo a b;; esac)"
+        );
+        // A `$((` body is arithmetic only when its first `(` closes with
+        // `))`; otherwise it is a subshell in command text.
+        let command = "echo $((echo a #) '\n)) ; git reset --hard #'";
+        assert_eq!(&command[..end(command)], "echo $((echo a #) '\n))");
+        let command = "echo $(( (1 + 2) # 3 )) ; git";
+        assert_eq!(&command[..end(command)], "echo $(( (1 + 2) # 3 ))");
+        let command = "cat <((echo a #) '\n)) ; git reset --hard #'";
+        let start = command.find("<(").expect("opener") + 2;
+        assert_eq!(
+            &command[..consume_shell_paren_construct(command.as_bytes(), start, command.len())],
+            "cat <((echo a #) '\n))"
         );
         let command = "x=$(case a in (a) :;; b|c) :;& *) :;;& esac) printf";
         assert_eq!(
