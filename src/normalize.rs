@@ -6430,6 +6430,7 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
     let mut wrapper: NormalizeWrapper = NormalizeWrapper::None;
     let mut dcg_syntax_end = None;
     let mut dcg_native_tokens = None;
+    let mut function_name = false;
 
     for tok in &tokens {
         // The generic tokenizer may mistake a backtick in a PowerShell
@@ -6445,6 +6446,7 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
             current_cmd_word = None;
             wrapper = NormalizeWrapper::None;
             dcg_syntax_end = None;
+            function_name = false;
             continue;
         }
 
@@ -6491,12 +6493,27 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
         }
 
         // If a wrapper is active and this token isn't an option/assignment, the wrapper is done.
-        if !matches!(wrapper, NormalizeWrapper::None) {
+        let after_wrapper = !matches!(wrapper, NormalizeWrapper::None);
+        if after_wrapper {
             wrapper = NormalizeWrapper::None;
         }
 
         // If we haven't found the command word yet, check wrappers/assignments.
         let posix_command_roles = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown);
+        // `{`, `!`, `if`, `then`, `do` and the other reserved words open the
+        // command after them, and `function NAME` opens a body; only a
+        // wrapper makes such a word the program (`command then`).
+        if posix_command_roles && std::mem::take(&mut function_name) {
+            continue;
+        }
+        if posix_command_roles
+            && !after_wrapper
+            && (crate::context::is_shell_command_prefix_reserved_word(current)
+                || current == "function")
+        {
+            function_name = current == "function";
+            continue;
+        }
         if posix_command_roles
             && let Some(next_wrapper) = NormalizeWrapper::from_command_word(current)
         {

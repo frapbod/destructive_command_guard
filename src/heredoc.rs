@@ -7424,11 +7424,21 @@ fn primary_command_positions(
             after_wrapper = None;
             continue;
         }
+        // `function NAME { …; }`: [`command_word_positions`] already skips
+        // the name; the body's first word is the primary command.
         if !seen
             && (crate::normalize::is_env_assignment(word)
                 || matches!(
                     word,
-                    "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until"
+                    "{" | "!"
+                        | "if"
+                        | "then"
+                        | "else"
+                        | "elif"
+                        | "do"
+                        | "while"
+                        | "until"
+                        | "function"
                 ))
         {
             continue;

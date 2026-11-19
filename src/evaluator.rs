@@ -7793,6 +7793,8 @@ fn evaluate_obfuscated_posix_inline_launchers(
     // outer-shell launcher assembly.
     let inert_interpreter_stdin_possible = command.contains("<<");
     for segment in crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix) {
+        // The launcher after any syntax that opens it (`f() { b''ash -c …`).
+        let (segment, _) = posix_segment_command(segment);
         let segment_start = segment.as_ptr() as usize - command.as_ptr() as usize;
         let envelope =
             match parse_obfuscated_posix_inline_launcher_segment(segment, max_payload_bytes) {
@@ -11734,6 +11736,19 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
             return;
         };
         let segment = &command[segment_start..segment_end];
+        // Read the command the substitution belongs to, after any syntax
+        // that opens it (`f() { bash <(…)`, `case a in a) source <(…)`). A
+        // substitution outside that command, in a group's redirect
+        // (`( … ) < <(…)`), keeps the whole segment.
+        let (segment, segment_start) = match posix_segment_command(segment) {
+            (inner, offset)
+                if substitution.start >= segment_start + offset
+                    && substitution.end <= segment_start + offset + inner.len() =>
+            {
+                (inner, segment_start + offset)
+            }
+            _ => (segment, segment_start),
+        };
         let local_start = substitution.start - segment_start;
         let local_end = substitution.end - segment_start;
         let before = &segment[..local_start];
@@ -25932,9 +25947,22 @@ fn tar_invocation_ranges(
     command: &str,
     sources: &mut Vec<TarHelperSource>,
 ) -> Vec<(usize, usize, bool, bool)> {
+    // A segment opened by other syntax (`f() {`, `case a in a)`, `then`,
+    // `(`) is read at the command it runs. Its caller-local evidence is not
+    // trusted: a function body runs when it is called, an arm or branch only
+    // when chosen. The group walk below replaces subshell and brace-group
+    // seeds with exact scopes.
     let mut ranges: Vec<_> = command_segment_ranges(command)
         .into_iter()
-        .map(|(start, end)| (start, end, false, false))
+        .map(|(start, end)| {
+            let (tar_command, offset) = posix_segment_command(&command[start..end]);
+            if tar_command.len() == end - start {
+                (start, end, false, false)
+            } else {
+                let start = start + offset;
+                (start, start + tar_command.len(), true, true)
+            }
+        })
         .collect();
     if !command.contains(['(', '{']) || command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
         // Cheap text hints can come entirely from quoted data. Until a real
@@ -26894,15 +26922,30 @@ mod tar_helper_tests {
     fn grouped_tar_discovery_preserves_data_and_function_boundaries_540() {
         for command in [
             "(printf '%s' \"tar -tf archive --checkpoint-action='exec=git reset --hard'\")",
-            "unused() { (tar -tf archive --checkpoint-action='exec=git reset --hard'); }; printf ready",
             "cat <<'EOF'\n(tar -tf archive --checkpoint-action='exec=git reset --hard')\nEOF",
             "printf '%s' '(tar'; )",
         ] {
             assert!(
                 collect_tar_helper_sources(command, ShellDialect::Posix).is_empty(),
-                "group discovery must not promote data or a function body: {command}"
+                "group discovery must not promote data: {command}"
             );
         }
+        // A function body runs when it is called: its tar is read, but never
+        // with the caller's file or stdin evidence.
+        let body = "unused() { (tar -tf archive --checkpoint-action='exec=git reset --hard'); }; printf ready";
+        let sources = collect_tar_helper_sources(body, ShellDialect::Posix);
+        assert!(
+            !sources.is_empty()
+                && sources.iter().all(|source| matches!(
+                    source,
+                    TarHelperSource::Command {
+                        automated_stdin: true,
+                        nonlocal_filesystem: true,
+                        ..
+                    }
+                )),
+            "a function body's tar keeps no caller evidence: {sources:?}"
+        );
         let large_data = format!(
             "printf '%s' '{} (tar)'",
             "x".repeat(super::MAX_INDIRECT_INPUT_BYTES as usize)
@@ -26949,14 +26992,14 @@ fn collect_sed_shell_sources(
     let segment_ranges = command_segment_ranges(command);
     let compound_command = segment_ranges.len() > 1;
     for (start, end) in segment_ranges {
-        let segment = &command[start..end];
-        let Some((executable, args)) = command_tokens(segment) else {
+        let (sed_command, _) = posix_segment_command(&command[start..end]);
+        let Some((executable, args)) = command_tokens(sed_command) else {
             continue;
         };
         if executable != "sed" || sed_sandbox_option_is_active(&args) {
             continue;
         }
-        let nonlocal_filesystem = script_segment_is_nonlocal(segment);
+        let nonlocal_filesystem = script_segment_is_nonlocal(sed_command);
         let _filesystem_scope = NonlocalFilesystemScope::enter(nonlocal_filesystem);
         let mut segment_sources = Vec::new();
         for script in sed_expression_scripts(&args) {
@@ -36129,8 +36172,11 @@ fn proven_cd_directory(
         let Some(text) = source.get(start..end) else {
             continue;
         };
-        let trimmed = text
-            .trim_start_matches(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | '{'))
+        // The command after any syntax that opens it (`( cd`, `f() { cd`,
+        // `case a in a) cd`, `then cd`).
+        let (command, peeled) = posix_segment_command(text);
+        let trimmed = command
+            .trim_start()
             .trim_end_matches(|c: char| c.is_ascii_whitespace() || matches!(c, ')' | '}' | ';'));
         // `x=1 cd ~/.ssh` changes directory as `cd ~/.ssh` does.
         let mut words = crate::normalize::posix_command_words(trimmed)
@@ -36148,11 +36194,7 @@ fn proven_cd_directory(
             }
             _ => continue,
         }
-        let verb_start = start
-            + (text.len()
-                - text
-                    .trim_start_matches(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | '{'))
-                    .len());
+        let verb_start = start + peeled + (command.len() - command.trim_start().len());
         if !directory_change_reaches(source, start, end, verb_start, segment_start) {
             continue;
         }
@@ -38940,6 +38982,13 @@ fn segment_executable_in_dialect(segment: &str, dialect: ShellDialect) -> Segmen
         return cmd_segment_executable_name_at_depth(segment, 0)
             .map_or(SegmentExecutable::Unresolvable, SegmentExecutable::Name);
     }
+    // A function header, case pattern or reserved word opens the command
+    // (`f() { mkfs.ext4 …`).
+    let segment = if matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        posix_segment_command(segment).0
+    } else {
+        segment
+    };
 
     let stripped = crate::normalize::strip_wrapper_prefixes(segment);
     if stripped.wrapper_limit_reached {
