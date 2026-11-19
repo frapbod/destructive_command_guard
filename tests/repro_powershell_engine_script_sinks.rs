@@ -481,6 +481,15 @@ fn long_spelling_rows() -> (Vec<String>, Vec<String>) {
         "[scriptblock]::('Cre'+SP'ate')('git reset --hard').Invoke()",
         "[scriptblock]::\"$(SP'Create')\"('git reset --hard').Invoke()",
         "[scriptblock]::@\"\n$(SP'Create')\n\"@('git reset --hard').Invoke()",
+        // Review round 6 (runner rv6/truth.out, rv6/truth2.out): a block
+        // comment glued to the chain whose opening lies before the window.
+        "$m=$ExecutionContext<#XS#>.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+        "$m=$ExecutionContext.InvokeCommand<#XS#>.InvokeScript; $m.Invoke('git reset --hard')",
+        "$t=[scriptblock]; $f=$t<#XS#>::Create; $f.Invoke('git reset --hard').Invoke()",
+        "$h=@{a=[scriptblock]}; $f=$h<#XS#>.a::Create; $f.Invoke('git reset --hard').Invoke()",
+        "$m=$ExecutionContext<#XS<#y#>.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+        "$m=$ExecutionContext.InvokeCommand<#XS<#y#>.InvokeScript; $m.Invoke('git reset --hard')",
+        "$t=[scriptblock]; $f=$t<#XS<#y#>::Create; $f.Invoke('git reset --hard').Invoke()",
     ];
     let harmless = [
         "[scriptblock]::(SP'Create')('git status').Invoke()",
