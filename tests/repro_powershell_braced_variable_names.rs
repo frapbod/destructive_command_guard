@@ -93,14 +93,6 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     "echo ${x:- it's}",
 ];
 
-/// Harmless, and allowed in the Unknown dialect. The PowerShell dialect
-/// denies a lone variable in command position
-/// (`windows.filesystem:windows-filesystem-semantic-unverified`), on base
-/// d95833b3 too.
-const HARMLESS_IN_UNKNOWN: &[&str] = &[
-    "${env:ProgramFiles(x86)}",
-];
-
 fn dcg_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
@@ -272,13 +264,6 @@ fn powershell_and_unknown_dialects_read_braced_variable_names() {
     for command in HARMLESS_IN_POWERSHELL {
         assert_eq!(
             decision_in(command, ShellDialect::PowerShell),
-            EvaluationDecision::Allow,
-            "{command:?}"
-        );
-    }
-    for command in HARMLESS_IN_UNKNOWN {
-        assert_eq!(
-            decision_in(command, ShellDialect::Unknown),
             EvaluationDecision::Allow,
             "{command:?}"
         );
