@@ -6995,15 +6995,24 @@ pub(crate) fn powershell_line_breaks_as_line_feeds(command: &str) -> Option<Stri
 ///
 /// Spelled: a `#` at a token start (see [`token_starts_at`]) while a `(` is
 /// open, or right after a `)`. A `#` after a word byte (`2#1`, `$#`) starts
-/// no comment to any reader and is left alone. The scan counts parentheses
-/// without reading quotes, as a quote in a comment is what it must not
-/// trust; a `)` never takes the count below zero. So a quoted `(` can only
-/// add spellings, and a quoted `)` in the same group can end the count early
-/// (`ls (a")" #)`), a known limit. Heredoc bodies that every shell reads as
-/// bodies are raw text and passed over (see
-/// [`crate::context::undisputed_heredoc_body_ranges`]). The cost: a real
-/// comment there that names a destructive command (`(true)# git reset
-/// --hard`, or one inside a subshell) is denied.
+/// no comment to any reader and is left alone. Two scans decide whether a
+/// `(` is open, and a `#` either one spells is spelled: a union only adds
+/// spellings, so it can only over-block.
+///
+/// - The first counts parentheses without reading quotes, as a quote in a
+///   comment is what it must not trust; a `)` never takes the count below
+///   zero. A quoted `(` only adds spellings here, but a quoted `)` ends the
+///   count early.
+/// - The second reads quotes as zsh does (see [`quoted_paren_hashes`]), so
+///   a `)` in quotes, `$'…'`, a backquote or `${…}` closes nothing:
+///   `ls (a")" #); git reset --hard`, `ls (a${x%)} #); git reset --hard` and
+///   `case x in (a")" #) ;; esac; git reset --hard` run `git reset --hard`
+///   in zsh 5.9 (measured with `scripts/shell-truth`).
+///
+/// Heredoc bodies that every shell reads as bodies are raw text and passed
+/// over (see [`crate::context::undisputed_heredoc_body_ranges`]). The cost:
+/// a real comment there that names a destructive command (`(true)# git
+/// reset --hard`, or one inside a subshell) is denied.
 ///
 /// Length preserving (one ASCII byte for another), so every range in the
 /// view is the same range in `command`.
@@ -7012,8 +7021,8 @@ pub(crate) fn paren_hashes_as_data(command: &str) -> Option<String> {
     let bytes = command.as_bytes();
     let first_open = memchr::memchr2(b'(', b')', bytes)?;
     memchr::memchr(b'#', &bytes[first_open..])?;
-    let bodies = crate::context::undisputed_heredoc_body_ranges(command);
-    let mut bodies = bodies.iter().peekable();
+    let body_ranges = crate::context::undisputed_heredoc_body_ranges(command);
+    let mut bodies = body_ranges.iter().peekable();
     let mut spelled: Option<Vec<u8>> = None;
     let mut depth = 0usize;
     let mut i = first_open;
@@ -7041,8 +7050,113 @@ pub(crate) fn paren_hashes_as_data(command: &str) -> Option<String> {
         }
         i += 1;
     }
+    quoted_paren_hashes(bytes, &body_ranges, &mut spelled);
     // Only an ASCII byte changed into another ASCII byte.
     spelled.and_then(|spelled| String::from_utf8(spelled).ok())
+}
+
+/// What [`quoted_paren_hashes`] is inside of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParenHashFrame {
+    /// Command text (the whole command, or a `$(…)` or `$((…))` body), with
+    /// the parentheses open in it.
+    Commands(usize),
+    /// Quoted text that ends at this byte: a double-quoted string (`"`), a
+    /// backquoted command (`` ` ``) or a `${…}` (`}`).
+    Quoted(Quoted),
+}
+
+/// The quote-aware scan of [`paren_hashes_as_data`]: spell `_` in `spelled`
+/// each `#` at a token start while a `(` is open in its command text, or
+/// right after a `)`, reading quotes as zsh does.
+///
+/// Quoted text is read by [`quote_opens`]: a `)` in `'…'`, `$'…'`, `"…"`, a
+/// backquoted command or `${…}` closes nothing. A `$(…)` or `$((…))` body
+/// is command text with its own count, which its closing `)` ends. Any
+/// other `#` at a token start in command text starts a comment to its line
+/// end, whose quotes open nothing; a spelled `#` is data, as in the
+/// spelling. So this scan spells a `#` in a `$(…)` body only while a `(` is
+/// open in that body, where the first scan spells it too unless a quoted
+/// `)` ended its count early: it adds no `#` in a comment that only the
+/// `$(` keeps open. Known limit, shared with dcg's other readers: the `)`
+/// that ends a `case` pattern in a `$(…)` ends the body there.
+fn quoted_paren_hashes(
+    bytes: &[u8],
+    bodies: &[std::ops::Range<usize>],
+    spelled: &mut Option<Vec<u8>>,
+) {
+    let mut bodies = bodies.iter().peekable();
+    let mut frames = vec![ParenHashFrame::Commands(0)];
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(body) = bodies.peek() {
+            if i >= body.end {
+                bodies.next();
+                continue;
+            }
+            if i >= body.start {
+                i = body.end;
+                continue;
+            }
+        }
+        let Some(&top) = frames.last() else {
+            return;
+        };
+        let context = match top {
+            ParenHashFrame::Commands(_) => None,
+            ParenHashFrame::Quoted(quoted) => Some(quoted),
+        };
+        match quote_opens(bytes, i, context) {
+            Some(QuoteOpen::Skip(past)) => {
+                i = past;
+                continue;
+            }
+            Some(QuoteOpen::Push(Quoted::Parens(_), body)) => {
+                frames.push(ParenHashFrame::Commands(0));
+                i = body;
+                continue;
+            }
+            Some(QuoteOpen::Push(quoted, body)) => {
+                frames.push(ParenHashFrame::Quoted(quoted));
+                i = body;
+                continue;
+            }
+            None => {}
+        }
+        match (top, bytes[i]) {
+            (ParenHashFrame::Commands(open), b'(') => {
+                frames.pop();
+                frames.push(ParenHashFrame::Commands(open + 1));
+            }
+            (ParenHashFrame::Commands(open), b')') if open > 0 => {
+                frames.pop();
+                frames.push(ParenHashFrame::Commands(open - 1));
+            }
+            (ParenHashFrame::Commands(_), b')') => {
+                // The `)` of a `$(…)` body; a stray one at the top closes
+                // nothing.
+                if frames.len() > 1 {
+                    frames.pop();
+                }
+            }
+            (ParenHashFrame::Commands(open), b'#') if token_starts_at(bytes, i, 0) => {
+                if open > 0 || byte_before(bytes, i, 0) == Some(b')') {
+                    spelled.get_or_insert_with(|| bytes.to_vec())[i] = b'_';
+                } else {
+                    // A comment, to its line end.
+                    i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |at| i + at);
+                    continue;
+                }
+            }
+            (ParenHashFrame::Quoted(Quoted::Double), b'"')
+            | (ParenHashFrame::Quoted(Quoted::Backquote), b'`')
+            | (ParenHashFrame::Quoted(Quoted::Braces { .. }), b'}') => {
+                frames.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 /// The Bash reading [`bash_hashes_as_data`] or [`bash_parameter_openers`]
@@ -9858,6 +9972,26 @@ mod tests {
             ("ls # x", None),
             // A heredoc body is raw text.
             ("cat <<'EOF'\n(\n#\nEOF\n# x", None),
+            // A quoted `)` closes nothing to the quote-aware scan.
+            ("ls (a\")\" #); x", Some("ls (a\")\" _); x")),
+            ("ls (a$')' #); x", Some("ls (a$')' _); x")),
+            ("ls (a${x%)} #); x", Some("ls (a${x%)} _); x")),
+            ("ls (a`echo )` #); x", Some("ls (a`echo )` _); x")),
+            (
+                "case x in (a')'|#)) ;; esac; x",
+                Some("case x in (a')'|_)) ;; esac; x"),
+            ),
+            (
+                "echo \"$(ls (a')' #))\"; x",
+                Some("echo \"$(ls (a')' _))\"; x"),
+            ),
+            // ... and reads comments, whose quotes open nothing.
+            (
+                "echo hi # it's\nls (a\")\" #); x",
+                Some("echo hi # it's\nls (a\")\" _); x"),
+            ),
+            ("echo $(echo \")\") # x", None),
+            ("x=$(git log --format='%h)' # it's\n)", None),
         ] {
             assert_eq!(
                 paren_hashes_as_data(command).as_deref(),
