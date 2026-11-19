@@ -9682,10 +9682,12 @@ pub(crate) fn shell_positional_events(command: &str) -> Option<Vec<PositionalEve
 /// when its function does, and the frame for that call replaces it on the
 /// next reading. The call's words are taken as written, before any data
 /// masking of the command name (`echo() { "$@"; }; echo git reset --hard`).
-/// A call's assignment words (`X=1 f ARGS`) run first in the frame, and
-/// `time [-p] f ARGS` reads as the call it times. A call with a redirection
-/// before its name, a body with no expansion and a definition the call
-/// cannot see (after it, in a child shell, removed) are left alone. `None` when nothing was replaced or the parse is incomplete.
+/// A call's assignment words (`X=1 f ARGS`) run first in the frame, its
+/// redirections (`>/dev/null f ARGS`) apply to the frame, a quoted name
+/// (`\"f\"`, `\\f`) still runs the function, and `time [-p] [NAME=VALUE]... f
+/// ARGS` reads as the call it times. A body with no expansion and a
+/// definition the call cannot see (after it, in a child shell, removed) are
+/// left alone. `None` when nothing was replaced or the parse is incomplete.
 pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
     if !command.contains('$') || !(command.contains("()") || command.contains("function")) {
         return None;
@@ -9716,8 +9718,11 @@ pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
         let Some(name) = node.field("name") else {
             continue;
         };
-        // Assignment words before the name are in force while the body runs.
+        // Assignment words before the name are in force while the body runs;
+        // a redirection applies to the whole call, wherever it is written.
         let mut prefix = String::new();
+        let mut redirections = String::new();
+        let mut readable = true;
         for child in node.children() {
             if child.range().start >= name.range().start {
                 break;
@@ -9727,19 +9732,23 @@ pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
                     prefix.push_str(child.text().as_ref());
                     prefix.push_str("; ");
                 }
+                "file_redirect" => {
+                    redirections.push(' ');
+                    redirections.push_str(child.text().as_ref());
+                }
                 _ if child.is_named() => {
-                    prefix.clear();
+                    readable = false;
                     break;
                 }
                 _ => {}
             }
         }
-        let mut name_range = name.range();
-        let mut name_text = name.text().into_owned();
-        if name_range.start != call.start && prefix.is_empty() {
+        if !readable {
             continue;
         }
-        // `time [-p] f ARGS` runs the function `f`.
+        let mut name_range = name.range();
+        let mut name_text = name.text().into_owned();
+        // `time [-p] [NAME=VALUE]... f ARGS` runs the function `f`.
         if name_text == "time" {
             let rest = command.get(name_range.end..call.end)?;
             let mut words = rest
@@ -9749,6 +9758,16 @@ pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
             if word.is_some_and(|(_, word)| word == "-p") {
                 word = words.next();
             }
+            while let Some((_, assignment)) = word
+                && is_shell_env_assignment(assignment)
+            {
+                if assignment.contains(['\'', '"', '\\', '$', '`']) {
+                    break;
+                }
+                prefix.push_str(assignment);
+                prefix.push_str("; ");
+                word = words.next();
+            }
             let Some((offset, word)) = word else {
                 continue;
             };
@@ -9756,9 +9775,13 @@ pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
             name_range = start..start + word.len();
             name_text = word.to_string();
         }
-        if !is_static_shell_name(&name_text) {
+        // Quoting the name does not keep a function from running (`"f"`, `\f`).
+        let Some(name_text) = crate::normalize::decode_posix_literal_word(&name_text)
+            .map(std::borrow::Cow::into_owned)
+            .filter(|name| is_static_shell_name(name))
+        else {
             continue;
-        }
+        };
         let Some(body) = shell_function_body_before(command, call.start, &name_text) else {
             continue;
         };
@@ -9770,9 +9793,37 @@ pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
             .strip_prefix('{')
             .and_then(|inner| inner.strip_suffix('}'))
             .unwrap_or(body);
-        let arguments = command.get(name_range.end..call.end)?;
+        // The call's words, one per argument; its redirections move to the
+        // frame, and a heredoc leaves the call as written.
+        let mut arguments = String::new();
+        for child in node.children() {
+            if child.range().start < name_range.end {
+                continue;
+            }
+            match child.kind().as_ref() {
+                "file_redirect" | "herestring_redirect" => {
+                    redirections.push(' ');
+                    redirections.push_str(child.text().as_ref());
+                }
+                "heredoc_redirect" => {
+                    readable = false;
+                    break;
+                }
+                _ if child.is_named() => {
+                    arguments.push(' ');
+                    arguments.push_str(child.text().as_ref());
+                }
+                _ => {}
+            }
+        }
+        if !readable {
+            continue;
+        }
         // A space keeps `(` after `(` or `$(` from reading as `((`.
-        frames.push((call, format!(" ( {prefix}set --{arguments}; {body}\n)")));
+        frames.push((
+            call,
+            format!(" ( {prefix}set --{arguments}; {body}\n){redirections}"),
+        ));
     }
     if frames.is_empty() {
         return None;

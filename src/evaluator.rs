@@ -18539,17 +18539,26 @@ fn evaluate_command_in_dialect_union(
         // is judged one level down, where its bare rendering must not split
         // again.
         let unknown_names = nested_command_depth == 0;
+        // A positional proof only adds a reading: the view without it is
+        // judged too, so a denial it gives stays.
         let views = posix_proven_variable_view(command, deadline, unknown_names).and_then(|view| {
             let arguments = posix_proven_argument_view(command, deadline, unknown_names)?;
-            Ok(frames.into_iter().chain(view).chain(arguments).fold(
-                Vec::new(),
-                |mut views, candidate| {
+            let without_positionals = if posix_text_has_positional_reference(command) {
+                posix_proven_view_without_positionals(command, deadline, unknown_names)?
+            } else {
+                None
+            };
+            Ok(frames
+                .into_iter()
+                .chain(view)
+                .chain(arguments)
+                .chain(without_positionals)
+                .fold(Vec::new(), |mut views, candidate| {
                     if !views.contains(&candidate) {
                         views.push(candidate);
                     }
                     views
-                },
-            ))
+                }))
         });
         // An unfinished view is never proof that the command is safe.
         match views {
@@ -20845,7 +20854,7 @@ fn posix_proven_variable_view(
     deadline: Option<&Deadline>,
     unknown_names: bool,
 ) -> Result<Option<String>, ProvenViewIncomplete> {
-    posix_proven_view(command, deadline, unknown_names, false)
+    posix_proven_view(command, deadline, unknown_names, false, true)
 }
 
 /// [`posix_proven_variable_view`] that also splices a whole single-field
@@ -20862,7 +20871,21 @@ fn posix_proven_argument_view(
     deadline: Option<&Deadline>,
     unknown_names: bool,
 ) -> Result<Option<String>, ProvenViewIncomplete> {
-    posix_proven_view(command, deadline, unknown_names, true)
+    posix_proven_view(command, deadline, unknown_names, true, true)
+}
+
+/// [`posix_proven_variable_view`] with positional parameters left as
+/// written: no `$1`, `$@` or `$*` splice and no `a=$1` or `a="$*"` copy.
+/// It is the reading the positional proof extends, judged beside the others
+/// so a wrong positional proof can never remove a denial it gives: the
+/// unknown-name reading still denies `"$1" reset --hard` here, whatever a
+/// trap, alias, function or pipeline stage did to `$1`.
+fn posix_proven_view_without_positionals(
+    command: &str,
+    deadline: Option<&Deadline>,
+    unknown_names: bool,
+) -> Result<Option<String>, ProvenViewIncomplete> {
+    posix_proven_view(command, deadline, unknown_names, false, false)
 }
 
 /// A value that is the same word quoted or bare, and cannot be shell syntax.
@@ -20882,6 +20905,7 @@ fn posix_proven_view(
     deadline: Option<&Deadline>,
     unknown_names: bool,
     arguments: bool,
+    positionals: bool,
 ) -> Result<Option<String>, ProvenViewIncomplete> {
     // Every binding source spells `=` (an assignment word) or `printf -v`;
     // IFS holds its default with none. Without one, every reference is
@@ -20893,7 +20917,7 @@ fn posix_proven_view(
     let bindings_possible = command.contains('=')
         || command.contains("printf")
         || command.contains("IFS")
-        || posix_text_has_positional_reference(command);
+        || (positionals && posix_text_has_positional_reference(command));
     if !bindings_possible && !unknown_names {
         return Ok(None);
     }
@@ -20902,6 +20926,7 @@ fn posix_proven_view(
         return Ok(None);
     }
     let _deadline = DenyOnlyDeadlineScope::enter(deadline);
+    let _positionals = PositionalProofScope::enter(positionals);
     let quoted_bodies: Vec<Range<usize>> = if command.contains("<<") {
         deny_only_heredoc_bodies(command)
             .iter()
@@ -33985,6 +34010,25 @@ thread_local! {
     /// reference asks again for the same command.
     static DENY_ONLY_HEREDOCS: std::cell::RefCell<Option<(String, HeredocBodies)>> =
         const { std::cell::RefCell::new(None) };
+    /// Whether the deny-only proof reads positional parameters
+    /// ([`positional_fields_at`]); off for the view that leaves them as
+    /// written ([`PositionalProofScope`]).
+    static DENY_ONLY_POSITIONALS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Holds [`DENY_ONLY_POSITIONALS`] for one view and restores the outer value.
+struct PositionalProofScope(bool);
+
+impl PositionalProofScope {
+    fn enter(positionals: bool) -> Self {
+        Self(DENY_ONLY_POSITIONALS.with(|cell| cell.replace(positionals)))
+    }
+}
+
+impl Drop for PositionalProofScope {
+    fn drop(&mut self) {
+        DENY_ONLY_POSITIONALS.with(|cell| cell.set(self.0));
+    }
 }
 
 /// Heredoc and here-string bodies, each with whether its delimiter is quoted.
@@ -35604,6 +35648,9 @@ fn positional_fields_at(
     point: usize,
     copy_depth: usize,
 ) -> Option<Vec<PositionalField>> {
+    if !DENY_ONLY_POSITIONALS.with(std::cell::Cell::get) {
+        return None;
+    }
     let definitions = crate::heredoc::shell_function_definitions(source);
     let frame = |offset: usize| {
         definitions
@@ -55253,7 +55300,8 @@ mod tests {
             ("f() { \"$@\"; }; f 'git reset --hard'", false),
             ("f() { :; }; f git reset --hard; \"$@\"", false),
             ("f git reset --hard; f() { \"$@\"; }", false),
-            ("IFS=,; set -- git reset --hard; \"$*\"", false),
+            // Denied as on the base: the unknown-name reading stays.
+            ("IFS=,; set -- git reset --hard; \"$*\"", true),
             ("f() { \"$@\"; }; f \"$x\"", false),
             ("retry() { \"$@\" || retry \"$@\"; }; retry make", false),
             ("x='git reset --hard'; cat <<< \"$x\"", false),
@@ -55319,8 +55367,52 @@ mod tests {
                 "set -- ls; for i in 1 2; do \"$1\" reset --hard; set -- git; done",
                 true,
             ),
-            ("set -- git; set -- ls; \"$1\" reset --hard", false),
-            ("set -- git; { set -- ls; }; \"$1\" reset --hard", false),
+            ("set -- git; set -- ls; \"$1\" reset --hard", true),
+            ("set -- git; { set -- ls; }; \"$1\" reset --hard", true),
+            // Review round 3: a wrong positional proof never removes the
+            // base's denial of an unknown command word.
+            ("set -- >/dev/null git; \"$1\" reset --hard", true),
+            ("set -- ls 3>&1 git; \"$2\" reset --hard", true),
+            ("set -- ls \\\n git; \"$2\" reset --hard", true),
+            (
+                "set -- git; set() { :; }; set -- ls; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- git ls; shift() { :; }; shift; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- git; enable -n set; set -- ls; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- git\nalias set=:\nset -- ls\n\"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- ls; trap 'set -- git' DEBUG; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "trap 'set -- git' ERR; set -- ls; false; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- x git; trap shift ERR; false; \"$1\" reset --hard",
+                true,
+            ),
+            ("set -- ls; : | set -- git; \"$1\" reset --hard", true),
+            ("set -- ls git; : | shift; \"$1\" reset --hard", true),
+            ("set -- ls; argv=(git); \"$1\" reset --hard", true),
+            ("set -- ls; noglob set -- git; \"$1\" reset --hard", true),
+            // Redirections, a quoted name and `time` with assignment words.
+            ("f() { \"$@\"; }; >/dev/null f git reset --hard", true),
+            ("f() { \"$@\"; }; X=1 >/dev/null f git reset --hard", true),
+            ("f() { \"$@\"; }; \"f\" git reset --hard", true),
+            ("f() { \"$@\"; }; \\f git reset --hard", true),
+            ("f() { \"$@\"; }; time X=1 f git reset --hard", true),
+            ("f() { \"$@\"; }; >/dev/null f make", false),
             // Calls in a subshell, after `time`, with assignment words, and
             // a `"$*"` copy.
             ("f() { \"$@\"; }; (f git reset --hard)", true),
@@ -55404,7 +55496,23 @@ mod tests {
             view("f() { \"$@\"; }; X=1 f a").as_deref(),
             Some("f() { \"$@\"; };  ( X=1; set -- a;  \"$@\"; \n)")
         );
-        assert_eq!(view("f() { \"$@\"; }; >/dev/null f a"), None);
+        // Redirections move to the frame; a quoted name still runs `f`.
+        assert_eq!(
+            view("f() { \"$@\"; }; >/dev/null f a").as_deref(),
+            Some("f() { \"$@\"; };  ( set -- a;  \"$@\"; \n) >/dev/null")
+        );
+        assert_eq!(
+            view("f() { \"$@\"; }; X=1 >/dev/null f a 2>&1").as_deref(),
+            Some("f() { \"$@\"; };  ( X=1; set -- a;  \"$@\"; \n) >/dev/null 2>&1")
+        );
+        assert_eq!(
+            view("f() { \"$@\"; }; \\f a").as_deref(),
+            Some("f() { \"$@\"; };  ( set -- a;  \"$@\"; \n)")
+        );
+        assert_eq!(
+            view("f() { \"$@\"; }; time X=1 f a").as_deref(),
+            Some("f() { \"$@\"; };  ( X=1; set -- a;  \"$@\"; \n)")
+        );
         // Not yet defined, defined in a child shell, removed, or no expansion.
         assert_eq!(view("f a; f() { \"$@\"; }"), None);
         assert_eq!(view("( f() { \"$@\"; } ); f a"), None);

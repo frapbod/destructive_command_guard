@@ -152,7 +152,6 @@ fn frames_do_not_leak_or_run_before_their_definition() {
         &[
             r#"f() { :; }; f git reset --hard; "$@""#,
             r#"f git reset --hard; f() { "$@"; }"#,
-            r#"IFS=,; set -- git reset --hard; "$*""#,
             r#"f() { "$@"; }; f "$x""#,
             r#"x='git reset --hard'; cat <<< "$x""#,
             r#"x='git reset --hard'; grep -q foo <<< "$x""#,
@@ -274,12 +273,55 @@ fn unread_positional_changes_leave_parameters_unknown() {
             r#"set -- ls; for i in 1 2; do "$1" reset --hard; set -- git; done"#,
         ],
     );
+    assert_both("allow", &[r#"set -- ls; for i in 1 2; do "$1" -la; done"#]);
+}
+
+/// Review round 3 of PR #15: whatever the positional proof gets wrong, the
+/// reading that leaves positional parameters as written is judged too, so
+/// the base's denial of an unknown command word stays. Each row runs Git in
+/// the shell named.
+#[test]
+fn positional_proof_never_removes_a_base_denial() {
     assert_both(
-        "allow",
+        "deny",
         &[
+            // Redirections and line continuations among `set` words
+            // (bash, dash, zsh).
+            r#"set -- >/dev/null git; "$1" reset --hard"#,
+            r#"set -- 2>/dev/null git; "$1" reset --hard"#,
+            r#"set -- ls 2>/dev/null git; "$2" reset --hard"#,
+            r#"set -- ls 3>&1 git; "$2" reset --hard"#,
+            "set -- \\\n git; \"$1\" reset --hard",
+            "set -- ls \\\n git; \"$2\" reset --hard",
+            // A `set` or `shift` that is not the builtin.
+            r#"set -- git; set() { :; }; set -- ls; "$1" reset --hard"#,
+            r#"set -- git; function set { :; }; set -- ls; "$1" reset --hard"#,
+            r#"set -- git ls; shift() { :; }; shift; "$1" reset --hard"#,
+            r#"set -- git; enable -n set; set -- ls; "$1" reset --hard"#,
+            "set -- git\nshopt -s expand_aliases\nalias set=:\nset -- ls\n\"$1\" reset --hard",
+            "set -- git\nalias set=:\nset -- ls\n\"$1\" reset --hard",
+            // Traps that change positionals (bash, zsh).
+            r#"set -- ls; trap 'set -- git' ERR; false; "$1" reset --hard"#,
+            r#"set -- ls; trap 'set -- git' DEBUG; "$1" reset --hard"#,
+            r#"trap 'set -- git' DEBUG; set -- ls; "$1" reset --hard"#,
+            r#"trap 'set -- git' ERR; set -- ls; false; "$1" reset --hard"#,
+            r#"set -- x git; trap shift ERR; false; "$1" reset --hard"#,
+            r#"set -- ls git; trap 'shift' ERR; false; "$1" reset --hard"#,
+            // The last pipeline stage in the current shell (zsh; Bash lastpipe).
+            r#"set -- ls; : | set -- git; "$1" reset --hard"#,
+            r#"set -- ls git; : | shift; "$1" reset --hard"#,
+            r#"set -- ls; true | { set -- git; }; "$1" reset --hard"#,
+            r#"shopt -s lastpipe; set -- ls; : | set -- git; "$1" reset --hard"#,
+            // Changes only zsh makes.
+            r#"set -- ls; argv=(git); "$1" reset --hard"#,
+            r#"set -- ls; argv[1]=git; "$1" reset --hard"#,
+            r#"set -- ls; noglob set -- git; "$1" reset --hard"#,
+            r#"set -- ls; nocorrect set -- git; "$1" reset --hard"#,
+            // Denied as on the base: the unknown-name reading does not trust
+            // the positional proof.
             r#"set -- git; set -- ls; "$1" reset --hard"#,
             r#"set -- git; { set -- ls; }; "$1" reset --hard"#,
-            r#"set -- ls; for i in 1 2; do "$1" -la; done"#,
+            r#"IFS=,; set -- git reset --hard; "$*""#,
         ],
     );
 }
@@ -297,6 +339,14 @@ fn calls_in_subshells_after_time_and_with_assignments_are_judged() {
             r#"f() { "$@"; }; X=1 f git reset --hard"#,
             r#"f() { local cmd="$*"; $cmd; }; f git reset --hard"#,
             r#"run() { cmd="$*"; $cmd; }; run git reset --hard"#,
+            // Review round 3: redirections, a quoted name, `time` with
+            // assignment words.
+            r#"f() { "$@"; }; >/dev/null f git reset --hard"#,
+            r#"f() { "$@"; }; X=1 >/dev/null f git reset --hard"#,
+            r#"f() { "$@"; }; "f" git reset --hard"#,
+            r#"f() { "$@"; }; \f git reset --hard"#,
+            r#"f() { "$@"; }; time X=1 f git reset --hard"#,
+            r#"f() { "$@"; }; f git reset --hard 2>/dev/null"#,
         ],
     );
     assert_both(
@@ -306,6 +356,9 @@ fn calls_in_subshells_after_time_and_with_assignments_are_judged() {
             r#"f() { "$@"; }; time f make"#,
             r#"f() { "$@"; }; X=1 f ls"#,
             r#"f() { local cmd="$*"; $cmd; }; f ls -la"#,
+            r#"f() { "$@"; }; >/dev/null f make"#,
+            r#"f() { "$@"; }; "f" ls"#,
+            r#"f() { "$@"; }; time X=1 f make test"#,
         ],
     );
 }
