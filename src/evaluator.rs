@@ -40902,7 +40902,7 @@ fn evaluate_heredoc(
                 return Some(EvaluationResult::indeterminate_due_to_budget());
             }
 
-if let Some(blocked) =
+            if let Some(blocked) =
                 heredoc_ast_finding_verdict(command, &content, m, context, first_allowlist_hit)
             {
                 return Some(blocked);
@@ -41105,9 +41105,10 @@ fn heredoc_ast_finding_verdict(
         return None;
     }
     let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
-    let allow_hit = context
-        .allowlists
-        .match_rule_at_path(&pack_id, &pattern_name, context.project_path);
+    let allow_hit =
+        context
+            .allowlists
+            .match_rule_at_path(&pack_id, &pattern_name, context.project_path);
     let pattern_match = PatternMatch {
         reason: format_heredoc_denial_reason(content, &m, &pack_id, &pattern_name),
         pack_id: Some(pack_id),

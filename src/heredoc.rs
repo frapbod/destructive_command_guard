@@ -4773,7 +4773,9 @@ fn extract_deno_eval_inline_scripts(
             target_command: Some("deno".to_string()),
             additional_execution_target: None,
             parent_expanded_source: interpreter_source_with_outer_values(
-                command.get(program.word_range.clone()).filter(|_| !program.resolved),
+                command
+                    .get(program.word_range.clone())
+                    .filter(|_| !program.resolved),
                 ScriptLanguage::from_command("deno"),
             ),
         });
@@ -17532,7 +17534,10 @@ ls"#,
         let m = OUTER_VALUE_MARK;
         let sources = |command: &str| -> Vec<(ScriptLanguage, Option<String>)> {
             match extract_content(command, &ExtractionLimits::default()) {
-                ExtractionResult::Extracted(items) | ExtractionResult::Partial { extracted: items, .. } => items
+                ExtractionResult::Extracted(items)
+                | ExtractionResult::Partial {
+                    extracted: items, ..
+                } => items
                     .into_iter()
                     .map(|item| (item.language, item.parent_expanded_source))
                     .collect(),
