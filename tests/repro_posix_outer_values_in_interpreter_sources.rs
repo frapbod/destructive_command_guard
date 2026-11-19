@@ -193,6 +193,66 @@ fn outer_values_in_an_interpreter_program_are_unknown_shell_text() {
     assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
 }
 
+/// Every sink shape dcg denies for a literal command (`os.system('''git
+/// reset --hard''')`, Ruby backquotes, `%x(…)`, `IO.popen`, `Open3`) also
+/// denies when a parent value lands in that command. These shapes are read
+/// by the AST rules and the backstop, which match the sink's literal text,
+/// so the program is also read with every value empty. Linux bash hands
+/// each interpreter exactly the literal program (fake interpreters).
+#[test]
+fn outer_values_in_every_literal_sink_shape_deny() {
+    let misses = misses(
+        &[
+            r#"python3 -c "import os; os.system('''gi${x}t reset --hard''')""#,
+            r#"python3 -c "import os; os.system(\"\"\"gi${x}t reset --hard\"\"\")""#,
+            r#"python3 -c "import os; os.system(r\"gi${x}t reset --hard\")""#,
+            r#"python3 -c "import os; os.system(f\"gi${x}t reset --hard\")""#,
+            r#"python3 -c "import subprocess as s; s.run(\"gi$(true)t reset --hard\", shell=True)""#,
+            r#"ruby -e "\`gi${x}t reset --hard\`""#,
+            r#"ruby -e "%x(gi${x}t reset --hard)""#,
+            r#"ruby -e "IO.popen(\"gi${x}t reset --hard\")""#,
+            r#"ruby -e "require \"open3\"; Open3.capture2(\"gi${x}t reset --hard\")""#,
+            "python3 <<EOF\nimport os; os.system('''gi${x}t reset --hard''')\nEOF",
+            "python3 <<EOF\nimport os; os.system(\"\"\"gi${x}t reset --hard\"\"\")\nEOF",
+            "python3 <<EOF\nimport os; os.system(r\"gi${x}t reset --hard\")\nEOF",
+            "python3 <<EOF\nimport os; os.system(f\"gi${x}t reset --hard\")\nEOF",
+            "python3 <<EOF\nimport subprocess as s; s.run(\"gi${x}t reset --hard\", shell=True)\nEOF",
+            "ruby <<EOF\n\\`gi${x}t reset --hard\\`\nEOF",
+            "ruby <<EOF\n%x(gi${x}t reset --hard)\nEOF",
+            "ruby <<EOF\nIO.popen(\"gi${x}t reset --hard\")\nEOF",
+            "ruby <<EOF\nrequire \"open3\"; Open3.capture2(\"gi${x}t reset --hard\")\nEOF",
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    );
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
+/// The same sink shapes with a harmless command stay allowed.
+#[test]
+fn outer_values_in_literal_sink_shapes_with_harmless_commands_stay_allowed() {
+    let misses = misses(
+        &[
+            r#"python3 -c "import os; os.system('''git status ${x}''')""#,
+            r#"python3 -c "import os; os.system(\"\"\"ls ${d}\"\"\")""#,
+            r#"python3 -c "import os; os.system(r\"echo ${x}\")""#,
+            r#"python3 -c "import os; os.system(f\"git log ${x}\")""#,
+            r#"python3 -c "import subprocess as s; s.run(\"ls ${d}\", shell=True)""#,
+            r#"ruby -e "\`echo ${x}\`""#,
+            r#"ruby -e "%x(ls ${d})""#,
+            r#"ruby -e "IO.popen(\"ls ${d}\")""#,
+            r#"ruby -e "require \"open3\"; Open3.capture2(\"git status ${x}\")""#,
+            "python3 <<EOF\nimport os; os.system('''git status ${x}''')\nEOF",
+            "python3 <<EOF\nimport subprocess as s; s.run(\"ls ${d}\", shell=True)\nEOF",
+            "ruby <<EOF\n\\`echo ${x}\\`\nEOF",
+            "ruby <<EOF\nIO.popen(\"ls ${d}\")\nEOF",
+        ],
+        &POSIX,
+        EvaluationDecision::Allow,
+    );
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
 /// Text the parent shell does not expand reaches the program as written (its
 /// single quotes, an escaped `$`, a quoted heredoc delimiter), and a value
 /// where the program's shell cannot make it a command stays harmless.

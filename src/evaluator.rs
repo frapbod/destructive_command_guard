@@ -40318,6 +40318,10 @@ fn evaluate_heredoc(
             .then(|| {
                 let mut shell_view = content.clone();
                 shell_view.language = crate::heredoc::ScriptLanguage::Bash;
+                // The program the interpreter receives is not a shell's
+                // source; this view reads the here-string's own words
+                // (`ExtractedContent::parent_expanded_source`).
+                shell_view.parent_expanded_source = None;
                 shell_view
             });
         // A POSIX shell reads an unquoted-delimiter heredoc body after its
@@ -41156,6 +41160,14 @@ fn heredoc_ast_finding_verdict(
 /// word. This reading can only add a denial. A layer that cannot finish on
 /// it leaves the decision to the body as written, which every layer has
 /// already read with its own failure policy.
+///
+/// Every layer reads two programs: the marked one, and the one the
+/// interpreter receives when every value is empty. The layers that match a
+/// sink's literal text (the AST rules, the backstop) cannot see a command
+/// through a mark (`os.system('''gi\u{E000}t reset --hard''')`, Ruby
+/// backquotes, `IO.popen`), so the second reading gives every sink shape
+/// they deny for a literal command the same denial when a value lands in
+/// that command.
 fn parent_expanded_source_verdict(
     command: &str,
     content: &crate::heredoc::ExtractedContent,
@@ -41163,32 +41175,42 @@ fn parent_expanded_source_verdict(
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
 ) -> Option<EvaluationResult> {
     let source = content.parent_expanded_source.as_deref()?;
-    if deadline_exceeded(context.deadline) {
-        return Some(EvaluationResult::indeterminate_due_to_budget());
-    }
-    let mut reading = content.clone();
-    source.clone_into(&mut reading.content);
-    reading.content_range = None;
-    reading.word_range = None;
-    reading.parent_expanded_source = None;
-    if let Ok(matches) = DEFAULT_MATCHER.find_matches(&reading.content, reading.language) {
-        for m in matches {
-            if let Some(blocked) =
-                heredoc_ast_finding_verdict(command, &reading, m, context, first_allowlist_hit)
-            {
-                return Some(blocked);
+    let values_empty = source.replace(crate::heredoc::OUTER_VALUE_MARK, "");
+    let readings =
+        std::iter::once(source).chain((values_empty != source).then_some(values_empty.as_str()));
+    for program in readings {
+        if deadline_exceeded(context.deadline) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+        let mut reading = content.clone();
+        program.clone_into(&mut reading.content);
+        reading.content_range = None;
+        reading.word_range = None;
+        reading.parent_expanded_source = None;
+        if let Ok(matches) = DEFAULT_MATCHER.find_matches(&reading.content, reading.language) {
+            for m in matches {
+                if let Some(blocked) =
+                    heredoc_ast_finding_verdict(command, &reading, m, context, first_allowlist_hit)
+                {
+                    return Some(blocked);
+                }
             }
         }
+        if let Some(blocked) =
+            exec_sink_backstop_verdict(command, &reading, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
+        if let Some(blocked) = exec_sink_pack_verdict(command, &reading, context, true) {
+            return Some(blocked);
+        }
+        if let Some(blocked) =
+            dynamic_source_verdict(command, &reading, context, first_allowlist_hit)
+        {
+            return Some(blocked);
+        }
     }
-    if let Some(blocked) =
-        exec_sink_backstop_verdict(command, &reading, context, first_allowlist_hit)
-    {
-        return Some(blocked);
-    }
-    if let Some(blocked) = exec_sink_pack_verdict(command, &reading, context, true) {
-        return Some(blocked);
-    }
-    dynamic_source_verdict(command, &reading, context, first_allowlist_hit)
+    None
 }
 
 /// The exec-sink backstop's verdict on one extracted body.
