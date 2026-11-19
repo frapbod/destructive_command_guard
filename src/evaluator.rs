@@ -4339,8 +4339,8 @@ const POWERSHELL_VALUE_AS_CMD_VARIABLE: &str = "%DCG_POWERSHELL_VALUE%";
 /// `cmd /c "echo %USERNAME%"`; a deny-only reading judges the text around
 /// it). `Unknown` includes the POSIX reading. After PowerShell's
 /// stop-parsing token `--%` it expands nothing, so later words stay as
-/// written; a quoted `'--%'` is not that token
-/// ([`crate::normalize::powershell_word_stops_parsing`]).
+/// written; a quoted `'--%'` is that token only when a parameter word
+/// follows it ([`crate::normalize::powershell_stop_parsing_words`]).
 fn decoded_cmd_launcher_tail(
     words: &[&str],
     start: usize,
@@ -4372,9 +4372,10 @@ fn decoded_cmd_launcher_tail(
                     if index < start || stop_parsing {
                         return Cow::Borrowed(*raw);
                     }
-                    // A quoted `'--%'` is dropped but does not stop PowerShell
-                    // from expanding later values; the decoder drops it too.
-                    if crate::normalize::powershell_word_stops_parsing(raw) {
+                    // A quoted `'--%'` without a parameter word after it is
+                    // dropped but does not stop PowerShell from expanding
+                    // later values; the decoder drops it too.
+                    if crate::normalize::powershell_stop_parsing_words(words, index) > 0 {
                         stop_parsing = true;
                         return Cow::Borrowed(*raw);
                     }
@@ -5131,12 +5132,9 @@ fn powershell_command_payload(
     if outer_dialect == ShellDialect::PowerShell
         && expansions == LauncherExpansions::Refuse
         && !raw_payload_is_outer_powershell_script_block(words, start, outer_dialect)
-        && words
-            .get(start..)
-            .unwrap_or_default()
-            .iter()
-            .take_while(|raw| !crate::normalize::powershell_word_stops_parsing(raw))
-            .any(|raw| powershell_argument_is_computed(raw))
+        && (start..words.len())
+            .take_while(|&index| crate::normalize::powershell_stop_parsing_words(words, index) == 0)
+            .any(|index| powershell_argument_is_computed(words[index]))
     {
         return WindowsLauncherParse::Unverified(format!(
             "{launcher} payload holds a value the outer PowerShell computes"
@@ -5277,11 +5275,23 @@ fn parse_powershell_launcher(
                 "the PowerShell host reads its options from the PowerShell value {raw:?}"
             ));
         }
-        // PowerShell drops a quoted `'--%'` and keeps expanding values after
-        // it, as for cmd ([`parse_cmd_launcher`]): `pwsh '--%' -c $x` is
-        // read as `pwsh -c $x`.
+        // After PowerShell's stop-parsing token the host reads the rest of
+        // the line as written, and a quoted `'--%'` followed by a parameter
+        // word is that token too (`pwsh '--%' -x -c "git reset --hard"` hands
+        // pwsh `-c "git reset --hard"`, measured with pwsh 7.5). Its options
+        // are not read here.
         if outer_dialect == ShellDialect::PowerShell
-            && !crate::normalize::powershell_word_stops_parsing(raw)
+            && crate::normalize::powershell_stop_parsing_words(words, index) > 0
+        {
+            return WindowsLauncherParse::Unverified(
+                "the PowerShell host reads its options after PowerShell's stop-parsing token"
+                    .to_string(),
+            );
+        }
+        // PowerShell drops a quoted `'--%'` and keeps expanding values after
+        // it, as for cmd ([`parse_cmd_launcher`]): `pwsh '--%' $x` is read
+        // as `pwsh $x`.
+        if outer_dialect == ShellDialect::PowerShell
             && shell_word_value(raw, ShellDialect::PowerShell).is_none()
         {
             index += 1;
@@ -5453,13 +5463,17 @@ fn parse_cmd_launcher(
 ) -> WindowsLauncherParse {
     let mut index = 1usize;
     // After PowerShell's `--%` cmd receives the rest of the line as written
-    // (`cmd --% /c git reset --hard` hands it `/c git reset --hard`).
+    // (`cmd --% /c git reset --hard` hands it `/c git reset --hard`). A
+    // quoted `'--%'` followed by a parameter word does the same, and
+    // PowerShell drops that word: `cmd '--%' -x /c git reset --hard` hands
+    // cmd `/c git reset --hard` (measured with pwsh 7.5).
     let mut stop_parsing = false;
     while let Some(raw) = words.get(index) {
         if outer_dialect == ShellDialect::PowerShell && !stop_parsing {
-            if crate::normalize::powershell_word_stops_parsing(raw) {
+            let stop_words = crate::normalize::powershell_stop_parsing_words(words, index);
+            if stop_words > 0 {
                 stop_parsing = true;
-                index += 1;
+                index += stop_words;
                 continue;
             }
             // PowerShell drops a quoted `'--%'` from cmd's argv and keeps
@@ -14564,6 +14578,8 @@ fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option
     // words are verbatim arguments after `--%` (until a pipe or newline).
     let mut comment_end = 0usize;
     let mut verbatim = false;
+    // The previous PowerShell word was a quoted `'--%'`.
+    let mut quoted_marker = false;
     for token in &tokenize_for_shell_dialect(command, dialect) {
         if token.byte_range.start < comment_end {
             continue;
@@ -14580,6 +14596,7 @@ fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option
             }
             previous_word_end = None;
             verbatim = false;
+            quoted_marker = false;
             continue;
         }
         previous_word_end = Some(token.byte_range.end);
@@ -14607,12 +14624,18 @@ fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option
                 continue;
             }
             // Only the stop-parsing token makes the rest verbatim; a quoted
-            // `'--%'` does not.
-            if crate::normalize::powershell_word_stops_parsing(raw) {
+            // `'--%'` does when a parameter word follows it, which the
+            // tokenizer then reads as verbatim too.
+            let after_quoted_marker = std::mem::take(&mut quoted_marker);
+            if crate::normalize::powershell_word_stops_parsing(raw)
+                || (after_quoted_marker
+                    && crate::normalize::powershell_parameter_token_len(raw) == Some(raw.len()))
+            {
                 verbatim = true;
                 target_next = false;
                 continue;
             }
+            quoted_marker = crate::normalize::powershell_word_is_quoted_marker(raw);
         }
         if std::mem::take(&mut target_next) {
             blank(token.byte_range.clone());

@@ -461,9 +461,15 @@ fn a_quoted_stop_parsing_token_does_not_stop_expansion() {
             r"$a = 'reset','--hard'; cmd '--%' /c git @a",
             r"$x = '&git'; cmd /c ver '--%' $x reset --hard",
             r"cmd '--%' /c git reset --hard",
-            // The host reader drops it too and reads the computed payload.
+            // Before a parameter word a quoted `'--%'` stops parsing like a
+            // bare one: pwsh receives `$x` as written, not `-c` and the
+            // value (pwsh 7.5). The host reader fails closed on a
+            // stop-parsing token where it reads its options.
             r"$x = 'git reset --hard'; pwsh '--%' -c $x",
             r"$x = 'git reset --hard'; pwsh -NoProfile '--%' -c $x",
+            // So it fails closed on a harmless payload too, as on `pwsh --%
+            // -c 'Get-Date'`.
+            r"pwsh '--%' -c 'Get-Date'",
         ]),
         &PS,
         "PowerShell",
@@ -491,7 +497,7 @@ fn a_quoted_stop_parsing_token_does_not_stop_expansion() {
             r"Write-Output '--%'",
             r"git '--%' status",
             r"Write-Output '--%'; git status",
-            r"pwsh '--%' -c 'Get-Date'",
+            r"pwsh '--%' 'Get-Date'",
         ]),
         &[ShellDialect::PowerShell],
         "PowerShell",
@@ -503,6 +509,100 @@ fn a_quoted_stop_parsing_token_does_not_stop_expansion() {
         deny.join("\n"),
         deny_statements.join("\n"),
         allow.join("\n")
+    );
+}
+
+/// Review round 4. A quoted `'--%'` followed by a parameter word does stop
+/// PowerShell's parsing: the parser peeks at the token after the quoted
+/// string and enters verbatim mode when it is a parameter, which it drops
+/// (`Parser.cs` `GetVerbatimCommandArgumentToken`). `cmd '--%' -x /c git
+/// reset --hard` hands cmd `/c git reset --hard`, and `cmd '--%' -x /c ver #
+/// & git status` hands it `/c ver # & git status`: no comment, no separator
+/// (pwsh 7.5, fake cmd and git).
+#[test]
+fn a_quoted_stop_parsing_token_before_a_parameter_stops_parsing() {
+    let deny = expect_everywhere(
+        &strings(&[
+            r"cmd '--%' -x /c git reset --hard",
+            r#"cmd "--%" -x /c git reset --hard"#,
+            r"cmd '--%' -x /c echo 'a & git reset --hard & '",
+            r#"cmd '--%' -d /c "git reset --hard""#,
+            r#"cmd '--%' -x /c "echo a & git reset --hard""#,
+            r"cmd /d '--%' -x /c git reset --hard",
+            r"cmd '--%'-x /c git reset --hard",
+            "cmd '--%' \u{2013}x /c git reset --hard",
+            r"cmd '--%' -x: /c git reset --hard",
+            r"& cmd '--%' -x /c git reset --hard",
+            r"cmd '--%' -NoProfile /c git reset --hard",
+            // Verbatim text has no comments and no statement separators.
+            r"cmd '--%' -x /c ver # & git reset --hard",
+            r"cmd '--%' -x /c ver <# c #> & git reset --hard",
+            // The parameter may follow a line continuation or a block
+            // comment, and it ends before `.`, `(` and `,` and after `:`
+            // (`-x.y` hands cmd `.y`), or takes the rest of a glued word.
+            "cmd '--%' `\n -x /c ver # & git reset --hard",
+            r"cmd '--%' <# c #> -x /c ver # & git reset --hard",
+            r"cmd /c ver '--%' -x # & git reset --hard",
+            r"cmd /c ver '--%' -x.y # & git reset --hard",
+            r"cmd /c ver '--%' -x(1) # & git reset --hard",
+            r"cmd /c ver '--%' -x:y # & git reset --hard",
+            r"cmd /c ver '--%' -x,y # & git reset --hard",
+            r"cmd /c ver '--%'-x/c # & git reset --hard",
+            // Any program: git receives `reset --hard`.
+            r"git '--%' -x reset --hard",
+            // The host reads its options as written: fail closed.
+            r#"pwsh '--%' -x -c "git reset --hard""#,
+            r#"powershell -NoProfile '--%' -x -c "git reset --hard""#,
+        ]),
+        &PS,
+        "PowerShell",
+        EvaluationDecision::Deny,
+    );
+    // The Unknown reading allows `cmd /c rd /s /q C:\src` itself (base).
+    let deny_ps = expect_everywhere(
+        &strings(&[
+            r"cmd '--%' -x /c rd /s /q C:\src",
+            r"cmd /d '--%' -x /c ver # & rd /s /q C:\src",
+        ]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Deny,
+    );
+    let allow = expect_everywhere(
+        &strings(&[
+            r"cmd '--%' -x /c ver",
+            r"cmd '--%' -x /c echo $x",
+            // Verbatim text ends at a pipe or `&&`.
+            r"cmd '--%' -x /c ver | Select-String x",
+            // cmd receives `/c echo ^& git reset --hard`, an escaped `&`.
+            r"cmd /c echo '--%' -x ^& git reset --hard",
+            // No parameter after the quoted marker: parsing goes on, and
+            // `-x'y'`, `--x`, `-1` and `-` are not parameters.
+            r"cmd '--%' /c ver # & git reset --hard",
+            r"Write-Output '--%' --x # & git reset --hard",
+            r"cmd '--%' -x'y' /c ver # & git reset --hard",
+            r"cmd '--%' -1 /c ver # & git reset --hard",
+            r"cmd '--%' - /c ver # & git reset --hard",
+        ]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Allow,
+    );
+    // Verbatim text after the quoted marker and the parameter is not
+    // PowerShell code: the next statement is cmd's argument, not a command.
+    let allow_statements = expect_everywhere(
+        &strings(&[r"Write-Output '--%' -x; git reset --hard"]),
+        &[ShellDialect::PowerShell],
+        "PowerShell",
+        EvaluationDecision::Allow,
+    );
+    assert!(
+        deny.is_empty() && deny_ps.is_empty() && allow.is_empty() && allow_statements.is_empty(),
+        "deny misses:\n{}\n{}\nallow misses:\n{}\n{}",
+        deny.join("\n"),
+        deny_ps.join("\n"),
+        allow.join("\n"),
+        allow_statements.join("\n")
     );
 }
 
