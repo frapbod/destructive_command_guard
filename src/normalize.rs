@@ -7464,11 +7464,15 @@ fn zsh_equals_substitution_starts(bytes: &[u8], at: usize, budget: &mut usize) -
                 b'}' | b'\n' => break,
                 // The pattern ends at its first `/`.
                 b'/' => {
-                    let slash = if i > 0 && bytes[i - 1] == b'/' { i - 1 } else { i };
+                    let slash = if i > 0 && bytes[i - 1] == b'/' {
+                        i - 1
+                    } else {
+                        i
+                    };
                     let name = name_start(slash, budget)?;
-                    return Some(name.is_some_and(|name| {
-                        name >= 2 && &bytes[name - 2..name] == b"${"
-                    }));
+                    return Some(
+                        name.is_some_and(|name| name >= 2 && &bytes[name - 2..name] == b"${"),
+                    );
                 }
                 _ => {}
             }

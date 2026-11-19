@@ -106,10 +106,11 @@ fn hook_decision(protocol: Protocol, tool_name: &str, command: &str) -> String {
 }
 
 fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
-    let enabled: std::collections::HashSet<String> = ["core.git", "core.filesystem", "windows.filesystem"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let enabled: std::collections::HashSet<String> =
+        ["core.git", "core.filesystem", "windows.filesystem"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
     let ordered = REGISTRY.expand_enabled_ordered(&enabled);
     let keywords = REGISTRY.collect_enabled_keywords(&enabled);
     let index = REGISTRY.build_enabled_keyword_index(&ordered);
@@ -169,7 +170,6 @@ fn strings(commands: &[&str]) -> Vec<String> {
 }
 
 const POSIX: [ShellDialect; 2] = [ShellDialect::Posix, ShellDialect::Unknown];
-
 
 /// Each place zsh runs a `=(…)` body: a word start, an assignment value and
 /// the word after a `${…}` operator.
