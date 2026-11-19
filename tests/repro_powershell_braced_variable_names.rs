@@ -68,6 +68,18 @@ const RUNS_IT: &[&str] = &[
     // In a script string and a child shell's payload.
     "iex '${a''b}; git reset --hard'",
     "pwsh -c '${a''b} = 1; git reset --hard'",
+    // From review round 4 of card t_222650ea (PR #41): the same name again
+    // after the command, and as a `"…"` member name.
+    "${a\"b}=1; git reset --hard; ${a\"b}=2",
+    "${a\"b}=1; Invoke-Expression 'git reset --hard'; ${a\"b}=2",
+    "${a\"b}=1; [scriptblock]::Create('git reset --hard').Invoke(); ${a\"b}=2",
+    "${a'b}=1; [scriptblock]::Create('git reset --hard').Invoke(); ${a'b}=2",
+    "${a\"b}=1; $ExecutionContext.InvokeCommand.InvokeScript('git reset --hard'); ${a\"b}=2",
+    "${a\"b}=1; $a2='git reset --hard'; [scriptblock]::Create($a2).Invoke(); ${a\"b}=2",
+    "${a'b}='InvokeScript'; $ExecutionContext.InvokeCommand.\"${a'b}\"('git reset --hard')",
+    "${a\"b}='InvokeScript'; $ExecutionContext.InvokeCommand.\"${a\"b}\"('git reset --hard')",
+    "${a\"b}='Create'; [scriptblock]::\"${a\"b}\"('git reset --hard').Invoke()",
+    "$t=[scriptblock]; ${a\"b}='Create'; $t::\"${a\"b}\"('git reset --hard').Invoke()",
 ];
 
 /// Harmless in sandboxed PowerShell 7.5 (no `git reset`), and allowed in the
@@ -78,6 +90,9 @@ const HARMLESS: &[&str] = &[
     "Write-Output \"${a; git reset --hard}\"",
     "Write-Output ${env:ProgramFiles(x86)}",
     "Get-ChildItem \"${env:ProgramFiles(x86)}\\Git\"",
+    "${a\"b}=1; [scriptblock]::Create('git status').Invoke(); ${a\"b}=2",
+    "${a\"b}='InvokeScript'; $ExecutionContext.InvokeCommand.\"${a\"b}\"('git status')",
+    "${a\"b}='Create'; [scriptblock]::\"${a\"b}\"('git status').Invoke()",
 ];
 
 /// Harmless in sandboxed PowerShell 7.5 and allowed in the PowerShell
