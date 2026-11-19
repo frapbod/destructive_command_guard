@@ -407,6 +407,10 @@ impl ContextClassifier {
         };
 
         let mut i = 0;
+        // A removed backslash-newline does not end a word. Track this while
+        // scanning rather than guessing from the byte immediately before '#'.
+        let mut word_start = true;
+        let mut parens = PosixParens::default();
         while i < len {
             let byte = bytes[i];
             let Some(current_state) = stack.last().copied() else {
@@ -420,6 +424,9 @@ impl ContextClassifier {
                     TokenizerState::Comment | TokenizerState::PowerShellBlockComment
                 );
                 if effective {
+                    if current_state == TokenizerState::Normal && bytes.get(i + 1) != Some(&b'\n') {
+                        word_start = false;
+                    }
                     // Consume the backslash and the next character
                     i += 1; // Skip \
                     if i < len {
@@ -433,6 +440,15 @@ impl ContextClassifier {
 
             match current_state {
                 TokenizerState::Normal => {
+                    let at_word_start = word_start;
+                    word_start = match byte {
+                        b' ' | b'\t' | b'\n' | b'|' | b';' => true,
+                        b'&' => !is_ampersand_redirection_byte(bytes, i, len),
+                        // The `(` of `$(` never gets here: `$` pushes the body.
+                        b'(' => parens.open(bytes, i),
+                        b')' => parens.close(),
+                        _ => false,
+                    };
                     match byte {
                         b'\'' | b'$' if byte == b'\'' || ansi_c_quote_starts_at(bytes, i) => {
                             let ansi_c = byte == b'$';
@@ -577,14 +593,9 @@ impl ContextClassifier {
                             i = consume_braced_parameter(command, i).0;
                             continue;
                         }
-                        // A carriage return or form feed is no blank to the
-                        // shell: a `#` right after one is part of a word.
-                        b'#' if i == 0
-                            || matches!(
-                                bytes[i - 1],
-                                b' ' | b'\t' | b'\n' | b'|' | b'&' | b';'
-                            ) =>
-                        {
+                        // Only an actual word boundary opens a comment. Removed
+                        // continuations and escaped blanks do not create one.
+                        b'#' if at_word_start => {
                             // Comment start if start of word (including after separators).
                             if i > span_start {
                                 spans.push(Span::new(current_kind, span_start, i));
@@ -758,6 +769,7 @@ impl ContextClassifier {
                             spans.push(Span::new(SpanKind::Comment, span_start, i + 1));
                             span_start = i + 1;
                             current_kind = SpanKind::Executed;
+                            word_start = true;
                         }
                     }
                 }
@@ -1593,7 +1605,23 @@ fn plain_sanitize_mask_ranges(command: &str) -> Option<SmallVec<[Range<usize>; 8
     if !SAFE_COMMANDS_MATCHER.is_match(command) && !has_comment_char && !may_have_flowctl_data {
         return Some(SmallVec::new());
     }
-    token_mask_ranges(command, &tokenize_command(command), may_have_flowctl_data)
+    let posix = token_mask_ranges(
+        command,
+        &tokenize_command(command, true),
+        may_have_flowctl_data,
+    )?;
+    if command.bytes().any(|b| matches!(b, b'\r' | b'\x0c')) {
+        // This reader also serves PowerShell, where CR can end a statement.
+        // Mask only what both whitespace readings agree is inert.
+        let other = token_mask_ranges(
+            command,
+            &tokenize_command(command, false),
+            may_have_flowctl_data,
+        )?;
+        Some(intersect_ranges(&posix, &other))
+    } else {
+        Some(posix)
+    }
 }
 
 /// Git subcommands whose `-m`/`--message` takes a message (or, for
@@ -2869,20 +2897,38 @@ impl SanitizeToken {
 
 type SanitizeTokens = SmallVec<[SanitizeToken; 16]>;
 
-fn tokenize_command(command: &str) -> SanitizeTokens {
+fn tokenize_command(command: &str, posix_blanks: bool) -> SanitizeTokens {
     let bytes = command.as_bytes();
     let len = bytes.len();
 
     let mut tokens = SanitizeTokens::new();
     let mut i = 0;
+    // A quoted `${` that no `}` closes makes later ones plain (see below).
+    let mut unclosed_brace = false;
+    // The POSIX view ends a word before a `#` that follows a `(` or `)` after
+    // which a word starts, so that `#` opens a comment here too.
+    let mut parens = posix_blanks.then(PosixParens::default);
 
     while i < len {
-        // Skip whitespace, but STOP at newline (it's a separator)
-        while i < len && bytes[i].is_ascii_whitespace() && bytes[i] != b'\n' {
+        // Preserve both POSIX and the pre-existing shared whitespace views.
+        while i < len
+            && if posix_blanks {
+                matches!(bytes[i], b' ' | b'\t')
+            } else {
+                bytes[i].is_ascii_whitespace() && bytes[i] != b'\n'
+            }
+        {
             i += 1;
         }
         if i >= len {
             break;
+        }
+
+        // A line continuation between words is removed, so a word still
+        // starts after it (`echo a \` LF `# it's` is a comment).
+        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 2;
+            continue;
         }
 
         // Newline is a separator
@@ -2923,10 +2969,10 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
             continue;
         }
 
-        // Check for comment start. A carriage return or form feed is skipped
-        // above like a blank, but the shell does not read either as one: a
-        // `#` right after it is part of a word.
-        if i < len && bytes[i] == b'#' && (i == 0 || !matches!(bytes[i - 1], b'\r' | b'\x0c')) {
+        // This point is a word boundary: continuations within a word were
+        // consumed as part of that word, not as whitespace.
+        if bytes[i] == b'#' && (posix_blanks || i == 0 || !matches!(bytes[i - 1], b'\r' | b'\x0c'))
+        {
             // Consume until newline
             let start = i;
             while i < len && bytes[i] != b'\n' {
@@ -2941,7 +2987,15 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
         }
 
         let start = i;
-        let (end, has_inline_code) = consume_word_token(command, bytes, i, len);
+        let (end, has_inline_code) = consume_word_token(
+            command,
+            bytes,
+            i,
+            len,
+            posix_blanks,
+            &mut unclosed_brace,
+            parens.as_mut(),
+        );
         i = end;
 
         if start < i {
@@ -3006,13 +3060,25 @@ fn consume_separator_token(
 }
 
 #[must_use]
-fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> (usize, bool) {
+fn consume_word_token(
+    command: &str,
+    bytes: &[u8],
+    mut i: usize,
+    len: usize,
+    posix_blanks: bool,
+    unclosed_brace: &mut bool,
+    mut parens: Option<&mut PosixParens>,
+) -> (usize, bool) {
     let mut has_inline_code = false;
 
     while i < len {
         let b = bytes[i];
 
-        if b.is_ascii_whitespace() {
+        if if posix_blanks {
+            matches!(b, b' ' | b'\t' | b'\n')
+        } else {
+            b.is_ascii_whitespace()
+        } {
             break;
         }
 
@@ -3072,6 +3138,21 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
                             has_inline_code = true;
                             i = consume_backticks(command, i);
                         }
+                        // Quotes nest inside `${…}`: `"${y:-" #"}"` is one
+                        // string, so the `#` after the blank is no comment.
+                        // One that no `}` closes was read to the end; later
+                        // ones are then plain, so a run of them stays linear.
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' && !*unclosed_brace => {
+                            let (end, inline, closed) =
+                                consume_braced_parameter_core(bytes, i, true);
+                            if closed {
+                                has_inline_code |= inline;
+                                i = end;
+                            } else {
+                                *unclosed_brace = true;
+                                i += 1;
+                            }
+                        }
                         _ => {
                             i += 1;
                         }
@@ -3096,6 +3177,19 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
             b'`' => {
                 has_inline_code = true;
                 i = consume_backticks(command, i);
+            }
+            b'(' | b')' if parens.is_some() => {
+                let word_follows = parens.as_mut().is_some_and(|parens| {
+                    if b == b'(' {
+                        parens.open(bytes, i)
+                    } else {
+                        parens.close()
+                    }
+                });
+                i += 1;
+                if word_follows && bytes.get(i) == Some(&b'#') {
+                    break;
+                }
             }
             _ => {
                 i += 1;
@@ -3172,17 +3266,21 @@ fn consume_process_substitution(command: &str, start: usize) -> usize {
 }
 
 #[must_use]
-fn consume_dollar_paren(command: &str, start: usize) -> usize {
+fn consume_dollar_paren<T: AsRef<[u8]> + ?Sized>(command: &T, start: usize) -> usize {
     consume_dollar_paren_recursive(command, start, 0)
 }
 
-fn consume_dollar_paren_recursive(command: &str, start: usize, recursion_depth: usize) -> usize {
+fn consume_dollar_paren_recursive<T: AsRef<[u8]> + ?Sized>(
+    command: &T,
+    start: usize,
+    recursion_depth: usize,
+) -> usize {
+    let bytes: &[u8] = command.as_ref();
     // Prevent stack overflow on pathological input
     if recursion_depth > 500 {
-        return command.len(); // Fail safe: consume rest of command to ensure masking
+        return bytes.len(); // Fail safe: consume rest of command to ensure masking
     }
 
-    let bytes = command.as_bytes();
     let len = bytes.len();
 
     debug_assert_eq!(bytes.get(start), Some(&b'$'));
@@ -3251,8 +3349,8 @@ fn consume_dollar_paren_recursive(command: &str, start: usize, recursion_depth: 
 }
 
 #[must_use]
-fn consume_backticks(command: &str, start: usize) -> usize {
-    let bytes = command.as_bytes();
+fn consume_backticks<T: AsRef<[u8]> + ?Sized>(command: &T, start: usize) -> usize {
+    let bytes: &[u8] = command.as_ref();
     let len = bytes.len();
 
     debug_assert_eq!(bytes.get(start), Some(&b'`'));
@@ -3290,9 +3388,43 @@ fn consume_backticks(command: &str, start: usize) -> usize {
 /// readers take each body apart from the lines around it (see
 /// [`heredoc_body_ranges`]).
 #[must_use]
-pub(crate) fn consume_braced_parameter(command: &str, start: usize) -> (usize, bool) {
-    let bytes = command.as_bytes();
+pub(crate) fn consume_braced_parameter<T: AsRef<[u8]> + ?Sized>(
+    command: &T,
+    start: usize,
+) -> (usize, bool) {
+    let (end, has_inline_code, _closed) =
+        consume_braced_parameter_core(command.as_ref(), start, false);
+    (end, has_inline_code)
+}
+
+/// End of a `${…}` that really closes, for the scanners that must keep a
+/// word whole across it (`#` inside is data, a blank inside is no word
+/// break). `None` when no `}` closes it: the shell reports a syntax error
+/// and runs nothing, and the scanners then keep reading the line as before.
+///
+/// `in_double_quotes` is for an expansion that opens inside `"…"`. There
+/// dash reads a `'` as an ordinary character where bash reads a quote; it
+/// is read as ordinary here, as dash does. Limit: where bash quotes, a
+/// `'` read this way can end the span early, and a `#` after it can then
+/// look like a comment: bash runs the git command in
+/// `echo "${y:-'}" #'}"; git reset --hard`, and this reading misses it.
+#[must_use]
+pub(crate) fn braced_parameter_span(
+    bytes: &[u8],
+    start: usize,
+    in_double_quotes: bool,
+) -> Option<usize> {
+    let (end, _code, closed) = consume_braced_parameter_core(bytes, start, in_double_quotes);
+    closed.then_some(end)
+}
+
+fn consume_braced_parameter_core(
+    bytes: &[u8],
+    start: usize,
+    single_quote_is_literal: bool,
+) -> (usize, bool, bool) {
     let len = bytes.len();
+    let command = bytes;
 
     debug_assert_eq!(bytes.get(start..start + 2), Some(&b"${"[..]));
 
@@ -3312,9 +3444,10 @@ pub(crate) fn consume_braced_parameter(command: &str, start: usize) -> (usize, b
                 i += 1;
                 depth -= 1;
                 if depth == 0 {
-                    return (i, has_inline_code);
+                    return (i, has_inline_code, true);
                 }
             }
+            b'\'' if single_quote_is_literal => i += 1,
             b'\'' => {
                 i += 1;
                 while i < len && bytes[i] != b'\'' {
@@ -3354,7 +3487,7 @@ pub(crate) fn consume_braced_parameter(command: &str, start: usize) -> (usize, b
             _ => i += 1,
         }
     }
-    (len, has_inline_code)
+    (len, has_inline_code, false)
 }
 
 // =============================================================================
@@ -4009,6 +4142,120 @@ pub(crate) fn skip_ansi_c_quoted(bytes: &[u8], start: usize) -> usize {
 
 thread_local! {
     static PLAIN_DOLLAR_QUOTE_READING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Where a POSIX word starts after an unquoted, unescaped `(` or `)`. Every
+/// scanner that reads `#` comments asks this one rule (the segmenter and the
+/// quoted-separator mask in `packs`, the POSIX normalization tokenizer, the
+/// sanitizer's POSIX token view and the span classifier), so they agree on
+/// where a comment starts. Where they disagree, the view that misses a real
+/// comment reads its quote as a string that hides the next line, and the one
+/// that reads a false comment hides the rest of its line.
+///
+/// Scanners read `$(`, `<(` and `>(` as bodies of their own; only the
+/// classifier gives the `(` of `<(`. Measured with `scripts/shell-truth`
+/// (bash 3.2/5, zsh, sh, dash, Linux bash/dash), where a `#` right after the
+/// paren opens a comment:
+///
+/// | `(` opens | after `(` | after its `)` |
+/// |---|---|---|
+/// | a subshell or `(( ))` at a command start (after `;` `&` `|` a line end `(` `)` or `!` `{` `if` `then` `else` `elif` `do` `while` `until` `for` `time`) | comment | comment |
+/// | a function header `f()` | - | comment |
+/// | an array `x=(`, a process substitution `<(` | comment | data |
+/// | a case pattern (after `in`, `;;`, `;&`) | data | comment |
+/// | an extglob or zsh glob group (`@(` `*(` `+(` `?(` `a!(`), anything else | data | data |
+///
+/// No `(` open (a case pattern `x)`): comment. A case-pattern or glob `(`
+/// is data because zsh runs `git reset --hard` in
+/// `case x in (#) ;; esac; git reset --hard` and `ls *(#); git reset --hard`,
+/// where bash reports a syntax error and runs nothing.
+#[derive(Debug, Default)]
+pub(crate) struct PosixParens {
+    /// One entry per open `(`: whether a word starts after its `)`.
+    open: Vec<bool>,
+}
+
+impl PosixParens {
+    /// Note the `(` at `index`; whether a word starts after it.
+    pub(crate) fn open(&mut self, bytes: &[u8], index: usize) -> bool {
+        let (after_open, after_close) = posix_paren_word_starts(bytes, index);
+        self.open.push(after_close);
+        after_open
+    }
+
+    /// Note a `)`; whether a word starts after it.
+    pub(crate) fn close(&mut self) -> bool {
+        self.open.pop().unwrap_or(true)
+    }
+}
+
+/// A byte that ends a POSIX word.
+fn ends_posix_word(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' | b'`'
+    )
+}
+
+/// Whether a word starts after the `(` at `index`, and after its `)` (see
+/// [`PosixParens`]). Looks back over blanks and one short word, and forward
+/// over blanks, so a run of parens stays linear.
+fn posix_paren_word_starts(bytes: &[u8], index: usize) -> (bool, bool) {
+    match index.checked_sub(1).map(|at| bytes[at]) {
+        Some(b'=' | b'<' | b'>' | b'$') => return (true, false),
+        Some(b'@' | b'+' | b'*' | b'?') => return (false, false),
+        Some(b'!') if index >= 2 && !ends_posix_word(bytes[index - 2]) => return (false, false),
+        _ => {}
+    }
+    let mut next = index + 1;
+    while next < bytes.len() && matches!(bytes[next], b' ' | b'\t') {
+        next += 1;
+    }
+    if bytes.get(next) == Some(&b')') {
+        return (true, true);
+    }
+    let mut start = index;
+    while start > 0 && matches!(bytes[start - 1], b' ' | b'\t' | b'\n') {
+        start -= 1;
+    }
+    let before = &bytes[..start];
+    if before.ends_with(b";;")
+        || before.ends_with(b";&")
+        || (before.ends_with(b"in") && (start == 2 || ends_posix_word(bytes[start - 3])))
+    {
+        return (false, true);
+    }
+    let mut end = index;
+    while end > 0 && matches!(bytes[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    if end == 0
+        || matches!(
+            bytes[end - 1],
+            b';' | b'&' | b'|' | b'\n' | b'(' | b')' | b'`'
+        )
+    {
+        return (true, true);
+    }
+    let mut word = end;
+    while word > 0 && end - word < 6 && !ends_posix_word(bytes[word - 1]) {
+        word -= 1;
+    }
+    let keyword = (word == 0 || ends_posix_word(bytes[word - 1]))
+        && matches!(
+            &bytes[word..end],
+            b"!" | b"{"
+                | b"if"
+                | b"then"
+                | b"else"
+                | b"elif"
+                | b"do"
+                | b"while"
+                | b"until"
+                | b"for"
+                | b"time"
+        );
+    (keyword, keyword)
 }
 
 /// Whether the unquoted `$` at `i` opens a Bash ANSI-C string `$'…'`, in
@@ -5136,6 +5383,11 @@ mod tests {
             "echo ${x:-$'a\\'b' #}; rm -rf /",
             "echo a\r#b; rm -rf /",
             "echo a\x0c#b; rm -rf /",
+            // Nonblank bytes remain in the word across removed continuations.
+            "echo x\r\\\n#; rm -rf /",
+            "echo x\x0c\\\n#; rm -rf /",
+            "echo x\x0b\\\n#; rm -rf /",
+            "echo x\r\\\n\\\n#; rm -rf /",
         ] {
             assert!(
                 sanitize_for_pattern_matching(cmd).contains("rm -rf /"),
@@ -5166,6 +5418,98 @@ mod tests {
                     .iter()
                     .any(|span| span.kind == SpanKind::Comment && span.text(cmd) == "# rm -rf /"),
                 "{cmd:?}: {spans:?}"
+            );
+        }
+    }
+
+    /// A quoted `${` that no `}` closes is read to the end once; later ones
+    /// are plain, so a run of them stays linear (it was quadratic: 64 KB of
+    /// `${` in quotes took 13 s) and the command after the string stays seen.
+    #[test]
+    fn unclosed_quoted_braced_parameters_are_read_in_linear_time() {
+        let started = std::time::Instant::now();
+        for cmd in [
+            format!("echo \"{}\"; rm -rf /", "${".repeat(100_000)),
+            format!("echo {}; rm -rf /", "\"${a\" ".repeat(40_000)),
+        ] {
+            assert!(sanitize_for_pattern_matching(&cmd).contains("rm -rf /"));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Every scanner that reads POSIX `#` comments reads one after a `(` or
+    /// `)` alike (see [`PosixParens`]). Where one missed a comment the others
+    /// saw, its quote opened a string that hid the next line: review round 4
+    /// found `(( 1 ))#it's` LF `git reset --hard` allowed.
+    #[test]
+    fn posix_comment_after_a_paren_is_read_alike_by_every_scanner() {
+        use crate::normalize::{NormalizeTokenKind, ShellDialect, tokenize_for_shell_dialect};
+        // (command, whether its first `#` opens a comment)
+        for (cmd, comment) in [
+            ("(( 1 ))#it's\ngit status; ls", true),
+            ("((1))#it's\ngit status; ls", true),
+            ("if (( 1 ))#it's\nthen git status; fi", true),
+            ("for ((i=0;i<1;i++))#it's\ndo git status; done", true),
+            ("(cd /tmp)#it's\ngit status; ls", true),
+            ("(true)#it's\ngit status; ls", true),
+            ("(#it's\ngit status; ls)", true),
+            ("case x in x)#it's\ngit status;; esac", true),
+            ("f()#it's\n{ git status; }", true),
+            ("! (true)#it's\ngit status; ls", true),
+            ("!(true)#it's\ngit status; ls", true),
+            ("x=1; (true)#it's\ngit status; ls", true),
+            ("if true; then (#it's\ngit status\n); fi", true),
+            ("x=(#it's\n1)\ngit status; ls", true),
+            ("case x in (x)#it's\ngit status;; esac", true),
+            ("case x in (#it's\nx) git status;; esac", false),
+            ("case x in a) :;; (#it's\nx) git status;; esac", false),
+            ("ls *(#it's\ngit status; ls)", false),
+            ("echo x(#it's\ngit status; ls)", false),
+            ("echo (#it's\ngit status; ls)", false),
+            ("x=(1 2)#it's\ngit status; ls", false),
+            ("x+=(1)#it's\ngit status; ls", false),
+            ("echo @(a)#it's\ngit status; ls", false),
+            ("echo a!(b)#it's\ngit status; ls", false),
+            ("cat <(true)#it's\ngit status; ls", false),
+        ] {
+            let hash = cmd.find('#').unwrap();
+            let segments = crate::packs::split_command_segments(cmd);
+            assert_eq!(
+                segments.iter().any(|s| s.ends_with("git status")),
+                comment,
+                "segmenter {cmd:?} -> {segments:?}"
+            );
+            assert_eq!(
+                crate::packs::quoted_shell_separator_offsets(cmd).is_empty(),
+                comment,
+                "mask {cmd:?}"
+            );
+            let tokens = tokenize_for_shell_dialect(cmd, ShellDialect::Posix);
+            assert_eq!(
+                tokens
+                    .iter()
+                    .any(|t| t.kind == NormalizeTokenKind::Word && t.text(cmd) == Some("git")),
+                comment,
+                "tokenizer {cmd:?}"
+            );
+            assert_eq!(
+                tokenize_command(cmd, true)
+                    .iter()
+                    .any(|t| t.kind == SanitizeTokenKind::Comment && t.byte_range.start == hash),
+                comment,
+                "sanitizer {cmd:?}"
+            );
+            assert_eq!(
+                classify_command(cmd)
+                    .spans()
+                    .iter()
+                    .any(|s| s.kind == SpanKind::Comment && s.byte_range.start == hash),
+                comment,
+                "classifier {cmd:?}"
             );
         }
     }
