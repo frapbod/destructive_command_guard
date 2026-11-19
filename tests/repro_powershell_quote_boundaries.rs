@@ -370,6 +370,13 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "${c}<#x#>=iex 'git reset --hard'",
         // A block glued after the `<#` text (PR #34's class).
         "$l = Write-Output a<#{git reset --hard}; & $l[1]",
+        // In a ForEach-Object member call (PR #31's statement reader).
+        "$ExecutionContext.InvokeCommand | % InvokeScript a<#; $ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' #>",
+        "$ExecutionContext.InvokeCommand | % InvokeScript a<# ; & {git reset --hard} #>",
+        "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' a<#",
+        "$ExecutionContext.InvokeCommand | % InvokeScript $c<# ; git reset --hard #>",
+        "$ExecutionContext.InvokeCommand | % InvokeScript 2>$null<# ; git reset --hard #> 'git status'",
+        "New-Object System.Management.Automation.Runspaces.Command a<#; $p=[powershell]::Create(); [void]$p.AddScript('git reset --hard'); $p.Invoke() #>",
     ];
     let harmless = [
         "Write-Output $c#'\ngit reset --hard\n#'",
@@ -390,6 +397,8 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "Write-Output a>x; git status",
         "Write-Output a <# ; & {git reset --hard} #>",
         "$c <#x#> = 1; & {git status}",
+        "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' <# ; git reset --hard #>",
+        "$ExecutionContext.InvokeCommand | % InvokeScript 'git status'<# ; git reset --hard #>",
     ];
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
         for command in dangerous {
