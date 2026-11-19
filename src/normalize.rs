@@ -10042,6 +10042,30 @@ mod tests {
         );
     }
 
+    /// The quote-aware scan of `paren_hashes_as_data` reads each byte once,
+    /// also through runs of nested or unclosed quoted text.
+    #[test]
+    fn paren_hashes_as_data_is_linear_on_nested_and_unclosed_quotes() {
+        let start = std::time::Instant::now();
+        for command in [
+            format!("ls ({} #); git reset --hard", "a\")\"".repeat(20_000)),
+            format!("ls ( {} #", "$(".repeat(30_000)),
+            format!("ls ( {} #", "\"$(".repeat(20_000)),
+            format!("ls ( {} #", "${".repeat(30_000)),
+            format!("ls ( {} #", "$'\\'".repeat(20_000)),
+            format!("ls ( '{} #", "(".repeat(60_000)),
+            format!("ls ( `{} #", "\\`".repeat(30_000)),
+            format!("ls ( {}", "# it's\n(".repeat(10_000)),
+        ] {
+            let _ = paren_hashes_as_data(&command);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
     #[test]
     fn bash_hashes_as_data_reads_nested_parentheses_exactly() {
         let tail = " (( 1 #)); git reset --hard";
