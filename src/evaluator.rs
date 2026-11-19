@@ -4318,44 +4318,187 @@ fn decoded_launcher_tail(
 /// it builds a cmd.exe payload ([`decoded_cmd_launcher_tail`]).
 const POSIX_VALUE_AS_CMD_VARIABLE: &str = "%DCG_POSIX_VALUE%";
 
+/// The cmd variable that stands for a value PowerShell computes while it
+/// builds a cmd.exe payload ([`powershell_values_as_cmd_variables`]).
+const POWERSHELL_VALUE_AS_CMD_VARIABLE: &str = "%DCG_POWERSHELL_VALUE%";
+
 /// The payload words of a `cmd /c` / `cmd /k` launcher, as cmd.exe receives
 /// them ([`decoded_launcher_tail`]).
 ///
-/// A POSIX shell (WSL, Git Bash) substitutes every `$x`, `${x}`, `$(…)` and
-/// backquote outside single quotes before cmd.exe starts, so
-/// `cmd.exe /c "gi${X}t reset --hard"` hands cmd `git reset --hard` when `X`
-/// is empty (measured with bash 5). Read as written, cmd's reading kept
-/// `${X}` as literal text. The value is not known here: each one becomes a
-/// cmd variable, cmd's own spelling of unknown text, so cmd's rules for
-/// `%VAR%` decide (a top-level launcher fails closed, as for
+/// The outer shell substitutes its values before cmd.exe starts. A POSIX
+/// shell (WSL, Git Bash) substitutes every `$x`, `${x}`, `$(…)` and
+/// backquote outside single quotes, so `cmd.exe /c "gi${X}t reset --hard"`
+/// hands cmd `git reset --hard` when `X` is empty (measured with bash 5).
+/// PowerShell expands a variable or subexpression in a double-quoted or bare
+/// argument, so `cmd /c "gi$('')t reset --hard"` hands cmd `git reset
+/// --hard`, and `$x = 'a & git reset --hard'; cmd /c "echo $x"` hands it
+/// `echo a & git reset --hard` (measured with pwsh 7.5). Read as written,
+/// cmd's reading kept these as literal text. The value is not known here:
+/// each one becomes a cmd variable, cmd's own spelling of unknown text, so
+/// cmd's rules for `%VAR%` decide (a top-level launcher fails closed, as for
 /// `cmd /c "echo %USERNAME%"`; a deny-only reading judges the text around
-/// it). `Unknown` includes the POSIX reading.
+/// it). `Unknown` includes the POSIX reading. After PowerShell's
+/// stop-parsing token `--%` it expands nothing, so later words stay as
+/// written; a quoted `'--%'` is that token only when a parameter word
+/// follows it ([`crate::normalize::powershell_stop_parsing_words`]).
 fn decoded_cmd_launcher_tail(
     words: &[&str],
     start: usize,
     outer_dialect: ShellDialect,
     argv: NativeArgv,
 ) -> Option<String> {
-    if !matches!(outer_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        return decoded_launcher_tail(words, start, outer_dialect, argv);
-    }
-    let rendered: Vec<Cow<'_, str>> = words
-        .iter()
-        .enumerate()
-        .map(|(index, raw)| {
-            (index >= start)
-                .then(|| {
-                    crate::normalize::posix_word_with_values_replaced(
-                        raw,
-                        POSIX_VALUE_AS_CMD_VARIABLE,
-                    )
+    let rendered: Vec<Cow<'_, str>> = match outer_dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => words
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                (index >= start)
+                    .then(|| {
+                        crate::normalize::posix_word_with_values_replaced(
+                            raw,
+                            POSIX_VALUE_AS_CMD_VARIABLE,
+                        )
+                    })
+                    .flatten()
+                    .map_or(Cow::Borrowed(*raw), Cow::Owned)
+            })
+            .collect(),
+        ShellDialect::PowerShell => {
+            let mut stop_parsing = false;
+            words
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| {
+                    if index < start || stop_parsing {
+                        return Cow::Borrowed(*raw);
+                    }
+                    // A quoted `'--%'` without a parameter word after it is
+                    // dropped but does not stop PowerShell from expanding
+                    // later values; the decoder drops it too.
+                    if crate::normalize::powershell_stop_parsing_words(words, index) > 0 {
+                        stop_parsing = true;
+                        return Cow::Borrowed(*raw);
+                    }
+                    if powershell_argument_is_list(raw) {
+                        return Cow::Borrowed(POWERSHELL_VALUE_AS_CMD_VARIABLE);
+                    }
+                    powershell_values_as_cmd_variables(raw, false)
                 })
-                .flatten()
-                .map_or(Cow::Borrowed(*raw), Cow::Owned)
-        })
-        .collect();
+                .collect()
+        }
+        ShellDialect::Cmd => return decoded_launcher_tail(words, start, outer_dialect, argv),
+    };
     let rendered: Vec<&str> = rendered.iter().map(AsRef::as_ref).collect();
     decoded_launcher_tail(&rendered, start, outer_dialect, argv)
+}
+
+/// A bare argument word that PowerShell turns into a list of arguments: a
+/// splat (`@name`) or an array subexpression (`@( … )`). `$a = 'git',
+/// 'reset','--hard'; cmd /c @a` hands cmd `/c git reset --hard` (measured
+/// with pwsh 7.5).
+fn powershell_argument_is_list(raw: &str) -> bool {
+    raw.strip_prefix('@')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|ch| ch == '(' || ch == '_' || ch.is_alphanumeric())
+}
+
+/// Whether PowerShell computes this raw argument word, or the words it
+/// stands for, at run time: it holds a value
+/// ([`powershell_values_as_cmd_variables`]) or it is a list
+/// ([`powershell_argument_is_list`]).
+fn powershell_argument_is_computed(raw: &str) -> bool {
+    powershell_argument_is_list(raw)
+        || matches!(
+            powershell_values_as_cmd_variables(raw, false),
+            Cow::Owned(_)
+        )
+}
+
+/// One raw PowerShell argument word with every value PowerShell expands in
+/// it replaced by [`POWERSHELL_VALUE_AS_CMD_VARIABLE`].
+///
+/// A value is a `$( … )` subexpression, a `${ … }` braced variable, a
+/// `$name` or `$scope:name` variable (`$env:USERNAME`), or one of `$$`,
+/// `$?` and `$^`, outside single quotes and not escaped by a backtick. A
+/// `$` before anything else is literal. An unclosed `$(` or `${` runs to the
+/// end of the word. The quotes and escapes stay for the decoder.
+/// `in_double_quotes` starts the scan inside a double-quoted string (the
+/// body of one, without its quotes).
+pub(crate) fn powershell_values_as_cmd_variables(
+    raw: &str,
+    in_double_quotes: bool,
+) -> Cow<'_, str> {
+    if !raw.contains('$') {
+        return Cow::Borrowed(raw);
+    }
+    let bytes = raw.as_bytes();
+    let name_char = |index: usize| {
+        raw[index..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '?'))
+    };
+    let name_end = |mut index: usize| {
+        while index < raw.len() && name_char(index) {
+            index += raw[index..].chars().next().map_or(1, char::len_utf8);
+        }
+        index
+    };
+    let mut output = String::with_capacity(raw.len());
+    let mut double = in_double_quotes;
+    let mut copied = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = escape_sequence_end(raw, index),
+            b'\'' if !double => index = skip_powershell_single_quote(raw, index),
+            b'"' if double && bytes.get(index + 1) == Some(&b'"') => index += 2,
+            b'"' => {
+                double = !double;
+                index += 1;
+            }
+            b'$' => {
+                let end = match bytes.get(index + 1) {
+                    Some(b'(') => find_powershell_subexpression_close(raw, index + 2)
+                        .map_or(raw.len(), |close| close + 1),
+                    Some(b'{') => {
+                        let mut close = index + 2;
+                        while close < bytes.len() && bytes[close] != b'}' {
+                            close = if bytes[close] == b'`' {
+                                escape_sequence_end(raw, close)
+                            } else {
+                                close + 1
+                            };
+                        }
+                        (close + 1).min(raw.len())
+                    }
+                    Some(b'$' | b'^') => index + 2,
+                    Some(_) if name_char(index + 1) => {
+                        let end = name_end(index + 1);
+                        if bytes.get(end) == Some(&b':') && name_char(end + 1) {
+                            name_end(end + 1)
+                        } else {
+                            end
+                        }
+                    }
+                    _ => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                output.push_str(&raw[copied..index]);
+                output.push_str(POWERSHELL_VALUE_AS_CMD_VARIABLE);
+                copied = end;
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    if copied == 0 {
+        return Cow::Borrowed(raw);
+    }
+    output.push_str(&raw[copied..]);
+    Cow::Owned(output)
 }
 
 /// `CharExtensions.IsDash` / `SpecialCharacters.IsDash` in PowerShell's
@@ -4966,14 +5109,37 @@ fn decode_powershell_encoded_payload(
 
 /// The `-Command` payload that starts at `words[start]`: every later word,
 /// joined with spaces, as the host joins them.
+///
+/// An outer PowerShell expands its values in a double-quoted or bare word
+/// before the host starts: `$x = 'git reset --hard'; powershell -c "$x"`
+/// hands the host `git reset --hard`, and `powershell -c "Write-Output
+/// '$x'"` with `$x = "'; git reset --hard; '"` hands it `Write-Output '';
+/// git reset --hard; ''` (measured with pwsh 7.5). Read as written, the
+/// payload is a harmless variable read or a single-quoted string. Its
+/// text is not known, so a top-level reading (`expansions` is
+/// [`LauncherExpansions::Refuse`]) is unverified; a deny-only reading keeps
+/// it as written. A script block (`powershell -c { … }`) is passed
+/// unexpanded.
 fn powershell_command_payload(
     words: &[&str],
     start: usize,
     outer_dialect: ShellDialect,
     argv: NativeArgv,
+    expansions: LauncherExpansions,
     max_payload_bytes: usize,
     launcher: &'static str,
 ) -> WindowsLauncherParse {
+    if outer_dialect == ShellDialect::PowerShell
+        && expansions == LauncherExpansions::Refuse
+        && !raw_payload_is_outer_powershell_script_block(words, start, outer_dialect)
+        && (start..words.len())
+            .take_while(|&index| crate::normalize::powershell_stop_parsing_words(words, index) == 0)
+            .any(|index| powershell_argument_is_computed(words[index]))
+    {
+        return WindowsLauncherParse::Unverified(format!(
+            "{launcher} payload holds a value the outer PowerShell computes"
+        ));
+    }
     if words
         .get(start)
         .and_then(|raw| shell_word_value(raw, outer_dialect))
@@ -5096,11 +5262,41 @@ fn parse_powershell_launcher(
     executable: &str,
     outer_dialect: ShellDialect,
     argv: NativeArgv,
+    expansions: LauncherExpansions,
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let host = PowerShellHost::from_executable(executable);
     let mut index = 1usize;
     while let Some(raw) = words.get(index) {
+        // A PowerShell value where the host reads its options can be or hold
+        // them (`$a = '-c','git reset --hard'; pwsh $a`).
+        if outer_dialect == ShellDialect::PowerShell && powershell_argument_is_computed(raw) {
+            return WindowsLauncherParse::Unverified(format!(
+                "the PowerShell host reads its options from the PowerShell value {raw:?}"
+            ));
+        }
+        // After PowerShell's stop-parsing token the host reads the rest of
+        // the line as written, and a quoted `'--%'` followed by a parameter
+        // word is that token too (`pwsh '--%' -x -c "git reset --hard"` hands
+        // pwsh `-c "git reset --hard"`, measured with pwsh 7.5). Its options
+        // are not read here.
+        if outer_dialect == ShellDialect::PowerShell
+            && crate::normalize::powershell_stop_parsing_words(words, index) > 0
+        {
+            return WindowsLauncherParse::Unverified(
+                "the PowerShell host reads its options after PowerShell's stop-parsing token"
+                    .to_string(),
+            );
+        }
+        // PowerShell drops a quoted `'--%'` and keeps expanding values after
+        // it, as for cmd ([`parse_cmd_launcher`]): `pwsh '--%' $x` is read
+        // as `pwsh $x`.
+        if outer_dialect == ShellDialect::PowerShell
+            && shell_word_value(raw, ShellDialect::PowerShell).is_none()
+        {
+            index += 1;
+            continue;
+        }
         match powershell_host_option(raw, host, outer_dialect, argv) {
             PowerShellHostOption::Command => {
                 return powershell_command_payload(
@@ -5108,6 +5304,7 @@ fn parse_powershell_launcher(
                     index + 1,
                     outer_dialect,
                     argv,
+                    expansions,
                     max_payload_bytes,
                     "PowerShell -Command",
                 );
@@ -5157,14 +5354,25 @@ fn parse_powershell_launcher(
                 return WindowsLauncherParse::NotLauncher;
             }
             PowerShellHostOption::NoValue => index += 1,
-            PowerShellHostOption::OptionalValue => index += 2,
-            PowerShellHostOption::Value => {
-                if words.get(index + 1).is_none() {
-                    return WindowsLauncherParse::Unverified(format!(
-                        "PowerShell host option {raw:?} is missing its value"
-                    ));
+            option @ (PowerShellHostOption::OptionalValue | PowerShellHostOption::Value) => {
+                match words.get(index + 1) {
+                    None if matches!(option, PowerShellHostOption::Value) => {
+                        return WindowsLauncherParse::Unverified(format!(
+                            "PowerShell host option {raw:?} is missing its value"
+                        ));
+                    }
+                    // A value can be a list (`$a`, `@a`), which shifts the
+                    // words after it into the host's options.
+                    Some(value)
+                        if outer_dialect == ShellDialect::PowerShell
+                            && powershell_argument_is_computed(value) =>
+                    {
+                        return WindowsLauncherParse::Unverified(format!(
+                            "PowerShell host option {raw:?} takes the PowerShell value {value:?}"
+                        ));
+                    }
+                    _ => index += 2,
                 }
-                index += 2;
             }
             PowerShellHostOption::Unmodeled => {
                 return WindowsLauncherParse::Unverified(format!(
@@ -5193,6 +5401,7 @@ fn parse_powershell_launcher(
                         index,
                         outer_dialect,
                         argv,
+                        expansions,
                         max_payload_bytes,
                         "PowerShell positional command",
                     );
@@ -5253,13 +5462,53 @@ fn parse_cmd_launcher(
     max_payload_bytes: usize,
 ) -> WindowsLauncherParse {
     let mut index = 1usize;
+    // After PowerShell's `--%` cmd receives the rest of the line as written
+    // (`cmd --% /c git reset --hard` hands it `/c git reset --hard`). A
+    // quoted `'--%'` followed by a parameter word does the same, and
+    // PowerShell drops that word: `cmd '--%' -x /c git reset --hard` hands
+    // cmd `/c git reset --hard` (measured with pwsh 7.5).
+    let mut stop_parsing = false;
     while let Some(raw) = words.get(index) {
-        let Some(option) = cmd_host_switch(raw, outer_dialect) else {
+        if outer_dialect == ShellDialect::PowerShell && !stop_parsing {
+            let stop_words = crate::normalize::powershell_stop_parsing_words(words, index);
+            if stop_words > 0 {
+                stop_parsing = true;
+                index += stop_words;
+                continue;
+            }
+            // PowerShell drops a quoted `'--%'` from cmd's argv and keeps
+            // expanding values after it: `$x = 'a & git reset --hard'; cmd
+            // '--%' /c "echo $x"` hands cmd `/c echo a & git reset --hard`
+            // (measured with pwsh 7.5).
+            if shell_word_value(raw, ShellDialect::PowerShell).is_none() {
+                index += 1;
+                continue;
+            }
+            // A PowerShell value before `/c` can be or hold cmd's switches
+            // (`$a = '/c','git reset --hard'; cmd $a`): cmd's argv is unknown.
+            if powershell_argument_is_computed(raw) {
+                return WindowsLauncherParse::Unverified(format!(
+                    "cmd reads its switches from the PowerShell value {raw:?}"
+                ));
+            }
+        }
+        let switch_dialect = if stop_parsing {
+            ShellDialect::Cmd
+        } else {
+            outer_dialect
+        };
+        let Some(option) = cmd_host_switch(raw, switch_dialect) else {
             return WindowsLauncherParse::NotLauncher;
         };
         if matches!(option.as_str(), "/c" | "/k") {
-            let Some(command) = decoded_cmd_launcher_tail(words, index + 1, outer_dialect, argv)
-            else {
+            // After `--%` cmd reads the words as typed at its own prompt:
+            // `cmd --% /c "git reset --hard"` runs git.
+            let command = if stop_parsing {
+                decoded_launcher_tail(words, index + 1, ShellDialect::Cmd, argv)
+            } else {
+                decoded_cmd_launcher_tail(words, index + 1, outer_dialect, argv)
+            };
+            let Some(command) = command else {
                 return WindowsLauncherParse::Unverified(format!(
                     "cmd {option} has no statically inspectable payload"
                 ));
@@ -6032,6 +6281,14 @@ fn parse_windows_launcher_segment_as(
         .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
         .map(str::trim_start)
         .unwrap_or(segment);
+    // PowerShell performs the redirections written on the launcher call
+    // (`cmd /c "…" 2>&1`, `pwsh -c … *> $null`); they are not part of the
+    // launched program's argv. Its tokenizer splits a stream merge at the
+    // `&`, which would end the launcher reading.
+    let redirection_free = (outer_dialect == ShellDialect::PowerShell)
+        .then(|| windows_redirection_free_view(segment, ShellDialect::PowerShell))
+        .flatten();
+    let segment = redirection_free.as_deref().map_or(segment, str::trim);
 
     if outer_dialect == ShellDialect::Cmd {
         if let Some(command) = segment.strip_prefix('@') {
@@ -6105,9 +6362,14 @@ fn parse_windows_launcher_segment_as(
         return WindowsLauncherParse::NotLauncher;
     };
     match executable.as_str() {
-        "powershell" | "pwsh" => {
-            parse_powershell_launcher(&words, &executable, outer_dialect, argv, max_payload_bytes)
-        }
+        "powershell" | "pwsh" => parse_powershell_launcher(
+            &words,
+            &executable,
+            outer_dialect,
+            argv,
+            expansions,
+            max_payload_bytes,
+        ),
         "cmd" => parse_cmd_launcher(&words, outer_dialect, argv, expansions, max_payload_bytes),
         "call" if outer_dialect == ShellDialect::Cmd => {
             let Some(command) = decoded_launcher_tail(&words, 1, outer_dialect, argv) else {
@@ -6302,6 +6564,146 @@ fn cmd_name_ending_word(command: &str, cmd_offset: usize, word_end: usize) -> Op
         .then(|| &from_cmd[..name_len])
 }
 
+/// The PowerShell launcher call that starts at `call` (a statement start in
+/// some command), spelled with each parenthesized argument as one value
+/// word. `None` when the call is not a launcher (`cmd`, `powershell`,
+/// `pwsh`) or has no such argument.
+///
+/// In argument mode a `( … )`, `$( … )` or `@( … )` word is an expression
+/// whose value PowerShell hands the program: `$a = '/c','git reset --hard';
+/// cmd ($a)` hands cmd `/c` `git reset --hard`, and `$x = '&git'; cmd /c ver
+/// $($x) reset --hard` hands it `/c ver &git reset --hard` (measured with
+/// pwsh 7.5). The tokenizer ends a segment at each parenthesis, so the
+/// launcher reader saw `cmd` or `cmd /c ver $` without the word. Here the
+/// call runs to the end of its statement (a separator outside the groups,
+/// other than the `&` of a stream merge such as `2>&1`); a `$( … )` group
+/// becomes the variable `$DCG_VALUE` and any other group the splat
+/// `@DCG_VALUE`, so the launcher reader judges it as the value it is.
+/// The statements inside a group are still judged as their own segments.
+///
+/// `tokens` are PowerShell's tokens of the whole `command`, read once for all
+/// its segments; the call starts at byte `start` and `segment` is its first
+/// segment. Only the call's own statement is walked.
+fn powershell_launcher_call_with_group_values(
+    segment: &str,
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+) -> Option<String> {
+    const VALUE: &str = "$DCG_VALUE";
+    const LIST: &str = "@DCG_VALUE";
+    let starts_launcher = |text: &str| {
+        let tokens = tokenize_for_shell_dialect(text, ShellDialect::PowerShell);
+        // A statement-leading `&` is the call operator.
+        let mut tokens = tokens.iter().skip_while(|token| {
+            token.kind == NormalizeTokenKind::Separator && token.text(text) == Some("&")
+        });
+        tokens.next().is_some_and(|token| {
+            token.kind == NormalizeTokenKind::Word
+                && token
+                    .text(text)
+                    .and_then(|raw| launcher_executable_name(raw, ShellDialect::PowerShell))
+                    .is_some_and(|name| matches!(name.as_str(), "cmd" | "powershell" | "pwsh"))
+        })
+    };
+    let call = command.get(start..)?;
+    if !call.contains('(') || !starts_launcher(segment) {
+        return None;
+    }
+    // The call's tokens, with byte ranges relative to `call`.
+    let first = tokens.partition_point(|token| token.byte_range.start < start);
+    let mut tokens = tokens[first..]
+        .iter()
+        .map(|token| crate::normalize::NormalizeToken {
+            kind: token.kind,
+            byte_range: token.byte_range.start - start..token.byte_range.end - start,
+        })
+        .skip_while(|token| {
+            token.kind == NormalizeTokenKind::Separator && token.text(call) == Some("&")
+        });
+    let bytes = call.as_bytes();
+    let mut view = String::with_capacity(call.len());
+    let mut copied = 0usize;
+    let mut end = call.len();
+    let mut grouped = false;
+    while let Some(token) = tokens.next() {
+        if token.kind == NormalizeTokenKind::Word {
+            continue;
+        }
+        let start = token.byte_range.start;
+        let text = token.text(call).unwrap_or_default();
+        if text == "&" && start > 0 && matches!(bytes[start - 1], b'<' | b'>') {
+            continue;
+        }
+        if text != "(" {
+            end = start;
+            break;
+        }
+        // The matching `)`; an unclosed group runs to the end.
+        let mut depth = 1usize;
+        let mut close = call.len();
+        for inner in tokens.by_ref() {
+            if inner.kind != NormalizeTokenKind::Separator {
+                continue;
+            }
+            match inner.text(call) {
+                Some("(") => depth += 1,
+                Some(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = inner.byte_range.end;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A backtick-escaped `$` or `@` is literal text before the group
+        // (`` `$($x) `` hands the program `$` and the value).
+        let sigil = start
+            .checked_sub(1)
+            .filter(|&before| {
+                bytes[..before]
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'`')
+                    .count()
+                    % 2
+                    == 0
+            })
+            .filter(|&before| match bytes[before] {
+                b'$' => true,
+                // `@(` makes an array only where a word starts.
+                b'@' => before == 0 || bytes[before - 1].is_ascii_whitespace(),
+                _ => false,
+            })
+            .map(|before| bytes[before]);
+        let (group_start, value) = match sigil {
+            Some(b'$') => (start - 1, VALUE),
+            Some(_) => (start - 1, LIST),
+            None => (start, LIST),
+        };
+        view.push_str(&call[copied..group_start]);
+        if sigil.is_none() && !view.ends_with(char::is_whitespace) {
+            view.push(' ');
+        }
+        view.push_str(value);
+        if bytes
+            .get(close)
+            .is_some_and(|after| !after.is_ascii_whitespace())
+        {
+            view.push(' ');
+        }
+        copied = close;
+        grouped = true;
+    }
+    if !grouped {
+        return None;
+    }
+    view.push_str(&call[copied.min(end)..end]);
+    Some(view)
+}
+
 fn windows_launcher_envelopes(
     command: &str,
     outer_dialect: ShellDialect,
@@ -6348,6 +6750,41 @@ fn windows_launcher_envelopes(
         matches!(outer_dialect, ShellDialect::Posix | ShellDialect::Unknown)
             && command.contains("<<");
 
+    // PowerShell's tokens of the whole command, for a launcher call that
+    // continues past a parenthesized argument
+    // ([`powershell_launcher_call_with_group_values`]). Read once, and only
+    // when there is a group.
+    let powershell_tokens = (matches!(
+        outer_dialect,
+        ShellDialect::PowerShell | ShellDialect::Unknown
+    ) && command.contains('('))
+    .then(|| tokenize_for_shell_dialect(command, ShellDialect::PowerShell));
+    let offset = |segment: &str| (segment.as_ptr() as usize).checked_sub(command.as_ptr() as usize);
+    let powershell_launcher_segment = |segment: &str| {
+        powershell_tokens.as_ref().and_then(|tokens| {
+            powershell_launcher_call_with_group_values(segment, command, tokens, offset(segment)?)
+        })
+    };
+    // Under Unknown the segments are POSIX's, which do not end where a
+    // PowerShell group starts: in `$y = (cmd /c "ver $x reset --hard")` and
+    // `if (cmd …) { … }` the cmd call starts a PowerShell statement inside
+    // the segment. Codex's `Bash` tool on Windows runs PowerShell and gets
+    // this reading. So the PowerShell candidate also reads the PowerShell
+    // segments that are not segments here.
+    let powershell_only_segments: Vec<&str> = match powershell_tokens {
+        Some(_) if outer_dialect == ShellDialect::Unknown => {
+            let spans: Vec<(Option<usize>, usize)> = segments
+                .iter()
+                .map(|segment| (offset(segment.trim()), segment.trim().len()))
+                .collect();
+            crate::packs::split_command_segments_in_dialect(command, ShellDialect::PowerShell)
+                .into_iter()
+                .filter(|segment| !spans.contains(&(offset(segment.trim()), segment.trim().len())))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+
     for segment in segments {
         let mut segment_envelopes = Vec::new();
         let mut unverified = None;
@@ -6366,9 +6803,15 @@ fn windows_launcher_envelopes(
                 &[NativeArgv::Verbatim]
             };
             let mut launcher_reading = false;
+            // A PowerShell launcher call continues past a parenthesized
+            // argument, where the segment ends.
+            let grouped_call = (candidate == ShellDialect::PowerShell)
+                .then(|| powershell_launcher_segment(segment))
+                .flatten();
+            let launcher_segment = grouped_call.as_deref().unwrap_or(segment);
             for &argv in readings {
                 match parse_windows_launcher_segment_as(
-                    segment,
+                    launcher_segment,
                     candidate,
                     argv,
                     LauncherExpansions::Refuse,
@@ -6411,6 +6854,36 @@ fn windows_launcher_envelopes(
             all_segments_are_envelopes = false;
         }
         envelopes.extend(segment_envelopes);
+    }
+    for segment in powershell_only_segments {
+        let grouped_call = powershell_launcher_segment(segment);
+        match parse_windows_launcher_segment_as(
+            grouped_call.as_deref().unwrap_or(segment),
+            ShellDialect::PowerShell,
+            NativeArgv::Verbatim,
+            LauncherExpansions::Refuse,
+            max_payload_bytes,
+        ) {
+            WindowsLauncherParse::NotLauncher => {}
+            // The payload is judged too; whether every segment is a launcher
+            // stays as the segments above decided.
+            WindowsLauncherParse::Envelope(envelope) => {
+                if !envelopes.contains(&envelope) {
+                    envelopes.push(envelope);
+                }
+            }
+            WindowsLauncherParse::Unverified(reason) => {
+                let start = offset(segment).unwrap_or_default();
+                if !inert_interpreter_stdin_possible
+                    || !crate::heredoc::range_is_inert_interpreter_stdin(
+                        command,
+                        &(start..start + segment.len()),
+                    )
+                {
+                    return Err(reason);
+                }
+            }
+        }
     }
     Ok((envelopes, all_segments_are_envelopes))
 }
@@ -13442,9 +13915,8 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
             }
         }
         let segment = &command[command_token.byte_range.start..segment_end];
-        // `--%`, bare or quoted, stops PowerShell's parsing. The decoder
-        // drops it, so it is kept here as the word `--%`, which is not
-        // placed; each word is decoded on its own.
+        // The decoder drops `--%`, bare or quoted, so it is kept here as the
+        // word `--%`, which is not placed; each word is decoded on its own.
         let words: Vec<(String, bool, std::ops::Range<usize>)> =
             tokenize_for_shell_dialect(segment, ShellDialect::PowerShell)
                 .iter()
@@ -14106,6 +14578,8 @@ fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option
     // words are verbatim arguments after `--%` (until a pipe or newline).
     let mut comment_end = 0usize;
     let mut verbatim = false;
+    // The previous PowerShell word was a quoted `'--%'`.
+    let mut quoted_marker = false;
     for token in &tokenize_for_shell_dialect(command, dialect) {
         if token.byte_range.start < comment_end {
             continue;
@@ -14122,6 +14596,7 @@ fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option
             }
             previous_word_end = None;
             verbatim = false;
+            quoted_marker = false;
             continue;
         }
         previous_word_end = Some(token.byte_range.end);
@@ -14148,15 +14623,19 @@ fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option
                 target_next = false;
                 continue;
             }
-            // The decoder consumes `--%` (quoted or not) as control syntax.
-            if ShellTokenDecoder::new(ShellDialect::PowerShell)
-                .decode(raw, ShellTokenRole::Syntax)
-                .is_none()
+            // Only the stop-parsing token makes the rest verbatim; a quoted
+            // `'--%'` does when a parameter word follows it, which the
+            // tokenizer then reads as verbatim too.
+            let after_quoted_marker = std::mem::take(&mut quoted_marker);
+            if crate::normalize::powershell_word_stops_parsing(raw)
+                || (after_quoted_marker
+                    && crate::normalize::powershell_parameter_token_len(raw) == Some(raw.len()))
             {
                 verbatim = true;
                 target_next = false;
                 continue;
             }
+            quoted_marker = crate::normalize::powershell_word_is_quoted_marker(raw);
         }
         if std::mem::take(&mut target_next) {
             blank(token.byte_range.clone());
@@ -17915,49 +18394,66 @@ fn evaluate_command_in_dialect_union(
         primary
     };
 
-    // PowerShell's dot-source operator runs a command like the call operator:
-    // `. git reset --hard` runs Git. Judge the line with each dot in command
-    // position read as `&`, and each call operator after `return`, `throw` or
-    // `exit` moved to its statement start, deny wins. The view has the same
-    // length, so a denial's span still addresses the command. What the user
-    // allowed as written stays allowed. The view is not a request the user made, so it may spend no
-    // allow-once grant: one for the `&` spelling belongs to that request
-    // (GH#537). A grant for the dot spelling itself is found at the outer
-    // entry, after this view denies.
-    let primary = if matches!(
+    // Two PowerShell readings the line's own tokens miss, each judged as a
+    // view of the same length (a denial's span still addresses the
+    // command), deny wins:
+    // - The dot-source operator runs a command like the call operator: `.
+    //   git reset --hard` runs Git. Each dot in command position reads as
+    //   `&`, and each call operator after `return`, `throw` or `exit` moves
+    //   to its statement start.
+    // - A quoted `'--%'` before a parameter word starts verbatim text only
+    //   when it is a command argument; as an expression (`'--%' -f 1; git
+    //   reset --hard`) the line goes on. The tokenizer reads it as verbatim,
+    //   so the marker is also read as an ordinary string.
+    // What the user allowed as written stays allowed. A view is not a
+    // request the user made, so it may spend no allow-once grant: one for
+    // the `&` spelling belongs to that request (GH#537). A grant for the
+    // dot spelling itself is found at the outer entry, after this view
+    // denies.
+    let mut primary = primary;
+    if matches!(
         shell_dialect,
         ShellDialect::PowerShell | ShellDialect::Unknown
-    ) && primary.decision == EvaluationDecision::Allow
-        && primary.allowlist_override.is_none()
-        && let Some(view) = crate::normalize::powershell_invocation_operator_view(command)
-        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
-    {
-        let alternate = if deadline_exceeded(deadline) {
-            EvaluationResult::indeterminate_due_to_budget()
-        } else {
-            let _allow_once_scope = AllowOnceSuppressionScope::enter();
-            evaluate_command_with_pack_order_deadline_at_path_inner(
-                &view,
-                enabled_keywords,
-                ordered_packs,
-                keyword_index,
-                compiled_overrides,
-                allowlists,
-                heredoc_settings,
-                None,
-                project_path,
-                deadline,
-                shell_dialect,
-                nested_command_depth,
-                inherited_automated_stdin,
-            )
-        };
-        let mut primary = primary;
-        adopt_alternate_reading(&mut primary, alternate, command);
-        primary
-    } else {
-        primary
-    };
+    ) {
+        let readings: [fn(&str) -> Option<String>; 2] = [
+            crate::normalize::powershell_invocation_operator_view,
+            crate::normalize::powershell_quoted_marker_expression_view,
+        ];
+        for reading in readings {
+            if primary.decision != EvaluationDecision::Allow || primary.allowlist_override.is_some()
+            {
+                break;
+            }
+            let Some(view) = reading(command) else {
+                continue;
+            };
+            if explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+            {
+                break;
+            }
+            let alternate = if deadline_exceeded(deadline) {
+                EvaluationResult::indeterminate_due_to_budget()
+            } else {
+                let _allow_once_scope = AllowOnceSuppressionScope::enter();
+                evaluate_command_with_pack_order_deadline_at_path_inner(
+                    &view,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    None,
+                    project_path,
+                    deadline,
+                    shell_dialect,
+                    nested_command_depth,
+                    inherited_automated_stdin,
+                )
+            };
+            adopt_alternate_reading(&mut primary, alternate, command);
+        }
+    }
 
     if shell_dialect != ShellDialect::Unknown
         || nested_command_depth != 0

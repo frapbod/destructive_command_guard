@@ -2200,15 +2200,20 @@ pub(crate) enum ShellTokenRole {
 /// The state is needed only for PowerShell's `--%` stop-parsing token. Create a
 /// decoder per command segment. A syntax token whose decoded value is `--%`
 /// (including quoted forms) is consumed as shell control syntax
-/// ([`Self::decode`] returns `None`); subsequent tokens are still returned as
-/// parser-visible tokens, but byte-for-byte because PowerShell no longer
-/// interprets their shell syntax. POSIX syntax-role tokens decode only
+/// ([`Self::decode`] returns `None`), and so is the parameter word after a
+/// quoted `'--%'`, which PowerShell drops ([`powershell_stop_parsing_words`]).
+/// After the stop-parsing token (bare, or a quoted one with that parameter)
+/// subsequent tokens are still returned as parser-visible tokens,
+/// but byte-for-byte because PowerShell no longer interprets their shell
+/// syntax. POSIX syntax-role tokens decode only
 /// deterministic quote/escape syntax; unknown and data-role input deliberately
 /// remain unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShellTokenDecoder {
     dialect: ShellDialect,
     powershell_stop_parsing: bool,
+    /// The previous syntax token was a quoted `'--%'`.
+    powershell_quoted_marker: bool,
 }
 
 impl ShellTokenDecoder {
@@ -2217,6 +2222,7 @@ impl ShellTokenDecoder {
         Self {
             dialect,
             powershell_stop_parsing: false,
+            powershell_quoted_marker: false,
         }
     }
 
@@ -2242,6 +2248,7 @@ impl ShellTokenDecoder {
         token: &'a str,
         role: ShellTokenRole,
     ) -> Option<Cow<'a, str>> {
+        let after_quoted_marker = std::mem::take(&mut self.powershell_quoted_marker);
         if role == ShellTokenRole::Data {
             return Some(Cow::Borrowed(token));
         }
@@ -2253,9 +2260,15 @@ impl ShellTokenDecoder {
                 if self.powershell_stop_parsing {
                     return Some(Cow::Borrowed(token));
                 }
+                if after_quoted_marker && powershell_parameter_token_len(token) == Some(token.len())
+                {
+                    self.powershell_stop_parsing = true;
+                    return None;
+                }
                 let decoded = decode_powershell_syntax_token(token);
                 if decoded.as_ref() == "--%" {
-                    self.powershell_stop_parsing = true;
+                    self.powershell_stop_parsing = powershell_word_stops_parsing(token);
+                    self.powershell_quoted_marker = powershell_word_is_quoted_marker(token);
                     return None;
                 }
                 Some(decoded)
@@ -3092,6 +3105,102 @@ enum PowerShellQuote {
     Unquoted,
     Single,
     Double,
+}
+
+const POWERSHELL_QUOTE_CHARS: [char; 9] = [
+    '\'', '"', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{201C}', '\u{201D}', '\u{201E}',
+];
+
+/// Whether a raw PowerShell word is the stop-parsing token `--%` on its
+/// own, after which PowerShell hands the rest of the line (up to a pipe,
+/// `&&` or newline) to the program as written.
+///
+/// PowerShell stops parsing for `--%` spelled bare, with backticks (`` -`-%
+/// ``) or with a quoted part after its first character (`--'%'`). A word
+/// that starts with a quote (`'--%'`, `"--%"`, `‘--%’`) is dropped from a
+/// native program's argv and stops parsing only when a parameter word
+/// follows it ([`powershell_stop_parsing_words`]): `$x = 'a'; git '--%'
+/// $x` hands git `a`, and `Write-Output '--%'; git status` runs git, but
+/// `cmd '--%' -x /c echo $x` hands cmd `/c echo $x` (measured with pwsh
+/// 7.5). [`ShellTokenDecoder::decode`] consumes all of these.
+#[must_use]
+pub(crate) fn powershell_word_stops_parsing(raw: &str) -> bool {
+    !raw.starts_with(POWERSHELL_QUOTE_CHARS)
+        && decode_powershell_syntax_token(raw).as_ref() == "--%"
+}
+
+/// Whether a raw PowerShell word is a quoted string whose value is `--%`
+/// (`'--%'`, `"--%"`, `"-`-%"`), the form that stops parsing only when a
+/// parameter word follows it.
+#[must_use]
+pub(crate) fn powershell_word_is_quoted_marker(raw: &str) -> bool {
+    matches!(raw.as_bytes().first(), Some(b'\'' | b'"'))
+        && powershell_quoted_end(raw.as_bytes(), 0, raw.len()) == raw.len()
+        && decode_powershell_syntax_token(raw).as_ref() == "--%"
+}
+
+/// How many raw words starting at `words[index]` end PowerShell's normal
+/// parsing: 0 when they do not, 1 for the stop-parsing token itself
+/// ([`powershell_word_stops_parsing`]), and 2 for a quoted `'--%'` followed
+/// by a parameter word ([`powershell_parameter_token_len`]).
+///
+/// After a quoted `'--%'` PowerShell's parser peeks at the next token and
+/// enters verbatim mode when it is a parameter; the parameter is dropped
+/// (`Parser.cs` `GetVerbatimCommandArgumentToken`, the same in PowerShell 6.0
+/// and 7.5). So `cmd '--%' -x /c ver # & git status` hands cmd `/c ver # &
+/// git status`: `#` starts no comment and `&` separates nothing (measured
+/// with pwsh 7.5). The PowerShell tokenizer gives that parameter its own
+/// word, also when it is glued to the closing quote (`'--%'-x`). PowerShell
+/// makes this check only for a command argument; the evaluator also judges
+/// the line with the marker read as an expression
+/// ([`powershell_quoted_marker_expression_view`]).
+#[must_use]
+pub(crate) fn powershell_stop_parsing_words(words: &[&str], index: usize) -> usize {
+    let Some(raw) = words.get(index) else {
+        return 0;
+    };
+    if powershell_word_stops_parsing(raw) {
+        return 1;
+    }
+    if powershell_word_is_quoted_marker(raw)
+        && words
+            .get(index + 1)
+            .is_some_and(|next| powershell_parameter_token_len(next) == Some(next.len()))
+    {
+        return 2;
+    }
+    0
+}
+
+/// Byte length of the parameter token PowerShell's tokenizer reads at the
+/// start of `text` in command mode (`-x`, `-NoProfile`, `–x`, `-x:`), or
+/// `None` when `text` does not start one.
+///
+/// A parameter is a dash (`-`, en dash, em dash or horizontal bar) and a
+/// letter, `_` or `?`. It ends before whitespace or one of `{ } ( ) ; , | &
+/// . [`, and after a `:`; a quote in it makes the word an ordinary argument
+/// (`tokenizer.cs` `ScanParameter`, PowerShell 7.5).
+#[must_use]
+pub(crate) fn powershell_parameter_token_len(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    let (_, dash) = chars.next()?;
+    if !matches!(dash, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}') {
+        return None;
+    }
+    let (_, first) = chars.next()?;
+    if !(first.is_alphabetic() || first == '_' || first == '?') {
+        return None;
+    }
+    for (at, ch) in chars {
+        match ch {
+            ':' => return Some(at + 1),
+            '{' | '}' | '(' | ')' | ';' | ',' | '|' | '&' | '.' | '[' | '\0' => return Some(at),
+            ch if ch.is_whitespace() => return Some(at),
+            ch if POWERSHELL_QUOTE_CHARS.contains(&ch) => return None,
+            _ => {}
+        }
+    }
+    Some(text.len())
 }
 
 fn decode_powershell_syntax_token(token: &str) -> Cow<'_, str> {
@@ -4661,13 +4770,29 @@ fn tokenize_powershell_with_comments(
             byte_range: start..i,
         });
 
-        if !literal_mode {
-            let raw = &command[start..i];
-            // PowerShell recognizes stop-parsing by the token's decoded value:
-            // quoted `"--%"` and `'--%'` behave the same as bare `--%`.
-            if decode_powershell_syntax_token(raw).as_ref() == "--%" {
-                literal_mode = true;
+        if literal_mode {
+            continue;
+        }
+        if powershell_word_stops_parsing(&command[start..i]) {
+            literal_mode = true;
+        } else if let Some((marker_end, parameter)) = powershell_quoted_marker_parameter(
+            command,
+            start,
+            i,
+            read_comments.then_some(&mut masked),
+        ) {
+            // A quoted `'--%'` and the parameter after it: the parameter is
+            // its own word, and the rest of the line is verbatim
+            // ([`powershell_stop_parsing_words`]).
+            if let Some(last) = tokens.last_mut() {
+                last.byte_range.end = marker_end;
             }
+            tokens.push(NormalizeToken {
+                kind: NormalizeTokenKind::Word,
+                byte_range: parameter.clone(),
+            });
+            i = parameter.end;
+            literal_mode = true;
         }
     }
 
@@ -4675,6 +4800,102 @@ fn tokenize_powershell_with_comments(
         String::from_utf8(bytes).expect("masking whole comment bytes preserves UTF-8")
     });
     (tokens, masked)
+}
+
+/// The command with the first quoted `'--%'` that the PowerShell tokenizer
+/// reads as the stop-parsing token (a parameter word follows it,
+/// [`powershell_stop_parsing_words`]) read as an ordinary string instead.
+///
+/// PowerShell's parser makes that check only for a command argument
+/// (`Parser.cs` `GetVerbatimCommandArgumentToken`, called from the
+/// command-argument loop). Where the string is an expression (a statement
+/// start, after `=`, inside `( )`, in an array or a method call), the word
+/// after it is an operator and the line goes on: `'--%' -f 1; git status`,
+/// `$a = '--%' -join ','; git status` and `if ('--%' -eq $x) { 1 }; git
+/// status` run git (measured with pwsh 7.5). The tokenizer cannot tell the
+/// two apart, so the evaluator judges both readings, deny wins. The `%` of
+/// the marker becomes `_`, so the view has the same length as `command` and
+/// spans still address it. A later quoted marker keeps its reading: the
+/// evaluator judges this view the same way, one marker at a time. Returns
+/// `None` when no quoted marker starts verbatim text.
+#[must_use]
+pub(crate) fn powershell_quoted_marker_expression_view(command: &str) -> Option<String> {
+    if !command.contains('%') {
+        return None;
+    }
+    let tokens = tokenize_powershell_raw(command);
+    let marker = tokens.windows(2).find_map(|pair| {
+        let (word, parameter) = (&pair[0], &pair[1]);
+        if word.kind != NormalizeTokenKind::Word || parameter.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let raw = command.get(word.byte_range.clone())?;
+        let next = command.get(parameter.byte_range.clone())?;
+        if !powershell_word_is_quoted_marker(raw)
+            || powershell_parameter_token_len(next) != Some(next.len())
+        {
+            return None;
+        }
+        Some(word.byte_range.start + raw.rfind('%')?)
+    })?;
+    let mut view = command.to_string();
+    view.replace_range(marker..=marker, "_");
+    Some(view)
+}
+
+/// For the PowerShell word `command[start..word_end]`: when it starts with a
+/// quoted `'--%'` that a parameter follows, the end of the quoted string and
+/// the parameter's byte range ([`powershell_stop_parsing_words`]).
+///
+/// The parameter may be glued to the closing quote (`'--%'-x`) or follow
+/// after whitespace, line continuations and block comments, which
+/// PowerShell's parser passes over when it peeks (measured with pwsh 7.5:
+/// ``cmd '--%' `<LF> -x /c ver & git status`` and `cmd '--%' <# c #> -x /c
+/// ver & git status` hand cmd `/c ver & git status`). A block comment passed
+/// over is masked when `masked` is given.
+fn powershell_quoted_marker_parameter(
+    command: &str,
+    start: usize,
+    word_end: usize,
+    masked: Option<&mut Option<Vec<u8>>>,
+) -> Option<(usize, Range<usize>)> {
+    let bytes = command.as_bytes();
+    let quote = *bytes.get(start)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    let marker_end = powershell_quoted_end(bytes, start, word_end);
+    if marker_end < start + 2
+        || bytes.get(marker_end - 1) != Some(&quote)
+        || !powershell_word_is_quoted_marker(command.get(start..marker_end)?)
+    {
+        return None;
+    }
+    let len = bytes.len();
+    let mut at = marker_end;
+    let mut comments = Vec::new();
+    if marker_end == word_end {
+        loop {
+            at = skip_powershell_horizontal_whitespace(bytes, at, len);
+            if let Some(end) = powershell_line_continuation_end(bytes, at, len) {
+                at = end;
+            } else if bytes.get(at..at + 2) == Some(b"<#") {
+                let comment_start = at;
+                at = memchr::memmem::find(&bytes[at + 2..], b"#>")
+                    .map_or(len, |end| at + 2 + end + 2);
+                comments.push(comment_start..at);
+            } else {
+                break;
+            }
+        }
+    }
+    let parameter_len = powershell_parameter_token_len(command.get(at..)?)?;
+    if let Some(masked) = masked {
+        for comment in comments {
+            masked.get_or_insert_with(|| bytes.to_vec())[comment].fill(b' ');
+        }
+    }
+    Some((marker_end, at..at + parameter_len))
 }
 
 #[inline]
@@ -9775,13 +9996,13 @@ mod tests {
 
     #[test]
     fn powershell_raw_tokenizer_honors_stop_parsing_until_newline() {
-        let command = "git branch \"--%\" --delete \"feature name\" ; echo\r\nGet-Date; echo";
+        let command = "git branch -`-% --delete \"feature name\" ; echo\r\nGet-Date; echo";
         assert_eq!(
             raw_token_snapshot(command, ShellDialect::PowerShell),
             vec![
                 (NormalizeTokenKind::Word, "git".to_string()),
                 (NormalizeTokenKind::Word, "branch".to_string()),
-                (NormalizeTokenKind::Word, "\"--%\"".to_string()),
+                (NormalizeTokenKind::Word, "-`-%".to_string()),
                 (NormalizeTokenKind::Word, "--delete".to_string()),
                 (NormalizeTokenKind::Word, "\"feature name\"".to_string()),
                 (NormalizeTokenKind::Word, ";".to_string()),
@@ -9918,20 +10139,53 @@ mod tests {
             "tokens after --% must remain literal"
         );
 
-        for quoted_marker in [r#""--%""#, "'--%'"] {
-            let mut quoted_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+        // pwsh 7.5: `--%` with backticks or a quoted part after its first
+        // character stops parsing (`$x = 'a'; git --'%' $x` hands git `$x`).
+        for marker in ["-`-%", "--`%", "--'%'", "-\"-%\""] {
+            let mut marker_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+            assert_eq!(marker_decoder.decode(marker, ShellTokenRole::Syntax), None);
             assert_eq!(
-                quoted_decoder.decode(quoted_marker, ShellTokenRole::Syntax),
-                None,
-                "PowerShell recognizes --% by decoded token value"
+                marker_decoder
+                    .decode("g`it", ShellTokenRole::Syntax)
+                    .as_deref(),
+                Some("g`it"),
+                "{marker} stops parsing"
             );
+        }
+        // A word that starts with a quote is dropped from a native argv but
+        // does not stop parsing: `$x = 'a'; git '--%' $x` hands git `a`, and
+        // `Write-Output '--%'; git status` runs git (pwsh 7.5).
+        for quoted_marker in [r#""--%""#, "'--%'", "\u{2018}--%\u{2019}"] {
+            let mut quoted_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+            let decoded = quoted_decoder.decode(quoted_marker, ShellTokenRole::Syntax);
+            if quoted_marker.starts_with('\u{2018}') {
+                assert_eq!(decoded.as_deref(), Some(quoted_marker));
+            } else {
+                assert_eq!(decoded, None, "{quoted_marker} is dropped");
+            }
             assert_eq!(
                 quoted_decoder
                     .decode("g`it", ShellTokenRole::Syntax)
                     .as_deref(),
-                Some("g`it"),
-                "quoted --% must arm literal mode just like bare --%"
+                Some("git"),
+                "{quoted_marker} does not stop parsing"
             );
+        }
+    }
+
+    #[test]
+    fn powershell_tokenizer_does_not_stop_parsing_at_a_quoted_marker() {
+        // `Write-Output '--%'; git reset --hard` runs git (pwsh 7.5).
+        for command in [
+            "Write-Output '--%'; git reset --hard",
+            "Write-Output \"--%\"; git reset --hard",
+        ] {
+            let separators: Vec<String> = raw_token_snapshot(command, ShellDialect::PowerShell)
+                .into_iter()
+                .filter(|(kind, _)| *kind == NormalizeTokenKind::Separator)
+                .map(|(_, text)| text)
+                .collect();
+            assert_eq!(separators, vec![";".to_string()], "{command}");
         }
     }
 
