@@ -6555,6 +6555,11 @@ fn bash_hashes_as_data_within(
 ///   different places, a `#` between the two ends can be a comment to dcg
 ///   and data to Bash: Bash runs `git reset --hard` in
 ///   `echo "${y:-'}" #'}"; git reset --hard`. Unread as well.
+/// - A line continuation between the `$` and the `{` of a `${`
+///   (`echo "$\` LF `{y:-'}" #'}"; git reset --hard`): the shell drops it
+///   and reads `${`, but the end lookups above, and the readers that find a
+///   nested `${`, read only a `$` right before a `{`. Unread too, so the
+///   dispute above cannot hide behind a continuation.
 ///
 /// The scan reads the raw bytes without quote context: a `\` escapes the
 /// next byte, and a `\`LF pair (a line continuation) is passed over between
@@ -6574,6 +6579,7 @@ fn bash_hashes_as_data_within(
 pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
     let bytes = command.as_bytes();
     let len = bytes.len();
+    memchr::memchr(b'$', bytes)?;
     memchr::memchr(b'{', bytes)?;
     let next = |at: usize| past_line_continuations(bytes, at);
     let mut budget = 16 * len + 4096;
@@ -6612,27 +6618,32 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
                         ) {
                             return Some(BashHashReading::Unread);
                         }
-                        if after == i + 1 {
-                            let mut end = |dash: bool| -> Option<Option<usize>> {
-                                let ends = &mut ends[usize::from(dash)];
-                                if let Some(end) = ends.get(&i) {
-                                    return Some(*end);
-                                }
-                                let end = crate::context::braced_parameter_span_with_nested(
-                                    bytes,
-                                    i,
-                                    dash,
-                                    |opener, end| {
-                                        ends.insert(opener, end);
-                                    },
-                                );
-                                budget = budget.checked_sub(end.unwrap_or(len) - i)?;
-                                Some(end)
-                            };
-                            match (end(false), end(true)) {
-                                (Some(bash), Some(dash)) if bash == dash => {}
-                                _ => return Some(BashHashReading::Unread),
+                        // A line continuation between `$` and `{`: the shell
+                        // drops it and reads `${`, but the end lookups (and
+                        // the nested-`${` reads of every other reader) need
+                        // the two bytes side by side. Unread.
+                        if after != i + 1 {
+                            return Some(BashHashReading::Unread);
+                        }
+                        let mut end = |dash: bool| -> Option<Option<usize>> {
+                            let ends = &mut ends[usize::from(dash)];
+                            if let Some(end) = ends.get(&i) {
+                                return Some(*end);
                             }
+                            let end = crate::context::braced_parameter_span_with_nested(
+                                bytes,
+                                i,
+                                dash,
+                                |opener, end| {
+                                    ends.insert(opener, end);
+                                },
+                            );
+                            budget = budget.checked_sub(end.unwrap_or(len) - i)?;
+                            Some(end)
+                        };
+                        match (end(false), end(true)) {
+                            (Some(bash), Some(dash)) if bash == dash => {}
+                            _ => return Some(BashHashReading::Unread),
                         }
                         i = after + 1;
                     }
@@ -8121,6 +8132,12 @@ mod tests {
             "echo \"${y:-'}\" #'}\"; git reset --hard",
             "echo \"${y:-'}\" #'}\" && git push --force origin main",
             "echo \"${y#'}\"; git reset --hard; : '}\"",
+            // A line continuation between `$` and `{` hides no dispute.
+            "echo \"$\\\n{y:-'}\" #'}\"; git reset --hard",
+            "echo \"$\\\n{y:-'}\" #'}\" && git push --force origin main",
+            "echo \"$\\\n\\\n{y:-'}\" #'}\"; git reset --hard",
+            "x=\"$\\\n{y:-'}\" #'}\"; git reset --hard",
+            "echo ${y:-$\\\n{z}} #}; git reset --hard",
             "cat <<EOF\n${ git reset --hard; }\nEOF",
             "cat <<'EOF'\nEOF\necho ${ git reset --hard; }",
         ] {

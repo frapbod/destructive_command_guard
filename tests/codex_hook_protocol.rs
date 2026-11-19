@@ -1039,6 +1039,14 @@ fn bash_parameter_openers_hide_no_later_git_command() {
             "ask",
         ),
         ("echo \"${y:-'}\" #'}\"; git status", "ask"),
+        // The same dispute behind a line continuation between `$` and `{`.
+        ("echo \"$\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
+        (
+            "echo \"$\\\n{y:-'}\" #'}\" && git push --force origin main",
+            "ask",
+        ),
+        ("echo \"$\\\n\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
+        ("x=\"$\\\n{y:-'}\" #'}\"; git reset --hard", "ask"),
         // The assignment-prefix forms that merged PR #12 already denies.
         ("x=${y:- a} git reset --hard", "deny"),
         ("x=${y:- } git reset --hard", "deny"),
