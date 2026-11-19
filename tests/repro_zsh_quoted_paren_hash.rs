@@ -176,13 +176,13 @@ fn a_quoted_paren_in_a_glob_or_case_group_does_not_hide_the_rest_of_the_line() {
     let misses = expect_everywhere(
         &strings(&[
             r#"ls (a")" #); git reset --hard"#,
-            r#"ls (a')' #); git reset --hard"#,
-            r#"ls (a$')' #); git reset --hard"#,
+            r"ls (a')' #); git reset --hard",
+            r"ls (a$')' #); git reset --hard",
             r#"ls (a")"|#); git reset --hard"#,
             r#"ls (a")"| #); git reset --hard"#,
             "ls (a\")\"\t#); git reset --hard",
             r#"ls ("a)" #); git reset --hard"#,
-            r#"ls (a${x%)} #); git reset --hard"#,
+            r"ls (a${x%)} #); git reset --hard",
             r#"case x in (a")" #) ;; esac; git reset --hard"#,
             r#"case x in (a")"|#)) ;; esac; git reset --hard"#,
             r#"ls (a")" #); git push --force origin main"#,
@@ -203,7 +203,7 @@ fn a_quoted_paren_in_a_group_is_read_in_payloads_and_after_comments() {
     let misses = expect_everywhere(
         &strings(&[
             r#"zsh -c 'ls (a")" #); git reset --hard'"#,
-            r#"x=$(ls (a')' #); git reset --hard)"#,
+            r"x=$(ls (a')' #); git reset --hard)",
             "echo hi # it's\nls (a\")\" #); git reset --hard",
             r#"echo "$(ls (a')' #); git reset --hard)""#,
         ]),
