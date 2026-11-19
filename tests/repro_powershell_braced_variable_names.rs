@@ -55,6 +55,13 @@ const RUNS_IT: &[&str] = &[
     "${a`}'b}; git reset --hard",
     "Write-Output $$${a'b}; git reset --hard",
     "Write-Output ``${a'b}; git reset --hard",
+    // A here-string header, a smart quote and other syntax bytes in the name.
+    "${a@'\n}; git reset --hard",
+    "${a\u{2019}b}; git reset --hard",
+    "${a$(b}; git reset --hard",
+    "${a(b}; git reset --hard",
+    "${a[b}; git reset --hard",
+    "${a|b}; git reset --hard",
     // In an expandable string the name runs to its `}` too.
     "Write-Output \"${a\"b}\"; git reset --hard",
     "$x = @\"\n${a\"b}\n\"@; git reset --hard",

@@ -4763,8 +4763,8 @@ fn powershell_quoted_end(bytes: &[u8], i: usize, end: usize) -> usize {
 /// Read PowerShell comments, smart quotes and braced variable names in a
 /// separate deny-only view. Masked comments preserve line ends; block-comment
 /// line ends are spaces. Smart quotes use their ASCII spelling so the existing
-/// readers see them. A braced variable name that is not a plain name is
-/// spelled `_` (see [`mask_powershell_braced_variable_name`]).
+/// readers see them. A braced variable name that holds a quote is spelled
+/// `_` (see [`mask_powershell_braced_variable_name`]).
 pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
     let has_smart_quotes = command
         .chars()
@@ -5313,11 +5313,13 @@ fn consume_powershell_word(
 /// nothing). dcg's PowerShell readers each walk quotes their own way and none
 /// of them knows this, so a quote in such a name opened a string that hid
 /// the rest of the command. In the comment-reading view every byte of a name
-/// that is not a plain name (letters, digits, `_` and `:`, as in
-/// `${env:Path}`) is spelled `_`: the length and every boundary outside the
-/// name stay, and the readers find the statements PowerShell finds. `$$` is a
-/// variable of its own, so `$${…}` is `$$` and a block, as
-/// `powershell_brace_opener` in the evaluator reads it.
+/// that holds a quote is spelled `_`, so its other bytes (`;` in
+/// `${a';git reset --hard'}`) do not read as syntax either: the length and
+/// every boundary outside the name stay, and the readers find the statements
+/// PowerShell finds. Names without a quote stay as written; the readers
+/// already deny the rest of the command after them. `$$` is a variable of
+/// its own, so `$${…}` is `$$` and a block, as `powershell_brace_opener` in
+/// the evaluator reads it.
 fn mask_powershell_braced_variable_name(
     bytes: &[u8],
     i: usize,
@@ -5333,10 +5335,7 @@ fn mask_powershell_braced_variable_name(
         return len;
     };
     let name = i + 2..end - 1;
-    if !bytes[name.clone()]
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
-    {
+    if bytes[name.clone()].iter().any(|byte| matches!(byte, b'\'' | b'"')) {
         masked.get_or_insert_with(|| bytes.to_vec())[name].fill(b'_');
     }
     end
@@ -10628,7 +10627,7 @@ mod tests {
 
     #[test]
     fn powershell_comment_view_spells_braced_variable_names_plainly() {
-        // A name that is not a plain name is spelled `_`, bare or in an
+        // A name that holds a quote is spelled `_`, bare or in an
         // expandable string, through the first unescaped `}`.
         for (command, view) in [
             ("${a'b} = 1; git reset --hard", "${___} = 1; git reset --hard"),
@@ -10644,11 +10643,11 @@ mod tests {
                 "{command:?}"
             );
         }
-        // Plain and scope-qualified names stay; `$${` is `$$` and a block,
-        // `` `${ `` a literal `$` and a block; an unclosed `${` is no name;
-        // single quotes hold literal text.
+        // Names without a quote stay; `$${` is `$$` and a block, `` `${ `` a
+        // literal `$` and a block; an unclosed `${` is no name; single quotes
+        // hold literal text.
         for command in [
-            "${env:Path}; ${my_var}",
+            "${env:Path}; ${my_var}; ${env:ProgramFiles(x86)}; ${x:-y}",
             "$${a'b'}",
             "`${a'b'}",
             "${a'b",
