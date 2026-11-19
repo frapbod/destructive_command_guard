@@ -17463,12 +17463,14 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // a table and shells disagree (see `paren_hashes_as_data`): a false
     // comment there then fails closed too.
     //
-    // The last reading is the same for the `${` openers that Bash reads
+    // The fourth reading is the same for the `${` openers that Bash reads
     // another way than the shared readers (see `bash_parameter_openers`):
     // a `{` after `$$`, a Bash 5.3 `${ …; }`, and a `'` in a double-quoted
-    // `${…}`.
+    // `${…}`. The last is the same for the blanks Bash reads inside one
+    // word in a `$[…]` or an assignment subscript (see
+    // `bash_bracket_words`).
     let mut bash_spelling: Option<String> = None;
-    for reading_kind in 0..4 {
+    for reading_kind in 0..5 {
         if result.decision != EvaluationDecision::Allow
             || result.bypass_method == Some(BypassMethod::AllowOnce)
             || !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
@@ -17483,7 +17485,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 crate::normalize::bash_hashes_as_data(command, true)
             }
             2 => None,
-            _ => crate::normalize::bash_parameter_openers(command),
+            3 => crate::normalize::bash_parameter_openers(command),
+            _ => crate::normalize::bash_bracket_words(command),
         };
         let Some(reading) = reading else {
             continue;
@@ -21882,7 +21885,7 @@ fn posix_alias_definition_bodies(command: &str) -> Vec<String> {
     let mut bodies = Vec::new();
     for (start, end) in top_level_segment_ranges(command) {
         let (segment, _) = posix_segment_command(&command[start..end]);
-        let Ok(tokens) = shell_words::split(segment.trim()) else {
+        let Ok(tokens) = crate::normalize::posix_simple_command_words(segment.trim()) else {
             continue;
         };
         let mut words = tokens.iter().skip_while(|token| {
@@ -33510,40 +33513,11 @@ fn shell_maintained_posix_variable(name: &str) -> bool {
 /// (`x="a b"`, `x=${y:- a}`, `x=$(echo a b)`), so its second half is not
 /// mistaken for the command word.
 fn hazard_first_word(segment: &str) -> Cow<'_, str> {
-    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
-    // The tokenizer ends a word at the `&` of `2>&1` and the `|` of `>|f`;
-    // the shell reads one redirection there, so join them back.
-    let mut ranges: Vec<Range<usize>> = Vec::with_capacity(tokens.len());
-    let mut index = 0usize;
-    while let Some(token) = tokens.get(index) {
-        let mut range = token.byte_range.clone();
-        index += 1;
-        if token.kind == NormalizeTokenKind::Word
-            && token
-                .text(segment)
-                .is_some_and(|text| text.ends_with(['<', '>']))
-            && let Some(operator) = tokens.get(index)
-            && operator.byte_range.start == range.end
-            && matches!(operator.text(segment), Some("&" | "|"))
-        {
-            range.end = operator.byte_range.end;
-            index += 1;
-            if let Some(target) = tokens.get(index)
-                && target.kind == NormalizeTokenKind::Word
-                && target.byte_range.start == range.end
-            {
-                range.end = target.byte_range.end;
-                index += 1;
-            }
-        }
-        ranges.push(range);
-    }
-    let mut words = ranges.into_iter().filter_map(|range| {
+    let mut words = crate::normalize::posix_command_words(segment)
+        .into_iter()
         // A newline only ends a line of a compound body; any other
         // separator (`(`) is returned as is, which names no mutator.
-        let text = segment.get(range)?;
-        (text != "\n").then_some(text)
-    });
+        .filter(|text| *text != "\n");
     loop {
         match words.next() {
             Some(
@@ -33642,21 +33616,16 @@ fn posix_command_name_is_plain(field: &str) -> bool {
 }
 
 /// Whether a word sits before the command word without being it: a redirection
-/// (`2>/dev/null`, `>out`, `<in`) or an environment assignment (`LC_ALL=C`).
+/// (`2>/dev/null`, `>out`, `<in`) or an assignment (`LC_ALL=C`, `x+=1`,
+/// `x[1]=a`).
 fn word_is_redirect_or_assignment_prefix(word: &str) -> bool {
     if word.contains(['<', '>']) {
         return true;
     }
-    // `NAME=value`, with a name that is a plain shell identifier. `=` anywhere
-    // else (a path, an option value) is not an assignment.
-    match word.split_once('=') {
-        Some((name, _)) => {
-            !name.is_empty()
-                && !name.starts_with(|c: char| c.is_ascii_digit())
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        None => false,
-    }
+    // `NAME=value`, `NAME+=value` or `NAME[i]=value`, with a name that is a
+    // plain shell identifier. `=` anywhere else (a path, an option value) is
+    // not an assignment.
+    crate::normalize::is_env_assignment(word)
 }
 
 /// A command word with shell quoting removed, so the hazard scan dispatches on
@@ -35607,8 +35576,8 @@ fn cwd_anchored_segment(
 /// The literal directory a leading `env -C DIR` / `env --chdir=DIR` or
 /// `sudo -D DIR` / `sudo --chdir=DIR` runs the wrapped command in.
 fn wrapper_chdir_target(segment: &str) -> Option<String> {
-    let mut words = segment
-        .split_ascii_whitespace()
+    let mut words = crate::normalize::posix_command_words(segment)
+        .into_iter()
         .skip_while(|word| word_is_redirect_or_assignment_prefix(word))
         .peekable();
     let wrapper = *words.peek()?;
@@ -35667,9 +35636,13 @@ fn proven_cd_directory(
         let trimmed = text
             .trim_start_matches(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | '{'))
             .trim_end_matches(|c: char| c.is_ascii_whitespace() || matches!(c, ')' | '}' | ';'));
-        let mut words = trimmed
-            .split_ascii_whitespace()
-            .skip_while(|word| matches!(*word, "builtin" | "command"));
+        // `x=1 cd ~/.ssh` changes directory as `cd ~/.ssh` does.
+        let mut words = crate::normalize::posix_command_words(trimmed)
+            .into_iter()
+            .skip_while(|word| {
+                matches!(*word, "builtin" | "command")
+                    || word_is_redirect_or_assignment_prefix(word)
+            });
         let verb = words.next().unwrap_or("");
         match verb {
             "cd" | "pushd" => {}
@@ -35964,39 +35937,14 @@ fn redirect_operator_len(word: &str) -> Option<usize> {
     Some(index)
 }
 
-/// Byte ranges of the words of a simple command, split at unquoted whitespace.
+/// Byte ranges of the words of a simple command, as the POSIX shell splits
+/// them (see [`crate::normalize::posix_command_words`]): `x=${y:- a}` and
+/// `x=$(echo a b)` are one word each.
 fn unquoted_word_ranges(segment: &str) -> Vec<(usize, usize)> {
-    let bytes = segment.as_bytes();
-    let mut words = Vec::new();
-    let mut start = None;
-    let mut quote: Option<u8> = None;
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        match quote {
-            Some(open) if byte == b'\\' && open == b'"' => index += 1,
-            Some(open) if byte == open => quote = None,
-            Some(_) => {}
-            None if byte.is_ascii_whitespace() => {
-                if let Some(word_start) = start.take() {
-                    words.push((word_start, index));
-                }
-            }
-            None => {
-                start.get_or_insert(index);
-                match byte {
-                    b'\\' => index += 1,
-                    b'\'' | b'"' => quote = Some(byte),
-                    _ => {}
-                }
-            }
-        }
-        index += 1;
-    }
-    if let Some(word_start) = start {
-        words.push((word_start, bytes.len()));
-    }
-    words
+    crate::normalize::posix_command_word_ranges(segment)
+        .into_iter()
+        .map(|range| (range.start, range.end))
+        .collect()
 }
 
 fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
@@ -44284,6 +44232,16 @@ mod tests {
                 "segment {segment:?} must dispatch to the printf arm"
             );
         }
+        assert_eq!(hazard_first_word("x+=1 printf -v d %s x"), "printf");
+        assert_eq!(hazard_first_word("x[1]=a printf -v d %s x"), "printf");
+        assert_eq!(
+            hazard_first_word("x=$(echo a # )\n) printf -v d %s x"),
+            "printf"
+        );
+        assert_eq!(
+            hazard_first_word("x=$(case a in a) echo a b;; esac) printf -v d %s x"),
+            "printf"
+        );
         assert_eq!(hazard_first_word("x=${y:- a} read d"), "read");
         assert_eq!(hazard_first_word("x=\"a b\" . ./f"), ".");
         assert_eq!(hazard_first_word("x=${y:- a} echo hi"), "echo");

@@ -1838,10 +1838,18 @@ fn consume_word_token_inner(
     i
 }
 
+/// The end of the `$(…)`, `<(…)` or `>(…)` (or `$((…))`) whose body starts
+/// at `i`: the byte after the `)` that closes it, or `len`. The body is read
+/// as command text (see [`CommandText`]).
 pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    let mut command_text = CommandText::new(bytes, i);
     let mut depth = 1usize;
 
     while i < len {
+        if let CommandTextStep::Continue(next) = command_text.step(&bytes[..len], i) {
+            i = next;
+            continue;
+        }
         match bytes[i] {
             b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
                 i = consume_word_braced_parameter(bytes, i, len);
@@ -1892,6 +1900,9 @@ pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usi
                     }
                 }
             }
+            b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
+                i = consume_shell_paren_construct(bytes, i + 2, len);
+            }
             _ => {
                 i += 1;
             }
@@ -1899,6 +1910,176 @@ pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usi
     }
 
     len
+}
+
+/// The words of the command text in a `$(…)`, `<(…)` or `>(…)` body, as
+/// far as the scanners that look for its closing `)` need them.
+///
+/// The shell reads such a body as command text: a `#` that starts a word
+/// starts a comment to the end of the line, so a `)` or quote in it closes
+/// or opens nothing, and the `)` that ends a `case` pattern (and the
+/// optional `(` before one) ends the pattern, not the substitution. So
+/// `x=$(echo a # )` LF `) printf …` and `x=$(case a in a) echo;; esac)
+/// printf …` are each one word before `printf`, in bash 4 and later, dash
+/// and zsh. Bash 3.2 ends both at the first `)` and then reports a syntax
+/// error, so it runs nothing of the line. An arithmetic body (`$((…))`)
+/// has neither.
+pub(crate) struct CommandText {
+    /// False for an arithmetic body.
+    active: bool,
+    at_word_start: bool,
+    word_start: Option<usize>,
+    command_position: bool,
+    cases: Vec<CaseState>,
+    /// A heredoc opens in the body. Its lines are data to the shell, which
+    /// a scanner that does not know heredocs would read as words: a `case`
+    /// there must not hold the substitution open, so case statements are
+    /// no longer read.
+    heredoc: bool,
+}
+
+/// What a scanner does with the byte it gave [`CommandText::step`].
+pub(crate) enum CommandTextStep {
+    /// Read it as before.
+    Read,
+    /// Continue at this index: the byte started a comment (the index is the
+    /// newline that ends it, or the end), or it is the `(` or `)` around a
+    /// case pattern, or a `;;`, `;&` or `;;&`, none of which opens or
+    /// closes anything.
+    Continue(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseState {
+    /// After `case`, before its subject word.
+    Subject,
+    /// After the subject, before `in`.
+    In,
+    /// Reading a pattern list, up to its `)`.
+    Pattern,
+    /// Reading an arm's commands, up to `;;` or `esac`.
+    Body,
+}
+
+impl CommandText {
+    /// For a body that starts at `start`.
+    pub(crate) fn new(bytes: &[u8], start: usize) -> Self {
+        Self {
+            active: bytes.get(start) != Some(&b'('),
+            at_word_start: true,
+            word_start: None,
+            command_position: true,
+            cases: Vec::new(),
+            heredoc: false,
+        }
+    }
+
+    /// Read the byte at `i`, which is outside quotes in the body. Quoted
+    /// text, escapes and nested expansions are passed over by the caller
+    /// after it reads their first byte here.
+    pub(crate) fn step(&mut self, bytes: &[u8], i: usize) -> CommandTextStep {
+        if !self.active {
+            return CommandTextStep::Read;
+        }
+        let byte = bytes[i];
+        if byte == b'#' && self.at_word_start {
+            let end = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |at| i + at);
+            return CommandTextStep::Continue(end);
+        }
+        if !matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+        ) {
+            self.at_word_start = false;
+            self.word_start.get_or_insert(i);
+            return CommandTextStep::Read;
+        }
+        self.end_word(bytes, i);
+        match byte {
+            b'<' if bytes.get(i + 1) == Some(&b'<') => {
+                self.heredoc = true;
+                self.cases.clear();
+            }
+            b'\n' | b'&' | b'|' => self.command_position = true,
+            b';' => {
+                self.command_position = true;
+                if matches!(bytes.get(i + 1), Some(b';' | b'&')) {
+                    if let Some(state) = self.cases.last_mut()
+                        && *state == CaseState::Body
+                    {
+                        *state = CaseState::Pattern;
+                    }
+                    let len = if bytes.get(i + 1) == Some(&b';') && bytes.get(i + 2) == Some(&b'&')
+                    {
+                        3
+                    } else {
+                        2
+                    };
+                    return CommandTextStep::Continue(i + len);
+                }
+            }
+            b'(' | b')' if self.cases.last() == Some(&CaseState::Pattern) => {
+                if byte == b')' {
+                    *self.cases.last_mut().expect("open case") = CaseState::Body;
+                    self.command_position = true;
+                }
+                return CommandTextStep::Continue(i + 1);
+            }
+            b'(' => self.command_position = true,
+            _ => {}
+        }
+        CommandTextStep::Read
+    }
+
+    /// The word that ends before `at`, if any, read for its role.
+    fn end_word(&mut self, bytes: &[u8], at: usize) {
+        self.at_word_start = true;
+        let Some(start) = self.word_start.take() else {
+            return;
+        };
+        let word = &bytes[start..at];
+        let command_position = std::mem::replace(&mut self.command_position, false);
+        match self.cases.last().copied() {
+            Some(CaseState::Subject) => *self.cases.last_mut().expect("open case") = CaseState::In,
+            Some(CaseState::In) => {
+                if word == b"in" {
+                    *self.cases.last_mut().expect("open case") = CaseState::Pattern;
+                } else {
+                    // Not a case statement the shell reads; stop reading it.
+                    self.cases.pop();
+                }
+            }
+            Some(CaseState::Pattern) => {
+                if word == b"esac" {
+                    self.cases.pop();
+                }
+            }
+            _ if command_position && word == b"esac" && !self.cases.is_empty() => {
+                self.cases.pop();
+            }
+            _ if command_position && word == b"case" && !self.heredoc => {
+                self.cases.push(CaseState::Subject);
+            }
+            _ if command_position
+                && matches!(
+                    word,
+                    b"if"
+                        | b"then"
+                        | b"else"
+                        | b"elif"
+                        | b"while"
+                        | b"until"
+                        | b"do"
+                        | b"{"
+                        | b"!"
+                        | b"time"
+                ) =>
+            {
+                self.command_position = true;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Regex to strip absolute paths from git/rm/find/unlink/truncate binaries.
@@ -3502,6 +3683,71 @@ pub(crate) fn powershell_assignment_rhs(candidate: &str) -> Option<&str> {
     }
 
     None
+}
+
+/// The words and separators of `segment` as the POSIX shell reads them, as
+/// written: a word keeps its quoted, escaped and expanded blanks
+/// (`x="a b"`, `x=${y:- a}`, `x=$(echo a b)`), so its second half is not
+/// mistaken for the next word. For the readers that look for a command name
+/// past the words before it.
+pub(crate) fn posix_command_words(segment: &str) -> Vec<&str> {
+    posix_command_word_ranges(segment)
+        .into_iter()
+        .filter_map(|range| segment.get(range))
+        .collect()
+}
+
+/// The byte ranges of [`posix_command_words`].
+pub(crate) fn posix_command_word_ranges(segment: &str) -> Vec<std::ops::Range<usize>> {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    // The tokenizer ends a word at the `&` of `2>&1` and the `|` of `>|f`;
+    // the shell reads one redirection there, so join them back.
+    let mut ranges = Vec::with_capacity(tokens.len());
+    let mut index = 0usize;
+    while let Some(token) = tokens.get(index) {
+        let mut range = token.byte_range.clone();
+        index += 1;
+        if token.kind == NormalizeTokenKind::Word
+            && token
+                .text(segment)
+                .is_some_and(|text| text.ends_with(['<', '>']))
+            && let Some(operator) = tokens.get(index)
+            && operator.byte_range.start == range.end
+            && matches!(operator.text(segment), Some("&" | "|"))
+        {
+            range.end = operator.byte_range.end;
+            index += 1;
+            if let Some(target) = tokens.get(index)
+                && target.kind == NormalizeTokenKind::Word
+                && target.byte_range.start == range.end
+            {
+                range.end = target.byte_range.end;
+                index += 1;
+            }
+        }
+        ranges.push(range);
+    }
+    ranges
+}
+
+/// The words of one simple command with their quotes removed, as
+/// `shell_words::split` gives them, but split only where the POSIX shell
+/// splits them (see [`posix_command_words`]): `x=${y:- a}` and
+/// `x=$(echo a b)` are one word each. A word that `shell_words` would split
+/// further, a substitution holding a blank, is kept as written.
+pub(crate) fn posix_simple_command_words(
+    text: &str,
+) -> Result<Vec<String>, shell_words::ParseError> {
+    let mut words = Vec::new();
+    for raw in posix_command_words(text) {
+        let mut split = shell_words::split(raw)?;
+        match split.len() {
+            0 => {}
+            1 => words.extend(split.pop()),
+            _ => words.push(raw.to_string()),
+        }
+    }
+    Ok(words)
 }
 
 /// Tokenize a command while preserving every raw token's byte span.
@@ -6771,6 +7017,199 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
         .map(BashHashReading::Spelled)
 }
 
+/// The Bash reading of the bracketed words in `command` that dcg's shared
+/// readers split at a blank; `None` when there is none.
+///
+/// - `$[…]` is Bash's old arithmetic expansion, one piece of its word
+///   through the matching `]`, blanks included: `x=$[1 + 2] git reset --hard`
+///   runs `git reset --hard` in Bash.
+/// - A subscript in an assignment word: Bash reads `x[1 + 1]=a` as one
+///   assignment word, so `x[1 + 1]=a git reset --hard` runs it too.
+///
+/// dash and the shared readers read `x=$[1`, `+` and `2]` (or `x[1`, `+`
+/// and `1]=a`) as three words, so the command name is `+`. Spelled: each
+/// blank (space or tab) in such brackets, outside quotes and substitutions,
+/// as `_`, which no reader splits at. The caller reads the spelling too and
+/// deny wins, so where dash does split, the command as written still
+/// answers. Brackets that do not close on their line, and a subscript that
+/// no `=` or `+=` follows, are left alone. Heredoc bodies with a quoted
+/// delimiter are raw text and passed over. A command whose bracket lookups
+/// would read more than 16 times its length (plus 4 KiB) is
+/// [`BashHashReading::Unread`].
+///
+/// Length preserving (one ASCII byte for another), so every range in the
+/// view is the same range in `command`.
+#[must_use]
+pub(crate) fn bash_bracket_words(command: &str) -> Option<BashHashReading> {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    memchr::memchr(b'[', bytes)?;
+    let mut budget = 16 * len + 4096;
+    let mut spelled: Option<Vec<u8>> = None;
+    let mut bodies = crate::context::undisputed_quoted_heredoc_body_ranges(command).into_iter();
+    let mut body = bodies.next();
+    let mut in_double = false;
+    let mut i = 0;
+    while i < len {
+        while body.as_ref().is_some_and(|body| body.end <= i) {
+            body = bodies.next();
+        }
+        if let Some(raw) = body.as_ref().filter(|body| body.start <= i) {
+            i = raw.end;
+            continue;
+        }
+        let opener = match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'\'' if !in_double => {
+                i = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + 1 + at + 1);
+                continue;
+            }
+            b'"' => {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+            b'`' => {
+                i = posix_backquote_end(bytes, i + 1);
+                continue;
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                i = consume_shell_paren_construct(bytes, i + 2, len);
+                continue;
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                i = crate::context::consume_braced_parameter(bytes, i)
+                    .0
+                    .max(i + 2);
+                continue;
+            }
+            b'$' if !in_double && bytes.get(i + 1) == Some(&b'[') => i + 1,
+            b'[' if !in_double && assignment_name_ends_at(bytes, i) => i,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let Some((close, blanks)) = bracket_word_close(bytes, opener + 1, &mut budget) else {
+            if budget == 0 {
+                return Some(BashHashReading::Unread);
+            }
+            i = opener + 1;
+            continue;
+        };
+        let assigns = bytes[opener - 1] == b'$' || {
+            let after = &bytes[close + 1..];
+            after.starts_with(b"=") || after.starts_with(b"+=")
+        };
+        if assigns && !blanks.is_empty() {
+            let view = spelled.get_or_insert_with(|| bytes.to_vec());
+            for blank in blanks {
+                view[blank] = b'_';
+            }
+        }
+        i = close + 1;
+    }
+    // Only an ASCII byte changed into another ASCII byte.
+    spelled
+        .and_then(|spelled| String::from_utf8(spelled).ok())
+        .map(BashHashReading::Spelled)
+}
+
+/// Whether the `[` at `at` follows a shell name that starts a word: the
+/// subscript of an assignment word (`x[1]=a`), when `=` follows its `]`.
+fn assignment_name_ends_at(bytes: &[u8], at: usize) -> bool {
+    let start = bytes[..at]
+        .iter()
+        .rposition(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+        .map_or(0, |before| before + 1);
+    start < at
+        && (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_')
+        && (start == 0
+            || matches!(
+                bytes[start - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+            ))
+}
+
+/// The `]` that closes a bracket opened before `from`, and the blanks the
+/// bracket holds outside quotes and substitutions; `None` when it does not
+/// close on its line, or when the lookup would read past `budget` (then
+/// `budget` is 0).
+fn bracket_word_close(
+    bytes: &[u8],
+    from: usize,
+    budget: &mut usize,
+) -> Option<(usize, Vec<usize>)> {
+    let len = bytes.len();
+    let mut depth = 1usize;
+    let mut blanks = Vec::new();
+    let mut i = from;
+    while i < len {
+        let start = i;
+        match bytes[i] {
+            b'\n' => return None,
+            b'\\' => i += 2,
+            b' ' | b'\t' => {
+                blanks.push(i);
+                i += 1;
+            }
+            b'\'' => {
+                i = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + 1 + at + 1);
+            }
+            b'"' => {
+                i += 1;
+                while i < len && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'`' => i = posix_backquote_end(bytes, i + 1),
+            b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                i = consume_shell_paren_construct(bytes, i + 2, len);
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                i = crate::context::consume_braced_parameter(bytes, i)
+                    .0
+                    .max(i + 2);
+            }
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((i, blanks));
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+        let Some(left) = budget.checked_sub(i.min(len) - start) else {
+            *budget = 0;
+            return None;
+        };
+        *budget = left;
+    }
+    None
+}
+
+/// The byte after the backquote that closes one opened before `from`.
+fn posix_backquote_end(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'`' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
 fn spell_bash_data_hashes(
     command: &str,
     extglob: bool,
@@ -8184,6 +8623,85 @@ mod tests {
     /// `$$` is one parameter, so a `{` after it opens nothing and is spelled;
     /// a Bash 5.3 `${ …; }` and a `'` that ends a double-quoted `${…}` at
     /// another place for Bash than for dash have no reading.
+    #[test]
+    fn bash_bracket_words_spell_blanks_bash_reads_in_one_word() {
+        let spelled = |command: &str| match bash_bracket_words(command) {
+            Some(BashHashReading::Spelled(spelled)) => spelled,
+            other => panic!("{command:?}: {other:?}"),
+        };
+        assert_eq!(
+            spelled("x=$[1 + 2] git reset --hard"),
+            "x=$[1_+_2] git reset --hard"
+        );
+        assert_eq!(
+            spelled("x[1 + 1]=a git reset --hard"),
+            "x[1_+_1]=a git reset --hard"
+        );
+        assert_eq!(spelled("x[$i + 1]+=a git"), "x[$i_+_1]+=a git");
+        assert_eq!(
+            spelled("x=$[ a[1] + \"b c\" ] git"),
+            "x=$[_a[1]_+_\"b c\"_] git"
+        );
+        for unchanged in [
+            "x=$[1+2] git reset --hard",
+            "echo x[1 + 1]",
+            "echo '$[1 + 2]'",
+            "echo \"$[1 + 2]\"",
+            "x=$[1 +\n 2] git",
+            "[ -f x ] && echo ok",
+            "echo [a b]=c",
+        ] {
+            assert_eq!(bash_bracket_words(unchanged), None, "{unchanged:?}");
+        }
+        assert_eq!(bash_bracket_words("git status"), None);
+    }
+
+    #[test]
+    fn substitution_bodies_read_comments_and_case_patterns_as_command_text() {
+        let end = |command: &str| {
+            let start = command.find("$(").expect("opener") + 2;
+            consume_shell_paren_construct(command.as_bytes(), start, command.len())
+        };
+        let command = "x=$(echo a # )\n) printf";
+        assert_eq!(&command[..end(command)], "x=$(echo a # )\n)");
+        let command = "x=$(case a in a) echo a b;; esac) printf";
+        assert_eq!(
+            &command[..end(command)],
+            "x=$(case a in a) echo a b;; esac)"
+        );
+        let command = "x=$(case a in (a) :;; b|c) :;& *) :;;& esac) printf";
+        assert_eq!(
+            &command[..end(command)],
+            "x=$(case a in (a) :;; b|c) :;& *) :;;& esac)"
+        );
+        // A word that only spells `case`, a `#` inside a word, an arithmetic
+        // body and a heredoc body hold nothing open.
+        for (command, through) in [
+            ("x=$(echo case a in a) git", "x=$(echo case a in a)"),
+            ("x=$(echo a#b) git", "x=$(echo a#b)"),
+            ("x=$((1 # 2)) git", "x=$((1 # 2))"),
+            (
+                "x=$(cat <<EOF\ncase a in\nEOF\n); git",
+                "x=$(cat <<EOF\ncase a in\nEOF\n)",
+            ),
+        ] {
+            assert_eq!(&command[..end(command)], through, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn posix_simple_command_words_keep_expansions_whole() {
+        assert_eq!(
+            posix_simple_command_words("x=${y:- a} alias p='bash -s'").expect("words"),
+            ["x=${y:- a}", "alias", "p=bash -s"]
+        );
+        assert_eq!(
+            posix_simple_command_words("x=$(echo a b) \"c d\" e").expect("words"),
+            ["x=$(echo a b)", "c d", "e"]
+        );
+        assert!(posix_simple_command_words("echo 'a").is_err());
+    }
+
     #[test]
     fn bash_parameter_openers_reads_dollar_pairs_funsubs_and_quote_disputes() {
         let spelled = |command: &str| match bash_parameter_openers(command) {

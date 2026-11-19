@@ -1155,6 +1155,153 @@ fn blank_holding_prefix_words_hide_no_rebinding() {
     }
 }
 
+/// A word before the command name that holds a blank, a substitution or a
+/// subscript hides no command, wrapper or directory change: `x=$(echo a b)
+/// git reset --hard` runs `git`, as `x=1 git reset --hard` does.
+#[test]
+fn prefix_words_hide_no_command() {
+    let payload = |command: &str, codex: bool| {
+        let mut payload = serde_json::json!({
+            "session_id": "sess-prefix-command",
+            "cwd": "/tmp/test-workdir",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_use_id": "call_prefix_command",
+        });
+        if codex {
+            payload["turn_id"] = serde_json::json!("turn-prefix-command");
+        }
+        payload.to_string().into_bytes()
+    };
+    for command in [
+        "x=$(echo a b) git reset --hard",
+        "x=$(pwd -P) git reset --hard",
+        "x=`echo a b` git reset --hard",
+        "x=$((1 + 2)) git reset --hard",
+        "x=$(date +%s) y=1 git reset --hard",
+        "true; x=$(echo a b) git reset --hard",
+        "true && x=$(echo a b) git reset --hard",
+        "x=$(echo a b) git push --force origin main",
+        "x=$(echo a b) git clean -fdx",
+        "x=$[1 + 2] git reset --hard",
+        "x[1 + 1]=a git reset --hard",
+        "x=$(pwd) env git reset --hard",
+        "x=$(pwd) command git reset --hard",
+        "x=$(pwd) sudo git reset --hard",
+        "env x=$(pwd) git reset --hard",
+        "sudo x=$(pwd) git reset --hard",
+        "x=$(pwd) nice git reset --hard",
+        r#"x="$(pwd)" git reset --hard"#,
+        "x=$(echo a b)$(pwd) git reset --hard",
+        "if x=$(echo a b) git reset --hard; then :; fi",
+        "x=$(echo a b) rm -rf ~/",
+        "x=$(printf 'a b') git reset --hard",
+        "x=$[ 1 + 2 ] git reset --hard",
+        "x[$i + 1]=a git reset --hard",
+        "x+=$(echo a b) git reset --hard",
+        "x=$(echo a b) y=$(pwd) git reset --hard",
+        "x=${y:- a} env -C ~/.ssh rm -f id_rsa",
+        r#"x="a b" env -C ~/.ssh rm -f id_rsa"#,
+        "x='a b' sudo -D ~/.ssh rm -f id_rsa",
+        "x=$(echo a b) env --chdir=~/.ssh rm -f id_rsa",
+        "x=$(echo a b) sudo -D ~/.ssh rm -f id_rsa",
+        "x=${y:- a} alias python3='bash -s'
+python3 - <<'PY'
+git branch $name
+PY",
+        "x=$(echo a b) alias python3='bash -s'
+python3 - <<'PY'
+git branch $name
+PY",
+        "x=1 alias python3='bash -s'
+python3 - <<'PY'
+git branch $name
+PY",
+        r#"d=/tmp/dcgx; x=$[1 + 2] printf -v d %s "$HOME"; rm -rf "$d""#,
+        r#"d=/tmp/dcgx; x[1 + 1]=a printf -v d %s "$HOME"; rm -rf "$d""#,
+        r#"d=/tmp/dcgx; x=$(echo a # )
+) printf -v d %s "$HOME"; rm -rf "$d""#,
+        r#"d=/tmp/dcgx; x=$(case a in a) echo a b;; esac) printf -v d %s "$HOME"; rm -rf "$d""#,
+        r#"d=/tmp/dcgx; x+=1 printf -v d %s "$HOME"; rm -rf "$d""#,
+        r#"d=/tmp/dcgx; x[1]=a printf -v d %s "$HOME"; rm -rf "$d""#,
+        "x=1 cd ~/.ssh && rm id_rsa",
+        "x=1 cd /home/user/.ssh; echo k >>authorized_keys",
+        "x=1 builtin command git reset --hard",
+        "x=$(echo a b) cd ~/.ssh && rm id_rsa",
+        "2>/dev/null cd ~/.ssh && rm id_rsa",
+        r#"d=/tmp/dcgx; x=$(case a in (a) echo a b;; b|c) :;; esac) printf -v d %s "$HOME"; rm -rf "$d""#,
+        "echo $(case a in a) echo hi;; esac); git reset --hard",
+        "echo $(echo a # )
+); git reset --hard",
+        "builtin command git reset --hard",
+        "x=1 builtin exec git reset --hard",
+        "x=$(cat <<EOF
+case a in
+EOF
+); git reset --hard",
+        "x=$(cat <<'EOF'
+case a in a
+EOF
+)
+git reset --hard",
+        r#"echo "$(cat <<'EOF'
+# )
+EOF
+)"; git reset --hard"#,
+        "echo $(echo a # c ) ; git reset --hard
+); git push --force origin main",
+        "echo $(case a in a) echo x;; esac) && git reset --hard",
+        "echo $(case a in a) echo x) ; git reset --hard",
+        "x=$(echo case a in a) git reset --hard",
+        "echo $(echo 'case' a in a) ; git reset --hard",
+        "f=$(echo a#b) git reset --hard",
+        "echo $( (echo a) # )
+) ; git reset --hard",
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(!claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+    for command in [
+        "x=$(echo a b) git status",
+        "x=$(echo a b) ls -la",
+        r#"x="a b" git status"#,
+        r#"GIT_PAGER="less -R" git log -3"#,
+        "x=$(date +%s) echo hi",
+        "x=${y:- a} git status",
+        r#"d=/tmp/dcgx; x=$(echo a b) echo hi; rm -rf "$d""#,
+        r"2>&1 printf '%s\n' hi",
+        "x=$[1 + 2] git status",
+        "x[1 + 1]=a git status",
+        "echo $[1 + 2]",
+        "echo x[1 + 1]=a",
+        "x=$(pwd) env git status",
+        "x=$(echo a b) env -C /tmp rm -f x",
+        "x=$(pwd) command -v git",
+        "arr[1 + 1]=a; echo ${arr[2]}",
+        r#"d=/tmp/dcgx; rm -rf "$d""#,
+        "x=$(git rev-parse --show-toplevel) ls",
+        "cd ~/.ssh && ls",
+        "x=1 cd ~/proj && rm -f notes.txt",
+        "echo $(case a in a) echo hi;; esac); git status",
+        "x=$(echo a # c
+) echo hi",
+        "command -v git; git status",
+        "x=$(cat <<EOF
+case a in
+EOF
+); git status",
+        "echo $(case a in a) echo x;; esac); git status",
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+}
+
 #[test]
 fn vscode_copilot_terminal_tool_variants_block_destructive_commands() {
     for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {

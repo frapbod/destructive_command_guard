@@ -9644,7 +9644,7 @@ fn find_shell_name_override_deep<D: ast_grep_core::Doc>(
         }
         "command" => {
             let text = node.text();
-            match shell_words::split(text.as_ref()) {
+            match crate::normalize::posix_simple_command_words(text.as_ref()) {
                 Ok(tokens) => {
                     if shell_command_may_override_name(&tokens, target) {
                         *overridden = true;
@@ -9763,7 +9763,7 @@ fn shell_name_override_node<D: ast_grep_core::Doc>(
         }
         "command" => {
             let text = node.text();
-            match shell_words::split(text.as_ref()) {
+            match crate::normalize::posix_simple_command_words(text.as_ref()) {
                 Ok(tokens) => {
                     if shell_command_may_override_name(&tokens, target) {
                         *overridden = true;
