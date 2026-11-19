@@ -4959,6 +4959,92 @@ fn powershell_command_payload(
     }
 }
 
+/// Whether a PowerShell host given `arguments` (decoded argv words) runs
+/// code given on its command line, as [`parse_powershell_launcher`] reads
+/// it: `-Command`, an `-EncodedCommand` whose value decodes, or, in
+/// Windows PowerShell 5.1, a first argument that is not a switch (the
+/// command string). `false` when the host stops at a switch it does not
+/// know, reads a script file, or runs nothing, and when an
+/// `-EncodedCommand` value does not decode (`node -e 'console.log(1)'`,
+/// `-ec production`), or at a switch dcg does not model
+/// (`-ImportSystemModules`, `-s`): there the launcher would fail closed on
+/// the argv, not on code it runs. A value for which `is_unknown` holds is
+/// one dcg cannot read: as a command string it gives `false`, as an
+/// encoded command `true` (it may be one).
+///
+/// `Start-Process` uses this to decide whether a program it cannot name may
+/// be a PowerShell host for its argument list (`'-c','…'` is; `'/S'`,
+/// `'--install'` and `'-y'` are not, though [`parse_powershell_launcher`]
+/// fails closed on them for a program that is known to be PowerShell).
+pub(crate) fn powershell_host_may_run_inline(
+    arguments: &[String],
+    is_unknown: impl Fn(&str) -> bool,
+) -> bool {
+    use PowerShellHostOption::{
+        Command, EncodedCommand, File, NoValue, OptionalValue, Unknown, Unmodeled, Value,
+    };
+    let words: Vec<String> = arguments
+        .iter()
+        .map(|argument| format!("'{}'", argument.replace('\'', "''")))
+        .collect();
+    [PowerShellHost::Windows, PowerShellHost::Core]
+        .into_iter()
+        .any(|host| {
+            let mut index = 0usize;
+            while let Some(raw) = words.get(index) {
+                match powershell_host_option(
+                    raw,
+                    host,
+                    ShellDialect::PowerShell,
+                    NativeArgv::Verbatim,
+                ) {
+                    Command => return true,
+                    EncodedCommand => {
+                        return arguments.get(index + 1).is_some_and(|value| {
+                            is_unknown(value)
+                                || decode_powershell_encoded_payload(
+                                    value,
+                                    MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES,
+                                )
+                                .is_ok()
+                        });
+                    }
+                    File | Unmodeled => return false,
+                    NoValue => index += 1,
+                    OptionalValue | Value => index += 2,
+                    Unknown => {
+                        let argument = &arguments[index];
+                        return host == PowerShellHost::Windows
+                            && !powershell_argument_is_dashed(argument)
+                            && !argument.trim().is_empty()
+                            && !is_unknown(argument);
+                    }
+                }
+            }
+            false
+        })
+}
+
+/// Whether cmd.exe given `arguments` (decoded argv words) runs command
+/// text, as [`parse_cmd_launcher`] reads it: an exact `/C` or `/K` reached
+/// past switches that run nothing (`/D`, `/Q`, `/S`, `/E:…`, …). Any other
+/// word before it (`/configure`, `/VERYSILENT`, `/R`, a value dcg cannot
+/// read) gives `false`: the launcher would fail closed on that argv, not on
+/// code cmd runs. `Start-Process` uses this to decide whether a program it
+/// cannot name may be cmd for its argument list.
+pub(crate) fn cmd_host_may_run_inline(arguments: &[String]) -> bool {
+    for argument in arguments {
+        let option = argument.to_ascii_lowercase();
+        if matches!(option.as_str(), "/c" | "/k") {
+            return true;
+        }
+        if !cmd_switch_is_non_executing(&option) {
+            return false;
+        }
+    }
+    false
+}
+
 /// `executable` is the launcher's lower-case base name without `.exe`:
 /// `powershell` (Windows PowerShell 5.1) or `pwsh` (PowerShell 6+).
 fn parse_powershell_launcher(
@@ -5087,6 +5173,22 @@ fn cmd_host_switch(raw: &str, outer_dialect: ShellDialect) -> Option<String> {
     Some(option)
 }
 
+/// Whether a cmd word holds a `%NAME%` variable reference.
+fn cmd_word_has_variable(word: &str) -> bool {
+    let mut parts = word.split('%');
+    parts.next();
+    let mut inner = parts.collect::<Vec<_>>();
+    // `a%b%c` splits into ["a", "b", "c"]: a name sits between two `%`.
+    inner.pop();
+    inner.iter().any(|name| {
+        !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'-' | b'.' | b':' | b'~' | b',' | b'=')
+            })
+    })
+}
+
 fn cmd_switch_is_non_executing(option: &str) -> bool {
     matches!(option, "/d" | "/q" | "/a" | "/u" | "/s" | "/?")
         || ["/e:", "/f:", "/v:"]
@@ -5130,6 +5232,14 @@ fn parse_cmd_launcher(
                 }),
                 Err(reason) => WindowsLauncherParse::Unverified(reason),
             };
+        }
+        if cmd_word_has_variable(&option) {
+            // cmd expands `%NAME%` before it reads its switches: the value
+            // may be `/c` and a command (`Start-Process cmd -ArgumentList
+            // $x` runs `cmd <x>`).
+            return WindowsLauncherParse::Unverified(format!(
+                "cmd host switch {raw:?} holds a variable"
+            ));
         }
         if !cmd_switch_is_non_executing(&option) {
             if option.starts_with('/') {

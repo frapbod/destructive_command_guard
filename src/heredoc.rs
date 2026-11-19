@@ -171,9 +171,13 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     // PowerShell Invoke-Expression / its `iex` alias: executes a string as code. Tier 2
     // extracts the quoted argument and re-evaluates it.
     r"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b",
-    // PowerShell Start-Process (`saps`) with an argument list runs
-    // `<file> <args>`; Tier 2 reconstructs that line and re-evaluates it.
-    r"(?i)(?:^|[\s;|&({])(?:start-process|saps)\b[^\n]*\s(?:-ArgumentList|-Args)\b",
+    // PowerShell Start-Process (aliases `saps`, `start`) runs `<file>
+    // <args>`; Tier 2 binds its parameters as PowerShell does (any order,
+    // prefixes, aliases, positions) and re-evaluates that line. PowerShell
+    // ends the command name at a blank, a continuation, or a `(` or `{`
+    // that starts the first argument (`Start-Process('git')`). After the
+    // call or dot-source operator the name may be quoted (`& 'saps'`).
+    r#"(?i)(?:^|[\s;|&({=\\])(?:start-process|saps|start)(?:[^\S\r\n]|`\r?\n|[({])|[&.][^\S\r\n]*\(?[^\S\r\n]*['"\x{2018}-\x{201E}](?:microsoft\.powershell\.management\\)?(?:start-process|saps|start)['"\x{2018}-\x{201E}]"#,
     // Piped execution to interpreters (versioned, with optional .exe)
     r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)
@@ -1783,31 +1787,6 @@ static IEX_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
         .expect("iex inline script regex compiles")
 });
 
-/// Regex for `Start-Process [-FilePath] <file> -ArgumentList '<args>'` (or
-/// `saps`, `-Args`, `-FilePath:`/`-ArgumentList:` colon forms). Group 1 = the
-/// file, group 2 = the argument list: one quoted string, or a comma list of
-/// quoted strings and bare words, optionally in `@( )`, which Start-Process
-/// joins with spaces (see [`START_PROCESS_ARGUMENT`]). A variable is not
-/// reconstructed (no extraction, no change).
-///
-/// The list is one grammar: a first element, then any number of
-/// `<blanks>,<blanks><element>`, so blanks before a comma do not end it. A
-/// lone bare word is not a list. Only the first element is a place where a
-/// new parameter (`-Wait`) can start, so only it may not begin with `-`;
-/// after a comma, `--hard` is an element PowerShell passes on.
-static START_PROCESS_INLINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)(?:^|[\s;|&({])(?:start-process|saps)\s+(?:-FilePath\s*:?\s*)?['"]?([^\s'",;|$()]+)['"]?\s+(?:-ArgumentList|-Args)\s*:?\s*(?:@\(\s*)?((?:"[^"]*"|'[^']*')(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`][^\s'",;|$()`]*))*|[^\s'",;|$()@{}`-][^\s'",;|$()`]*(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^\s'",;|$()@{}`][^\s'",;|$()`]*))+)\s*\)?(?:\s|$|[;|&)])"#,
-    )
-    .expect("start-process inline regex compiles")
-});
-
-/// One element of a [`START_PROCESS_INLINE`] argument list. Group 1/2 = the
-/// double/single-quoted text, group 3 = a bare word.
-static START_PROCESS_ARGUMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""([^"]*)"|'([^']*)'|([^\s'",]+)"#).expect("start-process argument regex compiles")
-});
-
 /// Regex for `powershell -EncodedCommand <base64>` (flag abbreviates to any prefix
 /// of `-encodedcommand`, min `-e`). Group 1 = the base64 token, which Tier 2 decodes
 /// (base64 -> UTF-16LE -> text) and re-evaluates.
@@ -3281,7 +3260,7 @@ fn push_windows_inner(
 
 /// A Start-Process target's program name: last path component, lower case,
 /// without `.exe`.
-fn start_process_target_name(file: &str) -> String {
+pub(crate) fn start_process_target_name(file: &str) -> String {
     let name = file
         .rsplit(['/', '\\'])
         .next()
@@ -3295,7 +3274,7 @@ fn start_process_target_name(file: &str) -> String {
 
 /// Whether a Start-Process target is a shell that reads its joined argument
 /// list as one command line.
-fn start_process_target_is_shell(file: &str) -> bool {
+pub(crate) fn start_process_target_is_shell(file: &str) -> bool {
     matches!(
         start_process_target_name(file).as_str(),
         "cmd" | "powershell" | "pwsh" | "bash" | "sh" | "wsl"
@@ -3308,13 +3287,16 @@ fn start_process_target_is_shell(file: &str) -> bool {
 /// first word is the file. It is the target's own command line: cmd.exe
 /// reads it as cmd does (its operators, its CR removal, a
 /// `C:\…\cmd.exe` path kept as written), a PowerShell host as
-/// PowerShell, and anything else as POSIX, as before.
+/// PowerShell, and the other shells as POSIX. Another program's argv is
+/// spelled as a PowerShell call (`& git reset --hard`), which reads exactly
+/// that argv, with Windows paths as paths, and, when it has no Windows path
+/// syntax, also as the POSIX command (`git reset --hard`).
 #[must_use]
 pub fn start_process_line_dialect(line: &str) -> crate::normalize::ShellDialect {
     let file = line.split_ascii_whitespace().next().unwrap_or("");
     match start_process_target_name(file).as_str() {
         "cmd" => crate::normalize::ShellDialect::Cmd,
-        "powershell" | "pwsh" => crate::normalize::ShellDialect::PowerShell,
+        "powershell" | "pwsh" | "&" => crate::normalize::ShellDialect::PowerShell,
         _ => crate::normalize::ShellDialect::Posix,
     }
 }
@@ -3389,51 +3371,36 @@ fn extract_windows_inline_scripts(
         }
     }
 
-    // Start-Process <file> -ArgumentList '<args>': the process runs `<file>
-    // <args>`, so `Start-Process cmd -ArgumentList '/c rd /s /q C:\src'` is the
-    // same deletion as the denied `cmd /c rd /s /q C:\src`. The reconstructed
-    // line is not a substring of the command, so there is no content_range.
-    // A comma list (`-ArgumentList '/c', 'rd /s /q C:\src'`) runs the same
-    // line: Start-Process joins its elements with spaces. Only a shell reads
-    // that line as a command; another program's list is its own argv, which
-    // this POSIX re-reading would misread (`C:\work\f` as host `C`), and
-    // which its pack reads (`powershell_start_process_scp`).
-    for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2]) {
-        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
-            return;
-        }
-        let (Some(file), Some(args)) = (cap.get(1), cap.get(2)) else {
-            continue;
-        };
-        let full = cap.get(0).expect("group 0 always present");
-        let elements: Vec<&str> = START_PROCESS_ARGUMENT
-            .captures_iter(text(args))
-            .filter_map(|element| {
-                element
-                    .get(1)
-                    .or_else(|| element.get(2))
-                    .or_else(|| element.get(3))
-                    .map(|value| value.as_str())
-            })
-            .collect();
-        if elements.len() > 1 && !start_process_target_is_shell(text(file)) {
-            continue;
-        }
-        let mut line = text(file).to_string();
-        for element in elements {
-            line.push(' ');
-            line.push_str(element);
-        }
-        if !push_windows_inner(
-            extracted,
-            skip_reasons,
-            limits,
-            &line,
-            full.start()..full.end(),
-            None,
-            "start-process",
-        ) {
-            return;
+    // Start-Process: the process runs `<file> <args>`, so `Start-Process cmd
+    // -ArgumentList '/c rd /s /q C:\src'` is the same deletion as the denied
+    // `cmd /c rd /s /q C:\src`. Its parameters are bound as PowerShell binds
+    // them (`crate::start_process`), and each line is spelled for the
+    // program that reads it: a shell's whole command line, or another
+    // program's argv after Windows' argv rules. The line is not a substring
+    // of the command, so there is no content_range.
+    let mut start_process_seen: Vec<String> = Vec::new();
+    for view in &views {
+        for (range, lines) in crate::start_process::start_process_lines(view) {
+            if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+                return;
+            }
+            for line in lines {
+                if start_process_seen.contains(&line) {
+                    continue;
+                }
+                if !push_windows_inner(
+                    extracted,
+                    skip_reasons,
+                    limits,
+                    &line,
+                    range.clone(),
+                    None,
+                    "start-process",
+                ) {
+                    return;
+                }
+                start_process_seen.push(line);
+            }
         }
     }
 
@@ -20424,8 +20391,29 @@ mod tests {
         fn iexplore_does_not_falsely_trigger_iex() {
             // The `iex` alias must be a standalone token, not a prefix of `iexplore`.
             assert_eq!(
-                check_triggers("start iexplore.exe https://example.com"),
+                check_triggers("iexplore.exe https://example.com"),
                 TriggerResult::NoTrigger
+            );
+            // `start` is Start-Process, a trigger of its own: its reading is
+            // the browser's argv, and nothing is read as `iex`.
+            let contents = match extract_content(
+                "start iexplore.exe https://example.com",
+                &ExtractionLimits::default(),
+            ) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{other:?}"),
+            };
+            assert!(
+                contents
+                    .iter()
+                    .all(|content| content.target_command.as_deref() != Some("iex")),
+                "{contents:?}"
+            );
+            assert!(
+                contents
+                    .iter()
+                    .any(|content| content.content == "& iexplore.exe https://example.com"),
+                "{contents:?}"
             );
         }
 

@@ -645,7 +645,7 @@ fn scp_option_semantics(arguments: &[String], pscp: bool) -> (bool, bool, usize)
     (help, recursive, transfer_operand_count)
 }
 
-fn decode_powershell_literal_expression(expression: &str) -> Option<String> {
+pub(crate) fn decode_powershell_literal_expression(expression: &str) -> Option<String> {
     use crate::normalize::{ShellTokenDecoder, ShellTokenRole};
 
     let inner = expression
@@ -781,7 +781,7 @@ pub(crate) fn normalize_powershell_inline_start_process_parameters(
     })
 }
 
-fn decode_powershell_static_word(raw: &str) -> Option<String> {
+pub(crate) fn decode_powershell_static_word(raw: &str) -> Option<String> {
     use crate::normalize::{
         NormalizeTokenKind, ShellTokenDecoder, ShellTokenRole, tokenize_for_shell_dialect,
     };
