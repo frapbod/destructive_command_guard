@@ -6412,15 +6412,18 @@ pub(crate) fn paren_hashes_as_data(command: &str) -> Option<String> {
     spelled.and_then(|spelled| String::from_utf8(spelled).ok())
 }
 
-/// The Bash reading [`bash_hashes_as_data`] gives a command.
+/// The Bash reading [`bash_hashes_as_data`] or [`bash_parameter_openers`]
+/// gives a command.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BashHashReading {
-    /// The command with each `#` that is data to Bash, but may start a
-    /// comment to dcg's readers, spelled `_`.
+    /// The command with each byte that Bash reads one way, and dcg's readers
+    /// another, spelled `_`: a `#` that is data to Bash but may start a
+    /// comment to dcg's readers, or a `{` that opens nothing after `$$`.
     Spelled(String),
     /// The command has no reading here: the paren lookups read all the bytes
-    /// they may before its end, or a span this reading spells holds a comment
-    /// in a command substitution. The caller fails closed.
+    /// they may before its end, a span this reading spells holds a comment
+    /// in a command substitution, or a `${` is one dcg's readers cannot read
+    /// as Bash does. The caller fails closed.
     Unread,
 }
 
@@ -6524,6 +6527,98 @@ fn bash_hashes_as_data_within(
             .map(BashHashReading::Spelled),
         Err(NoReading) => Some(BashHashReading::Unread),
     }
+}
+
+/// The Bash reading of the `${` openers in `command`, where dcg's shared
+/// readers read them another way; `None` when they read every one as Bash
+/// does.
+///
+/// - `$$` is one parameter, the shell's process ID, so a `{` right after it
+///   is a plain character: `echo $${ ; git reset --hard` runs
+///   `git reset --hard`. The shared readers see a `${` at the second `$`
+///   that no `}` closes, and some of them then read the rest of the input
+///   as part of it. Spelled: each such `{` as `_`, so no reader sees an
+///   opener there. A run of `$` pairs from its left end, as the shell reads
+///   it: after `$$$` the `{` does open an expansion.
+/// - Bash 5.3 reads `${` followed by a blank or `|` as a command
+///   substitution (`${ cmd; }`, `${| cmd; }`), which ends at a `}` in
+///   command position and holds command text with its own quotes and
+///   comments: in `echo ${ : # "` LF `}; git reset --hard` LF `# "` the `"`
+///   is comment text and `git reset --hard` runs. Earlier Bash, dash and zsh
+///   report a bad substitution there. The shared readers read every `${` as
+///   a parameter expansion, so they read the `"` as a quote and the body is
+///   never read as commands. Unread: the caller fails closed.
+/// - In double quotes, Bash reads a `'` inside a `${…}` as a quote when it
+///   looks for the closing `}`; dash reads it as a plain character
+///   ([`crate::context::braced_parameter_span`] reads it the dash way, other
+///   readers the Bash way). When the two readings end the expansion at
+///   different places, a `#` between the two ends can be a comment to dcg
+///   and data to Bash: Bash runs `git reset --hard` in
+///   `echo "${y:-'}" #'}"; git reset --hard`. Unread as well.
+///
+/// The scan reads the raw bytes without quote context: a `\` escapes the
+/// next byte, and a `\`LF pair (a line continuation) is passed over between
+/// the bytes it tests. So an opener inside single quotes or a heredoc body
+/// counts too, which can only fail closed where the shell runs nothing;
+/// a wrong reading here only adds a reading, as deny wins. Each `${` looks up
+/// its end twice; a command whose lookups would read more than 16 times its
+/// length (plus 4 KiB) is Unread.
+///
+/// Length preserving (one ASCII byte for another), so every range in the
+/// view is the same range in `command`.
+#[must_use]
+pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    if memchr::memchr(b'{', bytes).is_none() {
+        return None;
+    }
+    let next = |at: usize| past_line_continuations(bytes, at);
+    let mut budget = 16 * len + 4096;
+    let mut spelled: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'$' => {
+                let after = next(i + 1);
+                match bytes.get(after) {
+                    // `$$`: a `{` right after it is a plain character.
+                    Some(b'$') => {
+                        let brace = next(after + 1);
+                        if bytes.get(brace) == Some(&b'{') {
+                            spelled.get_or_insert_with(|| bytes.to_vec())[brace] = b'_';
+                        }
+                        i = after + 1;
+                    }
+                    Some(b'{') => {
+                        if matches!(
+                            bytes.get(next(after + 1)),
+                            Some(b' ' | b'\t' | b'\n' | b'|')
+                        ) {
+                            return Some(BashHashReading::Unread);
+                        }
+                        if after == i + 1 {
+                            let bash = crate::context::braced_parameter_span(bytes, i, false);
+                            let dash = crate::context::braced_parameter_span(bytes, i, true);
+                            let read = bash.unwrap_or(len) + dash.unwrap_or(len) - 2 * i;
+                            match budget.checked_sub(read) {
+                                Some(left) if bash == dash => budget = left,
+                                _ => return Some(BashHashReading::Unread),
+                            }
+                        }
+                        i = after + 1;
+                    }
+                    _ => i = after,
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // Only an ASCII byte changed into another ASCII byte.
+    spelled
+        .and_then(|spelled| String::from_utf8(spelled).ok())
+        .map(BashHashReading::Spelled)
 }
 
 fn spell_bash_data_hashes(
@@ -7934,6 +8029,81 @@ mod tests {
             bash_spelling("(( $(f) + 1 #)); git reset --hard").as_deref(),
             Some("(( $(f) + 1 _)); git reset --hard")
         );
+    }
+
+    /// `$$` is one parameter, so a `{` after it opens nothing and is spelled;
+    /// a Bash 5.3 `${ …; }` and a `'` that ends a double-quoted `${…}` at
+    /// another place for Bash than for dash have no reading.
+    #[test]
+    fn bash_parameter_openers_reads_dollar_pairs_funsubs_and_quote_disputes() {
+        let spelled = |command: &str| match bash_parameter_openers(command) {
+            Some(BashHashReading::Spelled(spelled)) => Some(spelled),
+            other => panic!("{command:?}: {other:?}"),
+        };
+        assert_eq!(
+            spelled("echo $${ ; git reset --hard").as_deref(),
+            Some("echo $$_ ; git reset --hard")
+        );
+        assert_eq!(
+            spelled("echo $\\\n${ ; git reset --hard").as_deref(),
+            Some("echo $\\\n$_ ; git reset --hard")
+        );
+        assert_eq!(
+            spelled("echo $$$${x}; ${y:-$${z}}").as_deref(),
+            Some("echo $$$$_x}; ${y:-$$_z}}")
+        );
+        for command in [
+            "echo $${x}",
+            "echo $$ {x}",
+            "echo ${x:-a b}",
+            "echo \\${ x }",
+            "echo $$${x}",
+            "x=${y:- a} git reset --hard",
+            "echo \"${y:-'a'}\"",
+            "echo \"${y:-\"'}\"}\"",
+            "echo ${x",
+            "git status",
+        ] {
+            assert!(
+                !matches!(
+                    bash_parameter_openers(command),
+                    Some(BashHashReading::Unread)
+                ),
+                "{command:?}"
+            );
+        }
+        assert_eq!(bash_parameter_openers("echo $$ {x}"), None);
+        assert_eq!(spelled("echo $${x}").as_deref(), Some("echo $$_x}"));
+        assert_eq!(bash_parameter_openers("echo \"${y:-'a'}\""), None);
+        for command in [
+            "echo ${ : # \"\n}; git reset --hard\n# \"",
+            "echo \"${ : # \"\n}\"; git reset --hard\n# \"",
+            "echo ${| : # \"\n}; git reset --hard\n# \"",
+            "echo ${ git reset --hard; }",
+            "echo ${\tgit reset --hard; }",
+            "echo ${\ngit reset --hard\n}",
+            "echo ${|git reset --hard; }",
+            "echo ${\\\n git reset --hard; }",
+            "echo \\$${ git reset --hard; }",
+            "echo $$${ git reset --hard; }",
+            "echo \"${y:-'}\" #'}\"; git reset --hard",
+            "echo \"${y:-'}\" #'}\" && git push --force origin main",
+            "echo \"${y#'}\"; git reset --hard; : '}\"",
+        ] {
+            assert_eq!(
+                bash_parameter_openers(command),
+                Some(BashHashReading::Unread),
+                "{command:?}"
+            );
+        }
+        // A run of unclosed `${` costs one budget, then has no reading.
+        let unclosed = "echo ${x".repeat(4_000);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            bash_parameter_openers(&unclosed),
+            Some(BashHashReading::Unread)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     /// The spelling of [`bash_hashes_as_data`]; it must read the command.
