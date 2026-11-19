@@ -20992,8 +20992,9 @@ struct UnknownNameScope<'a> {
 /// `scope.same_shell`, may bind is the command's own. Otherwise a name
 /// `scope.parent` may bind is unset in the child when `proof` shows the
 /// parent cannot hand it over (`X=' '; bash <<'EOF'` with
-/// `git${X}reset${X}--hard` runs `gitreset--hard`). Any other name, and a
-/// special or positional parameter, is unknown.
+/// `git${X}reset${X}--hard` runs `gitreset--hard`), and keeps its bare
+/// spelling too. Any other name, and a special or positional parameter, is
+/// unknown.
 fn posix_command_word_name_scope(
     earlier: &str,
     scope: UnknownNameScope<'_>,
@@ -21017,8 +21018,13 @@ fn posix_command_word_name_scope(
 
 /// Whether the shells around a child shell's source may hand a name to the
 /// child in its environment. [`CommandWordName::Unset`] needs proof that
-/// they cannot; anything this does not read keeps the name unknown, the
-/// reading it had without that rule.
+/// they cannot; anything this does not read keeps the name unknown.
+///
+/// The proof decides only whether the name's field break is read: an unset
+/// name keeps its bare spelling as well. So a way of exporting that this
+/// does not read (zsh's `setopt ALL_EXPORT`, `env 'X=git'`, a name already
+/// in the environment) loses only the split reading of a value that holds a
+/// blank, never the bare one the packs judge.
 ///
 /// The texts read are the parent shell's whole text and every command dcg is
 /// evaluating around it, since an enclosing shell may have exported the name
@@ -21086,8 +21092,9 @@ impl<'a> ChildEnvironmentProof<'a> {
 /// so prefixes (`builtin export X`), quoted spellings (`export "X"`), function
 /// bodies and trap or eval text are covered; or when a command outside a
 /// heredoc body runs text this cannot read: a name that is not plain text
-/// (`$E X`), `eval`, `source`, `.`, `trap`, `alias`, `enable`, or `set`
-/// with an option cluster holding `a` (`set -ea`) or an expansion.
+/// (`$E X`), `eval`, `source`, `.`, `trap`, `alias`, `enable`, zsh's
+/// `setopt`, `unsetopt` and `emulate`, or `set` with an option cluster
+/// holding `a` or `o` (`set -ea`, `set -o allexport`) or an expansion.
 fn posix_text_export_commands(text: &str) -> Option<Vec<String>> {
     let unquoted: String = text
         .chars()
@@ -21155,13 +21162,15 @@ fn posix_text_export_commands(text: &str) -> Option<Vec<String>> {
             return None;
         }
         match program.rsplit('/').next().unwrap_or(&program) {
-            "eval" | "source" | "." | "trap" | "alias" | "enable" => return None,
+            "eval" | "source" | "." | "trap" | "alias" | "enable" | "setopt" | "unsetopt"
+            | "emulate" => return None,
             "set" => {
+                // `-a`, or an option name (`-o`), may turn on allexport.
                 let arguments = body.get(range.end..).unwrap_or_default();
                 let allexport = arguments.split_ascii_whitespace().any(|argument| {
                     let argument = dequoted_command_word(argument);
                     argument.contains(['$', '`'])
-                        || (argument.starts_with(['-', '+']) && argument.contains('a'))
+                        || (argument.starts_with(['-', '+']) && argument.contains(['a', 'o']))
                 });
                 if allexport {
                     return None;
@@ -21169,7 +21178,13 @@ fn posix_text_export_commands(text: &str) -> Option<Vec<String>> {
             }
             _ => {}
         }
-        commands.push(segment.to_string());
+        // Assignment words with their quotes removed (`env 'X=git' sh`).
+        commands.push(
+            segment
+                .chars()
+                .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+                .collect(),
+        );
     }
     Some(commands)
 }
@@ -21185,7 +21200,8 @@ enum CommandWordName {
     /// and what that proof left as written keeps its spelling.
     Bound,
     /// Only the parent shell binds it, without exporting it: the child
-    /// shell that runs this source sees it unset.
+    /// shell that runs this source sees it unset. It is read bare and
+    /// unset, never as a field break.
     Unset,
     /// Nothing proves its value: it may hold anything, including nothing.
     Unknown,
@@ -21214,7 +21230,7 @@ enum CommandWordPart {
 enum CommandWordReading {
     /// Each unquoted unknown reference is a field break.
     Split,
-    /// Each unknown reference keeps a bare spelling: one field.
+    /// Each reference keeps a bare spelling: one field.
     Bare,
     /// Each reference expands as it does with its name unset.
     Unset,
@@ -21420,9 +21436,12 @@ fn posix_unknown_command_word_readings(
                     bare,
                     unset,
                 } => match reading {
-                    _ if !unknown => rendered.push_str(unset),
-                    CommandWordReading::Split if !quoted => rendered.push(' '),
                     CommandWordReading::Unset => rendered.push_str(unset),
+                    // The proof that the child sees the name unset only
+                    // drops its field break; the bare spelling stays, so a
+                    // proof miss loses no other reading.
+                    CommandWordReading::Split if !unknown => rendered.push_str(unset),
+                    CommandWordReading::Split if !quoted => rendered.push(' '),
                     _ => {
                         // Quote removal glues the next text on: `'gi'$V't'`
                         // is `gi${V}t`, not `gi$Vt`.
@@ -46837,11 +46856,22 @@ mod tests {
                 "X=' '; bash <<'EOF'\n",
                 &[r"gitreset--hard"][..],
             ),
-            (r#""$X" reset --hard"#, r"X=git; bash -c ", &[][..]),
+            // It keeps its bare spelling: proof of unset only drops the
+            // field break.
+            (
+                r#""$X" reset --hard"#,
+                r"X=git; bash -c ",
+                &[r"$X reset --hard"][..],
+            ),
             (
                 r#"gi"${V}"t reset --hard"#,
                 r"V=x; /bin/bash -c ",
-                &[r"git reset --hard"][..],
+                &[r"gi${V}t reset --hard", r"git reset --hard"][..],
+            ),
+            (
+                r"'gi'${V}'t' reset --hard",
+                r"V=x; bash -c ",
+                &[r"gi${V}t reset --hard", r"git reset --hard"][..],
             ),
             // One it may hand the child is unknown there.
             (

@@ -12,8 +12,11 @@
 //!   an eval body and for source a shell reads from a pipe.
 //! - A name the parent shell binds without exporting it is unset in the
 //!   child (`V=x; bash -c 'gi"${V}"t reset --hard'` runs `git`), so the
-//!   child reads it empty; one the command may export, however spelled, or
-//!   one a source the parent runs itself reads (`.`, `source`), is unknown.
+//!   child reads it empty as well as bare; one the command may export,
+//!   however spelled, or one a source the parent runs itself reads (`.`,
+//!   `source`), is unknown. The proof of unset only drops the field break,
+//!   so an export it misses (`setopt ALL_EXPORT`, `env 'X=git'`, a name
+//!   already in the environment) still leaves the bare reading.
 //! - ANSI-C and locale quotes (`$'gi'${V}$'t'`) and references that keep
 //!   part of the value (`${V#x}`, `${V/x/}`, `${V:0}`, `${V:=git}`) glue the same way, and the
 //!   command name may follow a subshell's `(`, a function declaration, a
@@ -242,7 +245,8 @@ fn a_child_shells_own_unknown_names_are_read_like_the_commands() {
 /// shell. That needs proof the child cannot see it: wherever and however the
 /// command may export it (a prefix, quotes, `set` flags, the consumer's own
 /// assignment, a shell around the parent), or when the parent runs the
-/// source itself (`.`, `source`), the name is unknown.
+/// source itself (`.`, `source`), the name is unknown. Either way it keeps
+/// its bare spelling, so exports the proof does not read deny too.
 #[test]
 fn a_name_the_parent_does_not_export_is_unset_in_the_child() {
     let misses = misses(
@@ -267,6 +271,18 @@ fn a_name_the_parent_does_not_export_is_unset_in_the_child() {
             "X=git; . /dev/stdin <<EOF\n\"\\$X\" reset --hard $PWD\nEOF",
             "X=git; source /dev/stdin <<EOF\n\"\\$X\" reset --hard $PWD\nEOF",
             r#"X=git; . <(echo '"$X" reset --hard')"#,
+            r#"V=x; bash -c "'gi'\${V}'t' reset --hard $PWD""#,
+            r#"setopt ALL_EXPORT; X=git; bash -c "\"\$X\" reset --hard $PWD""#,
+            r#"emulate zsh -o ALL_EXPORT; X=git; bash -c "\"\$X\" reset --hard $PWD""#,
+            r#"unsetopt NO_ALL_EXPORT; X=git; echo '"$X" reset --hard' | sh"#,
+            r#"X=1; env 'X=git' bash -c "\"\$X\" reset --hard $PWD""#,
+            r#"X=1; env X\=git bash -c "\"\$X\" reset --hard $PWD""#,
+            r#"X=1; echo '"$X" reset --hard' | env 'X=git' sh"#,
+            r#"HOME=git; bash -c "\"\$HOME\" reset --hard $PWD""#,
+            // Option and quoted-assignment exports also keep the split.
+            r"setopt ALL_EXPORT; X=' '; bash -c 'git${X}reset${X}--hard'",
+            r"set -o allexport; X=' '; bash -c 'git${X}reset${X}--hard'",
+            r"X=1; env 'X= ' bash -c 'git${X}reset${X}--hard'",
         ],
         &POSIX,
         EvaluationDecision::Deny,
@@ -319,6 +335,9 @@ fn command_names_after_body_syntax_read_unknown_names() {
 /// Harmless commands with the same shapes stay allowed, and a name the
 /// parent binds without exporting it is empty in the child (decided in
 /// `repro_variable_field_splitting::values_the_shell_does_not_use_there_are_not_read`).
+/// Such a name also keeps its bare spelling, so `X=git; bash -c '"$X" reset
+/// --hard'` (harmless: the child runs `""`) is denied, a conservative
+/// reading.
 #[test]
 fn harmless_unknown_command_names_stay_allowed() {
     let mut found = misses(
@@ -333,10 +352,8 @@ fn harmless_unknown_command_names_stay_allowed() {
             "bash <<'EOF'\n\"$EDITOR\" notes.txt\nEOF",
             "X=' '; bash <<'EOF'\ngit${X}reset${X}--hard\nEOF",
             r#"X=git bash -c '"$X" status'"#,
-            r#"X=git; bash -c '"$X" reset --hard'"#,
-            r#"X=git; bash -c "\"\$X\" reset --hard $PWD""#,
-            r#"X=git; echo '"$X" reset --hard' | sh"#,
-            r#"set -e; X=git; bash -c '"$X" reset --hard'"#,
+            r#"X=git; bash -c '"$X" status'"#,
+            r#"X=git; echo '"$X" status' | sh"#,
             r"X=' '; echo 'git${X}reset${X}--hard' | bash",
             r"'gi'${V#x}'t' status",
             r#"( "$X" status )"#,
