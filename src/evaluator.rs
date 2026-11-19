@@ -42568,15 +42568,25 @@ fn reconstructed_interpreter_commands_verdict(
             continue;
         }
         let spelled = crate::heredoc::posix_source_with_marked_values(&reconstructed.command);
-        let unknown_name_view = match posix_proven_variable_view(&spelled, context.deadline, true) {
-            Ok(view) => view,
+        // The string's parent is the interpreter, not shell text, so no name
+        // is a parent's: one the string does not bind itself is unknown.
+        let unknown_name_views = match posix_proven_variable_view(
+            &spelled,
+            context.deadline,
+            Some(UnknownNameScope::default()),
+        ) {
+            Ok(views) => views,
             Err(ProvenViewIncomplete::Budget) => {
                 return Some(EvaluationResult::indeterminate_due_to_budget());
             }
         };
         readings.push((reconstructed.command.replace(mark, ""), start, end));
         readings.push((spelled, start, end));
-        readings.extend(unknown_name_view.map(|view| (view, start, end)));
+        readings.extend(
+            unknown_name_views
+                .into_iter()
+                .map(|view| (view, start, end)),
+        );
     }
     for (reconstructed, start, end) in readings {
         if deadline_exceeded(context.deadline) {
