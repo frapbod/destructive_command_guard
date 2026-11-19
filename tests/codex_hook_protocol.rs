@@ -1087,6 +1087,74 @@ fn bash_parameter_openers_hide_no_later_git_command() {
     }
 }
 
+/// An assignment prefix whose word holds a blank (`x=${y:- a}`, `x="a b"`)
+/// hides no rebinding after it. Bash, sh and dash run `printf -v d`, `read d`,
+/// `readarray d` or `. ./f` in the parent shell and change `d`, so the later
+/// `rm -rf "$d"` removes the new value, here `$HOME`. dcg's binding proof
+/// used to split the prefix at its blank, take the second half for the
+/// command word, miss the rebinding and allow the delete of the old value.
+#[test]
+// Shell text: clippy takes `${y:- a}` for a format argument.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn blank_holding_prefix_words_hide_no_rebinding() {
+    let payload = |command: &str, codex: bool| {
+        let mut payload = serde_json::json!({
+            "session_id": "sess-prefix-rebinding",
+            "cwd": "/tmp/test-workdir",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_use_id": "call_prefix_rebinding",
+        });
+        if codex {
+            payload["turn_id"] = serde_json::json!("turn-prefix-rebinding");
+        }
+        payload.to_string().into_bytes()
+    };
+    let d = "d=/tmp/dcgx; ";
+    for rest in [
+        "x=${y:- a} printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x=${y:- } printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x=${y:- a} printf -v d %s ~; rm -rf \"$d\"",
+        "x=${y:- a} printf -v d %s \"$HOME\" && rm -rf \"$d\"",
+        "z=1 x=${y:- a} printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x=\"a b\" printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x='a b' printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x=a\\ b printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x=$(echo a b) printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x=$((1 + 2)) printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x=\"${y:- a}\" printf -v d %s \"$HOME\"; rm -rf \"$d\"",
+        "x=${y:- a} read d <<< \"$HOME\"; rm -rf \"$d\"",
+        "x=\"a b\" read d <<< \"$HOME\"; rm -rf \"$d\"",
+        "x=${y:- a} read -r d <<< \"$HOME\"; rm -rf \"$d\"",
+        "x=${y:- a} readarray -t d <<< \"$HOME\"; rm -rf \"$d\"",
+        "x=${y:- a} . ./f; rm -rf \"$d\"",
+    ] {
+        let command = format!("{d}{rest}");
+        let codex = run_hook_raw(&payload(&command, true), &[]);
+        assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(&command, false), &[]);
+        assert!(!claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+    let command = "d=/tmp/dcgx\nx=${y:- a} printf -v d %s \"$HOME\"\nrm -rf \"$d\"";
+    let codex = run_hook_raw(&payload(command, true), &[]);
+    assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
+    let claude = run_hook_raw(&payload(command, false), &[]);
+    assert!(!claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    for command in [
+        "d=/tmp/dcgx; rm -rf \"$d\"",
+        "d=/tmp/dcgx; x=${y:- a} echo hi; rm -rf \"$d\"",
+        "d=/tmp/dcgx; x=\"a b\" echo hi; rm -rf \"$d\"",
+        "d=/tmp/dcgx; 2>&1 echo hi; rm -rf \"$d\"",
+        "x=${y:- a} git status",
+    ] {
+        let codex = run_hook_raw(&payload(command, true), &[]);
+        assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
+        let claude = run_hook_raw(&payload(command, false), &[]);
+        assert!(claude.is_allow_shape(), "claude {command:?}\n{claude}");
+    }
+}
+
 #[test]
 fn vscode_copilot_terminal_tool_variants_block_destructive_commands() {
     for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {
