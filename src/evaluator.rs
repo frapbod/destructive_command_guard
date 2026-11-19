@@ -5582,9 +5582,9 @@ fn parse_cmd_launcher(
 /// Whether `text` holds `/C`, `/K` or `/R` (any case), the switches after
 /// which cmd runs the rest of its command line.
 fn cmd_text_has_run_switch(text: &str) -> bool {
-    text.as_bytes().windows(2).any(|pair| {
-        pair[0] == b'/' && matches!(pair[1].to_ascii_lowercase(), b'c' | b'k' | b'r')
-    })
+    text.as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'/' && matches!(pair[1].to_ascii_lowercase(), b'c' | b'k' | b'r'))
 }
 
 /// The command texts cmd.exe may run for `command`, the text after its `/C`
@@ -69061,14 +69061,21 @@ mod cmd_switch_quote_tests {
     #[test]
     fn a_leading_quote_and_the_last_quote_are_also_read_removed() {
         for (payload, readings) in [
-            (r#""git reset --hard""#, &[r#""git reset --hard""#, "git reset --hard"][..]),
+            (
+                r#""git reset --hard""#,
+                &[r#""git reset --hard""#, "git reset --hard"][..],
+            ),
             (r#"  "a b" c"#, &[r#""a b" c"#, "a b c"]),
             (r#""a" "b & c""#, &[r#""a" "b & c""#, r#"a" "b & c"#]),
             (r#""a b"#, &[r#""a b"#, "a b"]),
             (r#"echo "a b""#, &[r#"echo "a b""#]),
             ("ver", &["ver"]),
         ] {
-            assert_eq!(cmd_switch_command_readings(payload), readings, "{payload:?}");
+            assert_eq!(
+                cmd_switch_command_readings(payload),
+                readings,
+                "{payload:?}"
+            );
         }
     }
 

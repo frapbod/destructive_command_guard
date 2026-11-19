@@ -286,7 +286,10 @@ fn a_word_that_is_not_a_switch_before_slash_c_fails_closed() {
         EvaluationDecision::Deny,
     );
     let cmd = cmd_misses(
-        &[r"cmd foo /c git reset --hard", r"cmd .y /c git reset --hard"],
+        &[
+            r"cmd foo /c git reset --hard",
+            r"cmd .y /c git reset --hard",
+        ],
         EvaluationDecision::Deny,
     );
     assert_no_misses(&[powershell, posix, cmd]);
