@@ -670,8 +670,19 @@ pub(crate) fn find_posix_substitution_close(
     let mut depth = usize::from(delimiter == b')');
     let mut in_single = false;
     let mut in_double = false;
+    // A `$(…)` body is command text: a comment or a `case` pattern in it
+    // closes nothing (`x="$(echo a #)" '` LF `)" git reset --hard`).
+    let mut text = crate::normalize::CommandText::new(bytes, start);
 
     while index < bytes.len() {
+        if delimiter == b')'
+            && !in_single
+            && !in_double
+            && let crate::normalize::CommandTextStep::Continue(next) = text.step(bytes, index)
+        {
+            index = next;
+            continue;
+        }
         match bytes[index] {
             b'\\' if !in_single => index = index.saturating_add(2),
             b'\'' if !in_double => {
@@ -887,8 +898,10 @@ impl SymbolicPosixWord {
     /// substitution (`x=$(pwd)`, `x=$((1 + 2))`): that is still an
     /// assignment, not the command name. The name must be literal.
     fn is_assignment(&self) -> bool {
+        // The name ends at `[`, `+=` or `=`; a subscript may hold a
+        // substitution (`x[$(pwd)]=a`), as a value may.
         crate::normalize::is_env_assignment(&self.text)
-            && self.text.split_once('=').is_some_and(|(name, _)| {
+            && self.text.split(['[', '+', '=']).next().is_some_and(|name| {
                 !name.contains(POSIX_DYNAMIC_QUOTED) && !name.contains(POSIX_DYNAMIC_UNQUOTED)
             })
     }
@@ -1069,32 +1082,6 @@ fn sole_posix_branch_name_query(command: &str) -> bool {
                 && branch == "branch"
                 && show_current == "--show-current"
     )
-}
-
-fn decoded_words_execute_git(words: &[String]) -> bool {
-    for word in words {
-        if crate::normalize::is_env_assignment(word)
-            || matches!(word.as_str(), "exec" | "time" | "nohup" | "!")
-        {
-            continue;
-        }
-        let Some(mut executable) = word.rsplit(['/', '\\']).next() else {
-            return false;
-        };
-        if executable
-            .get(executable.len().saturating_sub(4)..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
-        {
-            executable = executable
-                .get(..executable.len().saturating_sub(4))
-                .unwrap_or(executable);
-        }
-        return executable.eq_ignore_ascii_case("git")
-            || CORE_GIT_DASHED_BUILTINS
-                .iter()
-                .any(|(bare, _, _)| executable.eq_ignore_ascii_case(bare));
-    }
-    false
 }
 
 fn next_posix_prefix_token(
@@ -1679,7 +1666,7 @@ fn semantic_git_executable_index(
     None
 }
 
-fn symbolic_posix_may_execute_git(command: &str) -> bool {
+fn symbolic_posix_may_execute_git(command: &str, depth: usize) -> bool {
     // `strip_wrapper_prefixes` keeps an assignment whose value holds a
     // substitution (`x=$(pwd) env git …`), as the substitution runs; here it
     // only assigns, so peel it too and strip the wrappers behind it.
@@ -1693,6 +1680,21 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
         current = std::borrow::Cow::Owned(stripped.normalized.into_owned());
     }
     let command = current.as_ref();
+    // The literal reading looks through `xargs`, `watch`, `parallel` and
+    // `find -exec`; this reading must too, or a substitution anywhere in the
+    // command (`x=$(pwd) xargs git reset --hard`,
+    // `find . -exec git reset --hard $(pwd) \;`) hides the Git they run.
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let payloads = exec_wrapper_payloads(command, &tokens);
+    if !payloads.is_empty() && depth >= MAX_EXEC_WRAPPER_DEPTH {
+        return true;
+    }
+    if payloads
+        .iter()
+        .any(|payload| command_executes_git_in_dialect_at(payload, ShellDialect::Posix, depth + 1))
+    {
+        return true;
+    }
     let Ok(view) = posix_substitution_view(command) else {
         return true;
     };
@@ -4962,7 +4964,7 @@ fn command_executes_git_in_dialect_at(command: &str, dialect: ShellDialect, dept
                 resolved.as_str()
             }
             Ok(None) => command,
-            Err(()) => return symbolic_posix_may_execute_git(command),
+            Err(()) => return symbolic_posix_may_execute_git(command, depth),
         }
     } else {
         command
@@ -5044,10 +5046,13 @@ fn exec_wrapper_payloads<'a>(
     command: &'a str,
     tokens: &[crate::normalize::NormalizeToken],
 ) -> Vec<&'a str> {
+    // Assignments before the wrapper only assign: `x=$(echo a) watch git …`
+    // runs `watch git …`.
     let words: Vec<(&str, usize)> = tokens
         .iter()
         .filter(|token| token.kind == NormalizeTokenKind::Word)
         .filter_map(|token| Some((token.text(command)?, token.byte_range.start)))
+        .skip_while(|(word, _)| crate::normalize::is_env_assignment(word))
         .collect();
     let Some(&(first, _)) = words.first() else {
         return Vec::new();
@@ -5473,10 +5478,12 @@ fn syntax_views_with_split_words(
     if words.is_empty() {
         return None;
     }
-    if resolved_substitutions.is_some() && !decoded_words_execute_git(&words) {
+    if resolved_substitutions.is_some() && !command_executes_git_in_dialect(command, dialect) {
         // Command-substitution output is argv data; it is not parsed again as
         // shell source. Do not let an `echo "$(printf 'git reset --hard')"`
         // data argument become a synthetic Git invocation in the regex view.
+        // The executable reading looks through wrappers that run their argv
+        // (`x=$(echo a) watch git reset --hard`), as on the unresolved path.
         return Some(vec!["__dcg_non_git_command__".to_string()]);
     }
 

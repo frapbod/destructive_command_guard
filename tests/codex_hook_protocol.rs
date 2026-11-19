@@ -1258,6 +1258,76 @@ EOF
         "f=$(echo a#b) git reset --hard",
         "echo $( (echo a) # )
 ) ; git reset --hard",
+        // Bash 3.2 ends the body at the pattern's `)` and runs the rest.
+        "echo $(case a in a) echo hi; git reset --hard",
+        "x=$(case a in a) git reset --hard",
+        // A substitution sends the command to the symbolic reading, which
+        // looks through `xargs`, `watch`, `parallel` and `find -exec` too.
+        "x=$(pwd) xargs git reset --hard",
+        "x=$(echo a b) xargs git reset --hard",
+        "x=`echo a b` xargs git reset --hard",
+        "x=$((1 + 2)) xargs git reset --hard",
+        "x=$(pwd) env xargs git reset --hard",
+        "x=$(pwd) xargs -0 git reset --hard",
+        "x=$(pwd) xargs sudo git reset --hard",
+        "x=$(pwd) xargs git push --force origin main",
+        "x=$(pwd) watch git reset --hard",
+        "x=$(pwd) parallel git reset --hard ::: a",
+        r"x=$(pwd) find . -exec git reset --hard \;",
+        "xargs git reset --hard $(pwd)",
+        r"find . -exec git reset --hard $(pwd) \;",
+        // A subscript ends at its `]`, not at an `=` inside it.
+        "x[i=1]=a git reset --hard",
+        r#"x["a=b"]=a git reset --hard"#,
+        "x[i+=1]=a git reset --hard",
+        "x[i==1]=a git reset --hard",
+        "x[a[1]=2]=a git reset --hard",
+        r#"d=/tmp/dcgx; x[i=1]=a printf -v d %s "$HOME"; rm -rf "$d""#,
+        r#"d=/tmp/dcgx; x["a=b"]=a printf -v d %s "$HOME"; rm -rf "$d""#,
+        // A backslash-newline before `#` in a substitution body: the shell
+        // drops it first, so the `#` starts a comment.
+        "echo $(echo a \\\n#) '\n) ; git reset --hard #'",
+        "x=$(echo a \\\n#) '\n) git reset --hard #'",
+        "x=$(echo a;\\\n#) '\n) git reset --hard #'",
+        "cat <(echo a \\\n#) '\n) ; git reset --hard #'",
+        "echo $(echo a \\\n\\\n#) '\n) ; git reset --hard #'",
+        // The output mask reads an echo or printf argument's `$(…)` body as
+        // command text too.
+        "echo $(echo a #) '\n) ; git reset --hard #'",
+        "printf %s $(echo a \\\n#) '\n) ; git reset --hard #'",
+        "echo $(echo a \\\n#) '\n)\ngit reset --hard #'",
+        "echo <(echo a #) '\n) ; git reset --hard #'",
+        // A modeled substitution in an assignment before a wrapper.
+        "x=$(echo a) watch git reset --hard",
+        "x=$(echo a b) xargs git reset --hard",
+        "x=`echo a b` xargs git reset --hard",
+        "x=$(echo a b) find . -exec git reset --hard \\;",
+        // Any subscript before `=`: bash reads an array assignment, even an
+        // empty or bad one, and runs the command. Quotes, `${…}`, `$(…)`
+        // and backticks can hide a `]`, and readers see quote-removed words.
+        "x[']']=a git reset --hard",
+        r#"x["]"]=a git reset --hard"#,
+        r"x[\]]=a git reset --hard",
+        r"x[$'\x5d']=a git reset --hard",
+        "x['[']=a git reset --hard",
+        r#"x["["]=a git reset --hard"#,
+        r"x[\[]=a git reset --hard",
+        "x[']]']=a git reset --hard",
+        "x[${y:-]}]=a git reset --hard",
+        "x[']']=a git push --force origin main",
+        "x[${y:-]}]=a xargs git reset --hard",
+        "x[$(echo ])]=a xargs git reset --hard",
+        "x[`echo ]`]=a xargs git reset --hard",
+        "x['']=a git reset --hard",
+        r#"x[""]=a git reset --hard"#,
+        "x[]=a git reset --hard",
+        "x['']=a git push --force origin main",
+        // A `$(…)` body inside double quotes, or inside `${…}`, is command
+        // text too: its `#` starts a comment.
+        "echo \"$(echo a #)\" '\n)\" ; git reset --hard #'",
+        "x=\"$(echo a #)\" '\n)\" git reset --hard #'",
+        "echo \"${y:-$(echo a #)}\" '\n)}\" ; git reset --hard #'",
+        "echo ${y:-$(echo a #)} '\n)} ; git reset --hard #'",
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1275,6 +1345,23 @@ EOF
         r"2>&1 printf '%s\n' hi",
         "x=$[1 + 2] git status",
         "x[1 + 1]=a git status",
+        "x=$(echo a b) xargs echo",
+        "x=$(echo a b) watch git status",
+        "x=$(echo a b) find . -name '*.rs'",
+        "find . -name '*.rs' | xargs grep -l foo",
+        "x[i=1]=a git status",
+        "x[']']=a git status",
+        r#"x["]"]=a git status"#,
+        "x[$(echo 1)]=a git status",
+        "x[i=1]=a echo hi",
+        r#"x["a=b"]=a git status"#,
+        r#"echo "$(date)"; git status"#,
+        r#"echo "$(echo a) git reset --hard""#,
+        r#"echo "$(echo a # c
+)" done"#,
+        "x=$(echo a \\\nb) git status",
+        "echo $(echo a # c\n) done",
+        "printf '%s\\n' $(ls) ; git status",
         "echo $[1 + 2]",
         "echo x[1 + 1]=a",
         "x=$(pwd) env git status",
