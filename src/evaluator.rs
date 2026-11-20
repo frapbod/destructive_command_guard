@@ -7082,7 +7082,18 @@ fn evaluate_windows_launcher_envelopes(
             }
         }
     }
-    if all_segments_are_envelopes {
+    // A heredoc or here-string the outer shell feeds a launcher is its stdin,
+    // not part of its payload (`cmd /c cmd <<< "rd /s /q C:\x"`): the stdin
+    // collector judges it below.
+    let outer_stdin_reaches_launcher =
+        matches!(outer_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            && command.contains("<<")
+            && {
+                let mut stdin_sinks = Vec::new();
+                collect_stdin_redirect_consumer_sinks(command, &mut stdin_sinks);
+                !stdin_sinks.is_empty()
+            };
+    if all_segments_are_envelopes && !outer_stdin_reaches_launcher {
         // Every executable segment has already been decoded in its actual
         // inner dialect and recursively evaluated. Continuing into the outer
         // heredoc/regex passes would parse the launcher's argv as outer-shell
@@ -10458,10 +10469,31 @@ fn cmd_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
     for (index, argument) in args.iter().enumerate() {
         let argument = argument.to_ascii_lowercase();
         if matches!(argument.as_str(), "/c" | "/k") {
-            return if args.get(index + 1).is_some() {
-                PipelineShellInputMode::DoesNotReadStdin
-            } else {
-                PipelineShellInputMode::Unverified
+            let Some(payload) = args.get(index + 1..).filter(|payload| !payload.is_empty()) else {
+                return PipelineShellInputMode::Unverified;
+            };
+            // `/k` keeps cmd.exe reading commands from stdin after its payload.
+            if argument == "/k" {
+                return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Cmd);
+            }
+            // The payload runs with this stdin: a bare `cmd` there reads it
+            // (`cmd /c cmd`, `cmd /c "cmd /q"`).
+            let words: Vec<String> = payload
+                .iter()
+                .flat_map(|word| word.split_ascii_whitespace())
+                .map(str::to_string)
+                .collect();
+            return match words.split_first() {
+                Some((program, rest))
+                    if program
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .map(str::to_ascii_lowercase)
+                        .is_some_and(|name| name == "cmd" || name == "cmd.exe") =>
+                {
+                    cmd_pipeline_input_mode(rest)
+                }
+                _ => PipelineShellInputMode::DoesNotReadStdin,
             };
         }
         if !cmd_switch_is_non_executing(&argument) {
@@ -10617,6 +10649,27 @@ fn ssh_pipeline_input_mode(args: &[String], depth: usize) -> PipelineShellInputM
     remote_shell_payload_input_mode(&args[index..].join(" "), depth)
 }
 
+/// Whether a command (from [`command_tokens`]) is `. /dev/stdin` or `source
+/// /dev/stdin`, also behind `builtin`: it runs its stdin as shell source in
+/// its own shell, locally as well as in a remote one.
+fn sources_stdin(executable: &str, args: &[String]) -> bool {
+    let (executable, args) = match (executable, args) {
+        ("builtin", [name, rest @ ..]) => (name.as_str(), rest),
+        _ => (executable, args),
+    };
+    let args = match args {
+        [end, rest @ ..] if end == "--" => rest,
+        _ => args,
+    };
+    matches!(executable, "." | "source")
+        && args.first().is_some_and(|argument| {
+            matches!(
+                argument.as_str(),
+                "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
+            )
+        })
+}
+
 /// Classify whether a POSIX shell invocation consumes its standard input as
 /// shell source. A bare `sh`/`bash`/etc. does; `-c CODE` and a positional
 /// script path do not. `-s` explicitly restores stdin-source mode even when
@@ -10651,16 +10704,27 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
             return PipelineShellInputMode::Unverified;
         }
     }
-    if depth > 0
-        && matches!(executable.as_str(), "." | "source")
-        && args.first().is_some_and(|argument| {
-            matches!(
-                argument.as_str(),
-                "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
-            )
-        })
-    {
+    if sources_stdin(&executable, &args) {
         return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
+    }
+    // A program word the shell expands (`env $A sh`, `$W bash`) may become
+    // options, assignments or wrapper words before a later word that names
+    // the consumer: `A=X=git; … | env $A sh` runs sh on the pipe. Read the
+    // consumer from each later literal word. Every start is tried here, so a
+    // start whose own program word is expanded (`env $B sh`) is skipped
+    // rather than searched again.
+    if executable.contains(['$', '`']) {
+        for start in 0..args.len() {
+            let rest = posix_command_from_argv(&args[start..]);
+            if command_tokens(&rest).is_none_or(|(program, _)| program.contains(['$', '`'])) {
+                continue;
+            }
+            match pipeline_shell_input_mode_at_depth(&rest, depth) {
+                PipelineShellInputMode::NotShell | PipelineShellInputMode::DoesNotReadStdin => {}
+                mode => return mode,
+            }
+        }
+        return PipelineShellInputMode::NotShell;
     }
     if executable == "xargs" {
         if depth > 0 {
@@ -15390,6 +15454,7 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         let process_view = crate::heredoc::mask_inert_interpreter_stdin(command);
         collect_posix_process_substitution_sinks(process_view.as_ref(), &mut sinks);
         collect_data_heredoc_output_sinks(command, &interpreter_heredocs, &mut sinks);
+        collect_stdin_redirect_consumer_sinks(command, &mut sinks);
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
@@ -15440,6 +15505,136 @@ fn collect_data_heredoc_output_sinks(
             return;
         }
     }
+}
+
+/// A heredoc or here-string is its command's stdin, as a pipe is: read it as
+/// the pipe consumer it feeds would read it ([`pipeline_shell_input_mode`]).
+/// The heredoc reader names its receiver by language, which has no entry for
+/// a shell that sources stdin itself (`. /dev/stdin <<'EOF'`, `source
+/// /dev/stdin <<< …`), cmd.exe (`cmd.exe <<< "rd /s /q C:\x"`, `cmd /c cmd
+/// <<EOF`), or a program word the shell expands (`env $A sh <<'EOF'`); each
+/// fell to a Bash reading of the body, or to none. Those consumers are judged
+/// here; a receiver that reader names (`bash`, `python3`, `ssh`) keeps it.
+/// Like a pipeline producer, a body or operand with a value the parent shell
+/// substitutes is unknown source, and fails closed.
+fn collect_stdin_redirect_consumer_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    if !command.contains("<<") {
+        return;
+    }
+    let contents = match extract_content(
+        command,
+        &crate::heredoc::ExtractionLimits::structural_scan(),
+    ) {
+        ExtractionResult::Extracted(contents) => contents,
+        ExtractionResult::Partial { extracted, .. } => extracted,
+        ExtractionResult::NoContent
+        | ExtractionResult::Skipped(_)
+        | ExtractionResult::Failed(_) => return,
+    };
+    let owners = stdin_redirect_owners(command);
+    for content in contents {
+        let Some(heredoc_type) = content.heredoc_type else {
+            continue;
+        };
+        let operator = content.byte_range.start;
+        let Some((owner, span)) = owners
+            .iter()
+            .find(|(at, _, _)| *at == operator)
+            .map(|(_, owner, span)| (owner.as_str(), *span))
+        else {
+            continue;
+        };
+        let PipelineShellInputMode::ReadsStdin(kind) = pipeline_shell_input_mode(owner) else {
+            continue;
+        };
+        let judged_here = match kind {
+            PipelineSourceKind::Cmd => true,
+            PipelineSourceKind::PosixShell => {
+                command_tokens(owner).is_some_and(|(executable, args)| {
+                    executable.contains(['$', '`']) || sources_stdin(&executable, &args)
+                })
+            }
+            _ => false,
+        };
+        if !judged_here {
+            continue;
+        }
+        let source = if heredoc_type == crate::heredoc::HeredocType::HereString {
+            let operand = command
+                .get(content.byte_range.clone())
+                .and_then(|text| text.strip_prefix("<<<"))
+                .map(str::trim_start);
+            match operand {
+                Some(operand) if !operand.is_empty() => {
+                    static_producer_source(&format!("printf '%s\\n' {operand}"))
+                }
+                _ => IndirectInputSource::Unverified(
+                    "here-string operand could not be read".to_string(),
+                ),
+            }
+        } else if !content.quoted
+            && (contains_dynamic_shell_output(&content.content)
+                || crate::heredoc::heredoc_body_expands(&content.content))
+        {
+            IndirectInputSource::Unverified(
+                "unquoted heredoc input contains shell expansion or globbing".to_string(),
+            )
+        } else {
+            IndirectInputSource::StaticProducer(content.content.clone())
+        };
+        push_executable_input_source_at(
+            source,
+            kind,
+            Some(span),
+            script_segment_is_nonlocal(owner),
+            sinks,
+        );
+        if sinks.len() > MAX_EXECUTABLE_TEXT_SINKS {
+            return;
+        }
+    }
+}
+
+/// Each heredoc or here-string operator's offset with the command it feeds
+/// (its words without the redirects) and that statement's span.
+fn stdin_redirect_owners(command: &str) -> Vec<(usize, String, MatchSpan)> {
+    let mut owners = Vec::new();
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+        || crate::heredoc::longest_pipeline_stages(command)
+            > crate::heredoc::MAX_PARSED_PIPELINE_STAGES
+    {
+        return owners;
+    }
+    let ast = crate::heredoc::parse_shell_ast(command);
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() == "redirected_statement"
+            && let Some(owner) = node
+                .children()
+                .find(|child| child.kind().as_ref() == "command")
+        {
+            let range = node.range();
+            for redirect in node.children().filter(|child| {
+                matches!(
+                    child.kind().as_ref(),
+                    "heredoc_redirect" | "herestring_redirect"
+                )
+            }) {
+                if let Some(offset) = redirect.text().find("<<") {
+                    owners.push((
+                        redirect.range().start + offset,
+                        owner.text().to_string(),
+                        MatchSpan {
+                            start: range.start,
+                            end: range.end,
+                        },
+                    ));
+                }
+            }
+        }
+        pending.extend(node.children());
+    }
+    owners
 }
 
 #[allow(clippy::too_many_arguments)]
