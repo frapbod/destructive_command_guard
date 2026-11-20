@@ -5446,7 +5446,12 @@ impl PowerShellParseState {
                 if self.mode == PowerShellParseMode::StatementStart {
                     self.leading = false;
                 }
-                self.open_group(PowerShellParseMode::StatementStart, statements, false, false);
+                self.open_group(
+                    PowerShellParseMode::StatementStart,
+                    statements,
+                    false,
+                    false,
+                );
             }
             (b')', 1) => self.close_group(),
             // The call operator: a command name in argument mode follows
@@ -5492,7 +5497,9 @@ impl PowerShellParseState {
         let word = bytes[start..end].to_ascii_lowercase();
         if let [b':', name @ ..] = word.as_slice()
             && !name.is_empty()
-            && name.iter().all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && name
+                .iter()
+                .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_')
         {
             self.start(true);
             self.label = true;
@@ -5502,35 +5509,35 @@ impl PowerShellParseState {
         // new statement; later it is a command name.
         self.header = (word == b"param" && self.command_leading)
             || matches!(
-            word.as_slice(),
-            b"if"
-                | b"elseif"
-                | b"else"
-                | b"while"
-                | b"for"
-                | b"foreach"
-                | b"switch"
-                | b"do"
-                | b"until"
-                | b"try"
-                | b"catch"
-                | b"finally"
-                | b"trap"
-                | b"function"
-                | b"filter"
-                | b"workflow"
-                | b"configuration"
-                | b"class"
-                | b"enum"
-                | b"data"
-                | b"begin"
-                | b"process"
-                | b"end"
-                | b"clean"
-                | b"dynamicparam"
-                | b"parallel"
-                | b"sequence"
-        );
+                word.as_slice(),
+                b"if"
+                    | b"elseif"
+                    | b"else"
+                    | b"while"
+                    | b"for"
+                    | b"foreach"
+                    | b"switch"
+                    | b"do"
+                    | b"until"
+                    | b"try"
+                    | b"catch"
+                    | b"finally"
+                    | b"trap"
+                    | b"function"
+                    | b"filter"
+                    | b"workflow"
+                    | b"configuration"
+                    | b"class"
+                    | b"enum"
+                    | b"data"
+                    | b"begin"
+                    | b"process"
+                    | b"end"
+                    | b"clean"
+                    | b"dynamicparam"
+                    | b"parallel"
+                    | b"sequence"
+            );
         self.members = matches!(word.as_slice(), b"class" | b"enum");
         match word.as_slice() {
             b"return" | b"throw" | b"exit" => self.start(false),
@@ -11139,9 +11146,42 @@ mod tests {
                 "foreach ($i in 1) { } ${c}<#'#>; z",
                 "foreach ($i in 1) { } ${c}     ; z",
             ),
+            // A loop label, `until`, a leading `param(...)`, a hashtable key
+            // and a type member.
+            (":a while (0) { } $c#'\nz", ":a while (0) { } $c  \nz"),
+            ("do { } until (1) $c#'\nz", "do { } until (1) $c  \nz"),
+            ("param($a) $c#'\nz", "param($a) $c  \nz"),
+            ("& { param($a) $c#'\n}", "& { param($a) $c  \n}"),
+            (
+                "[CmdletBinding()]\nparam($a) $c#'\nz",
+                "[CmdletBinding()]\nparam($a) $c  \nz",
+            ),
+            ("@{a=1;b=$c#'\n}", "@{a=1;b=$c  \n}"),
+            ("@{a=1\nb=2#'\n}", "@{a=1\nb=2  \n}"),
+            ("@{a=1;b#x=2}", "@{a=1;b     "),
+            ("enum a { b#'\n}", "enum a { b  \n}"),
+            ("class a { hidden $p#'\n}", "class a { hidden $p  \n}"),
         ] {
             assert_eq!(masked(command), expected, "{command:?}");
         }
+        // Still command words: after a label, a later `param`, a hashtable
+        // value and a method body.
+        for command in [
+            ":a $c#x",
+            "echo 1; param($a) $c#x",
+            "@{a=1;b=echo x#y}",
+            "class a { m() { echo a#x } }",
+        ] {
+            assert_eq!(mask_powershell_comments(command), None, "{command:?}");
+        }
+        // The second view keeps the older reading of `${c}#` as a comment.
+        let braced = mask_powershell_comments_after_braced_variables;
+        assert_eq!(
+            braced("echo ${c}#x; z").as_deref(),
+            Some("echo ${c}     ")
+        );
+        assert_eq!(braced("echo $c#x; z"), None);
+        assert_eq!(braced("${c}#x"), None);
         // Argument mode and command names: the word keeps the `#`.
         for command in [
             "echo a#x",

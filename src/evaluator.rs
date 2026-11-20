@@ -17994,7 +17994,9 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                 .collect::<Vec<_>>()
         };
         let mut views = with_assignments(crate::normalize::mask_powershell_comments(command));
-        if let Some(view) = crate::normalize::mask_powershell_comments_after_braced_variables(command) {
+        if let Some(view) =
+            crate::normalize::mask_powershell_comments_after_braced_variables(command)
+        {
             views.extend(with_assignments(Some(view)));
         }
         let mut unseparated_reading = None;
