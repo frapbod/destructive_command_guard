@@ -1840,7 +1840,9 @@ fn consume_word_token_inner(
 
 /// The end of the `$(…)`, `<(…)` or `>(…)` (or `$((…))`) whose body starts
 /// at `i`: the byte after the `)` that closes it, or `len`. The body is read
-/// as command text (see [`CommandText`]).
+/// as command text (see [`CommandText`]); quoted strings (ANSI-C ones with
+/// their escapes), backquotes, `${…}` and nested `$(…)` are passed over
+/// whole.
 pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usize) -> usize {
     let mut command_text = CommandText::new(bytes, i);
     let mut depth = 1usize;
@@ -1867,6 +1869,23 @@ pub(crate) fn consume_shell_paren_construct(bytes: &[u8], mut i: usize, len: usi
             }
             b'\\' => {
                 i = (i + 2).min(len);
+            }
+            // An ANSI-C string ends at its first unescaped `'`, and a
+            // backquote substitution at the next unescaped backquote: the
+            // `)` in `$'\')'` or `` `echo )` `` closes nothing.
+            b'$' if crate::context::ansi_c_quote_starts_at(bytes, i) => {
+                i = crate::context::skip_ansi_c_quoted(&bytes[..len], i + 2);
+            }
+            b'`' => {
+                i += 1;
+                while i < len && bytes[i] != b'`' {
+                    i = if bytes[i] == b'\\' {
+                        (i + 2).min(len)
+                    } else {
+                        i + 1
+                    };
+                }
+                i = (i + 1).min(len);
             }
             b'\'' => {
                 i += 1;
@@ -2460,11 +2479,44 @@ pub(crate) fn posix_dollar_expands(next: Option<char>) -> bool {
 /// anything else is literal. A quote opened and never closed returns `None`;
 /// an expansion that never closes runs to the end of the word.
 pub(crate) fn posix_word_value_ranges(raw: &str) -> Option<Vec<Range<usize>>> {
+    posix_word_scan(raw).map(|scan| scan.values)
+}
+
+/// Where the shell's own redirection starts in one raw POSIX word: the
+/// offset of the first `<` or `>` outside quotes, escapes, values and
+/// parentheses (`ver>$null` at 3, `2>$null` at 1). The shell consumes the
+/// text from there (an operator and its target), so the program never
+/// receives it as an argument. A `<(…)` / `>(…)` process substitution is
+/// not a redirection: bash puts a path in its place and hands the program
+/// that path plus the rest of the word (`echo x<(true)$X` gives
+/// `x/dev/fd/63` and the value of `X`). A `<` or `>` inside it, up to the
+/// `)` the shell matches ([`consume_shell_paren_construct`]: a `case`
+/// pattern's `)` and a `)` in an ANSI-C string or backquotes do not end
+/// it), or inside any other parentheses in the word, is not one either.
+/// `None` when the word has none, a parenthesis never closes, its quoting
+/// is unterminated, or a quote or value this scan reads runs past the end
+/// found for a substitution (the two readings disagree, so neither is
+/// trusted).
+pub(crate) fn posix_word_redirection_start(raw: &str) -> Option<usize> {
+    posix_word_scan(raw)?.redirection
+}
+
+struct PosixWordScan {
+    values: Vec<Range<usize>>,
+    redirection: Option<usize>,
+}
+
+fn posix_word_scan(raw: &str) -> Option<PosixWordScan> {
     let bytes = raw.as_bytes();
     let mut ranges = Vec::new();
+    let mut redirection = None;
+    let mut parentheses = 0usize;
+    let mut substitution_end = 0usize;
+    let mut unclosed = false;
     let mut double = false;
     let mut index = 0usize;
     while index < bytes.len() {
+        let at = index;
         match bytes[index] {
             b'\\' => index += 2,
             b'\'' if !double => index += 1 + raw[index + 1..].find('\'')? + 1,
@@ -2523,10 +2575,34 @@ pub(crate) fn posix_word_value_ranges(raw: &str) -> Option<Vec<Range<usize>>> {
                 ranges.push(index..end);
                 index = end;
             }
+            b'<' | b'>' if !double && index >= substitution_end => {
+                if bytes.get(index + 1) == Some(&b'(') {
+                    substitution_end = consume_shell_paren_construct(bytes, index + 2, bytes.len());
+                    unclosed |= substitution_end == bytes.len() && bytes.last() != Some(&b')');
+                } else if parentheses == 0 {
+                    redirection.get_or_insert(index);
+                }
+                index += 1;
+            }
+            b'(' if !double && index >= substitution_end => {
+                parentheses += 1;
+                index += 1;
+            }
+            b')' if !double && index >= substitution_end => {
+                parentheses = parentheses.saturating_sub(1);
+                index += 1;
+            }
             _ => index += 1,
         }
+        // A quote or value read here that runs past the substitution's end
+        // means this reading and the shell's disagree on where it ends.
+        unclosed |= at < substitution_end
+            && (index > substitution_end || (index == substitution_end && double));
     }
-    (!double).then_some(ranges)
+    (!double).then_some(PosixWordScan {
+        values: ranges,
+        redirection: redirection.filter(|_| parentheses == 0 && !unclosed),
+    })
 }
 
 /// One raw POSIX argv word with each value the shell substitutes in it
@@ -8782,6 +8858,34 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_substitution_ends_where_the_shell_ends_it() {
+        // A `)` in an ANSI-C string, in backquotes or in a `case` pattern
+        // closes nothing; the shell ends each body at its last `)`.
+        for body in [
+            r"echo $'\')'>f)",
+            r"echo $'a\')b'>f)",
+            "echo `echo )`; echo >f)",
+            "echo `case x in x) echo y;; esac`>f)",
+            "case x in x) echo>f;; esac)",
+        ] {
+            assert_eq!(
+                super::consume_shell_paren_construct(body.as_bytes(), 0, body.len()),
+                body.len(),
+                "{body}"
+            );
+        }
+        assert_eq!(super::posix_word_redirection_start("<(true)>f"), Some(7));
+        assert_eq!(
+            super::posix_word_redirection_start(r"<(echo $'\')'>f)$X"),
+            None
+        );
+        // The comment reading ends the substitution at the `)` before `'`;
+        // this scan's quote from `#'` runs past it, so the two readings
+        // disagree and no redirection is trusted.
+        assert_eq!(super::posix_word_redirection_start("<(: #'\n)'>f'x'"), None);
+    }
+
     #[test]
     fn braced_parameter_is_one_word_across_shell_punctuation() {
         for word in [

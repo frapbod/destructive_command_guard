@@ -100,11 +100,16 @@ fn hook_decision(protocol: Protocol, command: &str) -> String {
 }
 
 fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
+    decision_with_packs(
+        command,
+        dialect,
+        &["core.git", "core.filesystem", "windows.filesystem"],
+    )
+}
+
+fn decision_with_packs(command: &str, dialect: ShellDialect, packs: &[&str]) -> EvaluationDecision {
     let enabled: std::collections::HashSet<String> =
-        ["core.git", "core.filesystem", "windows.filesystem"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        packs.iter().copied().map(str::to_string).collect();
     let ordered = REGISTRY.expand_enabled_ordered(&enabled);
     let keywords = REGISTRY.collect_enabled_keywords(&enabled);
     let index = REGISTRY.build_enabled_keyword_index(&ordered);
@@ -403,4 +408,105 @@ fn harmless_outer_values_in_a_cmd_payload_fail_closed_like_cmd_variables() {
         EvaluationDecision::Deny,
     );
     assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+}
+
+/// The outer shell's own redirections never reach cmd.exe, so a value in
+/// one is not cmd text: `cmd /c ver 2>$null` (a common PowerShell suffix
+/// that desktop Codex sends through the Unknown reading) is not a cmd
+/// variable. Without `core.filesystem`, whose redirect rule judges the
+/// redirection itself, nothing else denies it. A value cmd does receive
+/// still fails closed, with or without a redirection beside it.
+#[test]
+fn outer_redirections_beside_a_cmd_payload_are_not_cmd_values() {
+    let mut found = Vec::new();
+    for command in [
+        "cmd /c ver 2>$null",
+        "cmd /c ver 2> $null",
+        "cmd.exe /c ver >$null",
+        "cmd /c ver>$null",
+        r"cmd /c dir C:\x 2>$null",
+        r#"cmd /c "ver" 2>"$null""#,
+    ] {
+        for dialect in POSIX {
+            let got = decision_with_packs(command, dialect, &["core.git", "windows.filesystem"]);
+            if got != EvaluationDecision::Allow {
+                found.push(format!("{dialect:?}: {command:?} -> {got:?}"));
+            }
+        }
+    }
+    // Unknown also reads `<$in` as PowerShell, which rejects `<` (pwsh 7.5:
+    // "The '<' operator is reserved for future use") and fails closed there.
+    let got = decision_with_packs(
+        "cmd /c ver <$in",
+        ShellDialect::Posix,
+        &["core.git", "windows.filesystem"],
+    );
+    if got != EvaluationDecision::Allow {
+        found.push(format!("Posix: \"cmd /c ver <$in\" -> {got:?}"));
+    }
+    found.extend(misses(
+        &[
+            r#"cmd /c "gi${X}t reset --hard" 2>$null"#,
+            "cmd /c gi${X}t reset --hard 2>$null",
+            r#"cmd.exe /c "$X reset --hard" 2>/dev/null"#,
+            "cmd /c 2>$log gi${X}t reset --hard",
+            "cmd /c 2> $log $X reset --hard",
+            "cmd /c gi${X}t>$out reset --hard",
+            r#"cmd.exe /c "r${X}d /s /q C:\x" >$log"#,
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    ));
+    assert!(found.is_empty(), "misses:\n{}", found.join("\n"));
+}
+
+/// A `<(…)` / `>(…)` process substitution is not the outer shell's
+/// redirection: bash puts a path in its place and hands cmd that path plus
+/// the rest of the word. Measured with Linux bash (fake `cmd.exe`):
+/// `cmd.exe /c echo x<(true)$X` hands cmd `echo x/dev/fd/63` and the value,
+/// and with `X='&rd /s /q C:\x'`, `cmd.exe /c echo <(true)$X` hands it
+/// `echo /dev/fd/63&rd /s /q C:\x`. So the values after one still fail
+/// closed. Redirections that read or append stay allowed under the hook's
+/// default packs.
+#[test]
+fn process_substitutions_in_a_cmd_payload_are_not_outer_redirections() {
+    let mut found = misses(
+        &[
+            "cmd /c echo <(true)$X",
+            r#"cmd.exe /c echo x<(true)"$HOME""#,
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(true)$X",
+            "cmd.exe /c echo >(true)$X",
+            "cmd /c echo <(true)gi${X}t",
+            "cmd /c echo <(cat>f)$X",
+            "cmd /c echo 2>(true)$X",
+            "cmd /c echo ok>(cat>f)$X",
+            // A `case` pattern's `)` does not end the substitution.
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(case x in x) echo>f;; esac)$X",
+            r#"cmd.exe /c echo <(case x in x) echo>f;; esac)"$HOME""#,
+            "cmd.exe /c echo <(case x in x) echo>f;; esac)$X",
+            // Nor a `)` in an ANSI-C string or in backquotes (Linux bash,
+            // Mac bash 5 and zsh hand cmd the path plus the value).
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(echo $'\')'>f)$X",
+            r"cmd.exe /c echo <(echo $'\')'>f)$X",
+            r#"cmd.exe /c echo <(echo $'\')'>f)"$HOME""#,
+            r"cmd /c echo >(echo $'\')'>f)$X",
+            r"cmd /c echo <(echo $'a\')b'>f)$X",
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(echo `echo )`; echo >f)$X",
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo <(echo `case x in x) echo y;; esac`>f)$X",
+            // The same ends a command substitution's value.
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo $(echo $'\')'>f)$X",
+            r"X='&rd /s /q C:\x'; cmd.exe /c echo $(echo `echo )`; echo >f)$X",
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    );
+    for command in ["cmd /c ver <$in", r#"cmd /c ver >>"$HOME/log""#] {
+        for protocol in [Protocol::Claude, Protocol::Codex] {
+            let got = hook_decision(protocol, command);
+            if got != "allow" {
+                found.push(format!("{protocol:?}: {command:?} -> {got}"));
+            }
+        }
+    }
+    assert!(found.is_empty(), "misses:\n{}", found.join("\n"));
 }

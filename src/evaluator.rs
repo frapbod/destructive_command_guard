@@ -4341,6 +4341,11 @@ const POWERSHELL_VALUE_AS_CMD_VARIABLE: &str = "%DCG_POWERSHELL_VALUE%";
 /// stop-parsing token `--%` it expands nothing, so later words stay as
 /// written; a quoted `'--%'` is that token only when a parameter word
 /// follows it ([`crate::normalize::powershell_stop_parsing_words`]).
+///
+/// A POSIX shell's own redirections (`2>$null`, `> $log`, `ver>$out`)
+/// never reach cmd.exe, so a value in one is not cmd's text: such words
+/// stay as written, as before values were rendered. A word's text before
+/// its redirection is still an argument and gets the rendering.
 fn decoded_cmd_launcher_tail(
     words: &[&str],
     start: usize,
@@ -4348,21 +4353,31 @@ fn decoded_cmd_launcher_tail(
     argv: NativeArgv,
 ) -> Option<String> {
     let rendered: Vec<Cow<'_, str>> = match outer_dialect {
-        ShellDialect::Posix | ShellDialect::Unknown => words
-            .iter()
-            .enumerate()
-            .map(|(index, raw)| {
-                (index >= start)
-                    .then(|| {
-                        crate::normalize::posix_word_with_values_replaced(
-                            raw,
-                            POSIX_VALUE_AS_CMD_VARIABLE,
-                        )
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            let mut redirection_target_next = false;
+            words
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| {
+                    if index < start || std::mem::take(&mut redirection_target_next) {
+                        return Cow::Borrowed(*raw);
+                    }
+                    let (argument, redirection) =
+                        crate::normalize::posix_word_redirection_start(raw)
+                            .map_or((*raw, ""), |at| raw.split_at(at));
+                    // A bare operator (`2>`, `>>`) takes the next word as its target.
+                    redirection_target_next = !redirection.is_empty()
+                        && redirect_operator_len(redirection) == Some(redirection.len());
+                    crate::normalize::posix_word_with_values_replaced(
+                        argument,
+                        POSIX_VALUE_AS_CMD_VARIABLE,
+                    )
+                    .map_or(Cow::Borrowed(*raw), |argument| {
+                        Cow::Owned(argument + redirection)
                     })
-                    .flatten()
-                    .map_or(Cow::Borrowed(*raw), Cow::Owned)
-            })
-            .collect(),
+                })
+                .collect()
+        }
         ShellDialect::PowerShell => {
             let mut stop_parsing = false;
             words
@@ -62423,6 +62438,88 @@ mod tests {
                 "Git alias arguments reconstructed as shell argv must remain data: {command}: {:?}",
                 result.pattern_info
             );
+        }
+    }
+
+    #[test]
+    fn outer_redirections_stay_out_of_the_cmd_value_rendering() {
+        use crate::normalize::ShellDialect;
+
+        let tail = |words: &[&str]| {
+            decoded_cmd_launcher_tail(words, 2, ShellDialect::Posix, NativeArgv::Verbatim)
+        };
+        // The outer shell consumes the redirection; cmd never receives it.
+        for (words, payload) in [
+            (&["cmd", "/c", "ver", "2>$null"][..], "ver 2>$null"),
+            (&["cmd", "/c", "ver", "2>", "$null"][..], "ver 2> $null"),
+            (&["cmd", "/c", "ver>$null"][..], "ver>$null"),
+            (
+                &["cmd", "/c", "ver", "<$in", ">>\"$HOME/log\""][..],
+                "ver <$in >>\"$HOME/log\"",
+            ),
+            (&["cmd", "/c", "ver", "2>&1"][..], "ver 2>&1"),
+            // A process substitution after the operator is part of its target.
+            (
+                &["cmd", "/c", "echo", "2>x<(true)$X"][..],
+                "echo 2>x<(true)$X",
+            ),
+            (&["cmd", "/c", "echo", "<(true)>$X"][..], "echo <(true)>$X"),
+        ] {
+            assert_eq!(tail(words).as_deref(), Some(payload), "{words:?}");
+        }
+        // Values cmd does receive are still rendered as cmd variables,
+        // before, after and around a redirection.
+        for (words, payload) in [
+            (
+                &["cmd", "/c", "gi${X}t", "reset", "--hard", "2>$null"][..],
+                "gi%DCG_POSIX_VALUE%t reset --hard 2>$null",
+            ),
+            (
+                &["cmd", "/c", "2>", "$log", "$X", "reset", "--hard"][..],
+                "2> $log %DCG_POSIX_VALUE% reset --hard",
+            ),
+            (
+                &["cmd", "/c", "gi${X}t>$out", "reset"][..],
+                "gi%DCG_POSIX_VALUE%t>$out reset",
+            ),
+            (&["cmd", "/c", "\"a>$X\""][..], "a>%DCG_POSIX_VALUE%"),
+            (&["cmd", "/c", "\"$(a>b)\""][..], "%DCG_POSIX_VALUE%"),
+            // A process substitution is not a redirection: bash hands cmd a
+            // path in its place plus the rest of the word. A `<` or `>`
+            // inside it is not one either.
+            (
+                &["cmd", "/c", "echo", "x<(true)$X"][..],
+                "echo x<(true)%DCG_POSIX_VALUE%",
+            ),
+            (
+                &["cmd", "/c", "echo", "2>(true)$X"][..],
+                "echo 2>(true)%DCG_POSIX_VALUE%",
+            ),
+            (
+                &["cmd", "/c", "echo", "<(cat>f)$X"][..],
+                "echo <(cat>f)%DCG_POSIX_VALUE%",
+            ),
+            // The substitution ends at the `)` the shell matches, not at a
+            // `case` pattern's `)`.
+            (
+                &["cmd", "/c", "echo", "<(case x in x) echo>f;; esac)$X"][..],
+                "echo <(case x in x) echo>f;; esac)%DCG_POSIX_VALUE%",
+            ),
+            // Nor at a `)` in an ANSI-C string or in backquotes.
+            (
+                &["cmd", "/c", "echo", r"<(echo $'\')'>f)$X"][..],
+                r"echo <(echo $'\')'>f)%DCG_POSIX_VALUE%",
+            ),
+            (
+                &["cmd", "/c", "echo", "<(echo `echo )`; echo >f)$X"][..],
+                "echo <(echo %DCG_POSIX_VALUE%; echo >f)%DCG_POSIX_VALUE%",
+            ),
+            (
+                &["cmd", "/c", "echo", r"$(echo $'\')'>f)$X"][..],
+                "echo %DCG_POSIX_VALUE%%DCG_POSIX_VALUE%",
+            ),
+        ] {
+            assert_eq!(tail(words).as_deref(), Some(payload), "{words:?}");
         }
     }
 
