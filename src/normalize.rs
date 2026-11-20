@@ -7332,10 +7332,13 @@ pub(crate) fn bash_parameter_openers(command: &str) -> Option<BashHashReading> {
 ///   `${x==(…)}`, `${x/1/=(…)}`).
 ///
 /// It does not run one inside a word (`echo a=(…)`, `echo ""=(…)`,
-/// `echo $x=(…)`), after `\=`, or in quotes. Spelled: such a `=` as `<`,
-/// or as `$` after a `<` or `>` (so `cat <=(…)` reads as `cat <$(…)`, not as
-/// the heredoc operator `<<`), so the shared readers judge the body and the
-/// text that follows the word, as they do for `<(…)`. Quotes are not read:
+/// `echo $x=(…)`), after `\=`, or in quotes. Spelled: such a `=` at a word
+/// start as `<`, so the shared readers judge the body and the text that
+/// follows the word as they do for `<(…)`; after a `<` or `>` as `$` (so
+/// `cat <=(…)` reads as `cat <$(…)`, not as the heredoc operator `<<`); and
+/// in an assignment value or a `${…}` word also as `$`, where the shared
+/// readers judge a `$(…)` body (and fail closed on any `X=<(…)`) but read
+/// no `<(…)` in a `${…}` word. Quotes are not read:
 /// a spelled `=` in quotes is only another quoted word, and the caller reads
 /// the spelling too, with deny winning, so the command as written still
 /// answers. The bodies of heredocs with a quoted delimiter are raw text and
@@ -7361,16 +7364,9 @@ pub(crate) fn zsh_equals_process_substitutions(command: &str) -> Option<BashHash
         if body.as_ref().is_some_and(|body| body.start <= at) {
             continue;
         }
-        match zsh_equals_substitution_starts(bytes, at, &mut budget) {
-            Some(true) => {
-                let spelling = if at > 0 && matches!(bytes[at - 1], b'<' | b'>') {
-                    b'$'
-                } else {
-                    b'<'
-                };
-                spelled.get_or_insert_with(|| bytes.to_vec())[at] = spelling;
-            }
-            Some(false) => {}
+        match zsh_equals_substitution_spelling(bytes, at, &mut budget) {
+            Some(Some(spelling)) => spelled.get_or_insert_with(|| bytes.to_vec())[at] = spelling,
+            Some(None) => {}
             None => return Some(BashHashReading::Unread),
         }
     }
@@ -7380,10 +7376,14 @@ pub(crate) fn zsh_equals_process_substitutions(command: &str) -> Option<BashHash
         .map(BashHashReading::Spelled)
 }
 
-/// Whether zsh runs the `=(` at `at` as a process substitution (see
-/// [`zsh_equals_process_substitutions`]); `None` once `budget` bytes have
-/// been read back.
-fn zsh_equals_substitution_starts(bytes: &[u8], at: usize, budget: &mut usize) -> Option<bool> {
+/// How to spell the `=` of the `=(` at `at` if zsh runs it as a process
+/// substitution (see [`zsh_equals_process_substitutions`]); `None` once
+/// `budget` bytes have been read back.
+fn zsh_equals_substitution_spelling(
+    bytes: &[u8],
+    at: usize,
+    budget: &mut usize,
+) -> Option<Option<u8>> {
     let word_start = |i: usize| {
         i == 0
             || matches!(
@@ -7392,7 +7392,8 @@ fn zsh_equals_substitution_starts(bytes: &[u8], at: usize, budget: &mut usize) -
             )
     };
     if word_start(at) {
-        return Some(true);
+        let after_redirection = at > 0 && matches!(bytes[at - 1], b'<' | b'>');
+        return Some(Some(if after_redirection { b'$' } else { b'<' }));
     }
     let name_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     // Reads back from `end` (exclusive) over an optional `[…]` subscript and
@@ -7430,7 +7431,7 @@ fn zsh_equals_substitution_starts(bytes: &[u8], at: usize, budget: &mut usize) -
         if let Some(start) = name_start(end, budget)?
             && word_start(start)
         {
-            return Some(true);
+            return Some(Some(b'$'));
         }
     }
     // The word after a `${NAME` operator.
@@ -7450,7 +7451,7 @@ fn zsh_equals_substitution_starts(bytes: &[u8], at: usize, budget: &mut usize) -
                 && name >= 2
                 && &bytes[name - 2..name] == b"${"
             {
-                return Some(true);
+                return Some(Some(b'$'));
             }
         }
     }
@@ -7470,15 +7471,15 @@ fn zsh_equals_substitution_starts(bytes: &[u8], at: usize, budget: &mut usize) -
                         i
                     };
                     let name = name_start(slash, budget)?;
-                    return Some(
-                        name.is_some_and(|name| name >= 2 && &bytes[name - 2..name] == b"${"),
-                    );
+                    let opens =
+                        name.is_some_and(|name| name >= 2 && &bytes[name - 2..name] == b"${");
+                    return Some(opens.then_some(b'$'));
                 }
                 _ => {}
             }
         }
     }
-    Some(false)
+    Some(None)
 }
 
 /// Bash 3.2's reading of the comments in `$((…))` bodies, and of the
@@ -10100,18 +10101,18 @@ mod tests {
             ("cat <=(git x)", Some("cat <$(git x)")),
             ("cat <<<=(git x)", Some("cat <<<$(git x)")),
             ("echo 2>=(git x)", Some("echo 2>$(git x)")),
-            ("X==(git x)", Some("X=<(git x)")),
-            ("X+==(git x)", Some("X+=<(git x)")),
-            ("X[1]==(git x)", Some("X[1]=<(git x)")),
-            ("local X==(git x)", Some("local X=<(git x)")),
-            ("echo ${x:-=(git x)}", Some("echo ${x:-<(git x)}")),
-            ("echo ${x-=(git x)}", Some("echo ${x-<(git x)}")),
-            ("echo ${x:+=(git x)}", Some("echo ${x:+<(git x)}")),
-            ("echo ${x==(git x)}", Some("echo ${x=<(git x)}")),
-            ("echo ${x::==(git x)}", Some("echo ${x::=<(git x)}")),
-            ("echo ${x[1]:-=(git x)}", Some("echo ${x[1]:-<(git x)}")),
-            ("echo ${x/1/=(git x)}", Some("echo ${x/1/<(git x)}")),
-            ("echo ${x//a/=(git x)}", Some("echo ${x//a/<(git x)}")),
+            ("X==(git x)", Some("X=$(git x)")),
+            ("X+==(git x)", Some("X+=$(git x)")),
+            ("X[1]==(git x)", Some("X[1]=$(git x)")),
+            ("local X==(git x)", Some("local X=$(git x)")),
+            ("echo ${x:-=(git x)}", Some("echo ${x:-$(git x)}")),
+            ("echo ${x-=(git x)}", Some("echo ${x-$(git x)}")),
+            ("echo ${x:+=(git x)}", Some("echo ${x:+$(git x)}")),
+            ("echo ${x==(git x)}", Some("echo ${x=$(git x)}")),
+            ("echo ${x::==(git x)}", Some("echo ${x::=$(git x)}")),
+            ("echo ${x[1]:-=(git x)}", Some("echo ${x[1]:-$(git x)}")),
+            ("echo ${x/1/=(git x)}", Some("echo ${x/1/$(git x)}")),
+            ("echo ${x//a/=(git x)}", Some("echo ${x//a/$(git x)}")),
             ("echo ${x/a/b/=(git x)}", None),
             ("cmd /c echo =(true)$X", Some("cmd /c echo <(true)$X")),
             // Inside a word, or after a `=` that is not an assignment's.
