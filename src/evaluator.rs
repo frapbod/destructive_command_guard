@@ -41843,8 +41843,8 @@ fn exec_sink_pack_verdict(
     context: HeredocEvaluationContext<'_>,
     parent_expanded: bool,
 ) -> Option<EvaluationResult> {
-    let named =
-        crate::ast_matcher::exec_sink_reconstructed_commands(&content.content, content.language);
+    let crate::ast_matcher::SinkCommands { named, bound } =
+        crate::ast_matcher::exec_sink_commands(&content.content, content.language);
     if let Some(result) =
         reconstructed_interpreter_commands_verdict(command, content, context, named)
     {
@@ -41857,7 +41857,9 @@ fn exec_sink_pack_verdict(
     // as a Git invocation. Recover actual host-language literal values for
     // the existing pack evaluator without pretending their quotes are shell
     // syntax. Named calls retain their original ownership in the helper.
-    if !crate::ast_matcher::has_interpreter_literal_candidates(&content.content, content.language) {
+    let literal_candidates =
+        crate::ast_matcher::has_interpreter_literal_candidates(&content.content, content.language);
+    if !literal_candidates && bound.is_empty() {
         return None;
     }
     // The outer Bash parse belongs under the same wall-clock bound as the
@@ -41893,30 +41895,30 @@ fn exec_sink_pack_verdict(
             .min((remaining / 2).max(crate::ast_matcher::protected_scan_budget()))
             .min(remaining);
     }
-    let proof = move || {
-        let Some((source, range, decoded_program, language)) = source_identity else {
-            return (!inline || parent_expanded).then_some(false);
-        };
-        if let Some(program) = decoded_program {
-            // The complete word, decoded by the extractor's own lexer.
-            // An unresolved (partial or dynamic) word carries no
-            // `word_range` and never reaches this proof.
-            crate::heredoc::decoded_inline_interpreter_source_proof(
-                &source, &range, &program, language,
-            )
-        } else if inline {
-            // The existing inline extractor can return a partial raw
-            // fragment when shell quotes are escaped. Only extend it
-            // when the extracted bytes are exactly the complete program.
-            // Other consumers revoke the documentation exemption without
-            // suppressing additive checks of that complete source.
-            crate::heredoc::inline_interpreter_source_proof(&source, &range, language)
-        } else {
-            Some(crate::heredoc::range_is_quoted_interpreter_source(
-                &source, &range, language,
-            ))
-        }
-    };
+    // A sink call whose command is a name bound to a string literal is an
+    // indirect command like the recovery's below: it is judged only for a
+    // program proven to run (a replaced first `node -e` program does not),
+    // under the same proof. That proof exists for Python and JavaScript; Ruby
+    // and Perl run every `-e` program they are given and PHP takes one `-r`,
+    // so theirs need none.
+    let proof_language = matches!(
+        content.language,
+        crate::heredoc::ScriptLanguage::Python
+            | crate::heredoc::ScriptLanguage::JavaScript
+            | crate::heredoc::ScriptLanguage::TypeScript
+    );
+    if !bound.is_empty()
+        && (!proof_language
+            || interpreter_source_proof(source_identity.clone(), inline, parent_expanded).is_some())
+        && let Some(result) =
+            reconstructed_interpreter_commands_verdict(command, content, context, bound)
+    {
+        return Some(result);
+    }
+    if !literal_candidates {
+        return None;
+    }
+    let proof = move || interpreter_source_proof(source_identity, inline, parent_expanded);
     // An unquoted heredoc body is expanded by the outer shell first: its
     // backquotes run then, so its literals are judged whole (#560 narrows
     // only what a later shell might run).
@@ -41965,6 +41967,42 @@ fn exec_sink_pack_verdict(
         }
     };
     reconstructed_interpreter_commands_verdict(command, content, context, recovered)
+}
+
+/// Whether an interpreter program's extracted source is the complete program
+/// it runs, for the #544 literal recovery and sink calls read through a
+/// binding: `None` when it is not proven, else whether the documentation
+/// exemption may apply.
+fn interpreter_source_proof(
+    source_identity: Option<(
+        String,
+        std::ops::Range<usize>,
+        Option<String>,
+        crate::heredoc::ScriptLanguage,
+    )>,
+    inline: bool,
+    parent_expanded: bool,
+) -> Option<bool> {
+    let Some((source, range, decoded_program, language)) = source_identity else {
+        return (!inline || parent_expanded).then_some(false);
+    };
+    if let Some(program) = decoded_program {
+        // The complete word, decoded by the extractor's own lexer.
+        // An unresolved (partial or dynamic) word carries no
+        // `word_range` and never reaches this proof.
+        crate::heredoc::decoded_inline_interpreter_source_proof(&source, &range, &program, language)
+    } else if inline {
+        // The existing inline extractor can return a partial raw
+        // fragment when shell quotes are escaped. Only extend it
+        // when the extracted bytes are exactly the complete program.
+        // Other consumers revoke the documentation exemption without
+        // suppressing additive checks of that complete source.
+        crate::heredoc::inline_interpreter_source_proof(&source, &range, language)
+    } else {
+        Some(crate::heredoc::range_is_quoted_interpreter_source(
+            &source, &range, language,
+        ))
+    }
 }
 
 fn reconstructed_interpreter_commands_verdict(

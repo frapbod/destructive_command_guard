@@ -45,6 +45,9 @@ use std::sync::{Arc, LazyLock, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "ast_matcher/sink_strings.rs"]
+mod sink_strings;
+
 /// Hard timeout for AST operations (20ms as per ADR).
 ///
 /// Tests use a much more generous budget because the full suite runs thousands
@@ -593,6 +596,7 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         let arg_region = exec_sink_arg_region(
             inert_string_end.map_or(haystack, |end| &haystack[..end]),
             call_start,
+            language,
         );
         let hit = if inert_string_end.is_some() {
             detect_destructive_in_literal_args(arg_region, language)
@@ -710,7 +714,7 @@ pub(crate) fn literal_exec_sink_starts(
         let Some((call_start, _)) = exec_sink_call(&caps) else {
             continue;
         };
-        let region = exec_sink_arg_region(code, call_start);
+        let region = exec_sink_arg_region(code, call_start, language);
         let argv = exec_argv_operands(region, language);
         if !argv.unverified
             && !argv.values.is_empty()
@@ -748,10 +752,31 @@ pub fn exec_sink_reconstructed_commands(
     code: &str,
     language: ScriptLanguage,
 ) -> Vec<ReconstructedCommand> {
+    let SinkCommands { mut named, bound } = exec_sink_commands(code, language);
+    named.extend(bound);
+    named
+}
+
+/// The commands an interpreter body's sinks hand a shell or run as an argv
+/// ([`exec_sink_reconstructed_commands`]), with the ones read through a name
+/// bound to a string literal kept apart.
+pub struct SinkCommands {
+    /// Calls whose command is written in the call.
+    pub named: Vec<ReconstructedCommand>,
+    /// Calls whose command is a name, read as each string literal the body
+    /// binds to it. Like the #544 literal recovery, these are indirect: only
+    /// a program the evaluator proves runs should be judged by them (a
+    /// replaced first `node -e` program does not run).
+    pub bound: Vec<ReconstructedCommand>,
+}
+
+/// [`exec_sink_reconstructed_commands`], split into [`SinkCommands`].
+#[must_use]
+pub fn exec_sink_commands(code: &str, language: ScriptLanguage) -> SinkCommands {
     let sink_regex: &Regex = match language {
         ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => &JS_EXEC_SINK_LITERAL,
         ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
-        ScriptLanguage::Ruby => &RUBY_EXEC_SINK_LITERAL,
+        ScriptLanguage::Ruby => &RUBY_SHELL_SINK_CALL,
         ScriptLanguage::Perl => &PERL_SYSTEM_EXEC_LITERAL,
         // Go and PHP reach the packs for the same reason every other language
         // does, and their absence here was not a scope decision about them --
@@ -770,7 +795,12 @@ pub fn exec_sink_reconstructed_commands(
         // "dd", "if=…", "of=…")` stays allowed, because `echo` is what runs.
         ScriptLanguage::Go => &GO_EXEC_SINK_LITERAL,
         ScriptLanguage::Php => &PHP_EXEC_SINK_LITERAL,
-        _ => return Vec::new(),
+        _ => {
+            return SinkCommands {
+                named: Vec::new(),
+                bound: Vec::new(),
+            };
+        }
     };
     // Perl comments can hold a `system(...)` that never runs; mask them so a
     // commented call is not reconstructed and over-blocked. Masking preserves
@@ -800,18 +830,49 @@ pub fn exec_sink_reconstructed_commands(
     .then(|| install_python_const_env(build_python_const_env(code)))
     .flatten();
 
-    let mut out = Vec::new();
+    // Python names a module or a sink function anything it likes (`import
+    // subprocess as s`, `from os import system as run_it`).
+    let python_aliases =
+        (language == ScriptLanguage::Python).then(|| PythonSinkAliases::read(haystack));
+    let mut candidates: Vec<(usize, usize, &str, bool)> = Vec::new();
     for caps in sink_regex.captures_iter(haystack) {
         let Some(m) = caps.get(0) else { continue };
         let Some((call_start, sink)) = exec_sink_call(&caps) else {
             continue;
         };
+        // The rm/git backstop reads Ruby's `system`/`exec`/`spawn` at any
+        // receiver, and `IO.popen`/`Open3` only with a quoted first argument
+        // (`scan_ruby_exec_sink_matches`); nothing it does not read is left
+        // to it.
+        let backstop_sees = language != ScriptLanguage::Ruby
+            || matches!(sink, "system" | "exec" | "spawn")
+            || sink != "open" && haystack[m.end() - 1..].starts_with(['"', '\'']);
+        candidates.push((call_start, m.end(), sink, backstop_sees));
+    }
+    if let Some(aliases) = python_aliases.as_ref() {
+        // The rm/git backstop reads a call through a function alias only when
+        // the alias is itself a sink name it matches (`from os import system
+        // as run`); nothing else is left to it.
+        candidates.extend(aliases.function_calls(haystack).into_iter().map(
+            |(start, end, sink)| {
+                let seen = PY_EXEC_SINK_LITERAL
+                    .find_at(haystack, start)
+                    .is_some_and(|found| found.start() == start);
+                (start, end, sink, seen)
+            },
+        ));
+    }
+
+    let mut out = Vec::new();
+    let mut bound_out = Vec::new();
+    for (call_start, call_end, sink, backstop_sees) in candidates {
         let inert_string_end = python_text
             .as_ref()
             .and_then(|text| text.inert_string_end(call_start));
         let call_region = exec_sink_arg_region(
             inert_string_end.map_or(haystack, |end| &haystack[..end]),
             call_start,
+            language,
         );
         // A name bound to a literal list or tuple is reconstructed as that
         // literal written in its place (#602); in a string nothing runs, the
@@ -821,11 +882,24 @@ pub fn exec_sink_reconstructed_commands(
         } else {
             Vec::new()
         };
-        for region in std::iter::once(call_region).chain(bound.iter().map(String::as_str)) {
+        // A name bound to a string literal is read as that string. The rm/git
+        // backstop never reads those, so none is left to it.
+        let strings = if inert_string_end.is_none() {
+            bound_string_calls(language, haystack, call_region, python_text.as_ref())
+        } else {
+            Vec::new()
+        };
+        for (region, through_string) in std::iter::once((call_region, false))
+            .chain(bound.iter().map(|call| (call.as_str(), false)))
+            .chain(strings.iter().map(|call| (call.as_str(), true)))
+        {
             // A call the rm/git backstop owns (any `detect_destructive_in_args`
             // hit) is left to it, so an allowlisted `rm`/`git` is not re-denied
             // here under a pack rule id.
-            if detect_destructive_in_args(region, language).is_some() {
+            if !through_string
+                && backstop_sees
+                && detect_destructive_in_args(region, language).is_some()
+            {
                 continue;
             }
             // Operands, for the same reason `detect_destructive_in_args` uses them:
@@ -871,11 +945,27 @@ pub fn exec_sink_reconstructed_commands(
                 [] => continue,
                 // One string handed to a shell (#512): see below.
                 [script] => {
-                    if !single_string_sink_runs_shell(language, sink, haystack, call_start, region)
-                    {
+                    if !single_string_sink_runs_shell(
+                        language,
+                        sink,
+                        haystack,
+                        call_start,
+                        region,
+                        python_aliases.as_ref(),
+                    ) {
                         continue;
                     }
-                    script.to_string()
+                    // Ruby's `open` runs a shell only for a string that
+                    // starts with `|`, and the shell gets the rest.
+                    let script = if language == ScriptLanguage::Ruby && sink == "open" {
+                        let Some(rest) = script.strip_prefix('|') else {
+                            continue;
+                        };
+                        rest
+                    } else {
+                        script.as_ref()
+                    };
+                    shell_string_with_marked_values(script)
                 }
                 _ if matches!(
                     language,
@@ -891,37 +981,388 @@ pub fn exec_sink_reconstructed_commands(
                     .collect::<Vec<_>>()
                     .join(" "),
             };
-            out.push(ReconstructedCommand {
+            let reconstructed = ReconstructedCommand {
                 command,
                 start: call_start,
-                end: m.end(),
-            });
+                end: call_end,
+            };
+            if through_string {
+                bound_out.push(reconstructed);
+            } else {
+                out.push(reconstructed);
+            }
         }
     }
-    if language == ScriptLanguage::Perl {
-        // Backticks and `qx` hand their text to the shell as well. A payload the
-        // rm/git catalogue flags (`heredoc.perl.backticks.*`, `….qx.*`) is left
-        // to it, as above, so allowlisting the reported id still allows it.
-        let backticks = PERL_BACKTICKS_LITERAL
-            .captures_iter(haystack)
-            .filter_map(|caps| {
-                let whole = caps.get(0)?;
-                let payload = caps.name("cmd")?;
-                Some((whole.start()..whole.end(), payload.as_str().to_string()))
-            });
-        for (span, payload) in backticks.chain(perl_qx_literals(haystack)) {
-            if payload.trim().is_empty() || detect_shell_payload(&payload).is_some() {
-                continue;
-            }
-            out.push(ReconstructedCommand {
-                command: payload,
-                start: span.start,
-                end: span.end,
-            });
+    // Literals that are commands: Ruby's, Perl's and PHP's backticks, Perl's
+    // `qx` and Ruby's `%x`. A payload the rm/git catalogue flags as it reads
+    // it (`heredoc.perl.backticks.*`, `heredoc.ruby.exec_sink.*`) is left to
+    // it, as above, so allowlisting the reported id still allows it; PHP's
+    // backticks had no reader at all.
+    for (span, raw, payload) in command_literals(code, language) {
+        if payload.trim().is_empty()
+            || (language != ScriptLanguage::Php
+                && !raw.contains('\n')
+                && detect_shell_payload(raw).is_some())
+        {
+            continue;
         }
+        out.push(ReconstructedCommand {
+            command: shell_string_with_marked_values(&payload),
+            start: span.start,
+            end: span.end,
+        });
+    }
+    match language {
+        ScriptLanguage::Perl => out.extend(perl_piped_open_commands(haystack)),
+        ScriptLanguage::Python => {
+            out.extend(python_exec_family_commands(
+                haystack,
+                python_aliases.as_ref(),
+            ));
+        }
+        _ => {}
+    }
+    SinkCommands {
+        named: out,
+        bound: bound_out,
+    }
+}
+
+/// A string a sink hands to a shell, with each value only known at run time
+/// marked where the shell reads it ([`crate::heredoc::OUTER_VALUE_MARK`]).
+///
+/// The evaluator spells a mark for the shell's quoting context: inside the
+/// shell's single quotes a value is unknown text there, not the literal text
+/// `${…}` (`system("'gi${x}t' reset --hard")` runs `git reset --hard` when
+/// `$x` is empty). A string that is wholly unknown keeps its plain unknown
+/// value: there is no command text to read around it.
+fn shell_string_with_marked_values(script: &str) -> String {
+    if !script.contains(RUNTIME_VALUE) || script == RUNTIME_VALUE {
+        return script.to_string();
+    }
+    let mut mark = [0; 4];
+    script.replace(
+        RUNTIME_VALUE,
+        crate::heredoc::OUTER_VALUE_MARK.encode_utf8(&mut mark),
+    )
+}
+
+/// Each literal in `code` that runs its text as a command line: Ruby, Perl
+/// and PHP backticks, Perl `qx`, Ruby `%x`. Returns its span, its raw body
+/// and the command it runs, built as the language builds the string
+/// ([`sink_strings`]). Literals that are values and comments are skipped
+/// whole, so a backtick inside them is text.
+fn command_literals(
+    code: &str,
+    language: ScriptLanguage,
+) -> Vec<(std::ops::Range<usize>, &str, String)> {
+    if !matches!(
+        language,
+        ScriptLanguage::Ruby | ScriptLanguage::Perl | ScriptLanguage::Php
+    ) {
+        return Vec::new();
+    }
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(literal) = sink_strings::literal_at(code, i, language) {
+            if literal.command
+                && let Some(payload) = sink_strings::value(code, &literal, language, RUNTIME_VALUE)
+            {
+                out.push((
+                    i..literal.end,
+                    &code[literal.body.0..literal.body.1],
+                    payload,
+                ));
+            }
+            i = literal.end;
+            continue;
+        }
+        let comment = match bytes[i] {
+            b'#' => !(language == ScriptLanguage::Perl && i > 0 && bytes[i - 1] == b'$'),
+            b'/' => language == ScriptLanguage::Php && bytes.get(i + 1) == Some(&b'/'),
+            _ => false,
+        };
+        if comment {
+            i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |at| i + at);
+            continue;
+        }
+        if language == ScriptLanguage::Php && bytes[i..].starts_with(b"/*") {
+            i = memchr::memmem::find(&bytes[i + 2..], b"*/").map_or(bytes.len(), |at| i + at + 4);
+            continue;
+        }
+        i += 1;
     }
     out
 }
+
+/// Perl's piped `open`, which runs a command: `open(FH, "cmd |")`,
+/// `open(FH, "| cmd")`, `open(FH, "-|", "cmd")` (one string goes to the
+/// shell) and `open(FH, "-|", "git", "reset", "--hard")` (an argv). No reader
+/// saw any of them, so `open(F, "git reset --hard |")` was allowed.
+fn perl_piped_open_commands(haystack: &str) -> Vec<ReconstructedCommand> {
+    let mut out = Vec::new();
+    for found in PERL_OPEN_CALL.find_iter(haystack) {
+        let start = found.end() - "open".len();
+        let region = exec_sink_arg_region(haystack, start, ScriptLanguage::Perl);
+        let Some(arguments) = split_exec_operands(
+            exec_argv_region(region, ScriptLanguage::Perl),
+            b",",
+            ScriptLanguage::Perl,
+        ) else {
+            continue;
+        };
+        let values: Vec<Cow<'_, str>> = arguments
+            .iter()
+            .skip(1)
+            .map(|argument| concatenated_operand(argument, ScriptLanguage::Perl, 0))
+            .collect();
+        let command = match values.as_slice() {
+            [spec] => {
+                let spec = spec.trim();
+                let command = spec
+                    .strip_suffix('|')
+                    .or_else(|| spec.strip_prefix('|'))
+                    .map(str::trim);
+                match command {
+                    Some(command) if !command.is_empty() && command != "-" => {
+                        shell_string_with_marked_values(command)
+                    }
+                    _ => continue,
+                }
+            }
+            [mode, rest @ ..] if matches!(mode.trim(), "-|" | "|-") && !rest.is_empty() => {
+                if let [script] = rest {
+                    shell_string_with_marked_values(script)
+                } else {
+                    rest.iter()
+                        .map(|operand| quote_exec_operand(operand))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+            }
+            _ => continue,
+        };
+        out.push(ReconstructedCommand {
+            command,
+            start,
+            end: start + region.len(),
+        });
+    }
+    out
+}
+
+static PERL_OPEN_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|[^\w$@%&>:])open\b").expect("perl open call regex compiles")
+});
+
+/// Python's `os` process replacements and spawns, which take an argv rather
+/// than a command line: `os.execvp("git", ["git", "reset", "--hard"])`,
+/// `os.execlp(file, arg0, …)`, `os.spawnvp(mode, file, argv)`,
+/// `os.posix_spawnp(file, argv, env)`. No sink regex named them, so each was
+/// allowed while `subprocess.run` with the same argv denied. The program is
+/// the path argument; `argv[0]` is only the name the program sees.
+fn python_exec_family_commands(
+    haystack: &str,
+    aliases: Option<&PythonSinkAliases>,
+) -> Vec<ReconstructedCommand> {
+    let mut calls: Vec<(usize, &str)> = Vec::new();
+    for caps in PY_EXEC_FAMILY.captures_iter(haystack) {
+        let (Some(whole), Some(name)) = (caps.get(0), caps.name("sink")) else {
+            continue;
+        };
+        let receiver = haystack[..whole.start()].trim_end();
+        let module = receiver
+            .strip_suffix('.')
+            .map(|receiver| {
+                receiver
+                    .trim_end()
+                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+            })
+            .map(|name| aliases.map_or(name, |aliases| aliases.module(name)));
+        if module.is_some_and(|module| !matches!(module, "os" | "posix")) {
+            continue;
+        }
+        calls.push((whole.start(), name.as_str()));
+    }
+    if let Some(aliases) = aliases {
+        for (start, _, sink) in aliases.function_calls(haystack) {
+            if PY_EXEC_FAMILY_NAME.is_match(sink) {
+                calls.push((start, sink));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (start, sink) in calls {
+        let region = exec_sink_arg_region(haystack, start, ScriptLanguage::Python);
+        let Some(arguments) = region
+            .find('(')
+            .and_then(|open| region.get(open + 1..region.len().saturating_sub(1)))
+            .and_then(|inner| split_exec_operands(inner, b",", ScriptLanguage::Python))
+        else {
+            continue;
+        };
+        let arguments: Vec<&str> = arguments
+            .into_iter()
+            .filter(|argument| !argument.trim().is_empty())
+            .take_while(|argument| !is_keyword_argument(argument.trim_start()))
+            .collect();
+        let skip = usize::from(sink.starts_with("spawn"));
+        let Some(program) = arguments.get(skip) else {
+            continue;
+        };
+        let mut argv = ExecArgv {
+            values: Vec::new(),
+            unverified: false,
+        };
+        push_exec_operand(&mut argv, program, ScriptLanguage::Python);
+        let rest = &arguments[skip + 1..];
+        let list_form = sink.contains('v') || sink.starts_with("posix_spawn");
+        if list_form {
+            let Some(list) = rest.first().map(|list| list.trim()) else {
+                continue;
+            };
+            let Some(inner) = list
+                .strip_prefix(['[', '('])
+                .and_then(|list| list.strip_suffix([']', ')']))
+                .and_then(|inner| split_exec_operands(inner, b",", ScriptLanguage::Python))
+            else {
+                continue;
+            };
+            for element in inner
+                .into_iter()
+                .filter(|element| !element.trim().is_empty())
+                .skip(1)
+            {
+                push_exec_operand(&mut argv, element, ScriptLanguage::Python);
+            }
+        } else {
+            let take = rest.len().saturating_sub(usize::from(sink.ends_with('e')));
+            for element in rest.iter().take(take).skip(1) {
+                push_exec_operand(&mut argv, element, ScriptLanguage::Python);
+            }
+        }
+        if argv.unverified {
+            continue;
+        }
+        out.push(ReconstructedCommand {
+            command: argv
+                .values
+                .iter()
+                .map(|operand| quote_exec_operand(operand))
+                .collect::<Vec<_>>()
+                .join(" "),
+            start,
+            end: start + region.len(),
+        });
+    }
+    out
+}
+
+static PY_EXEC_FAMILY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)\b(?P<sink>execvpe|execvp|execve|execv|execlpe|execlp|execle|execl|spawnvpe|spawnvp|spawnve|spawnv|spawnlpe|spawnlp|spawnle|spawnl|posix_spawnp|posix_spawn)\s*\(",
+    )
+    .expect("python exec family regex compiles")
+});
+
+static PY_EXEC_FAMILY_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?)$")
+        .expect("python exec family name regex compiles")
+});
+
+/// The names a Python body gives the process modules and their sink
+/// functions: `import subprocess as s`, `from os import system as run_it`.
+struct PythonSinkAliases {
+    /// Alias to module, for `os`, `posix`, `subprocess`, `commands`, `pty`.
+    modules: HashMap<String, String>,
+    /// Alias to the sink function it names.
+    functions: HashMap<String, String>,
+}
+
+static PY_IMPORT_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|;)[ \t]*(?:from[ \t]+(?P<from>[A-Za-z_][A-Za-z0-9_.]*)[ \t]+)?import[ \t]+\(?(?P<names>[^\n;)]+)")
+        .expect("python import line regex compiles")
+});
+
+impl PythonSinkAliases {
+    fn read(code: &str) -> Self {
+        let mut aliases = Self {
+            modules: HashMap::new(),
+            functions: HashMap::new(),
+        };
+        if !code.contains("import") {
+            return aliases;
+        }
+        for caps in PY_IMPORT_LINE.captures_iter(code) {
+            let from = caps.name("from").map(|from| from.as_str());
+            let Some(names) = caps.name("names") else {
+                continue;
+            };
+            for item in names.as_str().split(',') {
+                let mut words = item.split_whitespace();
+                let (Some(name), alias) = (words.next(), words.nth(1)) else {
+                    continue;
+                };
+                let alias = alias.unwrap_or(name);
+                match from {
+                    None if matches!(name, "os" | "posix" | "subprocess" | "commands" | "pty") => {
+                        aliases.modules.insert(alias.to_string(), name.to_string());
+                    }
+                    Some("os" | "posix" | "subprocess" | "commands" | "pty")
+                        if alias != name
+                            && (PY_EXEC_SINK_FUNCTION.is_match(name)
+                                || PY_EXEC_FAMILY_NAME.is_match(name)) =>
+                    {
+                        aliases
+                            .functions
+                            .insert(alias.to_string(), name.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        aliases
+    }
+
+    /// The module a receiver name stands for.
+    fn module<'a>(&'a self, name: &'a str) -> &'a str {
+        self.modules.get(name).map_or(name, String::as_str)
+    }
+
+    /// Each call through a function alias: its start, the end of its name
+    /// and opening parenthesis, and the sink it calls.
+    fn function_calls<'a>(&'a self, code: &str) -> Vec<(usize, usize, &'a str)> {
+        let mut calls = Vec::new();
+        for (alias, sink) in &self.functions {
+            let mut from = 0;
+            while let Some(found) = code[from..].find(alias.as_str()) {
+                let start = from + found;
+                from = start + alias.len();
+                let before = code[..start].chars().next_back();
+                if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+                    continue;
+                }
+                let after = code[from..].trim_start();
+                if after.starts_with('(') && !code[..start].trim_end().ends_with("def") {
+                    calls.push((start, code.len() - after.len() + 1, sink.as_str()));
+                }
+            }
+        }
+        calls.sort_unstable();
+        calls
+    }
+}
+
+static PY_EXEC_SINK_FUNCTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:system|popen|check_call|check_output|call|run|Popen|getoutput|getstatusoutput)$",
+    )
+    .expect("python exec sink function regex compiles")
+});
 
 /// Whether an exec sink handed exactly one string runs that string through a
 /// shell, so the string is a whole command line the packs should judge (#512).
@@ -956,23 +1397,35 @@ fn single_string_sink_runs_shell(
     code: &str,
     sink_start: usize,
     region: &str,
+    python_aliases: Option<&PythonSinkAliases>,
 ) -> bool {
     let receiver = code[..sink_start].trim_end();
     let is_method = receiver.ends_with('.') || receiver.ends_with("->") || receiver.ends_with("::");
     let receiver_name = || {
-        receiver
+        let name = receiver
             .trim_end_matches(['.', '-', '>', ':'])
             .trim_end()
             .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
             .next()
-            .unwrap_or("")
+            .unwrap_or("");
+        // `import subprocess as s` makes `s.run` subprocess's `run`.
+        python_aliases.map_or(name, |aliases| aliases.module(name))
     };
     match language {
         ScriptLanguage::Perl => matches!(sink, "system" | "exec") && !is_method,
-        ScriptLanguage::Ruby => {
-            matches!(sink, "system" | "exec" | "spawn")
-                && (!is_method || matches!(receiver_name(), "Kernel" | "Process"))
-        }
+        ScriptLanguage::Ruby => match sink {
+            "system" | "exec" | "spawn" => {
+                !is_method || matches!(receiver_name(), "Kernel" | "Process")
+            }
+            // `Kernel#open("|cmd")`; the caller checks for the `|`.
+            "open" => !is_method || receiver_name() == "Kernel",
+            "popen" => is_method && receiver_name() == "IO",
+            "capture2e" | "capture2" | "capture3" | "popen2e" | "popen2" | "popen3"
+            | "pipeline_rw" | "pipeline_r" | "pipeline_w" | "pipeline_start" | "pipeline" => {
+                !is_method || receiver_name() == "Open3"
+            }
+            _ => false,
+        },
         ScriptLanguage::Python => match sink {
             "system" | "popen" => !is_method || matches!(receiver_name(), "os" | "posix"),
             "getoutput" | "getstatusoutput" => {
@@ -1076,7 +1529,7 @@ pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Op
             } else {
                 tail.split('\n').next().unwrap_or(tail)
             };
-            let region = exec_argv_region(call_text);
+            let region = exec_argv_region(call_text, ScriptLanguage::Ruby);
             let mut paths: Vec<&str> = ANY_STRING_LITERAL
                 .captures_iter(region)
                 .filter_map(|caps| string_literal_from_caps(&caps))
@@ -1375,7 +1828,7 @@ fn scan_ruby_exec_sink_matches(code: &str, newline_positions: &[usize]) -> Vec<P
     //    (`system("sh", "-c", "rm -rf /etc")`) is caught too.
     for caps in RUBY_QUOTED_EXEC_SINK_LITERAL.captures_iter(code) {
         let Some(m) = caps.get(0) else { continue };
-        let arg_region = exec_sink_arg_region(code, m.start());
+        let arg_region = exec_sink_arg_region(code, m.start(), ScriptLanguage::Ruby);
         if let Some(hit) = detect_destructive_in_args(arg_region, ScriptLanguage::Ruby) {
             let sink = caps.name("sink").map_or("exec", |s| s.as_str());
             keep(ruby_exec_sink_match(code, newline_positions, m, sink, &hit));
@@ -1587,7 +2040,7 @@ static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // and that reads as an unverified argv.
     Regex::new(concat!(
         r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)"#,
-        r#"\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)'|`[^`'"\\]*`)"#,
+        r#"\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)'|`(?:[^`\\]|\\[\s\S])*`|[A-Za-z_$][A-Za-z0-9_$]*\s*[,)])"#,
         r"|\bDeno\s*\.\s*(?P<deno>Command|run)\s*\(",
         r"|\b(?P<bun>spawnSync|spawn)\s*\(\s*[\[{]",
         r"|(?:^|[^A-Za-z0-9_$\\])(?P<tag>\$)(?:\.sync)?\s*(?:`|\(\s*\{)",
@@ -1658,9 +2111,20 @@ static PY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 static RUBY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // Aliased/qualified Ruby shell sinks with a string-literal first arg.
     Regex::new(
-        r#"(?m)\b(?P<sink>system|exec|spawn)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+        r#"(?m)\b(?P<sink>system|exec|spawn)\b(?:\s*\(\s*|[ \t]+)(?:["'%\[]|[a-z_][A-Za-z0-9_]*\b)"#,
     )
     .expect("ruby exec sink literal regex compiles")
+});
+
+/// Every Ruby call that runs a command it is handed, for the reconstruction
+/// the packs judge: [`RUBY_EXEC_SINK_LITERAL`]'s, `IO.popen`, `Open3`'s and
+/// `Kernel#open("|…")`. The receiver decides which are real
+/// ([`single_string_sink_runs_shell`]).
+static RUBY_SHELL_SINK_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)\b(?P<sink>system|exec|spawn|popen|capture2e|capture2|capture3|popen2e|popen2|popen3|pipeline_rw|pipeline_r|pipeline_w|pipeline_start|pipeline|open)\b(?:\s*\(\s*|[ \t]+)(?:["'%\[]|[a-z_][A-Za-z0-9_]*\b)"#,
+    )
+    .expect("ruby shell sink call regex compiles")
 });
 
 static GO_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
@@ -2857,6 +3321,9 @@ fn python_delete_targets_scratch<D: ast_grep_core::Doc>(call: &ast_grep_core::No
             let text = target.text();
             let value = if target.kind() == "concatenated_string" {
                 Cow::Owned(python_adjacent_literal_value(&target))
+            } else if PY_PREFIXED_LITERAL.is_match(&text) {
+                // The exemption is granted from plain literals only.
+                Cow::Borrowed(RUNTIME_VALUE)
             } else {
                 concatenated_operand(&text, ScriptLanguage::Python, 0)
             };
@@ -2877,6 +3344,14 @@ fn python_delete_targets_scratch<D: ast_grep_core::Doc>(call: &ast_grep_core::No
     }
     false
 }
+
+/// A Python string literal with a prefix (`f'…'`, `b'…'`, `r'…'`). The temp
+/// exemption is granted from plain literals only, though the operand reader
+/// decodes every kind.
+static PY_PREFIXED_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:^|[^A-Za-z0-9_])[rRbBuUfFtT]{1,2}['"]"#)
+        .expect("python prefixed literal regex compiles")
+});
 
 /// Python joins adjacent string literals at compile time, so `'/tmp/' 'build'`
 /// is the constant `'/tmp/build'`, exactly like `'/tmp/' + 'build'` (#549).
@@ -2899,6 +3374,7 @@ fn python_adjacent_literal_value<D: ast_grep_core::Doc>(
             || piece.kind() != "string"
             || piece.is_error()
             || piece.is_missing()
+            || PY_PREFIXED_LITERAL.is_match(&piece.text())
         {
             return RUNTIME_VALUE.to_string();
         }
@@ -3441,7 +3917,7 @@ static PERL_SYSTEM_EXEC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     //
     // We intentionally only match *simple single-line* string literals to keep signal high.
     Regex::new(
-        r#"(?m)\b(?P<call>system|exec)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+        r#"(?m)\b(?P<call>system|exec)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)'|["']|q[qw]?(?:\s|[^\w\s])|\$[A-Za-z_])"#,
     )
     .expect("perl system/exec literal regex compiles")
 });
@@ -3717,7 +4193,7 @@ fn scan_perl_system_exec(
         // argv-form `system`/`exec` unguarded — a `/` target included — while
         // the one-string form blocked. JavaScript, Python and Ruby already
         // read the list this way.
-        let region = exec_sink_arg_region(haystack, m.start());
+        let region = exec_sink_arg_region(haystack, m.start(), ScriptLanguage::Perl);
         let Some(hit) = detect_destructive_in_args(region, ScriptLanguage::Perl) else {
             continue;
         };
@@ -3814,7 +4290,10 @@ fn scan_perl_file_path(
         // `rmtree(['/'])`, since the array form matched nothing at all. The
         // region stops at an options hash (`{ keep_root => 1 }`), whose
         // strings are not paths.
-        let region = exec_argv_region(exec_sink_arg_region(haystack, m.start()));
+        let region = exec_argv_region(
+            exec_sink_arg_region(haystack, m.start(), ScriptLanguage::Perl),
+            ScriptLanguage::Perl,
+        );
         let paths: Vec<&str> = ANY_STRING_LITERAL
             .captures_iter(region)
             .filter_map(|caps| string_literal_from_caps(&caps))
@@ -4188,6 +4667,134 @@ fn python_bound_argv_calls(
     calls
 }
 
+/// Most string bindings of one name read per sink call.
+const MAX_STRING_BINDINGS: usize = 16;
+
+/// A sink call whose command (its first positional argument, or Python's
+/// `args=`) is a bare name, followed by `,`, `)`, or for a call without
+/// parentheses the end of its statement. Perl and PHP names carry their `$`.
+static PY_COMMAND_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*(?:args\s*=\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*[,)]",
+    )
+    .expect("python argv name regex compiles")
+});
+static JS_ARGV_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Za-z_$][A-Za-z0-9_$]*\s*\(\s*(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*[,)]")
+        .expect("javascript argv name regex compiles")
+});
+static RUBY_ARGV_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*|[ \t]+)(?P<name>[a-z_][A-Za-z0-9_]*)\s*(?:[,);]|$)",
+    )
+    .expect("ruby argv name regex compiles")
+});
+static SIGIL_ARGV_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*|[ \t]+)(?P<name>\$[A-Za-z_][A-Za-z0-9_]*)\s*(?:[,);]|$)")
+        .expect("perl/php argv name regex compiles")
+});
+
+/// A statement that assigns to a name, ending where its value starts.
+/// Python's may be annotated (`NAME: list[str] = `); JavaScript's may
+/// declare (`const NAME = `), Perl's too (`my $NAME = `).
+static PY_BINDING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|;)[ \t]*(?P<name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*(?::[^=\n;]*)?=[ \t]*")
+        .expect("python binding regex compiles")
+});
+static JS_BINDING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|[;{}])[ \t]*(?:(?:const|let|var)[ \t]+)?(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)[ \t]*=[ \t]*")
+        .expect("javascript binding regex compiles")
+});
+static RUBY_BINDING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|;)[ \t]*(?P<name>[a-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*")
+        .expect("ruby binding regex compiles")
+});
+static SIGIL_BINDING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|[;{])[ \t]*(?:(?:my|our|local)[ \t]+)?(?P<name>\$[A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*")
+        .expect("perl/php binding regex compiles")
+});
+
+/// The text of a sink call whose command is a bare name, once for each
+/// string literal the body assigns to that name, written in the name's place,
+/// as #602 reads a Python argv list ([`python_bound_argv_calls`]).
+///
+/// `c = "git reset --hard"; os.system(c)`, and its twins in JavaScript
+/// (`const c = …; execSync(c)`), Ruby, Perl (`my $c = …; system($c)`) and
+/// PHP, were allowed while the inline call denied. Every literal assignment
+/// counts, in any scope and whatever comes between, so a later rebinding or
+/// another function's variable of the same name can only add a reading. A
+/// name bound to anything else (a call, `sys.argv`, a concatenation) is not
+/// resolved and keeps its earlier posture, and a Python assignment inside a
+/// string literal is text. The value must end its statement: the literal at
+/// the start of `c = "git" + x` is not `c`'s value.
+fn bound_string_calls(
+    language: ScriptLanguage,
+    code: &str,
+    call: &str,
+    text: Option<&PythonSinkText>,
+) -> Vec<String> {
+    let (name_regex, binding_regex): (&Regex, &Regex) = match language {
+        ScriptLanguage::Python => (&PY_COMMAND_NAME, &PY_BINDING),
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => (&JS_ARGV_NAME, &JS_BINDING),
+        ScriptLanguage::Ruby => (&RUBY_ARGV_NAME, &RUBY_BINDING),
+        ScriptLanguage::Perl | ScriptLanguage::Php => (&SIGIL_ARGV_NAME, &SIGIL_BINDING),
+        _ => return Vec::new(),
+    };
+    let Some(name) = name_regex
+        .captures(call)
+        .and_then(|caps| caps.name("name"))
+        .filter(|name| {
+            !matches!(
+                name.as_str(),
+                "True"
+                    | "False"
+                    | "None"
+                    | "true"
+                    | "false"
+                    | "nil"
+                    | "null"
+                    | "undefined"
+                    | "self"
+                    | "this"
+            )
+        })
+    else {
+        return Vec::new();
+    };
+    let mut calls = Vec::new();
+    for caps in binding_regex.captures_iter(code) {
+        if calls.len() >= MAX_STRING_BINDINGS {
+            break;
+        }
+        if caps.name("name").map(|bound| bound.as_str()) != Some(name.as_str()) {
+            continue;
+        }
+        let Some(value_start) = caps.get(0).map(|found| found.end()) else {
+            continue;
+        };
+        if text.is_some_and(|text| text.strings.iter().any(|span| span.contains(&value_start))) {
+            continue;
+        }
+        let value_end = sink_strings::literal_at(code, value_start, language)
+            .filter(|literal| !literal.command && literal.kind != sink_strings::Body::Words)
+            .map(|literal| literal.end)
+            .filter(|&end| {
+                let rest = code[end..].trim_start_matches([' ', '\t']);
+                rest.is_empty() || rest.starts_with([';', '\n', '\r', '}', ')', ','])
+            });
+        let Some(value_end) = value_end else {
+            continue;
+        };
+        calls.push(format!(
+            "{}{}{}",
+            &call[..name.start()],
+            &code[value_start..value_end],
+            &call[name.end()..]
+        ));
+    }
+    calls
+}
+
 /// One past the bracket that closes the one opening at `open` in Python
 /// source, with string literals skipped, or `None` when it does not close.
 fn python_bracket_end(bytes: &[u8], open: usize) -> Option<usize> {
@@ -4394,7 +5001,7 @@ static ANY_STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 /// runs through the template's closing backtick, however many lines and
 /// `${…}` interpolations it spans. Without a template the tag runs nothing,
 /// and its region is the `$` alone rather than the rest of the line.
-fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
+fn exec_sink_arg_region(code: &str, match_start: usize, language: ScriptLanguage) -> &str {
     if code[match_start..].starts_with('$') {
         let end = js_shell_template(&code[match_start..]).map_or(1, |(end, _)| end);
         return &code[match_start..match_start + end];
@@ -4409,25 +5016,19 @@ fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
     let bytes = code.as_bytes();
     let mut depth: i32 = 0;
     let mut seen_open = false;
-    let mut quote: Option<u8> = None;
     let mut i = match_start;
 
     while i < bytes.len() {
         let b = bytes[i];
-        if let Some(q) = quote {
-            // Inside a string literal: only its terminator (un-escaped) matters.
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
+        // A string literal of any kind the language has: only its end
+        // matters ([`sink_strings`]).
+        if i > match_start
+            && let Some(literal) = sink_strings::literal_at(code, i, language)
+        {
+            i = literal.end;
             continue;
         }
         match b {
-            b'"' | b'\'' => quote = Some(b),
             b'(' | b'[' | b'{' => {
                 depth += 1;
                 seen_open = true;
@@ -4494,10 +5095,29 @@ fn detect_destructive_in_args_counting(
     let argv = exec_argv_operands(call_text, language);
     let literals: Vec<&str> = argv.values.iter().map(Cow::as_ref).collect();
 
+    // A fixed argv of literal words: each word reaches its program as one
+    // argument, and a shell reads one only when the program is a shell given
+    // `-c`. `subprocess.run(["echo", "git reset --hard"])` only prints; reading
+    // its second word as a command line denied it. Every other program that
+    // runs an operand (`ssh host '…'`, `docker exec c sh -c '…'`, `xargs`,
+    // `su -c`) is judged by the packs from the reconstructed argv
+    // ([`exec_sink_reconstructed_commands`]).
+    let fixed_argv = !argv.unverified
+        && literals.len() > 1
+        && literals
+            .iter()
+            .all(|literal| !literal.contains(RUNTIME_VALUE));
+    let shell_string = fixed_argv
+        .then(|| shell_command_string_index(&literals))
+        .flatten();
+
     // 1) Each literal on its own (catches `subprocess.run(["sh","-c","rm -rf /etc"])`
     //    where the destructive command lives in a single literal).
     let mut found = None;
-    for literal in &literals {
+    for (index, literal) in literals.iter().enumerate() {
+        if fixed_argv && index > 0 && Some(index) != shell_string {
+            continue;
+        }
         found = more_severe(found, detect_shell_payload(literal));
     }
 
@@ -4510,10 +5130,10 @@ fn detect_destructive_in_args_counting(
     // prior evidence, and their argv is read structurally. A template's quoted
     // fragments are not argv words either: `` $`echo 'rm -rf /'` `` only
     // prints its `'rm -rf /'`.
-    let fragments = if js_native_sink(call_text, language).is_some() {
+    let fragments = if fixed_argv || js_native_sink(call_text, language).is_some() {
         Vec::new()
     } else {
-        literal_fragment_operands(exec_argv_region(call_text))
+        literal_fragment_operands(exec_argv_region(call_text, language))
     };
     let fragment_words: Vec<&str> = fragments.iter().map(Cow::as_ref).collect();
     let mut fragment_hit = None;
@@ -4560,6 +5180,42 @@ fn detect_destructive_in_args_counting(
     found
 }
 
+/// The index of the word a POSIX shell runs as its command string in a fixed
+/// argv: `["sh", "-c", "…"]`, `["bash", "-lc", "…"]`, behind `sudo`, `env`
+/// or `command` as [`next_shell_command`] reads them.
+fn shell_command_string_index(argv: &[&str]) -> Option<usize> {
+    let mut unwrapped = argv.iter().copied().peekable();
+    let program = next_shell_command(&mut unwrapped)?;
+    let consumed = argv.len() - unwrapped.count() - 1;
+    let name = program.rsplit('/').next().unwrap_or(program);
+    if !matches!(
+        name,
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "ash" | "yash"
+    ) {
+        return None;
+    }
+    let mut command_option = false;
+    for (index, word) in argv.iter().copied().enumerate().skip(consumed + 1) {
+        if command_option && !word.starts_with('-') {
+            return Some(index);
+        }
+        if word == "--" {
+            return command_option
+                .then_some(index + 1)
+                .filter(|&next| next < argv.len());
+        }
+        if let Some(flags) = word
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+        {
+            command_option |= flags.contains('c');
+        } else if !word.starts_with("--") {
+            return None;
+        }
+    }
+    None
+}
+
 /// An argv vector whose scalar positions are preserved. `unverified` means
 /// a spread, computed argument list, or parsing bound prevents that claim.
 struct ExecArgv<'a> {
@@ -4578,7 +5234,7 @@ fn exec_argv_operands(call_text: &str, language: ScriptLanguage) -> ExecArgv<'_>
     if let Some(kind) = js_native_sink(call_text, language) {
         return js_native_exec_argv(call_text, kind, language);
     }
-    let region = exec_argv_region(call_text);
+    let region = exec_argv_region(call_text, language);
     let Some(arguments) = split_exec_operands(region, b",", language) else {
         return unverified_exec_argv(region, language);
     };
@@ -4605,7 +5261,9 @@ fn exec_argv_operands(call_text: &str, language: ScriptLanguage) -> ExecArgv<'_>
                     language,
                     ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
                 ) && matches!(sink, "exec" | "execSync")
-                || language == ScriptLanguage::Php && sink != "pcntl_exec")
+                || language == ScriptLanguage::Php && sink != "pcntl_exec"
+                // `IO.popen(cmd, mode)` and `open("|cmd", mode)`: one command.
+                || language == ScriptLanguage::Ruby && matches!(sink, "popen" | "open"))
         {
             break;
         }
@@ -4702,7 +5360,7 @@ fn unverified_exec_argv(region: &str, language: ScriptLanguage) -> ExecArgv<'_> 
         .trim_start_matches(['[', '('])
         .trim_start();
     let region = skip_exec_trivia(region, language);
-    let value = exec_literal_end(region)
+    let value = exec_literal_end_in(region, language)
         .filter(|&end| skip_exec_trivia(&region[end..], language).starts_with([',', ']', ')']))
         .and_then(|end| exec_literal_operand(&region[..end], language))
         .unwrap_or(Cow::Borrowed(RUNTIME_VALUE));
@@ -5102,6 +5760,21 @@ fn push_exec_operand<'a>(argv: &mut ExecArgv<'a>, expression: &'a str, language:
         argv.unverified = true;
         return;
     }
+    // A word list (Perl `qw(git reset --hard)`, Ruby `%w[…]`) is one argv
+    // word per word.
+    if let Some(words) = sink_strings::literal_at(expression, 0, language)
+        .filter(|literal| literal.end == expression.len())
+        .and_then(|literal| sink_strings::words(expression, &literal))
+    {
+        for word in words {
+            if argv.values.len() >= MAX_EXEC_ARGV_OPERANDS {
+                argv.unverified = true;
+                return;
+            }
+            argv.values.push(Cow::Borrowed(word));
+        }
+        return;
+    }
     if expression.starts_with(['*', '@'])
         || expression.starts_with("...")
         || expression
@@ -5150,23 +5823,22 @@ fn split_exec_operands<'a>(
 ) -> Option<Vec<&'a str>> {
     let bytes = region.as_bytes();
     let mut stack = Vec::new();
-    let mut quote = None;
     let mut start = 0;
     let mut i = 0;
     let mut parts = Vec::new();
     while i < bytes.len() {
         let byte = bytes[i];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' && delimiter != b'`' {
-                i += 2;
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-        } else if matches!(byte, b'\'' | b'"' | b'`') {
-            quote = Some(byte);
-        } else if byte == b'#'
+        // Every literal kind of the language is skipped whole, so a quote
+        // or bracket inside one (`'''it's'''`, `q(it's)`) is not syntax.
+        if let Some(literal) = sink_strings::literal_at(region, i, language) {
+            i = literal.end;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            // A quote that opens no literal of the language never closes.
+            return None;
+        }
+        if byte == b'#'
             || byte == b'/'
                 && bytes.get(i + 1) == Some(&b'/')
                 && matches!(
@@ -5204,7 +5876,7 @@ fn split_exec_operands<'a>(
         }
         i += 1;
     }
-    if quote.is_some() || !stack.is_empty() {
+    if !stack.is_empty() {
         return None;
     }
     parts.push(&region[start..]);
@@ -5688,77 +6360,24 @@ fn exec_literal_end(expression: &str) -> Option<usize> {
     None
 }
 
+/// A whole operand that is one string literal of `language`, read as the
+/// language builds it ([`sink_strings`]): every literal kind, escapes decoded,
+/// and each part only known at run time (an interpolation, an f-string field,
+/// a `${…}` in a template, an escape not modeled) one [`RUNTIME_VALUE`] where
+/// it sits. `None` for anything else, and for a literal that runs a command
+/// (Ruby's and Perl's backticks, `qx`, `%x`) or is a word list.
 fn exec_literal_operand(expression: &str, language: ScriptLanguage) -> Option<Cow<'_, str>> {
     let expression = skip_exec_trivia(expression, language);
-    if expression.starts_with('`')
-        && matches!(
-            language,
-            ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
-        )
-    {
-        // A JavaScript template literal is a string like any other, cooked,
-        // with each `${…}` as one runtime value. Reading it as wholly dynamic
-        // hid ``execSync(`git reset --hard`)`` and ``Bun.spawnSync(["sh",
-        // "-c", `git reset --hard`])`` from every exec-sink view (#570).
-        // Ruby's and Perl's backticks run a command, so they stay no value.
-        let (end, value) = js_template_literal(expression, 0)?;
-        return skip_exec_trivia(&expression[end..], language)
-            .is_empty()
-            .then_some(Cow::Owned(value));
-    }
-    let end = exec_literal_end(expression)?;
-    if !skip_exec_trivia(&expression[end..], language).is_empty() {
+    let literal = sink_strings::literal_at(expression, 0, language)?;
+    if literal.command || !skip_exec_trivia(&expression[literal.end..], language).is_empty() {
         return None;
     }
-    let quote = expression.as_bytes()[0];
-    if quote == b'`' && language != ScriptLanguage::Go {
-        return None;
-    }
-    let literal = &expression[1..end - 1];
-    let interpolated = quote == b'"'
-        && match language {
-            ScriptLanguage::Ruby => {
-                literal.contains("#{") || literal.contains("#@") || literal.contains("#$")
-            }
-            ScriptLanguage::Perl => literal.contains(['$', '@']),
-            ScriptLanguage::Php => literal.contains('$'),
-            _ => false,
-        };
-    if interpolated {
-        // Retain visible destructive prefixes without claiming the complete
-        // interpolated value is literal (including Ruby's `"/tmp/#{name}"`).
-        return Some(Cow::Owned(format!("{literal}{RUNTIME_VALUE}")));
-    }
-    if quote == b'`' || !literal.contains('\\') {
-        return Some(Cow::Borrowed(literal));
-    }
-    let mut decoded = String::new();
-    let mut chars = literal.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            decoded.push(ch);
-            continue;
-        }
-        let next = chars.next()?;
-        let single_quoted = quote == b'\''
-            && matches!(
-                language,
-                ScriptLanguage::Ruby | ScriptLanguage::Perl | ScriptLanguage::Php
-            );
-        match next {
-            '\\' | '\'' => decoded.push(next),
-            _ if single_quoted => {
-                decoded.push('\\');
-                decoded.push(next);
-            }
-            '"' => decoded.push('"'),
-            'n' => decoded.push('\n'),
-            'r' => decoded.push('\r'),
-            't' => decoded.push('\t'),
-            _ => decoded.push_str(RUNTIME_VALUE),
-        }
-    }
-    Some(Cow::Owned(decoded))
+    sink_strings::value(expression, &literal, language, RUNTIME_VALUE).map(Cow::Owned)
+}
+
+/// End of one complete literal of `language` at the start of `expression`.
+fn exec_literal_end_in(expression: &str, language: ScriptLanguage) -> Option<usize> {
+    sink_strings::literal_at(expression, 0, language).map(|literal| literal.end)
 }
 
 /// Ordinary argv text is quoted so spaces or metacharacters stay in their
@@ -5874,7 +6493,7 @@ fn is_concatenation_gap(gap: &str) -> bool {
 ///
 /// A dynamic positional argument does not end it: `system('rm', '-rf', $dir,
 /// '/')` still deletes `/`.
-fn exec_argv_region(call_text: &str) -> &str {
+fn exec_argv_region(call_text: &str, language: ScriptLanguage) -> &str {
     let bytes = call_text.as_bytes();
     let mut i = call_text
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.' | ':')))
@@ -5888,24 +6507,12 @@ fn exec_argv_region(call_text: &str) -> &str {
     }
     let begin = i;
     let mut depth = 0_usize;
-    let mut quote: Option<u8> = None;
     let mut arg_start = begin;
     let mut at_arg_start = true;
     let mut list_arg = false;
 
     while i < bytes.len() {
         let b = bytes[i];
-        if let Some(q) = quote {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
         if at_arg_start && !b.is_ascii_whitespace() {
             at_arg_start = false;
             arg_start = i;
@@ -5922,8 +6529,11 @@ fn exec_argv_region(call_text: &str) -> &str {
         {
             return &call_text[begin..i];
         }
+        if let Some(literal) = sink_strings::literal_at(call_text, i, language) {
+            i = literal.end;
+            continue;
+        }
         match b {
-            b'"' | b'\'' => quote = Some(b),
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => {
                 // Below the argument list: the call's own closing paren.
@@ -13247,6 +13857,396 @@ def cleanup():
             );
             // A template that does not end the operand is no literal value.
             assert!(exec_literal_operand("`a` + b", ScriptLanguage::JavaScript).is_none());
+        }
+    }
+
+    /// The sink-string reader: every string kind of each language, the
+    /// language's interpolation as an unknown value where the shell reads it,
+    /// names bound to literals, and the sinks no reader saw.
+    mod sink_string_reader {
+        use super::*;
+
+        const MARK: char = crate::heredoc::OUTER_VALUE_MARK;
+
+        fn commands(code: &str, language: ScriptLanguage) -> Vec<String> {
+            exec_sink_reconstructed_commands(code, language)
+                .into_iter()
+                .map(|c| c.command)
+                .collect()
+        }
+
+        fn has(code: &str, language: ScriptLanguage, expected: &str) {
+            let got = commands(code, language);
+            assert!(
+                got.iter().any(|command| command == expected),
+                "{language:?}: {code:?} must reconstruct {expected:?}; got {got:?}"
+            );
+        }
+
+        fn marked(text: &str) -> String {
+            text.replace('@', &MARK.to_string())
+        }
+
+        #[test]
+        fn every_string_kind_reaches_the_shell_as_written() {
+            use ScriptLanguage::{JavaScript, Perl, Php, Python, Ruby};
+            for (language, code, expected) in [
+                (
+                    Python,
+                    "import os; os.system('''git checkout -- a.txt''')",
+                    "git checkout -- a.txt",
+                ),
+                (
+                    Python,
+                    "import os; os.system(\"\"\"'git' reset --hard\"\"\")",
+                    "'git' reset --hard",
+                ),
+                (Python, "import os; os.system('''it's''')", "it's"),
+                (
+                    Python,
+                    r#"import os; os.system(r"'git' reset --hard")"#,
+                    "'git' reset --hard",
+                ),
+                (
+                    Python,
+                    r#"import os; os.system(f"'git' reset --hard")"#,
+                    "'git' reset --hard",
+                ),
+                (Python, r#"import os; os.system(f"a{{b}}c")"#, "a{b}c"),
+                (
+                    Python,
+                    r#"import os; os.system("\x67it checkout -- a.txt")"#,
+                    "git checkout -- a.txt",
+                ),
+                (Perl, "system(q('git' reset --hard))", "'git' reset --hard"),
+                (Perl, "system(qq(git checkout -- a))", "git checkout -- a"),
+                (Perl, "system qq{git checkout -- a}", "git checkout -- a"),
+                (Perl, "system(qw(git checkout -- a))", "git checkout -- a"),
+                (Ruby, "system(%Q(git checkout -- a))", "git checkout -- a"),
+                (Ruby, "system(%q('git' reset --hard))", "'git' reset --hard"),
+                (Ruby, "system(%(git checkout -- a))", "git checkout -- a"),
+                (
+                    JavaScript,
+                    "require('child_process').execSync(`'git' reset --hard`)",
+                    "'git' reset --hard",
+                ),
+                (
+                    Php,
+                    r#"system("git\x20checkout -- a");"#,
+                    "git checkout -- a",
+                ),
+            ] {
+                has(code, language, expected);
+            }
+        }
+
+        #[test]
+        fn interpolation_is_an_unknown_value_where_it_sits() {
+            use ScriptLanguage::{JavaScript, Perl, Php, Python, Ruby};
+            for (language, code, expected) in [
+                (
+                    Perl,
+                    r#"my $x=""; system("'gi${x}t' reset --hard")"#,
+                    "'gi@t' reset --hard",
+                ),
+                (Perl, r#"system("echo $dir/x")"#, "echo @/x"),
+                (Perl, r#"system("echo $h{k}[0] done")"#, "echo @ done"),
+                (Perl, r#"system("cost \$5")"#, "cost $5"),
+                (
+                    Php,
+                    r#"$x=""; system("'gi{$x}t' reset --hard");"#,
+                    "'gi@t' reset --hard",
+                ),
+                (
+                    Php,
+                    r#"$x=""; system("'gi${x}t' reset --hard");"#,
+                    "'gi@t' reset --hard",
+                ),
+                (Php, r#"system("a {$o["k"]} b");"#, "a @ b"),
+                (
+                    Ruby,
+                    r#"x=""; system("'gi#{x}t' reset --hard")"#,
+                    "'gi@t' reset --hard",
+                ),
+                (Ruby, r#"system("a #{"}"} b")"#, "a @ b"),
+                (
+                    Python,
+                    r#"import os; x=""; os.system(f"'gi{x}t' reset --hard")"#,
+                    "'gi@t' reset --hard",
+                ),
+                (Python, r#"import os; os.system(f"{a['k']:>{w}} x")"#, "@ x"),
+                (
+                    JavaScript,
+                    "const x=''; require('child_process').execSync(`'gi${x}t' reset --hard`)",
+                    "'gi@t' reset --hard",
+                ),
+            ] {
+                has(code, language, &marked(expected));
+            }
+            // A string that is wholly unknown keeps its plain unknown value.
+            has(
+                "import os, sys; os.system(f\"{sys.argv[1]}\")",
+                Python,
+                RUNTIME_VALUE,
+            );
+        }
+
+        #[test]
+        fn a_name_bound_to_a_literal_is_that_literal() {
+            use ScriptLanguage::{JavaScript, Perl, Php, Python, Ruby};
+            for (language, code) in [
+                (
+                    Python,
+                    r#"import os; c="git checkout -- a.txt"; os.system(c)"#,
+                ),
+                (
+                    Python,
+                    r#"import subprocess; c="git checkout -- a.txt"; subprocess.run(c, shell=True)"#,
+                ),
+                (
+                    JavaScript,
+                    r#"const c="git checkout -- a.txt"; require("child_process").execSync(c)"#,
+                ),
+                (
+                    JavaScript,
+                    "let c = 'git checkout -- a.txt'\nrequire('child_process').execSync(c)",
+                ),
+                (Ruby, r#"c="git checkout -- a.txt"; system(c)"#),
+                (Ruby, "c = 'git checkout -- a.txt'\nsystem c"),
+                (Perl, r#"my $c="git checkout -- a.txt"; system($c)"#),
+                (Php, r#"$c="git checkout -- a.txt"; system($c);"#),
+            ] {
+                has(code, language, "git checkout -- a.txt");
+            }
+            // Not a literal value of the name: nothing is invented.
+            for (language, code) in [
+                (Python, r#"import os; c="git " + x; os.system(c)"#),
+                (
+                    Python,
+                    r#"import os; c = "git reset --hard" if a else "ls"; os.system(c)"#,
+                ),
+                (
+                    JavaScript,
+                    r#"const c = "git reset --hard".slice(4); require("child_process").execSync(c)"#,
+                ),
+            ] {
+                let got = commands(code, language);
+                assert!(
+                    !got.iter().any(|command| command.contains("reset")),
+                    "{language:?}: {code:?}: {got:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn sinks_no_reader_saw() {
+            use ScriptLanguage::{Perl, Php, Python, Ruby};
+            for (language, code, expected) in [
+                (
+                    Python,
+                    "import subprocess as s; s.run(\"git checkout -- a.txt\", shell=True)",
+                    "git checkout -- a.txt",
+                ),
+                (
+                    Python,
+                    "import os as o; o.system(\"git checkout -- a.txt\")",
+                    "git checkout -- a.txt",
+                ),
+                (
+                    Python,
+                    "from subprocess import run as r; r(\"git checkout -- a.txt\", shell=True)",
+                    "git checkout -- a.txt",
+                ),
+                (
+                    Python,
+                    r#"import os; os.execvp("git", ["git", "reset", "--hard"])"#,
+                    "git reset --hard",
+                ),
+                (
+                    Python,
+                    r#"import os; os.execlp("git", "git", "reset", "--hard")"#,
+                    "git reset --hard",
+                ),
+                (
+                    Python,
+                    r#"import os; os.spawnvp(os.P_WAIT, "git", ["git", "reset", "--hard"])"#,
+                    "git reset --hard",
+                ),
+                (
+                    Python,
+                    r#"import os; os.posix_spawnp("git", ["git", "reset", "--hard"], os.environ)"#,
+                    "git reset --hard",
+                ),
+                (
+                    Python,
+                    r#"from os import execv as ev; ev("/usr/bin/git", ["git", "reset", "--hard"])"#,
+                    "/usr/bin/git reset --hard",
+                ),
+                (Ruby, "`git checkout -- a.txt`", "git checkout -- a.txt"),
+                (Ruby, "%x('git' reset --hard)", "'git' reset --hard"),
+                (
+                    Ruby,
+                    "IO.popen(\"git checkout -- a.txt\")",
+                    "git checkout -- a.txt",
+                ),
+                (
+                    Ruby,
+                    "IO.popen(\"git checkout -- a.txt\", \"r\")",
+                    "git checkout -- a.txt",
+                ),
+                (
+                    Ruby,
+                    "require 'open3'; Open3.capture2(\"git checkout -- a.txt\")",
+                    "git checkout -- a.txt",
+                ),
+                (
+                    Ruby,
+                    "open(\"|git checkout -- a.txt\")",
+                    "git checkout -- a.txt",
+                ),
+                (Ruby, "IO.popen(%w[git reset --hard])", "git reset --hard"),
+                (Perl, "open(F, \"git reset --hard |\")", "git reset --hard"),
+                (Perl, "open(F, \"| git reset --hard\")", "git reset --hard"),
+                (
+                    Perl,
+                    "open(my $f, \"-|\", \"git reset --hard\") or die",
+                    "git reset --hard",
+                ),
+                (
+                    Perl,
+                    "open(my $f, \"-|\", \"git\", \"reset\", \"--hard\")",
+                    "git reset --hard",
+                ),
+                (
+                    Php,
+                    "echo `git checkout -- a.txt`;",
+                    "git checkout -- a.txt",
+                ),
+                (Php, "echo `git reset --hard`;", "git reset --hard"),
+                (Php, "echo `'git' reset --hard`;", "'git' reset --hard"),
+            ] {
+                has(code, language, expected);
+            }
+        }
+
+        #[test]
+        fn text_that_runs_nothing_is_not_a_command() {
+            use ScriptLanguage::{JavaScript, Perl, Php, Python, Ruby};
+            for (language, code) in [
+                (Ruby, "puts \"use `git reset --hard` carefully\""),
+                (Ruby, "puts 1 # `git reset --hard`"),
+                (Ruby, "File.open(\"|git reset --hard\")"),
+                (Ruby, "x = 10 %(3)"),
+                (Perl, "print \"git reset --hard |\""),
+                (Perl, "open(my $f, \"<\", \"git reset --hard |\")"),
+                (Perl, "open(F, \"< a.txt\")"),
+                (Php, "echo \"`git reset --hard`\";"),
+                (Php, "echo 1; // `git reset --hard`"),
+                (JavaScript, "const c=\"git reset --hard\"; /git/.exec(c)"),
+                (
+                    Python,
+                    "import re as s; s.run(\"git reset --hard\", shell=True)",
+                ),
+                (
+                    Python,
+                    "import os; os.execvp(\"git\", [\"git\", \"status\"])",
+                ),
+            ] {
+                let got = commands(code, language);
+                assert!(
+                    !got.iter().any(|command| command.contains("reset --hard")),
+                    "{language:?}: {code:?}: {got:?}"
+                );
+            }
+        }
+
+        /// A word of a fixed argv reaches its program as one argument; it is
+        /// a command line only for a shell given `-c`.
+        #[test]
+        fn a_fixed_argv_word_is_a_command_only_for_a_shell() {
+            let hit = |code: &str| {
+                detect_destructive_in_args(code, ScriptLanguage::Python).map(|hit| hit.rule_suffix)
+            };
+            for code in [
+                r#"run(["echo", "git reset --hard"])"#,
+                r#"run(["printf", "%s", "rm -rf /"])"#,
+                r#"run(["git", "commit", "-m", "git reset --hard"])"#,
+                r#"run(["sh", "-c", "echo hi", "git reset --hard"])"#,
+            ] {
+                assert_eq!(hit(code), None, "{code}");
+            }
+            for code in [
+                r#"run(["sh", "-c", "git reset --hard"])"#,
+                r#"run(["bash", "-lc", "git reset --hard"])"#,
+                r#"run(["sudo", "-u", "x", "sh", "-c", "git reset --hard"])"#,
+                r#"run(["env", "A=1", "/bin/sh", "-ec", "git reset --hard"])"#,
+                r#"run(["git", "reset", "--hard"])"#,
+                r#"run([prog, "git reset --hard"])"#,
+            ] {
+                assert_eq!(hit(code), Some("git_reset_hard"), "{code}");
+            }
+            // The packs judge every other runner from the reconstruction.
+            assert_eq!(
+                commands(
+                    r#"import subprocess; subprocess.run(["ssh", "host", "git reset --hard"])"#,
+                    ScriptLanguage::Python
+                ),
+                vec!["ssh host 'git reset --hard'".to_string()]
+            );
+        }
+
+        #[test]
+        fn string_bindings_reach_the_packs_and_leave_the_backstop_as_it_was() {
+            let blocks = |code: &str, language: ScriptLanguage| {
+                scan_executing_sink_matches(code, language)
+                    .into_iter()
+                    .any(|m| m.severity.blocks_by_default())
+            };
+            for (code, language) in [
+                ("system(qq(git reset --hard))", ScriptLanguage::Perl),
+                ("system(qw(git reset --hard))", ScriptLanguage::Perl),
+                ("system(%Q(git reset --hard))", ScriptLanguage::Ruby),
+            ] {
+                assert!(blocks(code, language), "{language:?}: {code:?}");
+            }
+            // A name bound to a string is read only by the reconstruction, so
+            // the rule that judges it is the pack's, and a RegExp's `exec(c)`
+            // or `File.open` is no sink.
+            for (code, language) in [
+                (
+                    r#"import os; c="git reset --hard"; os.system(c)"#,
+                    ScriptLanguage::Python,
+                ),
+                (
+                    r#"const c="git reset --hard"; require("child_process").execSync(c)"#,
+                    ScriptLanguage::JavaScript,
+                ),
+                (
+                    r#"my $c="git reset --hard"; system($c)"#,
+                    ScriptLanguage::Perl,
+                ),
+            ] {
+                assert!(!blocks(code, language), "{language:?}: {code:?}");
+                let split = exec_sink_commands(code, language);
+                assert!(
+                    split.bound.iter().any(|c| c.command == "git reset --hard"),
+                    "{language:?}: {code:?}"
+                );
+            }
+            for (code, language) in [
+                (
+                    r#"const c="git reset --hard"; /git/.exec(c)"#,
+                    ScriptLanguage::JavaScript,
+                ),
+                ("File.open(\"|git reset --hard\")", ScriptLanguage::Ruby),
+            ] {
+                assert!(!blocks(code, language), "{language:?}: {code:?}");
+                assert!(
+                    commands(code, language).is_empty(),
+                    "{language:?}: {code:?}: {:?}",
+                    commands(code, language)
+                );
+            }
         }
     }
 }
