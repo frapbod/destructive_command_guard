@@ -12456,57 +12456,36 @@ fn powershell_code_blank_end(command: &str, mut start: usize) -> usize {
     powershell_blank_end(command, start)
 }
 
-/// Where the block comment that ends `text` opens, if `text` ends one: at
-/// the first `<#` after the `#>` before its own, searched within
-/// [`MAX_POWERSHELL_MEMBER_NAME_SPELLING`] bytes. `Err` holds the same answer
-/// when it may be wrong: the window holds no `#>` and starts after the start
-/// of `text`, so a `<#` before the window may open the comment instead.
-fn powershell_block_comment_open(text: &str) -> Result<Option<usize>, Option<usize>> {
-    let Some(body) = text.strip_suffix("#>") else {
-        return Ok(None);
-    };
-    let mut floor = body
-        .len()
-        .saturating_sub(MAX_POWERSHELL_MEMBER_NAME_SPELLING);
-    while !body.is_char_boundary(floor) {
-        floor -= 1;
-    }
-    let window = &body[floor..];
-    let close = window.rfind("#>");
-    let after_close = close.map_or(0, |close| close + 2);
-    let open = window[after_close..]
-        .find("<#")
-        .map(|open| floor + after_close + open)
-        .filter(|&open| skip_powershell_block_comment(text, open) == text.len());
-    if close.is_none() && floor > 0 {
-        Err(open)
-    } else {
-        Ok(open)
-    }
-}
-
 /// `text` without the blank space and block comments at its end
-/// ([`trim_powershell_blank_end`], [`powershell_block_comment_open`]).
-fn trim_powershell_code_blank_end(text: &str) -> &str {
-    trim_powershell_code_blank_end_within(text, false).unwrap_or(text)
-}
-
-/// [`trim_powershell_code_blank_end`]; when `sure`, `None` if a comment's
-/// opening may lie before the window.
-fn trim_powershell_code_blank_end_within(mut text: &str, sure: bool) -> Option<&str> {
+/// ([`trim_powershell_blank_end`]). A comment opens at the first `<#` after
+/// the `#>` before its own, searched within
+/// [`MAX_POWERSHELL_MEMBER_NAME_SPELLING`] bytes.
+fn trim_powershell_code_blank_end(mut text: &str) -> &str {
     for _ in 0..MAX_POWERSHELL_TYPE_COMMENTS {
         text = trim_powershell_blank_end(text);
-        let open = match powershell_block_comment_open(text) {
-            Ok(open) => open,
-            Err(_) if sure => return None,
-            Err(open) => open,
+        let Some(body) = text.strip_suffix("#>") else {
+            return text;
         };
-        let Some(open) = open else {
-            return Some(text);
+        let mut floor = body
+            .len()
+            .saturating_sub(MAX_POWERSHELL_MEMBER_NAME_SPELLING);
+        while !body.is_char_boundary(floor) {
+            floor -= 1;
+        }
+        let window = &body[floor..];
+        let after_close = window.rfind("#>").map_or(0, |close| close + 2);
+        let Some(open) = window[after_close..]
+            .find("<#")
+            .map(|open| floor + after_close + open)
+        else {
+            return text;
         };
+        if skip_powershell_block_comment(text, open) != text.len() {
+            return text;
+        }
         text = &text[..open];
     }
-    Some(trim_powershell_blank_end(text))
+    trim_powershell_blank_end(text)
 }
 
 /// The member name spelled at `start` and the byte after its spelling,
@@ -12631,54 +12610,40 @@ fn is_powershell_quote(character: char) -> bool {
 /// `$h.'a'::`, `.@'…'@.`, `$a<#c#>.b.`, `[t]::m().`), not a dot inside a
 /// bareword argument (`Write-Output a.b`), which is text.
 fn powershell_dot_follows_expression(command: &str, dot: usize) -> bool {
-    // Block comments may sit between the parts of the chain
-    // (`[t]<#c#>::Create`, `$a<#c#>.b.InvokeScript`). A comment whose
-    // opening the window cannot show may hide any chain, so the chain reads
-    // as an expression, which fails closed.
-    let Some(mut before) = trim_powershell_code_blank_end_within(&command[..dot], true) else {
+    // A block comment glued to the chain (`$a<#c#>.b.InvokeScript`,
+    // `$t<#c#>::Create`) reads as an expression, wherever the comment opens:
+    // a `<#` inside a string or name before it opens nothing, so its opening
+    // is not looked for. Bareword text with a glued comment
+    // (`Write-Output a<#c#>.InvokeScript`) is read the same way, which fails
+    // closed.
+    let before = trim_powershell_blank_end(&command[..dot]);
+    if before.ends_with("#>") {
         return true;
-    };
-    for _ in 0..=MAX_POWERSHELL_TYPE_COMMENTS {
-        // Walk back over the names and separators of the chain. PowerShell
-        // names may hold any letter, so every other character outside ASCII
-        // except blank space and quotes is read as a name character.
-        let Some((index, end)) = before.char_indices().rev().find(|&(_, character)| {
-            !(character.is_ascii_alphanumeric()
-                || matches!(character, '_' | '.' | ':' | '?')
-                || !(character.is_ascii()
-                    || character.is_whitespace()
-                    || is_powershell_quote(character)))
-        }) else {
-            return false;
-        };
-        match end {
-            // A variable, or the close of a group, call, index, braced
-            // variable, script block, hashtable or string.
-            '$' | ')' | ']' | '}' => return true,
-            character if is_powershell_quote(character) => return true,
-            // The close of a here-string.
-            '@' => return before[..index].ends_with(is_powershell_quote),
-            // A block comment glued between parts of the chain. A `>` that
-            // ends no comment is a redirection (`x >out.InvokeScript`), and a
-            // comment after blank space starts another word.
-            '>' if before[..index].ends_with('#') => {
-                let Some(comment_less) =
-                    trim_powershell_code_blank_end_within(&before[..=index], true)
-                else {
-                    return true;
-                };
-                if comment_less.len() > index
-                    || before.as_bytes().get(comment_less.len()) != Some(&b'<')
-                {
-                    return false;
-                }
-                before = comment_less;
-            }
-            _ => return false,
-        }
     }
-    // More comments than the bound: read as an expression, which fails closed.
-    true
+    // Walk back over the names and separators of the chain. PowerShell names
+    // may hold any letter, so every other character outside ASCII except
+    // blank space and quotes is read as a name character.
+    let Some((index, end)) = before.char_indices().rev().find(|&(_, character)| {
+        !(character.is_ascii_alphanumeric()
+            || matches!(character, '_' | '.' | ':' | '?')
+            || !(character.is_ascii()
+                || character.is_whitespace()
+                || is_powershell_quote(character)))
+    }) else {
+        return false;
+    };
+    match end {
+        // A variable, or the close of a group, call, index, braced variable,
+        // script block, hashtable or string.
+        '$' | ')' | ']' | '}' => true,
+        character if is_powershell_quote(character) => true,
+        // The close of a here-string.
+        '@' => before[..index].ends_with(is_powershell_quote),
+        // A glued block comment between parts of the chain, as above. A `>`
+        // that ends no comment is a redirection (`x >out.InvokeScript`).
+        '>' => before[..index].ends_with('#'),
+        _ => false,
+    }
 }
 
 /// The first argument of a .NET method call's argument text, up to the first

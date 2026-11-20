@@ -458,6 +458,21 @@ const RUNS_IT: &[&str] = &[
     "$h=@{a=[scriptblock]}; $f=$h.@\"\na\n\"@::Create; $f.Invoke('git reset --hard').Invoke()",
     "$h=@{'ä'=[scriptblock]}; $f=$h.'ä'<#c#>::Create; $f.Invoke('git reset --hard').Invoke()",
     "$ä=@{b=$ExecutionContext.InvokeCommand}; $m=$ä.b.InvokeScript; & { $m.Invoke('git reset --hard') }",
+    // Review round 7 (runner rv7/truth2.out, rv7/truth3.out): a comment
+    // glued to the chain after a `<#` that opens no comment, in a string,
+    // here-string, bareword or braced name earlier in the statement.
+    "$a = 'x y<#', $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$a = 'x y<#', $ExecutionContext.InvokeCommand<#c#>.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$a = \"x y<#\", $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$a = @'\nx y<#\n'@, $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$m = 'x y<#' ? $ExecutionContext<#c#>.InvokeCommand.InvokeScript : 0; $m.Invoke('git reset --hard')",
+    "$m = $(Write-Output 'x y<#' | Out-Null; $ExecutionContext<#c#>.InvokeCommand.InvokeScript); $m.Invoke('git reset --hard')",
+    "$m = (Write-Output a<#) ? $ExecutionContext<#c#>.InvokeCommand.InvokeScript : 0; $m.Invoke('git reset --hard')",
+    "$t=[scriptblock]; $f = 'x y<#', $t<#c#>::Create; $f[1].Invoke('git reset --hard').Invoke()",
+    "$h=@{a=[scriptblock]}; $f = 'x y<#', $h<#c#>.a::Create; $f[1].Invoke('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $f = 'x y<#' ? $t<#c#>::Create : 0; $f.Invoke('git reset --hard').Invoke()",
+    "$a = ${a <#}, $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$a = <#a#>'x y<#', $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
 ];
 
 /// Name spellings longer than dcg's first reading window (review round 2;
@@ -674,16 +689,14 @@ const HARMLESS: &[&str] = &[
     "Write-Output InvokeCommand.InvokeScript",
     "Write-Output Widget::Create",
     "Write-Output a.b.InvokeScript; git status",
-    // A quoted string is an expression even as an argument, a comment glued
-    // to a bareword is part of the word, and a word after blank space, a
-    // redirection or a name outside ASCII is text (review round 5; runner
-    // rv5/truth.out, p7/truth.out).
+    // A quoted string is an expression even as an argument, and a word
+    // after blank space, a redirection or a name outside ASCII is text
+    // (review round 5; runner rv5/truth.out, p7/truth.out). A comment glued
+    // to a bareword before an engine method name reads as an expression: a
+    // listed cost (review round 7).
     "Write-Output 'abc'.Length; git status",
-    "Write-Output $x <#c#>a.InvokeScript; git status",
     "Write-Output x >out.InvokeScript; git status",
     "Write-Output ä.InvokeScript; git status",
-    "Write-Output Widget<#c#>::Create; git status",
-    "Write-Output x<#c#>.InvokeScript; git status",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
