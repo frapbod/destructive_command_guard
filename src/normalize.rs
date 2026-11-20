@@ -8190,18 +8190,24 @@ fn posix_backquote_end(bytes: &[u8], from: usize) -> usize {
 ///   end, but Bash evaluates arithmetic only where its grammar or a builtin
 ///   says so. So when the command holds such a sink (an arithmetic span
 ///   above, `${!…}`, or a word naming `let`, `declare`, `typeset`, `local`,
-///   `export`, `readonly`, `read`, `printf`, `test`, `[`, `[[`, `getopts`
-///   or `wait`), or a value holds an array reference that a later word
-///   completes (`p='a['`, `"a[$q]"`), every quoted, escaped or `$'…'`
-///   decoded substitution in any word's value is spelled unquoted, also in
-///   the words of `$(…)`, backquote and `${…}` operand text. A quoted
-///   substitution beside a sink that runs nothing is read as a command too
-///   (`q='$(git reset --hard)'; x[$q]=1`): an accepted false positive.
+///   `export`, `readonly`, `read`, `printf -v`, `test -v`, `[ -v`, `[[`,
+///   `getopts` or `wait -p`), or a value holds an array reference that a
+///   later word completes (`p='a['`, `"a[$q]"`), every quoted, escaped or
+///   `$'…'` decoded substitution in any word's value is spelled unquoted,
+///   also in the words of `$(…)`, backquote and `${…}` operand text. The
+///   sink is looked for in the whole text: in `$(…)` and backquote bodies,
+///   in quoted text and in heredoc and here-string bodies, which `eval`,
+///   `sh -c`, `source` or a shell reading its input runs as code, and in a
+///   name spelled with quotes, backslashes or `$'…'` escapes (`\let y`). A
+///   quoted substitution beside a sink that runs nothing is read as a
+///   command too (`q='$(git reset --hard)'; x[$q]=1`, or a quoted `((` or
+///   `x[0]=` in data): an accepted false positive.
 ///
-/// Quoted heredoc bodies are passed over, and words are not read in any
-/// body: a body is the input of its command, like a file, and dcg does not
-/// follow input into a later evaluation. An opener the command puts
-/// together at run time (`printf -v y 'a[%s(…)]' '$'`) is not seen either.
+/// Quoted heredoc bodies are not spelled, and their words are not read: a
+/// body fed to a shell or to `source` is code, but its sinks already count,
+/// and a body fed to another command is its input, like a file. An opener
+/// or a builtin name the command puts together at run time
+/// (`printf -v y 'a[%s(…)]' '$'`, `read l <<< let; $l y`) is not seen.
 /// Each changed spelling is read through the whole evaluator, so the
 /// readers judge the substitution as they judge any other.
 #[must_use]
@@ -8224,42 +8230,94 @@ pub(crate) fn bash_arithmetic_quotes(command: &str) -> Option<BashHashReading> {
     // Only an ASCII byte changed into another ASCII byte.
     let spelled = spelled.and_then(|spelled| String::from_utf8(spelled).ok());
     let text = spelled.as_deref().unwrap_or(command);
-    let sink = !spans.is_empty() || names_arithmetic_sink(command);
+    let sink = !spans.is_empty() || holds_arithmetic_sink(command);
     let reading = requote_quoted_substitutions(text, &bodies, sink, 0).or(spelled)?;
     Some(BashHashReading::Spelled(reading))
 }
 
+/// Whether `command` holds an arithmetic sink of [`bash_arithmetic_quotes`]
+/// anywhere in its text: in a `$(…)` or backquote body, in quoted text and
+/// in a heredoc or here-string body, which a later evaluation may read as
+/// code (`echo $(echo $((y)))`, `eval 'let y'`, `bash <<'EOF'` with
+/// `echo $((y))` in its body), or as a word naming a builtin. Every quote,
+/// backslash and backquote is read as a blank and every `$(` as `(`, and
+/// the arithmetic spans of that text are found as if it were unquoted.
+fn holds_arithmetic_sink(command: &str) -> bool {
+    if names_arithmetic_sink(command) {
+        return true;
+    }
+    let bytes = command.as_bytes();
+    let mut flat = bytes.to_vec();
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'\'' | b'"' | b'\\' | b'`' => flat[at] = b' ',
+            b'$' if bytes.get(at + 1) == Some(&b'(') && bytes.get(at + 2) != Some(&b'(') => {
+                flat[at] = b' ';
+            }
+            _ => {}
+        }
+    }
+    !arithmetic_spans(&flat, &[], &[]).is_empty()
+}
+
 /// Whether `command` holds `${!…}` or a word naming a builtin that
-/// evaluates a name or a value as arithmetic, wherever the word is: a sink
-/// of [`bash_arithmetic_quotes`] besides the arithmetic spans. A quote
-/// does not end the word, so quoted data such as `b='['` names none.
-/// `printf`, `test`, `[` and `wait` evaluate a name only through an option
-/// (`printf -v`, `test -v`, `wait -p`), so without it they are no sink:
-/// `printf '%s' '$(git reset --hard)'` prints the text. The option may be
-/// quoted, as the shell removes its quotes.
+/// evaluates a name or a value as arithmetic, wherever the word is. The
+/// shell removes quotes and backslashes from a command name (`\let`,
+/// `'let'`, `l\et`, `$'\x6cet'`), and text a later evaluation reads
+/// (`eval 'let y'`) holds words of its own, so backslashes are removed and
+/// words also end at quotes; a word whose `$'…'` escapes decode to a name
+/// is read too. Quoted data such as `b='['` then names `[`, which is no
+/// sink on its own: `printf`, `test`, `[` and `wait` evaluate a name only
+/// through an option (`printf -v`, `test -v`, `wait -p`), so without it
+/// they are no sink: `printf '%s' '$(git reset --hard)'` prints the text.
 fn names_arithmetic_sink(command: &str) -> bool {
-    const SINKS: [&str; 9] = [
-        "let", "declare", "typeset", "local", "export", "readonly", "read", "[[", "getopts",
-    ];
     if command.contains("${!") {
         return true;
     }
-    let words: Vec<&str> = command
+    let text = command.replace('\\', "");
+    let words: Vec<&str> = text
         .split(|ch: char| {
-            ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '`')
+            ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '`' | '\'' | '"')
         })
         .filter(|word| !word.is_empty())
         .collect();
-    let unquoted = |word: &str| word.replace(['\'', '"', '\\'], "");
+    if names_sink_in(&words) {
+        return true;
+    }
+    if !command.contains("$'") {
+        return false;
+    }
+    // Words spelled with `$'…'` escapes, read as their decoded text.
+    let decoded: Vec<String> = posix_command_word_ranges(command)
+        .into_iter()
+        .filter_map(|range| {
+            posix_word_value(&command[range])?
+                .iter()
+                .map(|byte| match byte {
+                    ValueByte::Literal(ch, _) => Some(*ch),
+                    ValueByte::Expansion(..) => None,
+                })
+                .collect::<Option<String>>()
+        })
+        .collect();
+    names_sink_in(&decoded)
+}
+
+/// Whether one of `words` names a builtin that evaluates a name or a value
+/// as arithmetic, with the option it needs to do so.
+fn names_sink_in<S: AsRef<str>>(words: &[S]) -> bool {
+    const SINKS: [&str; 9] = [
+        "let", "declare", "typeset", "local", "export", "readonly", "read", "[[", "getopts",
+    ];
     words.iter().enumerate().any(|(at, word)| {
         let later = &words[at + 1..];
-        match *word {
+        match word.as_ref() {
             "printf" => later
                 .first()
-                .is_some_and(|next| unquoted(next).starts_with("-v")),
-            "test" | "[" => later.iter().any(|next| unquoted(next) == "-v"),
+                .is_some_and(|next| next.as_ref().starts_with("-v")),
+            "test" | "[" => later.iter().any(|next| next.as_ref() == "-v"),
             "wait" => later.iter().any(|next| {
-                let next = unquoted(next);
+                let next = next.as_ref();
                 next.starts_with('-') && next.contains('p')
             }),
             word => SINKS.contains(&word),
@@ -10729,6 +10787,28 @@ mod tests {
                 "set -- a{'[$(git reset --hard)]',x}; echo $(($1))",
                 "set -- a{'['$(git reset --hard)']',x}; echo $(($1))",
             ),
+            // The sink is in a body, in text evaluated later, or in a name
+            // spelled with quotes, a backslash or `$'…'` escapes.
+            (
+                "y=a; y+='[$(git reset --hard)]'; echo $(echo $((y)))",
+                "y=a; y+='['$(git reset --hard)']'; echo $(echo $((y)))",
+            ),
+            (
+                "y=a; y+='[$(git reset --hard)]'; eval 'let y'",
+                "y=a; y+='['$(git reset --hard)']'; eval 'let y'",
+            ),
+            (
+                "y='[$(git reset --hard)]' z=a$y bash <<'EOF'\necho $((z))\nEOF",
+                "y='['$(git reset --hard)']' z=a$y bash <<'EOF'\necho $((z))\nEOF",
+            ),
+            (
+                "y=a; y+='[$(git reset --hard)]'; l\\et y",
+                "y=a; y+='['$(git reset --hard)']'; l\\et y",
+            ),
+            (
+                "y=a; y+='[$(git reset --hard)]'; $'\\x6cet' y",
+                "y=a; y+='['$(git reset --hard)']'; $'\\x6cet' y",
+            ),
             // Accepted false positives: `$q`'s text is evaluated once and
             // runs nothing, but the command holds a sink.
             (
@@ -10758,6 +10838,8 @@ mod tests {
             "q='$(git reset --hard)'; echo \"$q\"",
             "y=a; y+='$(git reset --hard)'; echo \"$y\"",
             "b='['; q='$(git reset --hard)'; echo a$b$q]",
+            "y=a; y+='[$(git reset --hard)]'; eval 'echo \"$y\"'",
+            "y=a; y+='[$(git reset --hard)]'; echo $(echo \"$y\")",
         ] {
             assert_eq!(bash_arithmetic_quotes(unchanged), None, "{unchanged:?}");
         }

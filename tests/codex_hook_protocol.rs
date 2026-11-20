@@ -1625,6 +1625,37 @@ fn quoted_arithmetic_substitutions_hide_no_command() {
         // An option that makes a builtin evaluate a name, quoted or not.
         r#"q='$(git reset --hard)'; printf '-v' "a[$q]" x"#,
         r#"q='$(git reset --hard)'; [ ! -v "a[$q]" ]"#,
+        // A sink inside a command substitution or backquote body.
+        "y=a; y+='[$(git reset --hard)]'; echo $(echo $((y)))",
+        r#"y=a; y+='[$(git reset --hard)]'; echo "$(echo $((y)))""#,
+        "y=a; y+='[$(git reset --hard)]'; echo `echo $((y))`",
+        "y='[$(git reset --hard)]'; y=a$y; echo $(echo $[y])",
+        "y=${x:-'a[$(git reset --hard)]'}; echo $(echo $((y)))",
+        "b='['; q='$(git reset --hard)'; y=a$b$q]; echo $(echo $((y)))",
+        "y=a; y+='[$(git reset --hard)]'; z=$( (( y )); echo ok)",
+        // A sink in text the shell evaluates later.
+        "y=a; y+='[$(git reset --hard)]'; eval 'echo $((y))'",
+        r#"y=a; y+='[$(git reset --hard)]'; eval "echo \$((y))""#,
+        "y=a; y+='[$(git reset --hard)]'; eval 'let y'",
+        "y=a; y+='[$(git reset --hard)]'; eval '(( y ))'",
+        "y=a; y+='[$(git reset --hard)]'; builtin eval 'echo $((y))'",
+        "y=a; y+='[$(git reset --hard)]'; source /dev/stdin <<< 'echo $((y))'",
+        "y='[$(git reset --hard)]' z=a$y /bin/sh -c 'echo $((z))'",
+        "y='[$(git reset --hard)]' z=a$y \"$BASH\" <<'EOF'\necho $((z))\nEOF",
+        // A sink name spelled with quotes, a backslash or `$'…'`.
+        r"y=a; y+='[$(git reset --hard)]'; \let y",
+        "y=a; y+='[$(git reset --hard)]'; 'let' y",
+        r"y=a; y+='[$(git reset --hard)]'; l\et y",
+        r"y=a; y+='[$(git reset --hard)]'; $'let' y",
+        r"y=a; y+='[$(git reset --hard)]'; $'\x6cet' y",
+        r#"b='['; q='$(git reset --hard)'; "let" "a$b$q]""#,
+        r"y=${x:-'a[$(git reset --hard)]'}; \let y",
+        r"y=a; y+='[$(git reset --hard)]'; \declare -i z=y",
+        r"y=a; y+='[$(git reset --hard)]'; \typeset -i z=y",
+        r"f() { y=a; y+='[$(git reset --hard)]'; \local -i z=y; }; f",
+        r#"y=a; y+='[$(git reset --hard)]'; \read "$y" <<< 1"#,
+        r#"y=a; y+='[$(git reset --hard)]'; \printf -v "$y" 1"#,
+        r#"y=a; y+='[$(git reset --hard)]'; \test -v "$y""#,
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_codex_block_shape(), "codex {command:?}\n{codex}");
@@ -1648,6 +1679,10 @@ fn quoted_arithmetic_substitutions_hide_no_command() {
         "printf '%s' '$(git reset --hard)'",
         "[ -n '$(git reset --hard)' ]",
         "wait; test -n '$(git reset --hard)'",
+        // No sink in a body or in evaluated text either.
+        r#"y=a; y+='[$(git reset --hard)]'; echo "$y""#,
+        r#"y=a; y+='[$(git reset --hard)]'; eval 'echo "$y"'"#,
+        r#"y=a; y+='[$(git reset --hard)]'; echo $(echo "$y")"#,
     ] {
         let codex = run_hook_raw(&payload(command, true), &[]);
         assert!(codex.is_allow_shape(), "codex {command:?}\n{codex}");
