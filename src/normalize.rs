@@ -6533,10 +6533,12 @@ pub(crate) fn paren_hashes_as_data(command: &str) -> Option<String> {
 /// operator and the next code are blanks, so those readers see the one
 /// statement PowerShell runs.
 ///
-/// An operator counts when it is a word by itself or follows a value: a
-/// quoted string, a closing bracket, a variable (`$c+`, `$a.b.`) or a
-/// number (`0..`). Member access (`.`, `::`) counts only after a value, and
-/// `!`, `?` and `:` only by themselves. So `cd ..` and `rm -f` at a line end
+/// An operator counts when it is a word by itself or follows a value (see
+/// [`powershell_ends_with_value`]): a quoted string, a closing bracket, a
+/// type literal, a variable, any of them with a member chain after it
+/// (`$a.b+`, `@{a='x'}.a+`, `[string]::Empty+`), or a number literal
+/// (`0..`, `1L+`, `0x1+`, `1e0+`, `1d+`, `1kb+`). Member access (`.`, `::`)
+/// counts only after a value, and `!`, `?` and `:` only by themselves. So `cd ..` and `rm -f` at a line end
 /// do join (a cheap extra reading of harmless text), while `git add .`,
 /// `thing.`, `dir/`, `C:`, `else:`, `'key':` and `$c?` do not: no
 /// PowerShell expression continues there. A `,` always continues, as it
@@ -6547,15 +6549,18 @@ pub(crate) fn paren_hashes_as_data(command: &str) -> Option<String> {
 /// already read as one pipeline.
 ///
 /// A line break into the first line of a POSIX heredoc body, or into its
-/// terminator line, is left alone: the readers judge the body as data, and
-/// a body line ending in `/` joined with its `EOF` line would end the body
-/// nowhere and read it as commands (`md5sum <<EOF`). PowerShell rejects a
-/// `<<` after a command word, so it runs none of such text. The lines
-/// inside a body still join.
+/// terminator line, is left alone when PowerShell reads the body's `<<` as
+/// code: the readers judge the body as data, and a body line ending in `/`
+/// joined with its `EOF` line would end the body nowhere and read it as
+/// commands (`md5sum <<EOF`). PowerShell rejects a `<<` in its code, so it
+/// runs none of such text. A `<<` in a PowerShell comment or string is no
+/// operator to PowerShell, which runs the text around it, so such a body
+/// does not stop a join (`'git reset' + <#` LF `<<X` LF `#>` LF
+/// `' --hard' | iex`). The lines inside a body still join.
 ///
 /// Quoted strings, here-strings and braced variable names are passed over,
-/// with PowerShell's ASCII quote rules. Smart quotes are not read as quotes
-/// here (the comment and smart-quote view reads them).
+/// with PowerShell's quote rules, smart quotes included (see
+/// [`powershell_string_end`]).
 ///
 /// Length preserving (each changed byte becomes an ASCII blank, whole
 /// characters at a time), so every range in the view is the same range in
@@ -6568,7 +6573,9 @@ pub(crate) fn powershell_continued_lines_joined(command: &str) -> Option<String>
     // Where a POSIX heredoc body and its terminator line start, under any
     // shell's rules: the readers judge such a body as data, and a join into
     // either line would change where the body starts or ends.
-    let heredoc_lines: Vec<usize> = crate::context::heredoc_body_layouts(command)
+    // Each with where its `<<` starts, which counts only when this scan
+    // reads it as code (see `code_heredoc_operators`).
+    let heredoc_lines: Vec<(usize, usize)> = crate::context::heredoc_body_layouts(command)
         .iter()
         .flatten()
         .flat_map(|body| {
@@ -6580,9 +6587,17 @@ pub(crate) fn powershell_continued_lines_joined(command: &str) -> Option<String>
                 },
                 |lines| lines.start,
             );
-            [body.range.start, terminator]
+            [
+                (body.operator, body.range.start),
+                (body.operator, terminator),
+            ]
         })
         .collect();
+    // Where a `<<` stands in PowerShell code, outside its comments and
+    // strings. A body's `<<` comes before the line break into the body, with
+    // no code between them, so it is recorded by the time that line break
+    // is read.
+    let mut code_heredoc_operators: Vec<usize> = Vec::new();
     let mut joined: Option<Vec<u8>> = None;
     // The last word of code on the current line, and where its code ends.
     // A quoted value ends a word: the operator after it starts a new one.
@@ -6608,7 +6623,10 @@ pub(crate) fn powershell_continued_lines_joined(command: &str) -> Option<String>
             in_word = false;
             if continues {
                 let next = powershell_next_code(bytes, i);
-                if next < len && !heredoc_lines.iter().any(|&line| i < line && line <= next) {
+                let into_heredoc = heredoc_lines.iter().any(|&(operator, line)| {
+                    i < line && line <= next && code_heredoc_operators.contains(&operator)
+                });
+                if next < len && !into_heredoc {
                     joined.get_or_insert_with(|| bytes.to_vec())[code_end..next].fill(b' ');
                 }
                 i = next;
@@ -6635,11 +6653,11 @@ pub(crate) fn powershell_continued_lines_joined(command: &str) -> Option<String>
             continue;
         }
         let value_end = match byte {
-            b'\'' | b'"' => Some(powershell_quoted_end(bytes, i, len)),
-            b'@' => consume_powershell_here_string(bytes, i, len),
             b'$' if bytes.get(i + 1) == Some(&b'{') => {
                 Some(braced_variable_end(bytes, i, len).unwrap_or(len))
             }
+            // Smart quotes are three bytes from 0xE2.
+            b'\'' | b'"' | b'@' | 0xe2 => powershell_string_end(command, i),
             _ => None,
         };
         if let Some(end) = value_end {
@@ -6657,6 +6675,9 @@ pub(crate) fn powershell_continued_lines_joined(command: &str) -> Option<String>
                 in_word = true;
                 glued = false;
             }
+            if byte == b'<' && bytes.get(i + 1) == Some(&b'<') {
+                code_heredoc_operators.push(i);
+            }
             word.end = end;
         }
         i = word.end;
@@ -6664,6 +6685,153 @@ pub(crate) fn powershell_continued_lines_joined(command: &str) -> Option<String>
     }
     // Every changed byte span is whole characters set to ASCII blanks.
     joined.and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// The quote kind PowerShell reads `c` as: `'` for its single quotes (`'`
+/// and U+2018 to U+201B), `"` for its double quotes (`"` and U+201C to
+/// U+201E).
+fn powershell_quote_kind(c: char) -> Option<char> {
+    match c {
+        '\'' | '\u{2018}'..='\u{201b}' => Some('\''),
+        '"' | '\u{201c}'..='\u{201e}' => Some('"'),
+        _ => None,
+    }
+}
+
+/// Position after the PowerShell string that opens at `i` (the end of the
+/// text when it is not closed), or `None` when none opens there: a quoted
+/// string, or a here-string (`@'` or `@"`, blanks, a line break, and its
+/// closing quote and `@` at the start of a later line). Any of PowerShell's
+/// quotes of a kind, smart quotes included, opens and closes a string of that
+/// kind, and two of them in a row are one quote inside it; in a
+/// double-quoted string a backtick escapes the character after it.
+fn powershell_string_end(command: &str, i: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let char_at = |at: usize| command.get(at..).and_then(|rest| rest.chars().next());
+    let first = char_at(i)?;
+    if first == '@' {
+        let quote = char_at(i + 1)?;
+        let kind = powershell_quote_kind(quote)?;
+        let header_newline =
+            skip_powershell_header_whitespace(bytes, i + 1 + quote.len_utf8(), len);
+        let mut line_start = raw_newline_end(bytes, header_newline, len)?;
+        while line_start < len {
+            if let Some(close) = char_at(line_start)
+                && powershell_quote_kind(close) == Some(kind)
+                && bytes.get(line_start + close.len_utf8()) == Some(&b'@')
+            {
+                return Some(line_start + close.len_utf8() + 1);
+            }
+            let line_end = memchr::memchr2(b'\r', b'\n', &bytes[line_start..])
+                .map_or(len, |offset| line_start + offset);
+            line_start = raw_newline_end(bytes, line_end, len)?;
+        }
+        return Some(len);
+    }
+    let kind = powershell_quote_kind(first)?;
+    let mut j = i + first.len_utf8();
+    while let Some(c) = char_at(j) {
+        j += c.len_utf8();
+        if kind == '"' && c == '`' {
+            j += char_at(j).map_or(0, char::len_utf8);
+        } else if powershell_quote_kind(c) == Some(kind) {
+            match char_at(j) {
+                Some(next) if powershell_quote_kind(next) == Some(kind) => j += next.len_utf8(),
+                _ => return Some(j),
+            }
+        }
+    }
+    Some(len)
+}
+
+/// Whether `prefix`, the code right before a glued operator, ends with a
+/// value, so that PowerShell reads the operator as one (see
+/// [`powershell_continued_lines_joined`]). A value is a closing bracket
+/// (which also ends a type literal, `[string]`), a variable, a number
+/// literal, or a quoted string (`glued`: `prefix` starts right after one),
+/// with any member chain (`.name`, `::name`, with calls and indexes) after
+/// it; or such a value as the last operand after a glued operator (`1*1`).
+/// A command-mode bareword (`file.txt`, `dir`, `g`) is no value.
+fn powershell_ends_with_value(prefix: &str, glued: bool) -> bool {
+    let mut head = prefix;
+    loop {
+        if head.is_empty() {
+            return glued;
+        }
+        if head.ends_with([')', ']', '}'])
+            || head.starts_with('$')
+            || powershell_number_literal(head)
+        {
+            return true;
+        }
+        let before_name = head.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+        if before_name.len() < head.len()
+            && let Some(before) = before_name
+                .strip_suffix("::")
+                .or_else(|| before_name.strip_suffix('.'))
+        {
+            head = before;
+            continue;
+        }
+        // The last operand after a glued operator (`(1)*1`, `''*1kb`).
+        return head
+            .rfind(['+', '-', '*', '/', '%', '=', ','])
+            .is_some_and(|at| {
+                let operand = &head[at + 1..];
+                !operand.is_empty() && powershell_ends_with_value(operand, false)
+            });
+    }
+}
+
+/// Whether `text` is a PowerShell number literal: decimal (with a fraction
+/// and an exponent), hexadecimal (`0x`) or binary (`0b`), then a type suffix
+/// (`y uy s us l ul u n d`) and a multiplier (`kb mb gb tb pb`), in any case.
+fn powershell_number_literal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let count = |from: usize, digit: fn(&u8) -> bool| {
+        bytes
+            .get(from..)
+            .map_or(0, |rest| rest.iter().take_while(|b| digit(b)).count())
+    };
+    let end = if lower.starts_with("0x") || lower.starts_with("0b") {
+        let digits = if lower.starts_with("0x") {
+            count(2, u8::is_ascii_hexdigit)
+        } else {
+            count(2, |b| matches!(b, b'0' | b'1'))
+        };
+        if digits == 0 {
+            return false;
+        }
+        2 + digits
+    } else {
+        let whole = count(0, u8::is_ascii_digit);
+        let mut end = whole;
+        let mut fraction = 0;
+        if bytes.get(end) == Some(&b'.') {
+            fraction = count(end + 1, u8::is_ascii_digit);
+            end += 1 + fraction;
+        }
+        if whole + fraction == 0 {
+            return false;
+        }
+        if bytes.get(end) == Some(&b'e') {
+            let sign = usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+            let exponent = count(end + 1 + sign, u8::is_ascii_digit);
+            if exponent > 0 {
+                end += 1 + sign + exponent;
+            }
+        }
+        end
+    };
+    let rest = &lower[end..];
+    ["", "y", "uy", "s", "us", "l", "ul", "u", "n", "d"]
+        .iter()
+        .any(|suffix| {
+            rest.strip_prefix(suffix)
+                .is_some_and(|multiplier| ["", "kb", "mb", "gb", "tb", "pb"].contains(&multiplier))
+        })
 }
 
 /// Position after the `<#…#>` block comment that starts at `i`, or the end
@@ -6722,14 +6890,7 @@ fn powershell_word_continues_line(word: &str, glued: bool) -> bool {
     if word.ends_with(',') {
         return true;
     }
-    // What a glued operator follows: a closing bracket, a variable or member
-    // chain, or a number.
-    let value = |prefix: &str| {
-        prefix.ends_with([')', ']', '}'])
-            || prefix.starts_with('$')
-            || prefix.starts_with(|c: char| c.is_ascii_digit())
-                && prefix.chars().all(|c| c.is_ascii_digit() || c == '.')
-    };
+    let value = |prefix: &str| powershell_ends_with_value(prefix, glued);
     // The operator, and whether it follows a value (or stands alone).
     let symbol = POWERSHELL_SYMBOL_OPERATORS.iter().find_map(|operator| {
         let prefix = word.strip_suffix(operator)?;
@@ -8111,6 +8272,28 @@ mod tests {
             ("git reset `\n--hard", "git reset   --hard"),
             ("& { 'a' +\n'b' }; x\ny", "& { 'a' + 'b' }; x\ny"),
             ("'\u{e9}' + # \u{e9}\n'b'", "'\u{e9}' +      'b'"),
+            // A `<<` in a PowerShell comment or string opens no heredoc.
+            ("'a' + <#\n<<X\n#>\n'b'", "'a' +           'b'"),
+            ("'a' + <#\ncat <<'X'\n#>\n'b'", "'a' +                 'b'"),
+            ("'a' + # <<X\n'b'", "'a' +       'b'"),
+            (
+                "'a' + \u{2018}<<X\u{2019}*0 +\n'b'",
+                "'a' + \u{2018}<<X\u{2019}*0 + 'b'",
+            ),
+            ("'a' + @'\n<<X\n'@ +\n'b'", "'a' + @'\n<<X\n'@ + 'b'"),
+            ("@{a='x'}.a+\n'b'", "@{a='x'}.a+ 'b'"),
+            ("@{a='x'}.a-f\n'b'", "@{a='x'}.a-f 'b'"),
+            ("'x'.Length+\n1", "'x'.Length+ 1"),
+            ("[string]::Empty+\n'b'", "[string]::Empty+ 'b'"),
+            ("1L+\n2", "1L+ 2"),
+            ("0x1+\n2", "0x1+ 2"),
+            ("1e0+\n2", "1e0+ 2"),
+            ("1d+\n2", "1d+ 2"),
+            ("2KB*\n2", "2KB* 2"),
+            ("0b101ul-shl\n2", "0b101ul-shl 2"),
+            ("(1)*1+\n2", "(1)*1+ 2"),
+            ("''*1kb+\n2", "''*1kb+ 2"),
+            ("@\u{2018}\n<<X\n'@*0 +\n2", "@\u{2018}\n<<X\n'@*0 + 2"),
         ] {
             assert_eq!(
                 powershell_continued_lines_joined(command).as_deref(),
@@ -8138,6 +8321,12 @@ mod tests {
             "md5sum <<EOF\ngit reset --hard /\nEOF",
             "cat <<'EOF' -\nx\nEOF",
             "cat <<-EOF\ngit reset --hard +\n\n\tEOF\n",
+            "\u{2018}a +\nb\u{2019}",
+            "\u{201c}a +\nb\u{201d}",
+            "@\u{2018}\na +\n\u{2019}@\nx",
+            "file.txt+\ndir.name::x+\ng+\na.b-f\nx",
+            "1x+\n0xg+\nx",
+            "dir/x+\na-b+\nx",
             "",
         ] {
             assert_eq!(

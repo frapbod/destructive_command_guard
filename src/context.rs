@@ -3716,6 +3716,8 @@ pub(crate) enum HeredocRules {
 /// One body found by [`heredoc_body_ranges`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeredocBody {
+    /// Where its `<<` operator starts.
+    pub(crate) operator: usize,
     /// The body with its terminator line.
     pub(crate) range: Range<usize>,
     /// Its operator is in the command's own code, not inside a substitution,
@@ -3731,6 +3733,8 @@ pub(crate) struct HeredocBody {
 /// A heredoc whose operator has been read and whose body starts on the line
 /// after the next line end of the code that holds it.
 struct PendingHeredoc {
+    /// Where its `<<` operator starts.
+    operator: usize,
     /// What the terminator line holds: the delimiter after quote removal.
     delimiter: Vec<u8>,
     /// `<<-`: leading tabs are stripped from each body and terminator line.
@@ -4023,6 +4027,7 @@ impl HeredocScanner<'_> {
             return word_start;
         }
         self.pending.push(PendingHeredoc {
+            operator: at,
             delimiter,
             strip_tabs,
             continues_lines: !quoted,
@@ -4041,6 +4046,7 @@ impl HeredocScanner<'_> {
             let (end, joined_terminator) = self.body_end(body_start, &heredoc);
             if end > body_start {
                 self.bodies.push(HeredocBody {
+                    operator: heredoc.operator,
                     range: body_start..end,
                     top_level,
                     joined_terminator,

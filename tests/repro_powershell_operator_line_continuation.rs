@@ -6,7 +6,9 @@
 //! does this, in any case and with a Unicode dash, and so do unary
 //! operators, member access, the ternary and null-coalescing operators and
 //! a backtick before the line break; comments and blank lines between the
-//! operator and the next code change nothing.
+//! operator and the next code change nothing, and so does a `<<` in a
+//! PowerShell comment or string (smart quotes included), where a POSIX shell
+//! would read a heredoc.
 //!
 //! dcg's readers end a statement at every line break outside brackets: the
 //! pipeline source of `iex` was `' --hard'`, a harmless string, while the
@@ -72,6 +74,35 @@ const RUNS_IT: &[&str] = &[
     "$c = 'git reset'; $c +=\n' --hard'; iex $c",
     "[scriptblock]::Create('git reset' +\n' --hard').Invoke()",
     "icm ([scriptblock]::Create('git reset' +\n' --hard'))",
+    // A `<<` in a PowerShell comment or string opens no heredoc.
+    "'git reset' + <#\nx <<X\n#>\n' --hard' | iex",
+    "'git reset' + <#\n<<X\n#>\n' --hard' | iex",
+    "'git reset' + <#\ncat <<'X'\n#>\n' --hard' | iex",
+    "'git reset' + \u{2018}<<X\u{2019}*0 +\n' --hard' | iex",
+    "'git reset' + # <<X\n' --hard' | iex",
+    "'git reset' + \u{201c}<<X\u{201d}*0 +\n' --hard' | iex",
+    "'git reset' + @\u{2018}\n<<X\n\u{2019}@*0 +\n' --hard' | iex",
+    "'git reset' + @'\n<<X\n'@*0 +\n' --hard' | iex",
+    "'git reset' + 'it\u{2018}\u{2019}s <<X'*0 +\n' --hard' | iex",
+    // A member chain or a number literal before a glued operator.
+    "@{a='git reset'}.a+\n' --hard' | iex",
+    "@{a='git reset {0}'}.a-f\n'--hard' | iex",
+    "(@{a='git reset'}).a+\n' --hard' | iex",
+    "[string]'git reset'+[string]::Empty+\n' --hard' | iex",
+    "pwsh -c \"@{a='git reset'}.a+\n' --hard' | iex\"",
+    "'git reset' * 1L+\n' --hard' | iex",
+    "'git reset' * 0x1+\n' --hard' | iex",
+    "'git reset' * 1e0+\n' --hard' | iex",
+    "'git reset' * 1d+\n' --hard' | iex",
+    "'git reset' * (1)*1+\n' --hard' | iex",
+    "'git reset' * 1*1+\n' --hard' | iex",
+    "'git reset' + ''*1kb+\n' --hard' | iex",
+    "'git reset'.Trim()+\n' --hard' | iex",
+    "'git reset' * 0b1+\n' --hard' | iex",
+    "'git reset' * 1uy+\n' --hard' | iex",
+    "'git reset' * 1E0+\n' --hard' | iex",
+    "$a=@{b='git reset'}; $a.b+\n' --hard' | iex",
+    "'git reset' * 1e-0+\n' --hard' | iex",
     // Command mode: the line ends, and the next line is its own command.
     "Write-Output a +\ngit reset --hard",
     "Write-Output a -f\ngit reset --hard",
@@ -93,6 +124,11 @@ const HARMLESS: &[&str] = &[
     "git add .\ngit status",
     "$x = 'git reset --hard' +\n' is dangerous'; Write-Output $x",
     "Write-Output 'git reset' +\n' --hard'",
+    "md5sum <<EOF\ngit reset --hard /\nEOF",
+    "Write-Output \u{2018}a +\ngit reset --hard\u{2019}",
+    "Write-Output @\u{2018}\ngit reset +\n\u{2019}@\ngit status",
+    "Write-Output @\u{2018}\nx\n'@\ngit status",
+    "Write-Output \u{201c}a`\u{201d} +\ngit reset --hard\u{201d}",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
