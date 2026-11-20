@@ -7121,6 +7121,264 @@ pub(crate) fn paren_hashes_as_data(command: &str) -> Option<String> {
     spelled.and_then(|spelled| String::from_utf8(spelled).ok())
 }
 
+/// `command` with every line break at which PowerShell continues the
+/// statement spelled as a blank, or `None` when it has no such line break.
+///
+/// PowerShell continues a statement on the next line after a line that
+/// ends with an operator: `'git reset' +` LF `' --hard' | iex` runs
+/// `git reset --hard`. Measured with pwsh 7.5, every binary operator does
+/// this (`+ - * / %`, `-f`, `-join`, `-replace`, `-split`, `-and`, `-or`,
+/// `-xor`, the bitwise, shift, comparison, containment and type operators,
+/// each with or without an `i` or `c` prefix, `..` and `??`), and so do the
+/// unary operators (`!`, `-not`, `-bnot`), `,`, `=` and the compound
+/// assignments, member access (`.`, `::`), the ternary `?` and `:`, and a
+/// backtick before the line break. A dash may be U+2013, U+2014 or U+2015.
+/// Blanks, comments and blank lines between the operator and the next code
+/// change nothing. In command mode only `,` and the backtick continue
+/// (`Write-Output a +` LF `git reset --hard` runs the reset); this spelling
+/// also joins after the other operators there, which only adds a reading.
+///
+/// dcg's shared readers (the statement splitter, the pipeline source of
+/// `iex`, the assignment value scanner) end a statement at every line break
+/// outside brackets, so they read `' --hard' | iex` as a harmless string run
+/// by `iex`. In this spelling the line break and any comment between the
+/// operator and the next code are blanks, so those readers see the one
+/// statement PowerShell runs.
+///
+/// An operator counts when it is a word by itself or follows a value: a
+/// quoted string, a closing bracket, a variable (`$c+`, `$a.b.`) or a
+/// number (`0..`). Member access (`.`, `::`) counts only after a value, and
+/// `!`, `?` and `:` only by themselves. So `cd ..` and `rm -f` at a line end
+/// do join (a cheap extra reading of harmless text), while `git add .`,
+/// `thing.`, `dir/`, `C:`, `else:`, `'key':` and `$c?` do not: no
+/// PowerShell expression continues there. A `,` always continues, as it
+/// does in command mode. `++` and `--` end a statement (`$i++`). `|`, `||`
+/// and `&&` continue too, but every reader already splits there, so a line
+/// break after them hides nothing and is left alone. A line that starts
+/// with `|` continues the line before it (PowerShell 7), which the readers
+/// already read as one pipeline.
+///
+/// A line break into the first line of a POSIX heredoc body, or into its
+/// terminator line, is left alone: the readers judge the body as data, and
+/// a body line ending in `/` joined with its `EOF` line would end the body
+/// nowhere and read it as commands (`md5sum <<EOF`). PowerShell rejects a
+/// `<<` after a command word, so it runs none of such text. The lines
+/// inside a body still join.
+///
+/// Quoted strings, here-strings and braced variable names are passed over,
+/// with PowerShell's ASCII quote rules. Smart quotes are not read as quotes
+/// here (the comment and smart-quote view reads them).
+///
+/// Length preserving (each changed byte becomes an ASCII blank, whole
+/// characters at a time), so every range in the view is the same range in
+/// `command`.
+#[must_use]
+pub(crate) fn powershell_continued_lines_joined(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    memchr::memchr2(b'\n', b'\r', bytes)?;
+    // Where a POSIX heredoc body and its terminator line start, under any
+    // shell's rules: the readers judge such a body as data, and a join into
+    // either line would change where the body starts or ends.
+    let heredoc_lines: Vec<usize> = crate::context::heredoc_body_layouts(command)
+        .iter()
+        .flatten()
+        .flat_map(|body| {
+            let terminator = body.joined_terminator.as_ref().map_or_else(
+                || {
+                    command[body.range.clone()]
+                        .rfind('\n')
+                        .map_or(body.range.start, |offset| body.range.start + offset + 1)
+                },
+                |lines| lines.start,
+            );
+            [body.range.start, terminator]
+        })
+        .collect();
+    let mut joined: Option<Vec<u8>> = None;
+    // The last word of code on the current line, and where its code ends.
+    // A quoted value ends a word: the operator after it starts a new one.
+    let mut word = 0..0;
+    let mut in_word = false;
+    let mut glued = false;
+    let mut code_end = 0;
+    let mut i = 0;
+    while i < len {
+        let byte = bytes[i];
+        if byte == b'`'
+            && let Some(end) = raw_newline_end(bytes, i + 1, len)
+        {
+            // A backtick before a line break continues the line.
+            joined.get_or_insert_with(|| bytes.to_vec())[i..end].fill(b' ');
+            in_word = false;
+            i = end;
+            continue;
+        }
+        if matches!(byte, b'\r' | b'\n') {
+            let continues = powershell_word_continues_line(&command[word.clone()], glued);
+            word = i..i;
+            in_word = false;
+            if continues {
+                let next = powershell_next_code(bytes, i);
+                if next < len && !heredoc_lines.iter().any(|&line| i < line && line <= next) {
+                    joined.get_or_insert_with(|| bytes.to_vec())[code_end..next].fill(b' ');
+                }
+                i = next;
+            } else {
+                i += 1;
+            }
+            code_end = i;
+            continue;
+        }
+        if let Some(width) = powershell_horizontal_space_len(bytes, i) {
+            in_word = false;
+            i += width;
+            continue;
+        }
+        if byte == b'#' && powershell_hash_role(bytes, i) != PowerShellHashRole::Literal {
+            // A line comment runs to the line end; `code_end` stays before it.
+            in_word = false;
+            i = memchr::memchr2(b'\r', b'\n', &bytes[i..]).map_or(len, |offset| i + offset);
+            continue;
+        }
+        if powershell_block_comment_starts_after(bytes, i) {
+            in_word = false;
+            i = powershell_block_comment_end(bytes, i);
+            continue;
+        }
+        let value_end = match byte {
+            b'\'' | b'"' => Some(powershell_quoted_end(bytes, i, len)),
+            b'@' => consume_powershell_here_string(bytes, i, len),
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                Some(braced_variable_end(bytes, i, len).unwrap_or(len))
+            }
+            _ => None,
+        };
+        if let Some(end) = value_end {
+            word = end..end;
+            in_word = true;
+            glued = true;
+        } else {
+            // A backtick escapes the whole character after it (a line break
+            // after it was read above).
+            let start = if byte == b'`' { (i + 1).min(len) } else { i };
+            let end = start + command[start..].chars().next().map_or(0, char::len_utf8);
+            let end = end.max(i + 1);
+            if !in_word {
+                word.start = i;
+                in_word = true;
+                glued = false;
+            }
+            word.end = end;
+        }
+        i = word.end;
+        code_end = i;
+    }
+    // Every changed byte span is whole characters set to ASCII blanks.
+    joined.and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Position after the `<#…#>` block comment that starts at `i`, or the end
+/// of the text when it is not closed.
+fn powershell_block_comment_end(bytes: &[u8], i: usize) -> usize {
+    memchr::memmem::find(&bytes[i + 2..], b"#>").map_or(bytes.len(), |offset| i + 2 + offset + 2)
+}
+
+/// The first byte of code at or after the line break at `i`: blanks, line
+/// breaks, line comments and block comments are passed over.
+fn powershell_next_code(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    while i < len {
+        if matches!(bytes[i], b'\r' | b'\n') {
+            i += 1;
+        } else if let Some(width) = powershell_horizontal_space_len(bytes, i) {
+            i += width;
+        } else if bytes[i] == b'#' && powershell_hash_role(bytes, i) != PowerShellHashRole::Literal
+        {
+            i = memchr::memchr2(b'\r', b'\n', &bytes[i..]).map_or(len, |offset| i + offset);
+        } else if powershell_block_comment_starts_after(bytes, i) {
+            i = powershell_block_comment_end(bytes, i);
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// PowerShell's operators that take an operand after them, by name after
+/// the dash; each comparison, containment, match, replace and split
+/// operator also takes an `i` or `c` prefix.
+const POWERSHELL_DASH_OPERATORS: &str = "f and or xor not band bor bxor bnot shl shr eq ne gt ge \
+    lt le like notlike match notmatch replace contains notcontains in notin split join is isnot as";
+
+/// PowerShell's symbol operators that take an operand after them, longest
+/// first.
+const POWERSHELL_SYMBOL_OPERATORS: &[&str] = &[
+    "??=", "+=", "-=", "*=", "/=", "%=", "??", "::", "..", "+", "-", "*", "/", "%", "=", "!", ".",
+    "?", ":",
+];
+
+/// Whether a line whose last word of code is `word` continues on the next
+/// line (see [`powershell_continued_lines_joined`]). `glued` says that the
+/// word starts right after a quoted value, with no blank between.
+fn powershell_word_continues_line(word: &str, glued: bool) -> bool {
+    // PowerShell reads U+2013, U+2014 and U+2015 as `-`.
+    let word: Cow<'_, str> = if word.contains(['\u{2013}', '\u{2014}', '\u{2015}']) {
+        Cow::Owned(word.replace(['\u{2013}', '\u{2014}', '\u{2015}'], "-"))
+    } else {
+        Cow::Borrowed(word)
+    };
+    if word.ends_with("++") || word.ends_with("--") {
+        return false;
+    }
+    if word.ends_with(',') {
+        return true;
+    }
+    // What a glued operator follows: a closing bracket, a variable or member
+    // chain, or a number.
+    let value = |prefix: &str| {
+        prefix.ends_with([')', ']', '}'])
+            || prefix.starts_with('$')
+            || prefix.starts_with(|c: char| c.is_ascii_digit())
+                && prefix.chars().all(|c| c.is_ascii_digit() || c == '.')
+    };
+    // The operator, and whether it follows a value (or stands alone).
+    let symbol = POWERSHELL_SYMBOL_OPERATORS.iter().find_map(|operator| {
+        let prefix = word.strip_suffix(operator)?;
+        let after_value = if prefix.is_empty() {
+            glued
+        } else if value(prefix) {
+            true
+        } else {
+            return None;
+        };
+        Some((*operator, after_value))
+    });
+    if let Some((operator, after_value)) = symbol {
+        return match operator {
+            // Member access reads the value it follows: `git add .` is a
+            // path.
+            "." | "::" => after_value,
+            // Glued, these are part of a name or a label (`$c?`, `'k':`,
+            // `f():`); alone, they are the operator.
+            "!" | "?" | ":" => !after_value,
+            _ => true,
+        };
+    }
+    let Some(dash) = word.rfind('-') else {
+        return false;
+    };
+    let name = word[dash + 1..].to_ascii_lowercase();
+    let name = name.as_str();
+    let operator = |name: &str| {
+        POWERSHELL_DASH_OPERATORS
+            .split(' ')
+            .any(|known| known == name)
+    };
+    let named = operator(name) || name.strip_prefix(['i', 'c']).is_some_and(operator);
+    named && (dash == 0 || value(&word[..dash]))
+}
+
 /// The Bash reading [`bash_hashes_as_data`] or [`bash_parameter_openers`]
 /// gives a command.
 #[derive(Debug, PartialEq, Eq)]
@@ -9221,6 +9479,71 @@ mod tests {
         ] {
             assert_eq!(
                 powershell_line_breaks_as_line_feeds(command),
+                None,
+                "{command:?}"
+            );
+        }
+    }
+
+    /// PowerShell continues a statement after a line that ends with an
+    /// operator or a backtick; that line break, and any comment between the
+    /// operator and the next code, is spelled as blanks. Other line breaks,
+    /// and line breaks in quoted text, stay.
+    #[test]
+    fn powershell_continued_lines_are_joined() {
+        for (command, joined) in [
+            (
+                "'git reset' +\n' --hard' | iex",
+                "'git reset' + ' --hard' | iex",
+            ),
+            ("'a'+\r\n'b'", "'a'+  'b'"),
+            ("'a' +\r'b'", "'a' + 'b'"),
+            ("'a{0}' -f # it's\n\n# c\n'b'", "'a{0}' -f             'b'"),
+            ("'a' -JOIN <# c #>\n'b'", "'a' -JOIN         'b'"),
+            ("$a -ireplace\n'b'", "$a -ireplace 'b'"),
+            ("$c.p.\nTrim()", "$c.p. Trim()"),
+            ("'x'.\nTrim()", "'x'. Trim()"),
+            ("cd ..\nx", "cd .. x"),
+            ("cat <<EOF\na +\nb\nEOF", "cat <<EOF\na + b\nEOF"),
+            ("[IO.Path]::\nCombine()", "[IO.Path]:: Combine()"),
+            ("0..\n3", "0.. 3"),
+            ("$x ?\n1 :\n2", "$x ? 1 : 2"),
+            ("$a \u{2013}f\n'b'", "$a \u{2013}f 'b'"),
+            ("Write-Output a,\nb", "Write-Output a, b"),
+            ("git reset `\n--hard", "git reset   --hard"),
+            ("& { 'a' +\n'b' }; x\ny", "& { 'a' + 'b' }; x\ny"),
+            ("'\u{e9}' + # \u{e9}\n'b'", "'\u{e9}' +      'b'"),
+        ] {
+            assert_eq!(
+                powershell_continued_lines_joined(command).as_deref(),
+                Some(joined),
+                "{command:?}"
+            );
+        }
+        for command in [
+            "Write-Output a\ngit reset --hard",
+            "'a' + 'b'\n'c'",
+            "$i++\n$j--\nx",
+            "Write-Output thing.\ndir/\nC:\nelse:\n$c?\nx",
+            "Get-ChildItem -Recurse\nx",
+            "git add .\nx",
+            "'k':\nx",
+            "def f():\nx",
+            "'a'!\nx",
+            "'a +\nb'",
+            "@'\na +\n'@\nx",
+            "${a +\nb}",
+            "'a' +",
+            "'a' +\n# only a comment",
+            "a |\nb && \nc ||\nd",
+            "rm -rf\nx",
+            "md5sum <<EOF\ngit reset --hard /\nEOF",
+            "cat <<'EOF' -\nx\nEOF",
+            "cat <<-EOF\ngit reset --hard +\n\n\tEOF\n",
+            "",
+        ] {
+            assert_eq!(
+                powershell_continued_lines_joined(command),
                 None,
                 "{command:?}"
             );
