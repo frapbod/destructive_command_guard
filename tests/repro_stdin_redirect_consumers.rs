@@ -265,3 +265,40 @@ fn harmless_stdin_and_data_readers_stay_allowed() {
     );
     assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
 }
+
+/// The search behind an expanded program word reads a tail per start, so a
+/// consumer padded with many words must still end well inside the hook
+/// budget with base's verdict. Each start used to rebuild and re-tokenize the
+/// whole tail: 8,000 words took 13 s per evaluation, 30,000 words minutes,
+/// and the hook turned a deny into "ask". Base denies the padded commands
+/// too (an unknown program word may be a git alias).
+#[test]
+fn padded_consumer_after_an_expanded_program_word_stays_fast() {
+    let padding = vec!["a"; 8_000].join(" ");
+    let commands = [
+        format!("echo x | $A {padding}"),
+        format!("echo x | env $A {padding}"),
+        format!("git reset --hard; echo x | $A {padding}"),
+        format!("echo x | $A {padding}; rm -rf ~/"),
+    ];
+    let started = std::time::Instant::now();
+    let mut misses = Vec::new();
+    for command in &commands {
+        for dialect in POSIX {
+            let got = decision_in(command, dialect);
+            if got != EvaluationDecision::Deny {
+                misses.push(format!("{dialect:?}: {} -> {got:?}", &command[..40]));
+            }
+        }
+        let got = hook_decision(Protocol::Claude, command);
+        if got != "deny" {
+            misses.push(format!("Claude: {} -> {got}", &command[..40]));
+        }
+    }
+    assert!(misses.is_empty(), "misses:\n{}", misses.join("\n"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "twelve padded evaluations took {:?}",
+        started.elapsed()
+    );
+}

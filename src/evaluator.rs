@@ -10649,6 +10649,56 @@ fn ssh_pipeline_input_mode(args: &[String], depth: usize) -> PipelineShellInputM
     remote_shell_payload_input_mode(&args[index..].join(" "), depth)
 }
 
+const REMOTE_STDIN_CARRIERS: &[&str] = &["ssh", "docker", "podman", "nerdctl", "kubectl", "oc"];
+const POSIX_STDIN_SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "ksh", "dash"];
+
+const fn is_stdin_interpreter(language: crate::heredoc::ScriptLanguage) -> bool {
+    matches!(
+        language,
+        crate::heredoc::ScriptLanguage::Python
+            | crate::heredoc::ScriptLanguage::JavaScript
+            | crate::heredoc::ScriptLanguage::Ruby
+            | crate::heredoc::ScriptLanguage::Perl
+            | crate::heredoc::ScriptLanguage::Php
+    )
+}
+
+/// Whether the consumer read from this word on, after an expanded program
+/// word (`$A <word> …`), can be anything but `NotShell`, judged from the word
+/// alone so the tail is built only for such starts. An assignment or `&`
+/// only drops words before the program, so the next start reads the same
+/// consumer; an expanded word is skipped as an expanded program is. Any
+/// other word is a wrapper (`strip_wrapper_prefixes` decides), `exec`, or a
+/// program; every program `pipeline_shell_input_mode_at_depth` reads as
+/// other than `NotShell` is named here, and the rest are `NotShell` whatever
+/// their arguments.
+fn may_start_stdin_consumer(word: &str) -> bool {
+    if word.contains(['$', '`']) || word == "&" || is_shell_assignment(word) {
+        return false;
+    }
+    let name = word
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    REMOTE_STDIN_CARRIERS.contains(&name)
+        || POSIX_STDIN_SHELLS.contains(&name)
+        || matches!(
+            name,
+            "." | "source"
+                | "builtin"
+                | "exec"
+                | "xargs"
+                | "parallel"
+                | "powershell"
+                | "pwsh"
+                | "cmd"
+        )
+        || is_stdin_interpreter(crate::heredoc::ScriptLanguage::from_command(name))
+        || strip_wrapper_prefixes(&format!("{} true", posix_quote_argv_word(word))).was_normalized()
+}
+
 /// Whether a command (from [`command_tokens`]) is `. /dev/stdin` or `source
 /// /dev/stdin`, also behind `builtin`: it runs its stdin as shell source in
 /// its own shell, locally as well as in a remote one.
@@ -10685,7 +10735,6 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
     let Some((executable, args)) = command_tokens(command) else {
         return PipelineShellInputMode::NotShell;
     };
-    const REMOTE_STDIN_CARRIERS: &[&str] = &["ssh", "docker", "podman", "nerdctl", "kubectl", "oc"];
     let names_carrier = REMOTE_STDIN_CARRIERS.contains(&executable.as_str());
     // A leading local redirect can occupy command_tokens' apparent argv0.
     // Recover the actual executable before deciding that a carrier is absent.
@@ -10710,11 +10759,21 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
     // A program word the shell expands (`env $A sh`, `$W bash`) may become
     // options, assignments or wrapper words before a later word that names
     // the consumer: `A=X=git; … | env $A sh` runs sh on the pipe. Read the
-    // consumer from each later literal word. Every start is tried here, so a
-    // start whose own program word is expanded (`env $B sh`) is skipped
-    // rather than searched again.
+    // consumer from each later word that can start one. Every start is tried
+    // here, so a start whose own program word is expanded (`env $B sh`) is
+    // skipped rather than searched again. Each tried start reads the whole
+    // tail, so the starts are capped; past the cap the consumer is
+    // unverified rather than allowed.
     if executable.contains(['$', '`']) {
+        let mut tried = 0usize;
         for start in 0..args.len() {
+            if !may_start_stdin_consumer(&args[start]) {
+                continue;
+            }
+            tried += 1;
+            if tried > MAX_PIPELINE_WRAPPER_PREFIXES {
+                return PipelineShellInputMode::Unverified;
+            }
             let rest = posix_command_from_argv(&args[start..]);
             if command_tokens(&rest).is_none_or(|(program, _)| program.contains(['$', '`'])) {
                 continue;
@@ -10744,19 +10803,9 @@ fn pipeline_shell_input_mode_at_depth(command: &str, depth: usize) -> PipelineSh
     if executable == "cmd" {
         return cmd_pipeline_input_mode(&args);
     }
-    if !matches!(
-        executable.as_str(),
-        "sh" | "bash" | "zsh" | "fish" | "ksh" | "dash"
-    ) {
+    if !POSIX_STDIN_SHELLS.contains(&executable.as_str()) {
         let language = crate::heredoc::ScriptLanguage::from_command(&executable);
-        if !matches!(
-            language,
-            crate::heredoc::ScriptLanguage::Python
-                | crate::heredoc::ScriptLanguage::JavaScript
-                | crate::heredoc::ScriptLanguage::Ruby
-                | crate::heredoc::ScriptLanguage::Perl
-                | crate::heredoc::ScriptLanguage::Php
-        ) {
+        if !is_stdin_interpreter(language) {
             return PipelineShellInputMode::NotShell;
         }
         if language == crate::heredoc::ScriptLanguage::Python {
