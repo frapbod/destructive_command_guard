@@ -8146,6 +8146,934 @@ fn posix_backquote_end(bytes: &[u8], from: usize) -> usize {
     bytes.len()
 }
 
+/// The Bash reading of quoted text that Bash reads again as arithmetic, in
+/// which a command substitution runs; `None` when there is none.
+///
+/// Bash evaluates arithmetic in `$((…))`, `((…))` (also `for ((…))`), `$[…]`,
+/// the subscript of an assignment word, of a compound array element
+/// (`x=([…]=1)`) or of `${NAME[…]}`, the offset and length of `${NAME:…}`
+/// (also `${@:…}`), `let`, `[[ … -eq … ]]`, `declare -i` values, and the
+/// names that `declare`, `local`, `printf -v`, `read`, `test -v`, `${!NAME}`
+/// and the like take. The arithmetic evaluator reads `NAME[…]` as an array
+/// reference and expands its subscript, so a command substitution there
+/// runs, though the text was quoted when the shell first read it:
+/// `x['a[$(git reset --hard)]']=1`, `y='a[$(git reset --hard)]'; echo $((y))`,
+/// `declare 'x[$(git reset --hard)]=1'` and `let 'a[$(git reset --hard)]'` run
+/// `git reset --hard` in Bash. dcg's shared readers read the quoted text as
+/// data. Three spellings, read together:
+///
+/// - In `$((…))`, Bash 5, zsh and dash read a `'` as a plain character, and
+///   Bash 5 and zsh do so in `((…))`, an assignment, compound element or
+///   `${…}` subscript, while Bash also reads a `${NAME:…}` offset and a
+///   `$[…]` again: so `echo $(( '$(git reset --hard)' ))` runs it in every
+///   shell. In those spans, each `'…'` or `$'…'` that holds a `$(` or a
+///   backquote is spelled with its quote bytes as `_`, which leaves the
+///   substitution unquoted. This spelling is length preserving. An unquoted
+///   heredoc body is read as double-quoted text, as the shell expands it.
+/// - A word whose value, once its quotes are removed, holds an array
+///   reference (a name or an expansion, then `[`) whose subscript holds a
+///   `$(` or a backquote that was quoted or escaped is spelled again with
+///   that substitution unquoted and every other quoted byte single-quoted:
+///   `y='a[$(git reset --hard)]'` reads as `y='a['$(git reset --hard)']'`.
+///   The value is read through every quoting form (`'…'`, `\`, `\$` in
+///   double quotes, `$'…'` escapes, and a mix of them), as the value is what
+///   Bash evaluates; the subscript ends where Bash's does, past quoted and
+///   escaped `]`. Any later use of the word may be arithmetic, so its use
+///   is not checked; a quoted array reference holding a destructive command
+///   in plain data (`echo 'a[$(git reset --hard)]'`) is read as one too.
+/// - The array reference may be put together from other words, from
+///   `$'…'` escapes, from `${…}` defaults, from brace expansion or from the
+///   output of a builder: `q='$(git reset --hard)'; y="a[$q]"`,
+///   `y=a; y+='[$(git reset --hard)]'`, `y=$'a\x5b$(git reset --hard)]'`,
+///   `y=${x:-'a[$(git reset --hard)]'}`, `y=$(printf 'a[%s]' '$(…)')`, each
+///   followed by `echo $((y))`. Following each way of building one does not
+///   end, but Bash evaluates arithmetic only where its grammar or a builtin
+///   says so. So when the command holds such a sink (an arithmetic span
+///   above, `${!…}`, or a word naming `let`, `declare`, `typeset`, `local`,
+///   `export`, `readonly`, `read`, `printf -v`, `test -v`, `[ -v`, `[[`,
+///   `getopts` or `wait -p`), or a value holds an array reference that a
+///   later word completes (`p='a['`, `"a[$q]"`), every quoted, escaped or
+///   `$'…'` decoded substitution in any word's value is spelled unquoted,
+///   also in the words of `$(…)`, backquote and `${…}` operand text. The
+///   sink is looked for in the whole text: in `$(…)` and backquote bodies,
+///   in quoted text and in heredoc and here-string bodies, which `eval`,
+///   `sh -c`, `source` or a shell reading its input runs as code, and in a
+///   name spelled with quotes, backslashes or `$'…'` escapes (`\let y`). A
+///   quoted substitution beside a sink that runs nothing is read as a
+///   command too (`q='$(git reset --hard)'; x[$q]=1`, or a quoted `((` or
+///   `x[0]=` in data): an accepted false positive.
+///
+/// Quoted heredoc bodies are not spelled, and their words are not read: a
+/// body fed to a shell or to `source` is code, but its sinks already count,
+/// and a body fed to another command is its input, like a file. An opener
+/// or a builtin name the command puts together at run time
+/// (`printf -v y 'a[%s(…)]' '$'`, `read l <<< let; $l y`) is not seen.
+/// Each changed spelling is read through the whole evaluator, so the
+/// readers judge the substitution as they judge any other.
+#[must_use]
+pub(crate) fn bash_arithmetic_quotes(command: &str) -> Option<BashHashReading> {
+    let bytes = command.as_bytes();
+    // A `$'…'` may decode to a `(`, a `[` or a backquote.
+    let ansi_c = memchr::memmem::find(bytes, b"$'").is_some();
+    if (!ansi_c && memchr::memchr2(b'(', b'`', bytes).is_none())
+        || memchr::memchr3(b'\'', b'"', b'\\', bytes).is_none()
+    {
+        return None;
+    }
+    let bodies = crate::context::undisputed_heredoc_body_ranges(command);
+    let quoted_bodies = crate::context::undisputed_quoted_heredoc_body_ranges(command);
+    let spans = arithmetic_spans(bytes, &bodies, &quoted_bodies);
+    let mut spelled: Option<Vec<u8>> = None;
+    for span in &spans {
+        spell_quotes_holding_substitutions(bytes, span.start, span.end, &mut spelled);
+    }
+    // Only an ASCII byte changed into another ASCII byte.
+    let spelled = spelled.and_then(|spelled| String::from_utf8(spelled).ok());
+    let text = spelled.as_deref().unwrap_or(command);
+    let sink = !spans.is_empty() || holds_arithmetic_sink(command);
+    let reading = requote_quoted_substitutions(text, &bodies, sink, 0).or(spelled)?;
+    Some(BashHashReading::Spelled(reading))
+}
+
+/// Whether `command` holds an arithmetic sink of [`bash_arithmetic_quotes`]
+/// anywhere in its text: in a `$(…)` or backquote body, in quoted text and
+/// in a heredoc or here-string body, which a later evaluation may read as
+/// code (`echo $(echo $((y)))`, `eval 'let y'`, `bash <<'EOF'` with
+/// `echo $((y))` in its body), or as a word naming a builtin. Every quote,
+/// backslash and backquote is read as a blank and every `$(` as `(`, and
+/// the arithmetic spans of that text are found as if it were unquoted.
+fn holds_arithmetic_sink(command: &str) -> bool {
+    if names_arithmetic_sink(command) {
+        return true;
+    }
+    let bytes = command.as_bytes();
+    let mut flat = bytes.to_vec();
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'\'' | b'"' | b'\\' | b'`' => flat[at] = b' ',
+            b'$' if bytes.get(at + 1) == Some(&b'(') && bytes.get(at + 2) != Some(&b'(') => {
+                flat[at] = b' ';
+            }
+            _ => {}
+        }
+    }
+    !arithmetic_spans(&flat, &[], &[]).is_empty()
+}
+
+/// Whether `command` holds `${!…}` or a word naming a builtin that
+/// evaluates a name or a value as arithmetic, wherever the word is. The
+/// shell removes quotes and backslashes from a command name (`\let`,
+/// `'let'`, `l\et`, `$'\x6cet'`), and text a later evaluation reads
+/// (`eval 'let y'`) holds words of its own, so backslashes are removed and
+/// words also end at quotes; a word whose `$'…'` escapes decode to a name
+/// is read too. Quoted data such as `b='['` then names `[`, which is no
+/// sink on its own: `printf`, `test`, `[` and `wait` evaluate a name only
+/// through an option (`printf -v`, `test -v`, `wait -p`), so without it
+/// they are no sink: `printf '%s' '$(git reset --hard)'` prints the text.
+fn names_arithmetic_sink(command: &str) -> bool {
+    if command.contains("${!") {
+        return true;
+    }
+    let text = command.replace('\\', "");
+    let words: Vec<&str> = text
+        .split(|ch: char| {
+            ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '`' | '\'' | '"')
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    if names_sink_in(&words) {
+        return true;
+    }
+    if !command.contains("$'") {
+        return false;
+    }
+    // Words spelled with `$'…'` escapes, read as their decoded text.
+    let decoded: Vec<String> = posix_command_word_ranges(command)
+        .into_iter()
+        .filter_map(|range| {
+            posix_word_value(&command[range])?
+                .iter()
+                .map(|byte| match byte {
+                    ValueByte::Literal(ch, _) => Some(*ch),
+                    ValueByte::Expansion(..) => None,
+                })
+                .collect::<Option<String>>()
+        })
+        .collect();
+    names_sink_in(&decoded)
+}
+
+/// Whether one of `words` names a builtin that evaluates a name or a value
+/// as arithmetic, with the option it needs to do so.
+fn names_sink_in<S: AsRef<str>>(words: &[S]) -> bool {
+    const SINKS: [&str; 9] = [
+        "let", "declare", "typeset", "local", "export", "readonly", "read", "[[", "getopts",
+    ];
+    words.iter().enumerate().any(|(at, word)| {
+        let later = &words[at + 1..];
+        match word.as_ref() {
+            "printf" => later
+                .first()
+                .is_some_and(|next| next.as_ref().starts_with("-v")),
+            "test" | "[" => later.iter().any(|next| next.as_ref() == "-v"),
+            "wait" => later.iter().any(|next| {
+                let next = next.as_ref();
+                next.starts_with('-') && next.contains('p')
+            }),
+            word => SINKS.contains(&word),
+        }
+    })
+}
+
+/// Whether the byte before `at` ends a word, so a word starts at `at`.
+fn starts_word(bytes: &[u8], at: usize) -> bool {
+    at == 0
+        || matches!(
+            bytes[at - 1],
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'('
+        )
+}
+
+/// The index past an assignment's `=` or `+=` at `at`, if one is there.
+fn assignment_operator_end(bytes: &[u8], at: usize) -> Option<usize> {
+    match bytes.get(at) {
+        Some(b'=') => Some(at + 1),
+        Some(b'+') if bytes.get(at + 1) == Some(&b'=') => Some(at + 2),
+        _ => None,
+    }
+}
+
+/// The arithmetic spans of `bytes` outside quoted heredoc bodies, each the
+/// text Bash evaluates: `$((…))`, `((…))`, `$[…]`, the subscript and the
+/// offset of `${…}`, and the subscript of an assignment word or a compound
+/// array element. An unquoted heredoc body is read as double-quoted text.
+fn arithmetic_spans(
+    bytes: &[u8],
+    bodies: &[Range<usize>],
+    quoted_bodies: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    let len = bytes.len();
+    let mut spans = Vec::new();
+    let mut in_double = false;
+    let mut i = 0;
+    while i < len {
+        if let Some(raw) = quoted_bodies.iter().find(|body| body.contains(&i)) {
+            i = raw.end;
+            continue;
+        }
+        // An unquoted body expands like double-quoted text, but a quote in
+        // it is a plain character.
+        let in_body = bodies.iter().any(|body| body.contains(&i));
+        let plain = in_double || in_body;
+        i = match bytes[i] {
+            b'\\' => i + 2,
+            b'"' if !in_body => {
+                in_double = !in_double;
+                i + 1
+            }
+            b'\'' if !plain => {
+                memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + 1 + at + 1)
+            }
+            b'$' if !plain && crate::context::ansi_c_quote_starts_at(bytes, i) => {
+                crate::context::skip_ansi_c_quoted(bytes, i + 2)
+            }
+            b'`' => posix_backquote_end(bytes, i + 1),
+            b'$' if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) == Some(&b'(') => {
+                if let Some(end) = crate::context::arithmetic_end(bytes, i + 3) {
+                    spans.push(i + 3..end - 2);
+                    end
+                } else {
+                    // `$( (…) )`: a command substitution.
+                    consume_shell_paren_construct(bytes, i + 2, len)
+                }
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                consume_shell_paren_construct(bytes, i + 2, len)
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'[') => {
+                let end = crate::context::bracket_arithmetic_end(bytes, i + 2);
+                spans.push(i + 2..end.saturating_sub(1).max(i + 2));
+                end
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                let end = crate::context::consume_braced_parameter(bytes, i)
+                    .0
+                    .max(i + 2);
+                let mut at = i + 2;
+                if matches!(bytes.get(at), Some(b'#' | b'!')) {
+                    at += 1;
+                }
+                let name = at;
+                while bytes
+                    .get(at)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    at += 1;
+                }
+                // A special parameter: `${@:…}`, `${*:…}`.
+                if at == name && matches!(bytes.get(at), Some(b'@' | b'*' | b'?' | b'$' | b'-')) {
+                    at += 1;
+                }
+                if at > name && at < end && bytes[at] == b'[' {
+                    let close = crate::context::bracket_arithmetic_end(bytes, at + 1).min(end);
+                    spans.push(at + 1..close.saturating_sub(1).max(at + 1));
+                    at = close;
+                }
+                if at > name
+                    && at < end
+                    && bytes[at] == b':'
+                    && !matches!(bytes.get(at + 1), Some(b'-' | b'=' | b'+' | b'?'))
+                {
+                    spans.push(at + 1..end - 1);
+                }
+                // A nested `${…}` or `$((…))` is read in turn.
+                i + 2
+            }
+            b'(' if !plain
+                && bytes.get(i + 1) == Some(&b'(')
+                && (i == 0 || bytes[i - 1] != b'$') =>
+            {
+                if let Some(end) = crate::context::arithmetic_end(bytes, i + 2) {
+                    spans.push(i + 2..end - 2);
+                    end
+                } else {
+                    i + 1
+                }
+            }
+            // A compound array element: `x=([…]=1)`.
+            b'[' if !plain && starts_word(bytes, i) => {
+                let end = crate::context::bracket_arithmetic_end(bytes, i + 1);
+                if end <= len
+                    && bytes[end - 1] == b']'
+                    && assignment_operator_end(bytes, end).is_some()
+                {
+                    spans.push(i + 1..end - 1);
+                    end
+                } else {
+                    i + 1
+                }
+            }
+            // An assignment word: `x[…]=1`.
+            byte if !plain
+                && (byte.is_ascii_alphabetic() || byte == b'_')
+                && starts_word(bytes, i) =>
+            {
+                let mut at = i + 1;
+                while bytes
+                    .get(at)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    at += 1;
+                }
+                if bytes.get(at) == Some(&b'[') {
+                    let end = crate::context::bracket_arithmetic_end(bytes, at + 1);
+                    if end <= len
+                        && bytes[end - 1] == b']'
+                        && assignment_operator_end(bytes, end).is_some()
+                    {
+                        spans.push(at + 1..end - 1);
+                        end
+                    } else {
+                        at
+                    }
+                } else {
+                    at
+                }
+            }
+            _ => i + 1,
+        };
+    }
+    spans
+}
+
+/// Spell `_` the quote bytes of each `'…'` or `$'…'` in `start..end` that
+/// holds a `$(` or a backquote, and the `\` of each escaped `$(` or
+/// backquote there or in double-quoted text (Bash 3.2 removes it and then
+/// expands the text), passing over command substitutions, whose quotes are
+/// their own.
+fn spell_quotes_holding_substitutions(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    spelled: &mut Option<Vec<u8>>,
+) {
+    let holds_substitution = |text: &[u8]| {
+        memchr::memchr(b'`', text).is_some() || memchr::memmem::find(text, b"$(").is_some()
+    };
+    let end = end.min(bytes.len());
+    // Spell the `\` at `at` when it escapes a `$(` or a backquote.
+    let unescape = |at: usize, spelled: &mut Option<Vec<u8>>| {
+        if bytes.get(at + 1) == Some(&b'`')
+            || (bytes.get(at + 1) == Some(&b'$') && bytes.get(at + 2) == Some(&b'('))
+        {
+            spelled.get_or_insert_with(|| bytes.to_vec())[at] = b'_';
+        }
+    };
+    let mut i = start;
+    while i < end {
+        i = match bytes[i] {
+            b'\\' => {
+                unescape(i, spelled);
+                i + 2
+            }
+            b'"' => {
+                let mut at = i + 1;
+                while at < end && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' {
+                        unescape(at, spelled);
+                        2
+                    } else {
+                        1
+                    };
+                }
+                at + 1
+            }
+            b'`' => posix_backquote_end(bytes, i + 1),
+            b'$' if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') => {
+                consume_shell_paren_construct(bytes, i + 2, bytes.len())
+            }
+            b'\'' => {
+                let Some(close) = memchr::memchr(b'\'', &bytes[i + 1..]).map(|at| i + 1 + at)
+                else {
+                    return;
+                };
+                if holds_substitution(&bytes[i + 1..close]) {
+                    let view = spelled.get_or_insert_with(|| bytes.to_vec());
+                    view[i] = b'_';
+                    view[close] = b'_';
+                }
+                close + 1
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                let past = crate::context::skip_ansi_c_quoted(bytes, i + 2);
+                if past > i + 2
+                    && bytes[past - 1] == b'\''
+                    && holds_substitution(&bytes[i + 2..past - 1])
+                {
+                    let view = spelled.get_or_insert_with(|| bytes.to_vec());
+                    view[i] = b'_';
+                    view[i + 1] = b'_';
+                    view[past - 1] = b'_';
+                }
+                past
+            }
+            _ => i + 1,
+        };
+    }
+}
+
+/// One character of a POSIX word's value, for
+/// [`requote_quoted_substitutions`].
+#[derive(Clone, Copy)]
+enum ValueByte<'a> {
+    /// A character of the value; `true` when it was quoted or escaped.
+    Literal(char, bool),
+    /// An expansion the shell substitutes, as written; `true` when it was
+    /// in double quotes.
+    Expansion(&'a str, bool),
+}
+
+/// The words' array-reference reading of [`bash_arithmetic_quotes`]:
+/// `command` with each word whose value holds a quoted command substitution
+/// in an array subscript spelled again with that substitution unquoted, and,
+/// when the command holds an arithmetic sink (`anywhere`) or a word's value
+/// read here holds an array reference a later word completes, each word's
+/// quoted substitutions spelled unquoted wherever they are, `depth` levels
+/// into `$(…)`, backquote and `${…}` text; `None` when no word changes.
+fn requote_quoted_substitutions(
+    command: &str,
+    bodies: &[Range<usize>],
+    mut anywhere: bool,
+    depth: usize,
+) -> Option<String> {
+    let bytes = command.as_bytes();
+    if !anywhere
+        && memchr::memchr(b'[', bytes).is_none()
+        && memchr::memmem::find(bytes, b"$'").is_none()
+    {
+        return None;
+    }
+    let mut quoted: Vec<(Range<usize>, Vec<ValueByte<'_>>)> = Vec::new();
+    // Whether every word since the command started is an assignment.
+    let mut leading = true;
+    let mut previous_end = 0usize;
+    for range in posix_command_word_ranges(command) {
+        let raw = &command[range.clone()];
+        let gap = command.get(previous_end..range.start).unwrap_or("");
+        previous_end = range.end;
+        if gap.contains([';', '&', '|', '\n', '(', ')']) {
+            leading = true;
+        }
+        if raw.bytes().all(|byte| b";&|()\n".contains(&byte))
+            || matches!(
+                raw,
+                "{" | "}"
+                    | "!"
+                    | "then"
+                    | "do"
+                    | "else"
+                    | "elif"
+                    | "if"
+                    | "while"
+                    | "until"
+                    | "time"
+            )
+        {
+            leading = true;
+            continue;
+        }
+        if bodies
+            .iter()
+            .any(|body| body.start < range.end && range.start < body.end)
+        {
+            continue;
+        }
+        let bytes = raw.as_bytes();
+        let leading_assignment = leading && is_assignment_word(bytes);
+        leading = leading_assignment;
+        if memchr::memchr3(b'[', b'$', b'`', bytes).is_none() {
+            continue;
+        }
+        let Some(value) = posix_word_value(raw) else {
+            continue;
+        };
+        // A leading assignment's own subscript is evaluated once: only its
+        // value is kept for a later evaluation.
+        let from = if leading_assignment {
+            value_assignment_end(&value).unwrap_or(0)
+        } else {
+            0
+        };
+        anywhere = anywhere || value_joins_reference(&value, from);
+        if memchr::memchr3(b'\'', b'"', b'\\', bytes).is_some()
+            && (memchr::memchr2(b'(', b'`', bytes).is_some() || raw.contains("$'"))
+        {
+            quoted.push((range, value));
+        }
+    }
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    for (range, value) in quoted {
+        let Some(requoted) = requote_value(&value, anywhere, depth) else {
+            continue;
+        };
+        let out = out.get_or_insert_with(|| String::with_capacity(command.len() + 16));
+        out.push_str(&command[copied..range.start]);
+        out.push_str(&requoted);
+        copied = range.end;
+    }
+    let mut out = out?;
+    out.push_str(&command[copied..]);
+    Some(out)
+}
+
+/// Whether a raw word is spelled as an assignment: `NAME=`, `NAME+=` or
+/// `NAME[…]=`, with an unquoted name.
+fn is_assignment_word(bytes: &[u8]) -> bool {
+    if !bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return false;
+    }
+    let mut at = 1;
+    while bytes
+        .get(at)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        at += 1;
+    }
+    if bytes.get(at) == Some(&b'[') {
+        at = crate::context::bracket_arithmetic_end(bytes, at + 1);
+        if bytes.get(at - 1) != Some(&b']') {
+            return false;
+        }
+    }
+    assignment_operator_end(bytes, at).is_some()
+}
+
+/// The value index past the `=` of a leading assignment word's value.
+fn value_assignment_end(value: &[ValueByte<'_>]) -> Option<usize> {
+    let mut at = 0usize;
+    while matches!(value.get(at), Some(ValueByte::Literal(ch, false)) if ch.is_ascii_alphanumeric() || *ch == '_')
+    {
+        at += 1;
+    }
+    if matches!(value.get(at), Some(ValueByte::Literal('[', false))) {
+        at = subscript_close(value, at + 1)? + 1;
+    }
+    if matches!(value.get(at), Some(ValueByte::Literal('+', false))) {
+        at += 1;
+    }
+    matches!(value.get(at), Some(ValueByte::Literal('=', false))).then_some(at + 1)
+}
+
+/// The value index of the `]` that closes the subscript whose text starts at
+/// `start`, past nested brackets and quoted or escaped `]`, as Bash reads
+/// it; `None` when none does.
+fn subscript_close(value: &[ValueByte<'_>], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut at = start;
+    while at < value.len() {
+        if let ValueByte::Literal(ch, _) = value[at] {
+            match (quote, ch) {
+                (None, '\\') => at += 1,
+                (None, '\'' | '"') => quote = Some(ch),
+                (Some(open), _) if ch == open => quote = None,
+                (Some('"'), '\\') => at += 1,
+                (None, '[') => depth += 1,
+                (None, ']') if depth == 0 => return Some(at),
+                (None, ']') => depth -= 1,
+                _ => {}
+            }
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The array references in `value` from index `from`: each `[` after a name
+/// that is not a `$name`, or after an expansion, with the index of its
+/// closing `]` (`None` when it does not close).
+fn array_references(value: &[ValueByte<'_>], from: usize) -> Vec<(usize, Option<usize>)> {
+    let literal = |at: usize| match value.get(at) {
+        Some(ValueByte::Literal(ch, _)) => Some(*ch),
+        _ => None,
+    };
+    let is_name = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+    let mut references = Vec::new();
+    for at in from..value.len() {
+        if literal(at) != Some('[') || at == from {
+            continue;
+        }
+        let opens = if matches!(value[at - 1], ValueByte::Expansion(..)) {
+            true
+        } else {
+            let mut start = at;
+            while start > from && literal(start - 1).is_some_and(is_name) {
+                start -= 1;
+            }
+            start < at
+                && literal(start).is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                && (start == 0 || literal(start - 1) != Some('$'))
+        };
+        if opens {
+            references.push((at, subscript_close(value, at + 1)));
+        }
+    }
+    references
+}
+
+/// Whether `value` from `from` holds an array reference that a later
+/// expansion completes: one with an expansion in its subscript, or one
+/// that does not close (`p='a['`).
+fn value_joins_reference(value: &[ValueByte<'_>], from: usize) -> bool {
+    array_references(value, from)
+        .into_iter()
+        .any(|(open, close)| {
+            close.is_none_or(|close| {
+                value[open + 1..close]
+                    .iter()
+                    .any(|byte| matches!(byte, ValueByte::Expansion(..)))
+            })
+        })
+}
+
+/// The value of one raw POSIX word, character by character, with each
+/// expansion kept as written; `None` when a quote does not close. An escape
+/// that does not decode is kept as written, so the rest of the word is read.
+fn posix_word_value(raw: &str) -> Option<Vec<ValueByte<'_>>> {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    // Index past the expansion that starts at `at`, if one does.
+    let expansion_end = |at: usize| -> Option<usize> {
+        match (bytes[at], bytes.get(at + 1).copied()) {
+            (b'`', _) => Some(posix_backquote_end(bytes, at + 1)),
+            (b'$', Some(b'(')) => Some(consume_shell_paren_construct(bytes, at + 2, len)),
+            (b'$', Some(b'{')) => Some(
+                crate::context::consume_braced_parameter(bytes, at)
+                    .0
+                    .max(at + 2),
+            ),
+            (b'$', Some(b'[')) => Some(crate::context::bracket_arithmetic_end(bytes, at + 2)),
+            (b'$', Some(next)) if next.is_ascii_alphabetic() || next == b'_' => {
+                let mut end = at + 2;
+                while bytes
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    end += 1;
+                }
+                Some(end)
+            }
+            (b'$', Some(next)) if posix_dollar_expands(Some(char::from(next))) => Some(at + 2),
+            _ => None,
+        }
+    };
+    let mut value = Vec::with_capacity(len);
+    let mut i = 0usize;
+    let mut double = false;
+    while i < len {
+        let ch = raw[i..].chars().next()?;
+        if double {
+            match ch {
+                '"' => {
+                    double = false;
+                    i += 1;
+                }
+                '\\' => match bytes.get(i + 1)? {
+                    b'\n' => i += 2,
+                    byte @ (b'$' | b'`' | b'"' | b'\\') => {
+                        value.push(ValueByte::Literal(char::from(*byte), true));
+                        i += 2;
+                    }
+                    _ => {
+                        value.push(ValueByte::Literal('\\', true));
+                        i += 1;
+                    }
+                },
+                '$' | '`' if let Some(end) = expansion_end(i) => {
+                    value.push(ValueByte::Expansion(raw.get(i..end.min(len))?, true));
+                    i = end;
+                }
+                _ => {
+                    value.push(ValueByte::Literal(ch, true));
+                    i += ch.len_utf8();
+                }
+            }
+            continue;
+        }
+        match ch {
+            '\\' => match raw[i + 1..].chars().next() {
+                Some('\n') => i += 2,
+                Some(escaped) => {
+                    value.push(ValueByte::Literal(escaped, true));
+                    i += 1 + escaped.len_utf8();
+                }
+                // A backslash that ends the text is kept.
+                None => {
+                    value.push(ValueByte::Literal('\\', true));
+                    i += 1;
+                }
+            },
+            '\'' => {
+                let close = i + 1 + raw[i + 1..].find('\'')?;
+                value.extend(
+                    raw[i + 1..close]
+                        .chars()
+                        .map(|ch| ValueByte::Literal(ch, true)),
+                );
+                i = close + 1;
+            }
+            '"' => {
+                double = true;
+                i += 1;
+            }
+            '$' if crate::context::ansi_c_quote_starts_at(bytes, i) => {
+                let past = crate::context::skip_ansi_c_quoted(bytes, i + 2);
+                let body = raw.get(i + 2..past)?;
+                let mut chars = body.chars().peekable();
+                let mut decoded = String::new();
+                if decode_ansi_c_quoted(&mut chars, &mut decoded).is_err() {
+                    // An escape Bash decodes another way: its text as written.
+                    decoded.clear();
+                    decoded.push_str(body.strip_suffix('\'').unwrap_or(body));
+                }
+                value.extend(decoded.chars().map(|ch| ValueByte::Literal(ch, true)));
+                i = past;
+            }
+            '$' if bytes.get(i + 1) == Some(&b'"') => {
+                double = true;
+                i += 2;
+            }
+            '$' | '`' if let Some(end) = expansion_end(i) => {
+                value.push(ValueByte::Expansion(raw.get(i..end.min(len))?, false));
+                i = end;
+            }
+            _ => {
+                value.push(ValueByte::Literal(ch, false));
+                i += ch.len_utf8();
+            }
+        }
+    }
+    (!double).then_some(value)
+}
+
+/// The word spelled again from its `value` with each quoted or escaped
+/// command substitution in an array subscript unquoted (each one anywhere
+/// when `anywhere`, also in the text of each expansion, `depth` levels
+/// down), every other quoted character single-quoted, and the rest as
+/// written; `None` when the value holds no such substitution.
+fn requote_value(value: &[ValueByte<'_>], anywhere: bool, depth: usize) -> Option<String> {
+    // Each value index inside a substitution that is spelled unquoted.
+    let mut unquoted = vec![false; value.len()];
+    let mut found = false;
+    if anywhere {
+        found |= mark_substitutions(value, 0..value.len(), &mut unquoted);
+    } else {
+        for (open, close) in array_references(value, 0) {
+            found |=
+                mark_substitutions(value, open + 1..close.unwrap_or(value.len()), &mut unquoted);
+        }
+    }
+    // Each expansion spelled again from its own words.
+    let nested: Vec<Option<String>> = value
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| match *byte {
+            ValueByte::Expansion(text, _) if anywhere && !unquoted[index] => {
+                requote_expansion(text, depth + 1)
+            }
+            _ => None,
+        })
+        .collect();
+    found |= nested.iter().any(Option::is_some);
+    if !found {
+        return None;
+    }
+    let mut out = String::new();
+    let mut open = false;
+    for (index, byte) in value.iter().enumerate() {
+        let (text, quote): (Cow<'_, str>, bool) = match (*byte, &nested[index]) {
+            (ValueByte::Literal(ch, quoted), _) => {
+                (ch.to_string().into(), quoted && !unquoted[index])
+            }
+            (ValueByte::Expansion(text, double), nested) => {
+                let text = nested.as_deref().unwrap_or(text);
+                if double && !unquoted[index] {
+                    (format!("\"{text}\"").into(), false)
+                } else {
+                    (text.to_owned().into(), false)
+                }
+            }
+        };
+        if quote != open {
+            out.push('\'');
+            open = quote;
+        }
+        if quote && text == "'" {
+            out.push_str("'\\''");
+        } else {
+            out.push_str(&text);
+        }
+    }
+    if open {
+        out.push('\'');
+    }
+    Some(out)
+}
+
+/// The text of the expansion `text` (`$(…)`, a backquote or `${…}`) with
+/// the quoted substitutions in its words, or in its operand, spelled
+/// unquoted at `depth`; `None` when none changes or the levels run out.
+fn requote_expansion(text: &str, depth: usize) -> Option<String> {
+    const MAX_DEPTH: usize = 8;
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    if let Some(body) = text.strip_prefix("$(") {
+        // `$((…))` is an arithmetic span, spelled on its own.
+        if body.starts_with('(') {
+            return None;
+        }
+        let body = body.strip_suffix(')')?;
+        return requote_quoted_substitutions(body, &[], true, depth)
+            .map(|body| format!("$({body})"));
+    }
+    if let Some(body) = text.strip_prefix('`') {
+        let body = body.strip_suffix('`')?;
+        return requote_quoted_substitutions(body, &[], true, depth)
+            .map(|body| format!("`{body}`"));
+    }
+    let body = text.strip_prefix("${")?.strip_suffix('}')?;
+    let bytes = body.as_bytes();
+    // The name, with its subscript: `!`, `#`, a name or a special parameter.
+    let mut at = usize::from(matches!(bytes.first(), Some(b'!' | b'#')));
+    let name = at;
+    while bytes
+        .get(at)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        at += 1;
+    }
+    if at == name
+        && matches!(
+            bytes.get(at),
+            Some(b'@' | b'*' | b'#' | b'?' | b'$' | b'!' | b'-')
+        )
+    {
+        at += 1;
+    }
+    if bytes.get(at) == Some(&b'[') {
+        at = crate::context::bracket_arithmetic_end(bytes, at + 1).min(bytes.len());
+    }
+    let operand = requote_quoted_substitutions(body.get(at..)?, &[], true, depth)?;
+    Some(format!("${{{}{operand}}}", &body[..at]))
+}
+
+/// Mark in `unquoted` each command substitution whose `$(` or backquote is
+/// a character of `value` in `within`; whether there is one.
+fn mark_substitutions(
+    value: &[ValueByte<'_>],
+    within: Range<usize>,
+    unquoted: &mut [bool],
+) -> bool {
+    let literal = |at: usize| match value.get(at) {
+        Some(ValueByte::Literal(ch, _)) => Some(*ch),
+        _ => None,
+    };
+    let mut found = false;
+    let mut inner = within.start;
+    while inner < within.end {
+        let end = match literal(inner) {
+            Some('$') if literal(inner + 1) == Some('(') => {
+                substitution_end(value, inner, inner + 2)
+            }
+            Some('`') => substitution_end(value, inner, inner + 1),
+            _ => None,
+        };
+        if let Some(end) = end {
+            unquoted[inner..end]
+                .iter_mut()
+                .for_each(|spell| *spell = true);
+            found = true;
+            inner = end;
+        } else {
+            inner += 1;
+        }
+    }
+    found
+}
+
+/// The value index past the command substitution whose `$` or backquote is
+/// at `start` and whose body starts at `body`, read as command text; `None`
+/// when it does not close in the value.
+fn substitution_end(value: &[ValueByte<'_>], start: usize, body: usize) -> Option<usize> {
+    // The value as text, and the value index of each of its bytes.
+    let mut text = String::new();
+    let mut index = Vec::new();
+    for (at, byte) in value.iter().enumerate().skip(start) {
+        let before = text.len();
+        match *byte {
+            ValueByte::Literal(ch, _) => text.push(ch),
+            ValueByte::Expansion(raw, _) => text.push_str(raw),
+        }
+        index.extend(std::iter::repeat_n(at, text.len() - before));
+    }
+    let bytes = text.as_bytes();
+    let body_at = index.iter().position(|at| *at == body)?;
+    let end = if matches!(value[start], ValueByte::Literal('`', _)) {
+        let end = posix_backquote_end(bytes, body_at);
+        (bytes.get(end - 1) == Some(&b'`') && end > body_at).then_some(end)?
+    } else {
+        let end = consume_shell_paren_construct(bytes, body_at, bytes.len());
+        (bytes.get(end - 1) == Some(&b')')).then_some(end)?
+    };
+    // Past the value byte that holds the closing byte.
+    Some(index[end - 1] + 1)
+}
+
 fn spell_bash_data_hashes(
     command: &str,
     extglob: bool,
@@ -9679,6 +10607,242 @@ mod tests {
             assert_eq!(bash_bracket_words(unchanged), None, "{unchanged:?}");
         }
         assert_eq!(bash_bracket_words("git status"), None);
+    }
+
+    /// Bash evaluates a quoted array reference again as arithmetic and runs
+    /// the command substitution in its subscript; in `$((…))` and the other
+    /// arithmetic spans Bash 5 reads a `'` as a plain character. Measured
+    /// with sandboxed bash 3.2, 5.2 and 5.3, zsh 5.9 and dash.
+    #[test]
+    fn bash_arithmetic_quotes_unquote_substitutions_bash_evaluates() {
+        let spelled = |command: &str| match bash_arithmetic_quotes(command) {
+            Some(BashHashReading::Spelled(spelled)) => spelled,
+            other => panic!("{command:?}: {other:?}"),
+        };
+        for (command, reading) in [
+            (
+                "x['a[$(git reset --hard)]']=1",
+                "x[_a[$(git reset --hard)]_]=1",
+            ),
+            (
+                "y='a[$(git reset --hard)]'; echo $((y))",
+                "y='a['$(git reset --hard)']'; echo $((y))",
+            ),
+            (
+                "x[\"a[\\$(git reset --hard)]\"]=1",
+                "x[\"a[_$(git reset --hard)]\"]=1",
+            ),
+            (
+                "y=$'a[\\x24(git reset --hard)]'",
+                "y='a['$(git reset --hard)']'",
+            ),
+            (
+                "y='a['\"$\"'(git reset --hard)]'",
+                "y='a['$(git reset --hard)']'",
+            ),
+            (
+                "x[a\\[\\$\\(git\\ reset\\ --hard\\)\\]]=1",
+                "x[a'['$(git reset --hard)']']=1",
+            ),
+            (
+                "declare 'x[$(git reset --hard)]=1'",
+                "declare 'x['$(git reset --hard)']=1'",
+            ),
+            (
+                "x['$(git reset --hard)']=1 true",
+                "x[_$(git reset --hard)_]=1 true",
+            ),
+            // A compound array element's subscript.
+            (
+                "x=(['$(git reset --hard)']=1)",
+                "x=([_$(git reset --hard)_]=1)",
+            ),
+            // The subscript ends where Bash's does, past a quoted `]`.
+            (
+                "y='a[\"]\"$(git reset --hard)]'; echo $((y))",
+                "y='a[\"]\"'$(git reset --hard)']'; echo $((y))",
+            ),
+            (
+                "y='a[\\]$(git reset --hard)]'; echo $((y))",
+                "y='a[\\]'$(git reset --hard)']'; echo $((y))",
+            ),
+            // An escape that does not decode leaves the rest of the word read.
+            (
+                "y='a[$(git reset --hard)]+0'$'\\uD800'; echo $((y))",
+                "y='a['$(git reset --hard)']+0\\uD800'; echo $((y))",
+            ),
+            // An array reference put together from other words: each quoted
+            // substitution is unquoted.
+            (
+                "q='$(git reset --hard)'; echo $((a[$q]))",
+                "q=$(git reset --hard); echo $((a[$q]))",
+            ),
+            (
+                "q='$(git reset --hard)'; y=\"a[$q]\"; echo $((y))",
+                "q=$(git reset --hard); y=\"a[$q]\"; echo $((y))",
+            ),
+            (
+                "p='a['; q='$(git reset --hard)]'; y=$p$q; echo $((y))",
+                "p='a['; q=$(git reset --hard)']'; y=$p$q; echo $((y))",
+            ),
+            (
+                "y='[$(git reset --hard)]'; echo $((a$y))",
+                "y='['$(git reset --hard)']'; echo $((a$y))",
+            ),
+            (
+                "q='$(git reset --hard)'; declare x[$q]=1",
+                "q=$(git reset --hard); declare x[$q]=1",
+            ),
+            (
+                "set -- '$(git reset --hard)'; echo $((a[$1]))",
+                "set -- $(git reset --hard); echo $((a[$1]))",
+            ),
+            ("y='a[`git reset --hard`]'", "y='a['`git reset --hard`']'"),
+            (
+                "y='a[$(echo $(git reset --hard))]'",
+                "y='a['$(echo $(git reset --hard))']'",
+            ),
+            (
+                "y=\"$HOME a[\\$(rm -rf ~)]\"",
+                "y=\"$HOME\"' a['$(rm -rf ~)']'",
+            ),
+            (
+                "y='it'\\''s a[$(git reset --hard)]'",
+                "y='it'\\''s a['$(git reset --hard)']'",
+            ),
+            // Arithmetic spans: the quote bytes are spelled `_`.
+            (
+                "echo $(( '$(git reset --hard)' ))",
+                "echo $(( _$(git reset --hard)_ ))",
+            ),
+            (
+                "echo \"$(( $'$(git reset --hard)' ))\"",
+                "echo \"$(( __$(git reset --hard)_ ))\"",
+            ),
+            (
+                "(( 'a[$(git reset --hard)]' ))",
+                "(( _a[$(git reset --hard)]_ ))",
+            ),
+            (
+                "for (( i='$(git reset --hard)'; 0; )); do :; done",
+                "for (( i=_$(git reset --hard)_; 0; )); do :; done",
+            ),
+            (
+                "echo $[ '$(git reset --hard)' ]",
+                "echo $[ _$(git reset --hard)_ ]",
+            ),
+            (
+                "x=abc; echo ${x:'$(git reset --hard)'}",
+                "x=abc; echo ${x:_$(git reset --hard)_}",
+            ),
+            (
+                "echo ${x['$(git reset --hard)']}",
+                "echo ${x[_$(git reset --hard)_]}",
+            ),
+            (
+                "set -- a b; echo ${@:'$(git reset --hard)'}",
+                "set -- a b; echo ${@:_$(git reset --hard)_}",
+            ),
+            // An unquoted heredoc body expands as double-quoted text does.
+            (
+                "cat <<EOF\n$(( '$(git reset --hard)' ))\nEOF",
+                "cat <<EOF\n$(( _$(git reset --hard)_ ))\nEOF",
+            ),
+            // An escaped substitution in an arithmetic span (Bash 3.2).
+            (
+                "echo $(( a[\\$(git reset --hard)] ))",
+                "echo $(( a[_$(git reset --hard)] ))",
+            ),
+            (
+                "echo $(( a[\"\\$(git reset --hard)\"] ))",
+                "echo $(( a[\"_$(git reset --hard)\"] ))",
+            ),
+            // Beside an arithmetic sink, every quoted substitution is
+            // unquoted, however the array reference is put together.
+            (
+                "y=a; y+='[$(git reset --hard)]'; echo $((y))",
+                "y=a; y+='['$(git reset --hard)']'; echo $((y))",
+            ),
+            (
+                "b='['; q='$(git reset --hard)'; y=a$b$q]; echo $((y))",
+                "b='['; q=$(git reset --hard); y=a$b$q]; echo $((y))",
+            ),
+            (
+                "y=$'a\\x5b$(git reset --hard)]'; echo $((y))",
+                "y='a['$(git reset --hard)']'; echo $((y))",
+            ),
+            (
+                "y=$'a[\\x24\\x28git reset --hard\\x29]'; let y",
+                "y='a['$(git reset --hard)']'; let y",
+            ),
+            (
+                "y=${x:-'a[$(git reset --hard)]'}; echo $((y))",
+                "y=${x:-'a['$(git reset --hard)']'}; echo $((y))",
+            ),
+            (
+                "y=$(printf 'a[%s]' '$(git reset --hard)'); echo $((y))",
+                "y=$(printf 'a[%s]' $(git reset --hard)); echo $((y))",
+            ),
+            (
+                "set -- a{'[$(git reset --hard)]',x}; echo $(($1))",
+                "set -- a{'['$(git reset --hard)']',x}; echo $(($1))",
+            ),
+            // The sink is in a body, in text evaluated later, or in a name
+            // spelled with quotes, a backslash or `$'…'` escapes.
+            (
+                "y=a; y+='[$(git reset --hard)]'; echo $(echo $((y)))",
+                "y=a; y+='['$(git reset --hard)']'; echo $(echo $((y)))",
+            ),
+            (
+                "y=a; y+='[$(git reset --hard)]'; eval 'let y'",
+                "y=a; y+='['$(git reset --hard)']'; eval 'let y'",
+            ),
+            (
+                "y='[$(git reset --hard)]' z=a$y bash <<'EOF'\necho $((z))\nEOF",
+                "y='['$(git reset --hard)']' z=a$y bash <<'EOF'\necho $((z))\nEOF",
+            ),
+            (
+                "y=a; y+='[$(git reset --hard)]'; l\\et y",
+                "y=a; y+='['$(git reset --hard)']'; l\\et y",
+            ),
+            (
+                "y=a; y+='[$(git reset --hard)]'; $'\\x6cet' y",
+                "y=a; y+='['$(git reset --hard)']'; $'\\x6cet' y",
+            ),
+            // Accepted false positives: `$q`'s text is evaluated once and
+            // runs nothing, but the command holds a sink.
+            (
+                "q='$(git reset --hard)'; x[$q]=1",
+                "q=$(git reset --hard); x[$q]=1",
+            ),
+            (
+                "y='$(git reset --hard)'; echo $((y))",
+                "y=$(git reset --hard); echo $((y))",
+            ),
+        ] {
+            assert_eq!(spelled(command), reading, "{command:?}");
+        }
+        for unchanged in [
+            "echo '$(git reset --hard)'",
+            "echo 'a[1]' \"b[2]\"",
+            "y='$a[$(git reset --hard)]'",
+            "y=a[$(git status)]",
+            "x[\"$(git status)\"]=1",
+            "echo $(( 1 + 2 ))",
+            "(( '1' ))",
+            "echo ${x:-'$(git reset --hard)'}",
+            "cat <<'EOF'\na[$(git reset --hard)]\nEOF",
+            "echo \"a[\\$x]\" '(y)'",
+            "git status",
+            // No arithmetic sink: the quoted text stays data.
+            "q='$(git reset --hard)'; echo \"$q\"",
+            "y=a; y+='$(git reset --hard)'; echo \"$y\"",
+            "b='['; q='$(git reset --hard)'; echo a$b$q]",
+            "y=a; y+='[$(git reset --hard)]'; eval 'echo \"$y\"'",
+            "y=a; y+='[$(git reset --hard)]'; echo $(echo \"$y\")",
+        ] {
+            assert_eq!(bash_arithmetic_quotes(unchanged), None, "{unchanged:?}");
+        }
     }
 
     #[test]
