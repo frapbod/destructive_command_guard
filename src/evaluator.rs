@@ -17974,19 +17974,29 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             Separated,
             Value,
         }
-        let masked = crate::normalize::mask_powershell_comments(command);
-        let assignments =
-            crate::normalize::powershell_assignment_views(masked.as_deref().unwrap_or(command));
-        let views = masked
-            .map(|view| (view, View::Masked))
-            .into_iter()
-            .chain(assignments.separated.map(|view| (view, View::Separated)))
-            .chain(
-                assignments
-                    .values
-                    .into_iter()
-                    .map(|view| (view, View::Value)),
-            );
+        // Each comment view comes with the assignment views read from it. The
+        // second keeps the older reading of a `#` glued to `${c}` as a
+        // comment in any mode, so a misread parse mode in the first cannot
+        // allow what that reading denied.
+        let with_assignments = |masked: Option<String>| {
+            let assignments =
+                crate::normalize::powershell_assignment_views(masked.as_deref().unwrap_or(command));
+            masked
+                .map(|view| (view, View::Masked))
+                .into_iter()
+                .chain(assignments.separated.map(|view| (view, View::Separated)))
+                .chain(
+                    assignments
+                        .values
+                        .into_iter()
+                        .map(|view| (view, View::Value)),
+                )
+                .collect::<Vec<_>>()
+        };
+        let mut views = with_assignments(crate::normalize::mask_powershell_comments(command));
+        if let Some(view) = crate::normalize::mask_powershell_comments_after_braced_variables(command) {
+            views.extend(with_assignments(Some(view)));
+        }
         let mut unseparated_reading = None;
         for (view, kind) in views {
             if result.decision != EvaluationDecision::Allow

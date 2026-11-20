@@ -397,7 +397,6 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "$c=@{p='V'}; $c.p#x",
         "$c<#x#> = git status",
         "[int]$c<#x#> = 1; git status",
-        "Write-Output x${c}#'\ngit reset --hard\n#'",
         "Write-Output ${c}<#'\ngit reset --hard\n#>'",
         "Write-Output a<#x#>b; git status",
         "Write-Output a>x; git status",
@@ -407,6 +406,10 @@ fn powershell_glued_comments_follow_the_parse_mode() {
         "Start-Process -Wait -RedirectStandardOutput o<#x -FilePath git -ArgumentList status #>",
         "Start-Process -Wait -RedirectStandardOutput o<#x git status #>",
         "Start-Process -Wait -RedirectStandardOutput o<x -FilePath git -ArgumentList status",
+        // Not listed: `Write-Output x${c}#'` NL `git reset --hard` NL `#'`.
+        // pwsh keeps the `#` in the word, but a second comment view keeps
+        // the older reading of a `#` glued to `${c}` as a comment, so it
+        // stays denied as before (conservative, unchanged here).
         // Not listed: `… InvokeScript 'git status'<# ; git reset --hard #>`.
         // pwsh runs only `git status`, but the engine-script reader keeps its
         // older deny for a string with text glued after it; that denial is
@@ -538,6 +541,109 @@ fn powershell_glued_comments_after_keywords_and_block_statements() {
                 "deny",
                 "{protocol:?}: {command:?}"
             );
+        }
+        for command in harmless {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
+/// More places where pwsh 7.5's tokenizer reads the next token as an
+/// expression: after a loop label's loop (`:a foreach (…) { }`), after
+/// `do { } until (…)`, after a `param(…)` block that begins a script or
+/// script block, at a hashtable key after `;` or a newline (the value after
+/// `=` is a statement) and at an enum or class member. Every row was
+/// measured with sandboxed pwsh 7.5: each dangerous row ran
+/// `git reset --hard`, no harmless row did.
+#[test]
+fn powershell_glued_comments_after_labels_param_blocks_and_in_lists() {
+    let dangerous = [
+        ":a foreach ($i in 1) { } ${c}<#'#>; git reset --hard; #'",
+        ":a while (0) { } ${c}#'\ngit reset --hard\n#'",
+        ":a switch (1) { 2 {} } ${c}<#'#>; git reset --hard; #'",
+        ":a foreach ($i in 1) { } $c#'\ngit reset --hard\n#'",
+        ":a while (0) { } $c#'\ngit reset --hard\n#'",
+        ":a for (;0;) { } $c<#'#>; git reset --hard; #'",
+        ":a switch (1) { 2 {} } $c#'\ngit reset --hard\n#'",
+        ":a do { } while (0) $c#'\ngit reset --hard\n#'",
+        "do { } until (1) ${c}#'\ngit reset --hard\n#'",
+        "do { } until (1) ${c}<#'#>; git reset --hard; #'",
+        ":a do { } until (1) ${c}<#'#>; git reset --hard; #'",
+        "do { } until (1) $c#'\ngit reset --hard\n#'",
+        "param($a) ${c}<#'#>; git reset --hard; #'",
+        "param($a) $c#'\ngit reset --hard\n#'",
+        "& { param($a) $c#'\n}; git reset --hard\n#'",
+        "& { param($a) ${c}<#'#>}; git reset --hard; #'",
+        "function f { param($a) ${c}#'\n}; git reset --hard\n#'",
+        "[CmdletBinding()] param() $c#'\ngit reset --hard\n#'",
+        "[CmdletBinding()]\nparam($a) $c#'\ngit reset --hard\n#'",
+        "$h=@{a=1;b=${c}<#'#>}; git reset --hard; #'",
+        "$h=@{a=1;b=${c}#'\n}; git reset --hard\n#'",
+        "echo @{a=1;b=${c}<#'#>}; git reset --hard; #'",
+        "$h=@{\na=${c}<#'#>}; git reset --hard; #'",
+        "$h=@{a=1;b=$c#'\n}; git reset --hard\n#'",
+        "$h=@{\na=$c#'\n}; git reset --hard\n#'",
+        "$h=@{a=1\nb=2#'\n}; git reset --hard\n#'",
+        "$h=@{a=1;b=$c<#'#>}; git reset --hard; #'",
+        "@{a=1;b=$c#'\n}; git reset --hard\n#'",
+        "$h=@{a=1; b=$c#'\n}; git reset --hard\n#'",
+        "echo @{a=1;b=$c#'\n}; git reset --hard\n#'",
+        "$h=[ordered]@{a=1;b=$c<#'#>}; git reset --hard; #'",
+        "$h=@{a=1;b='x'#'\n}; git reset --hard\n#'",
+        "$h=@{a=@{b=1};c=$d#'\n}; git reset --hard\n#'",
+        "enum a { b#'\n}; git reset --hard\n#'",
+        "enum a { b<#'#> }; git reset --hard; #'",
+        "enum a { b=1\nc#'\n}; git reset --hard\n#'",
+        "class a { [int]$p#'\n}; git reset --hard\n#'",
+        "class a { hidden $p#'\n}; git reset --hard\n#'",
+    ];
+    // Harmless rows are PowerShell readings only (see above). The value
+    // after `=` is a statement, so `echo x#'` keeps the `#`; a key glued to
+    // a comment, a function name glued to one, `using` and a splatted or
+    // dynamic member name are parse errors or arguments, and nothing runs.
+    let harmless = [
+        "$h=@{a=1;b=echo x#'\n}; git reset --hard\n#'",
+        "$h=@{a=1;b#'\n=2}; git reset --hard\n#'",
+        "function a#'\n{ }; git reset --hard\n#'",
+        "filter a#'\n{ }; git reset --hard\n#'",
+        "function a<#'#> { }; git reset --hard; #'",
+        "using namespace System#'\ngit reset --hard\n#'",
+        "echo @c#'\ngit reset --hard\n#'",
+        "echo $c.$d#'\ngit reset --hard\n#'",
+        "echo $c.p.$d<#'#>; git reset --hard; #'",
+        "echo 1; param($a) $c#'\ngit reset --hard\n#'",
+        ":a $c#'\ngit reset --hard\n#'",
+        "class a { m() { echo a#'\n} }; git reset --hard\n#'",
+    ];
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        for command in dangerous {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+    for command in harmless {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Allow,
+            "{command:?}"
+        );
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for tool in ["PowerShell", "Shell"] {
+            for command in dangerous {
+                assert_eq!(
+                    hook_decision(protocol, tool, command),
+                    "deny",
+                    "{protocol:?} {tool}: {command:?}"
+                );
+            }
         }
         for command in harmless {
             assert_eq!(

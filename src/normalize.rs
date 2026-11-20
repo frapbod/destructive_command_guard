@@ -4065,7 +4065,7 @@ pub(crate) fn powershell_block_comment_opens_at(bytes: &[u8], index: usize) -> b
 }
 
 fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
-    tokenize_powershell_with_comments(command, false).0
+    tokenize_powershell_with_comments(command, false, false).0
 }
 
 /// Deny-only views of a command's PowerShell assignments: what PowerShell
@@ -4800,6 +4800,24 @@ fn powershell_quoted_end(bytes: &[u8], i: usize, end: usize) -> usize {
 /// Masked comments preserve line ends; block-comment line ends are spaces.
 /// Smart quotes use their ASCII spelling so the existing readers see them.
 pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
+    mask_powershell_comments_reading(command, false)
+}
+
+/// A second deny-only comment view that keeps the older reading of a `#` or
+/// `<#` glued to a braced variable (`${c}<#x#>`, `${c}#x`) as a comment in
+/// every parse mode. PowerShell does so in expression mode only, which the
+/// view of [`mask_powershell_comments`] follows; this one keeps a parse mode
+/// it misreads from allowing what the older reading denied. `None` when it
+/// masks nothing that view does not.
+pub(crate) fn mask_powershell_comments_after_braced_variables(command: &str) -> Option<String> {
+    mask_powershell_comments_reading(command, true)
+        .filter(|view| mask_powershell_comments(command).as_deref() != Some(view.as_str()))
+}
+
+fn mask_powershell_comments_reading(
+    command: &str,
+    braced_variables_open_comments: bool,
+) -> Option<String> {
     let has_smart_quotes = command
         .chars()
         .any(|c| matches!(c, '\u{2018}'..='\u{201e}'));
@@ -4813,18 +4831,19 @@ pub(crate) fn mask_powershell_comments(command: &str) -> Option<String> {
             })
             .collect();
         Some(
-            tokenize_powershell_with_comments(&spelled, true)
+            tokenize_powershell_with_comments(&spelled, true, braced_variables_open_comments)
                 .1
                 .unwrap_or(spelled),
         )
     } else {
-        tokenize_powershell_with_comments(command, true).1
+        tokenize_powershell_with_comments(command, true, braced_variables_open_comments).1
     }
 }
 
 fn tokenize_powershell_with_comments(
     command: &str,
     read_comments: bool,
+    braced_variables_open_comments: bool,
 ) -> (NormalizeTokens, Option<String>) {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
@@ -4834,6 +4853,7 @@ fn tokenize_powershell_with_comments(
     let mut i = 0usize;
     let mut literal_mode = false;
     let mut parse = PowerShellParseState::default();
+    parse.braced_variables_open_comments = braced_variables_open_comments;
 
     while i < len {
         i = skip_powershell_horizontal_whitespace(bytes, i, len);
@@ -4859,8 +4879,7 @@ fn tokenize_powershell_with_comments(
         if let Some(end) = consume_raw_newline(bytes, i, len, &mut tokens) {
             // PowerShell's stop-parsing mode ends at the physical newline.
             literal_mode = false;
-            parse.end_command_word(None);
-            parse.start(true);
+            parse.end_statement();
             i = end;
             continue;
         }
@@ -5288,6 +5307,24 @@ struct PowerShellParseState {
     /// statement and its body `{` has not opened yet. After that body a new
     /// statement starts with no separator: `if (1) {} $c#x` is a comment.
     header: bool,
+    /// The block statement waiting for its body declares a type (`class`,
+    /// `enum`): the body holds members, not statements.
+    members: bool,
+    /// This group lists entries, not statements: a hashtable's keys or a
+    /// type's members. After `;` or a newline the next token is an
+    /// expression (`@{a=1;b#x` and `enum a { b#x` are comments).
+    list: bool,
+    /// No statement has started yet in this script or script block, so a
+    /// `param(...)` block may come first; a new statement follows it.
+    leading: bool,
+    /// Whether the command word being read came first in its block.
+    command_leading: bool,
+    /// A loop label (`:a`) began this statement: a keyword after it counts,
+    /// and any other token is a command word (`:a $c#x` keeps the `#`).
+    label: bool,
+    /// Read a `#` or `<#` glued to a braced variable as a comment in every
+    /// mode (see [`mask_powershell_comments_after_braced_variables`]).
+    braced_variables_open_comments: bool,
     enclosing: Vec<PowerShellParseFrame>,
 }
 
@@ -5297,6 +5334,8 @@ struct PowerShellParseFrame {
     mode: PowerShellParseMode,
     statement: bool,
     header: bool,
+    list: bool,
+    leading: bool,
 }
 
 impl Default for PowerShellParseState {
@@ -5312,6 +5351,12 @@ impl PowerShellParseState {
             statement: true,
             command_start: None,
             header: false,
+            members: false,
+            list: false,
+            leading: true,
+            command_leading: false,
+            label: false,
+            braced_variables_open_comments: false,
             enclosing: Vec::new(),
         }
     }
@@ -5320,17 +5365,33 @@ impl PowerShellParseState {
         self.mode = PowerShellParseMode::StatementStart;
         self.statement = statement;
         self.command_start = None;
+        self.label = false;
+    }
+
+    /// `;` or a newline: a new statement, or in a list the next entry. A
+    /// block statement's header may go on after a newline (`if (1)` NL `{`).
+    fn end_statement(&mut self) {
+        self.end_command_word(None);
+        if self.list {
+            self.mode = PowerShellParseMode::Expression;
+            self.command_start = None;
+        } else {
+            self.start(true);
+        }
     }
 
     /// Open `(` or `{` (a statement body when `body`). Inside, `next` is the
-    /// mode and `statement` says whether statements start there.
-    fn open_group(&mut self, next: PowerShellParseMode, statement: bool, body: bool) {
+    /// mode, `statement` says whether statements start there and `list`
+    /// whether it lists entries instead.
+    fn open_group(&mut self, next: PowerShellParseMode, statement: bool, body: bool, list: bool) {
         self.end_command_word(None);
         let frame = if body {
             PowerShellParseFrame {
                 mode: PowerShellParseMode::StatementStart,
                 statement: true,
                 header: false,
+                list: self.list,
+                leading: false,
             }
         } else {
             PowerShellParseFrame {
@@ -5340,12 +5401,19 @@ impl PowerShellParseState {
                 },
                 statement: self.statement,
                 header: self.header,
+                list: self.list,
+                leading: self.leading,
             }
         };
         self.enclosing.push(frame);
         self.mode = next;
         self.statement = statement;
         self.header = false;
+        self.members = false;
+        self.list = list;
+        self.label = false;
+        // A script block or statement body may begin with `param(...)`.
+        self.leading = statement && next == PowerShellParseMode::StatementStart;
     }
 
     fn close_group(&mut self) {
@@ -5353,10 +5421,14 @@ impl PowerShellParseState {
             mode: PowerShellParseMode::StatementStart,
             statement: true,
             header: false,
+            list: false,
+            leading: false,
         });
         self.mode = frame.mode;
         self.statement = frame.statement;
         self.header = frame.header;
+        self.list = frame.list;
+        self.leading = frame.leading;
         self.command_start = None;
         if self.header {
             // A block statement's `(...)`: its body or, after `do {...}
@@ -5371,7 +5443,10 @@ impl PowerShellParseState {
         match (bytes[i], width) {
             (b'(', 1) => {
                 let statements = i > 0 && matches!(bytes[i - 1], b'$' | b'@');
-                self.open_group(PowerShellParseMode::StatementStart, statements, false);
+                if self.mode == PowerShellParseMode::StatementStart {
+                    self.leading = false;
+                }
+                self.open_group(PowerShellParseMode::StatementStart, statements, false, false);
             }
             (b')', 1) => self.close_group(),
             // The call operator: a command name in argument mode follows
@@ -5380,7 +5455,11 @@ impl PowerShellParseState {
             (b'&', 1) if self.mode == PowerShellParseMode::StatementStart => {
                 self.mode = PowerShellParseMode::Command;
             }
-            (b';' | b'&', 1) => {
+            (b';', 1) => {
+                self.header = false;
+                self.end_statement();
+            }
+            (b'&', 1) => {
                 self.header = false;
                 self.start(true);
             }
@@ -5411,7 +5490,18 @@ impl PowerShellParseState {
             return;
         };
         let word = bytes[start..end].to_ascii_lowercase();
-        self.header = matches!(
+        if let [b':', name @ ..] = word.as_slice()
+            && !name.is_empty()
+            && name.iter().all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            self.start(true);
+            self.label = true;
+            return;
+        }
+        // `param(...)` first in a script or script block is followed by a
+        // new statement; later it is a command name.
+        self.header = (word == b"param" && self.command_leading)
+            || matches!(
             word.as_slice(),
             b"if"
                 | b"elseif"
@@ -5421,6 +5511,7 @@ impl PowerShellParseState {
                 | b"foreach"
                 | b"switch"
                 | b"do"
+                | b"until"
                 | b"try"
                 | b"catch"
                 | b"finally"
@@ -5440,6 +5531,7 @@ impl PowerShellParseState {
                 | b"parallel"
                 | b"sequence"
         );
+        self.members = matches!(word.as_slice(), b"class" | b"enum");
         match word.as_slice() {
             b"return" | b"throw" | b"exit" => self.start(false),
             b"break" | b"continue" | b"class" | b"enum" | b"data" => {
@@ -5458,19 +5550,26 @@ impl PowerShellParseState {
                 if self.mode == PowerShellParseMode::Command {
                     self.end_command_word(Some((bytes, i)));
                 }
-                // `@{` is a hashtable: its keys and values are expressions.
+                // `@{` is a hashtable: its keys are expressions, and each
+                // value after `=` a statement. A type's body lists members,
+                // read as expressions; a method's body holds statements.
                 if i > 0 && bytes[i - 1] == b'@' {
-                    self.open_group(PowerShellParseMode::Expression, false, false);
+                    self.open_group(PowerShellParseMode::Expression, false, false, true);
+                } else if self.header && self.members {
+                    self.open_group(PowerShellParseMode::Expression, false, true, true);
                 } else {
                     let body = self.header;
-                    self.open_group(PowerShellParseMode::StatementStart, true, body);
+                    self.open_group(PowerShellParseMode::StatementStart, true, body, false);
                 }
             }
             b'}' => self.close_group(),
             _ => match self.mode {
                 PowerShellParseMode::StatementStart => {
                     self.header = false;
-                    self.mode = if powershell_starts_expression(bytes, i) {
+                    self.command_leading = self.leading;
+                    // An attribute may come before `param`: `[CmdletBinding()]`.
+                    self.leading &= byte == b'[';
+                    self.mode = if powershell_starts_expression(bytes, i) && !self.label {
                         PowerShellParseMode::Expression
                     } else {
                         if self.statement {
@@ -5478,6 +5577,7 @@ impl PowerShellParseState {
                         }
                         PowerShellParseMode::Command
                     };
+                    self.label = false;
                 }
                 // The right side of `=`, `+=`, `??=`... is a new statement.
                 PowerShellParseMode::Expression if byte == b'=' => self.start(true),
@@ -5501,7 +5601,10 @@ impl PowerShellParseState {
             return false;
         }
         let role = powershell_comment_predecessor_role(bytes, i);
-        if role == PowerShellHashRole::Comment || self.mode != PowerShellParseMode::Command {
+        if role == PowerShellHashRole::Comment
+            || self.mode != PowerShellParseMode::Command
+            || (self.braced_variables_open_comments && powershell_braced_variable_ends_at(bytes, i))
+        {
             return true;
         }
         // In argument mode a word absorbs `#` (`a#x`, `$c#x`, `a'b'#x`), but
