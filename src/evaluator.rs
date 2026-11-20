@@ -18491,6 +18491,12 @@ fn evaluate_command_in_dialect_union(
 ) -> EvaluationResult {
     let _phase = phase(ProfilePhase::Evaluation);
     let _trace_phase = crate::perf::PhaseTimer::start("evaluation_total");
+    let _judged = JudgedViews::enter(JudgedSettings::of(
+        ordered_packs,
+        compiled_overrides,
+        allowlists,
+        project_path,
+    ));
     let primary = evaluate_command_in_single_dialect_view(
         command,
         enabled_keywords,
@@ -18520,41 +18526,58 @@ fn evaluate_command_in_dialect_union(
     // evaluate the reconstruction with those values spliced in. Running it
     // last keeps every existing denial's rule and span; only a denial (or an
     // incomplete evaluation, which fails closed) is adopted.
+    let mut frame_view: Option<String> = None;
     let views: Vec<String> = if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
         && primary.decision == EvaluationDecision::Allow
         && primary.allowlist_override.is_none()
     {
         // A function call runs its body with the call's words as positional
-        // parameters; that reading is judged first, and the proven-variable
-        // view of it splices them where the body uses them. Each frame is
-        // one level deeper, so recursion stops at the frame limit. The
-        // command's own proven view is judged after it, deny wins.
-        let frames = (nested_command_depth < MAX_FUNCTION_FRAME_DEPTH)
-            .then(|| crate::heredoc::shell_function_frame_view(command))
-            .flatten();
-        // The frame view holds the whole command; the command's own two views
-        // follow it. Unknown names are read only in the command as the agent
-        // sent it: a nested payload (an `eval` body, `bash -c`) is judged
-        // without the bindings around it, and this view's own reconstruction
-        // is judged one level down, where its bare rendering must not split
-        // again.
+        // parameters: the frame view reads each call as `( set -- ARGS; BODY
+        // )`, with the calls in a body read as frames inside it up to the
+        // frame limit. It is judged first, as a frame view, where its proven
+        // and argument views splice the parameters where the body uses them.
+        // The command's own views follow, deny wins. Frames are read only in
+        // a command the agent sent, a payload in it, or a frame view: a
+        // proven view of the same command holds the same calls, and reading
+        // them again there would judge each frame once per view and level.
+        let kind = PROVEN_VIEW_KIND.with(std::cell::Cell::get);
+        if nested_command_depth < MAX_FUNCTION_FRAME_DEPTH && kind != ProvenViewKind::Proven {
+            match crate::heredoc::shell_function_frame_view(
+                command,
+                MAX_FUNCTION_FRAME_DEPTH - nested_command_depth,
+            ) {
+                Ok(frames) => frame_view = frames,
+                // Frames past the size read are never proof the calls are
+                // safe.
+                Err(crate::heredoc::FrameViewTooLarge) => {
+                    return EvaluationResult::indeterminate_due_to_budget();
+                }
+            }
+        }
+        // Unknown names are read only in the command as the agent sent it: a
+        // nested payload (an `eval` body, `bash -c`) is judged without the
+        // bindings around it, and this view's own reconstruction is judged
+        // one level down, where its bare rendering must not split again.
         let unknown_names = nested_command_depth == 0;
         // A positional proof only adds a reading: the view without it is
         // judged too, so a denial it gives stays.
         let views = posix_proven_variable_view(command, deadline, unknown_names).and_then(|view| {
             let arguments = posix_proven_argument_view(command, deadline, unknown_names)?;
-            let without_positionals = if posix_text_has_positional_reference(command) {
+            let without_positionals = if kind == ProvenViewKind::Command
+                && posix_text_has_positional_reference(command)
+            {
                 posix_proven_view_without_positionals(command, deadline, unknown_names)?
             } else {
                 None
             };
-            Ok(frames
+            Ok(frame_view
+                .clone()
                 .into_iter()
                 .chain(view)
                 .chain(arguments)
                 .chain(without_positionals)
                 .fold(Vec::new(), |mut views, candidate| {
-                    if !views.contains(&candidate) {
+                    if candidate != command && !views.contains(&candidate) {
                         views.push(candidate);
                     }
                     views
@@ -18570,10 +18593,28 @@ fn evaluate_command_in_dialect_union(
     } else {
         Vec::new()
     };
+    // A view already judged in this request is not judged again: the views
+    // of a proven view often spell the text another view already spelled,
+    // and a denial anywhere already decides the request.
+    let views: Vec<String> = views
+        .into_iter()
+        .filter(|view| {
+            JudgedViews::first_time(
+                view,
+                inherited_automated_stdin,
+                JudgedSettings::of(ordered_packs, compiled_overrides, allowlists, project_path),
+            )
+        })
+        .collect();
     let primary = if !views.is_empty()
         && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
         evaluate_proven_views(&views, primary, |expanded| {
+            let _kind = ProvenViewScope::enter(if frame_view.as_deref() == Some(expanded) {
+                ProvenViewKind::Frame
+            } else {
+                ProvenViewKind::Proven
+            });
             evaluate_command_with_pack_order_deadline_at_path_inner(
                 expanded,
                 enabled_keywords,
@@ -34016,6 +34057,114 @@ thread_local! {
     static DENY_ONLY_POSITIONALS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
+/// The settings a judged view's verdict depends on beyond its text: the
+/// packs, overrides, allowlists and project of the evaluation, by identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct JudgedSettings([usize; 4]);
+
+impl JudgedSettings {
+    fn of(
+        ordered_packs: &[String],
+        compiled_overrides: &crate::config::CompiledOverrides,
+        allowlists: &LayeredAllowlist,
+        project_path: Option<&Path>,
+    ) -> Self {
+        Self([
+            ordered_packs.as_ptr() as usize,
+            std::ptr::from_ref(compiled_overrides) as usize,
+            std::ptr::from_ref(allowlists) as usize,
+            project_path.map_or(0, |path| {
+                path.as_os_str().as_encoded_bytes().as_ptr() as usize
+            }),
+        ])
+    }
+}
+
+/// The proven views judged so far in one outermost evaluation, with whether
+/// stdin was automated, under the settings of its owner.
+type JudgedViewSet = (JudgedSettings, HashSet<(String, bool)>);
+
+thread_local! {
+    /// The [`JudgedViewSet`] of the outermost evaluation in progress
+    /// ([`JudgedViews`]).
+    static JUDGED_VIEWS: std::cell::RefCell<Option<JudgedViewSet>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps [`JUDGED_VIEWS`] for one outermost evaluation: the first
+/// [`JudgedViews::enter`] owns the set, nested ones with the same settings
+/// share it, and the owner clears it when it ends. A view judged once
+/// allows (a denial anywhere already decides the request), so it is not
+/// judged again in the same request.
+struct JudgedViews(bool);
+
+impl JudgedViews {
+    fn enter(settings: JudgedSettings) -> Self {
+        Self(JUDGED_VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            views.is_none() && {
+                *views = Some((settings, HashSet::new()));
+                true
+            }
+        }))
+    }
+
+    /// Whether `view` is judged here for the first time in this evaluation;
+    /// records it. Under other settings than the owner's, every view is new.
+    fn first_time(view: &str, automated_stdin: bool, settings: JudgedSettings) -> bool {
+        JUDGED_VIEWS.with(|views| {
+            views.borrow_mut().as_mut().is_none_or(|(owner, views)| {
+                *owner != settings || views.insert((view.to_string(), automated_stdin))
+            })
+        })
+    }
+}
+
+impl Drop for JudgedViews {
+    fn drop(&mut self) {
+        if self.0 {
+            JUDGED_VIEWS.with(|views| *views.borrow_mut() = None);
+        }
+    }
+}
+
+/// What text the evaluation in progress judges, which sets the views read
+/// of it in [`evaluate_command_in_dialect_union`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProvenViewKind {
+    /// A command the agent sent, or a payload in one: every view.
+    Command,
+    /// A function frame view: its frames, proven and argument views. The
+    /// base never read this text, so there is no base denial for a view
+    /// without positional parameters to keep.
+    Frame,
+    /// A proven, argument or positional-free view: its proven and argument
+    /// views only. Its calls are the command's, already read as frames.
+    Proven,
+}
+
+thread_local! {
+    /// The [`ProvenViewKind`] of the evaluation in progress
+    /// ([`ProvenViewScope`]).
+    static PROVEN_VIEW_KIND: std::cell::Cell<ProvenViewKind> =
+        const { std::cell::Cell::new(ProvenViewKind::Command) };
+}
+
+/// Holds [`PROVEN_VIEW_KIND`] for one view and restores the outer value.
+struct ProvenViewScope(ProvenViewKind);
+
+impl ProvenViewScope {
+    fn enter(kind: ProvenViewKind) -> Self {
+        Self(PROVEN_VIEW_KIND.with(|cell| cell.replace(kind)))
+    }
+}
+
+impl Drop for ProvenViewScope {
+    fn drop(&mut self) {
+        PROVEN_VIEW_KIND.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Holds [`DENY_ONLY_POSITIONALS`] for one view and restores the outer value.
 struct PositionalProofScope(bool);
 
@@ -35576,7 +35725,7 @@ fn posix_text_has_live_expansion(text: &str) -> bool {
 }
 
 /// Whether `text` spells a positional parameter reference anywhere.
-fn posix_text_has_positional_reference(text: &str) -> bool {
+pub(crate) fn posix_text_has_positional_reference(text: &str) -> bool {
     text.match_indices('$').any(|(index, _)| {
         let after = &text.as_bytes()[index + 1..];
         let after = after.strip_prefix(b"{").unwrap_or(after);
@@ -35584,6 +35733,63 @@ fn posix_text_has_positional_reference(text: &str) -> bool {
             .first()
             .is_some_and(|byte| matches!(byte, b'@' | b'*' | b'1'..=b'9'))
     })
+}
+
+/// The positional changes of one source and the function frame each is in,
+/// read once for every reference [`positional_fields_at`] proves in it.
+struct PositionalIndex {
+    definitions: Vec<Range<usize>>,
+    events: Vec<crate::heredoc::PositionalEvent>,
+    /// The innermost definition holding each event, by index.
+    event_frames: Vec<Option<usize>>,
+}
+
+impl PositionalIndex {
+    /// The index of `source`, `None` when its parse is incomplete. The last
+    /// few sources are kept: a command and the views read beside it.
+    fn of(source: &str) -> Option<Rc<Self>> {
+        thread_local! {
+            static RECENT: std::cell::RefCell<Vec<(String, Option<Rc<PositionalIndex>>)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        RECENT.with(|recent| {
+            let mut recent = recent.borrow_mut();
+            if let Some(found) = recent.iter().position(|(cached, _)| cached == source) {
+                let entry = recent.remove(found);
+                let index = entry.1.clone();
+                recent.push(entry);
+                return index;
+            }
+            let index = crate::heredoc::shell_positional_events(source).map(|events| {
+                let mut index = Self {
+                    definitions: crate::heredoc::shell_function_definitions(source),
+                    events,
+                    event_frames: Vec::new(),
+                };
+                index.event_frames = index
+                    .events
+                    .iter()
+                    .map(|event| index.frame(event.range.start))
+                    .collect();
+                Rc::new(index)
+            });
+            if recent.len() >= 4 {
+                recent.remove(0);
+            }
+            recent.push((source.to_string(), index.clone()));
+            index
+        })
+    }
+
+    /// The innermost function definition holding `offset`, by index.
+    fn frame(&self, offset: usize) -> Option<usize> {
+        self.definitions
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| definition.contains(&offset))
+            .min_by_key(|(_, definition)| definition.len())
+            .map(|(index, _)| index)
+    }
 }
 
 /// One positional parameter as a deny-only proof knows it.
@@ -35651,21 +35857,14 @@ fn positional_fields_at(
     if !DENY_ONLY_POSITIONALS.with(std::cell::Cell::get) {
         return None;
     }
-    let definitions = crate::heredoc::shell_function_definitions(source);
-    let frame = |offset: usize| {
-        definitions
-            .iter()
-            .filter(|definition| definition.contains(&offset))
-            .min_by_key(|definition| definition.len())
-    };
-    let use_frame = frame(point);
-    let events = crate::heredoc::shell_positional_events(source)?;
+    let index = PositionalIndex::of(source)?;
+    let use_frame = index.frame(point);
     // (where the binding `set` starts, its words)
     let mut bound: Option<(usize, Vec<&str>)> = None;
-    for event in &events {
+    for (event, event_frame) in index.events.iter().zip(&index.event_frames) {
         let range = &event.range;
         if range.contains(&point)
-            || frame(range.start) != use_frame
+            || *event_frame != use_frame
             || crate::heredoc::shell_scope_at(&event.steps, point)
                 == crate::heredoc::ShellScope::Child
         {
@@ -55406,6 +55605,39 @@ mod tests {
             ("set -- ls git; : | shift; \"$1\" reset --hard", true),
             ("set -- ls; argv=(git); \"$1\" reset --hard", true),
             ("set -- ls; noglob set -- git; \"$1\" reset --hard", true),
+            ("set -- 2>/dev/null git; \"$1\" reset --hard", true),
+            ("set -- ls 2>/dev/null git; \"$2\" reset --hard", true),
+            ("set -- \\\n git; \"$1\" reset --hard", true),
+            (
+                "set -- git; function set { :; }; set -- ls; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- git\nshopt -s expand_aliases\nalias set=:\nset -- ls\n\"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- ls; trap 'set -- git' ERR; false; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "trap 'set -- git' DEBUG; set -- ls; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- ls git; trap 'shift' ERR; false; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "set -- ls; true | { set -- git; }; \"$1\" reset --hard",
+                true,
+            ),
+            (
+                "shopt -s lastpipe; set -- ls; : | set -- git; \"$1\" reset --hard",
+                true,
+            ),
+            ("set -- ls; argv[1]=git; \"$1\" reset --hard", true),
+            ("set -- ls; nocorrect set -- git; \"$1\" reset --hard", true),
             // Redirections, a quoted name and `time` with assignment words.
             ("f() { \"$@\"; }; >/dev/null f git reset --hard", true),
             ("f() { \"$@\"; }; X=1 >/dev/null f git reset --hard", true),
@@ -55474,50 +55706,77 @@ mod tests {
 
     #[test]
     fn function_frame_view_spells_each_visible_call() {
-        let view = |command: &str| crate::heredoc::shell_function_frame_view(command);
+        let view = |command: &str| {
+            crate::heredoc::shell_function_frame_view(command, MAX_FUNCTION_FRAME_DEPTH)
+                .expect("bounded frame view")
+        };
         assert_eq!(
             view("f() { \"$@\"; }; f git reset --hard").as_deref(),
-            Some("f() { \"$@\"; };  ( set -- git reset --hard;  \"$@\"; \n)")
+            Some(":;  ( set -- git reset --hard;  \"$@\"; \n)")
         );
         assert_eq!(
             view("f() ( \"$@\" ); f a").as_deref(),
-            Some("f() ( \"$@\" );  ( set -- a; ( \"$@\" )\n)")
+            Some(":;  ( set -- a; ( \"$@\" )\n)")
         );
         // A call in a subshell, after `time`, and with assignment words.
         assert_eq!(
             view("f() { \"$@\"; }; (f a)").as_deref(),
-            Some("f() { \"$@\"; }; ( ( set -- a;  \"$@\"; \n))")
+            Some(":; ( ( set -- a;  \"$@\"; \n))")
         );
         assert_eq!(
             view("f() { \"$@\"; }; time -p f a").as_deref(),
-            Some("f() { \"$@\"; };  ( set -- a;  \"$@\"; \n)")
+            Some(":;  ( set -- a;  \"$@\"; \n)")
         );
         assert_eq!(
             view("f() { \"$@\"; }; X=1 f a").as_deref(),
-            Some("f() { \"$@\"; };  ( X=1; set -- a;  \"$@\"; \n)")
+            Some(":;  ( X=1; set -- a;  \"$@\"; \n)")
         );
         // Redirections move to the frame; a quoted name still runs `f`.
         assert_eq!(
             view("f() { \"$@\"; }; >/dev/null f a").as_deref(),
-            Some("f() { \"$@\"; };  ( set -- a;  \"$@\"; \n) >/dev/null")
+            Some(":;  ( set -- a;  \"$@\"; \n) >/dev/null")
         );
         assert_eq!(
             view("f() { \"$@\"; }; X=1 >/dev/null f a 2>&1").as_deref(),
-            Some("f() { \"$@\"; };  ( X=1; set -- a;  \"$@\"; \n) >/dev/null 2>&1")
+            Some(":;  ( X=1; set -- a;  \"$@\"; \n) >/dev/null 2>&1")
         );
         assert_eq!(
             view("f() { \"$@\"; }; \\f a").as_deref(),
-            Some("f() { \"$@\"; };  ( set -- a;  \"$@\"; \n)")
+            Some(":;  ( set -- a;  \"$@\"; \n)")
         );
         assert_eq!(
             view("f() { \"$@\"; }; time X=1 f a").as_deref(),
-            Some("f() { \"$@\"; };  ( X=1; set -- a;  \"$@\"; \n)")
+            Some(":;  ( X=1; set -- a;  \"$@\"; \n)")
         );
-        // Not yet defined, defined in a child shell, removed, or no expansion.
+        // A call in a body is a frame in its caller's frame; a body that
+        // expands a variable is read where the call runs; a substitution
+        // that expands nothing is the same in every frame.
+        assert_eq!(
+            view("f() { \"$@\"; }; g() { f \"$@\"; }; g a").as_deref(),
+            Some(":; :;  ( set -- a;   ( set -- \"$@\";  \"$@\"; \n); \n)")
+        );
+        assert_eq!(
+            view("f() { $x; }; f").as_deref(),
+            Some(":;  ( set --;  $x; \n)")
+        );
+        assert_eq!(
+            view("f() { x=\"$(date)\"; \"$@\"; }; f a").as_deref(),
+            Some(":;  ( set -- a;  x=\"${DCG_FRAME_SUBSTITUTION_OUTPUT}\"; \"$@\"; \n)")
+        );
+        // Not yet defined, defined in a child shell, removed, no expansion,
+        // or one that only prints its words.
         assert_eq!(view("f a; f() { \"$@\"; }"), None);
         assert_eq!(view("( f() { \"$@\"; } ); f a"), None);
         assert_eq!(view("f() { \"$@\"; }; unset -f f; f a"), None);
         assert_eq!(view("f() { ls; }; f a $x"), None);
+        assert_eq!(view("log() { printf '%s\\n' \"$*\" >&2; }; log a"), None);
+        assert_eq!(view("log() { echo \"[$(date +%T)] $*\"; }; log a"), None);
+        // Printed into a pipe, a substitution or with `printf -v`, the words
+        // are read.
+        assert!(view("f() { echo \"$*\" | sh; }; f a").is_some());
+        assert!(view("f() { x=$(echo \"$*\"); $x; }; f a").is_some());
+        assert!(view("f() { printf -v x '%s' \"$*\"; $x; }; f a").is_some());
+        assert!(view("echo() { \"$@\"; }; f() { echo \"$*\"; }; f a").is_some());
     }
 
     #[test]

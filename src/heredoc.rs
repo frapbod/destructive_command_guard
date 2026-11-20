@@ -9536,6 +9536,215 @@ pub(crate) fn shell_function_body_before(
     body
 }
 
+/// One function definition as [`functions_read_in_frames`] reads it.
+struct FunctionUses {
+    name: String,
+    body: std::ops::Range<usize>,
+    /// Argument bytes of `echo` and `printf` (not `printf -v`) whose output
+    /// nothing reads: no pipe stage after them and no substitution around
+    /// them. dcg reads their arguments as data ([`crate::context`]'s safe
+    /// string registry), and so does Bash.
+    data: Vec<std::ops::Range<usize>>,
+    /// Calls by plain name to a function the command defines, with the
+    /// bytes of their arguments.
+    calls: Vec<(String, Vec<std::ops::Range<usize>>)>,
+}
+
+/// The names of the functions in `command` whose call can run something
+/// their definition alone does not show: a body that reads a positional
+/// parameter or expands a variable, other than as printed data or as an
+/// argument to a function that does neither, or that calls a function that
+/// does. The call's words and the caller's bindings decide what such a body
+/// runs, and the frame reads them where the call runs. Any other body runs
+/// the same way whatever its call, so a frame for it would only repeat the
+/// definition: `log() { printf '%s\n' "$*"; }` prints its words and runs
+/// none.
+fn functions_read_in_frames(command: &str) -> std::collections::HashSet<String> {
+    let mut reading = std::collections::HashSet::new();
+    let Ok(ast) = try_parse_shell_ast(command) else {
+        return reading;
+    };
+    let mut definitions: Vec<FunctionUses> = Vec::new();
+    for node in ast.root().dfs() {
+        if node.kind().as_ref() != "function_definition" {
+            continue;
+        }
+        let (Some(name), Some(body)) = (node.field("name"), node.field("body")) else {
+            continue;
+        };
+        let name = name.text().into_owned();
+        if !is_static_shell_name(&name) {
+            continue;
+        }
+        definitions.push(FunctionUses {
+            name,
+            body: body.range(),
+            data: Vec::new(),
+            calls: Vec::new(),
+        });
+    }
+    let defined: std::collections::HashSet<String> =
+        definitions.iter().map(|uses| uses.name.clone()).collect();
+    for uses in &mut definitions {
+        for node in ast.root().dfs() {
+            let range = node.range();
+            if node.kind().as_ref() != "command"
+                || range.start < uses.body.start
+                || range.end > uses.body.end
+            {
+                continue;
+            }
+            let Some(name) = node.field("name") else {
+                continue;
+            };
+            let Some(name_text) = crate::normalize::decode_posix_literal_word(name.text().as_ref())
+                .map(std::borrow::Cow::into_owned)
+            else {
+                continue;
+            };
+            let arguments: Vec<std::ops::Range<usize>> = node
+                .children()
+                .filter(|child| {
+                    child.is_named()
+                        && child.range().start >= name.range().end
+                        && !child.kind().as_ref().ends_with("redirect")
+                })
+                .map(|child| child.range())
+                .collect();
+            if defined.contains(&name_text) {
+                uses.calls.push((name_text, arguments));
+                continue;
+            }
+            let printed = matches!(name_text.as_str(), "echo" | "printf")
+                && !(name_text == "printf"
+                    && arguments
+                        .iter()
+                        .any(|argument| command[argument.clone()].starts_with("-v")));
+            if printed && !output_is_read(&node, &uses.body) {
+                uses.data.extend(arguments);
+            }
+        }
+    }
+    loop {
+        let before = reading.len();
+        for uses in &definitions {
+            if reading.contains(&uses.name) {
+                continue;
+            }
+            let calls_reading = uses
+                .calls
+                .iter()
+                .any(|(callee, _)| reading.contains(callee));
+            let mut masked = command[uses.body.clone()].as_bytes().to_vec();
+            let inert = uses.data.iter().chain(
+                uses.calls
+                    .iter()
+                    .filter(|(callee, _)| !reading.contains(callee))
+                    .flat_map(|(_, arguments)| arguments),
+            );
+            for range in inert {
+                for byte in &mut masked[range.start - uses.body.start..range.end - uses.body.start]
+                {
+                    *byte = b' ';
+                }
+            }
+            let masked = String::from_utf8_lossy(&masked);
+            if calls_reading
+                || crate::evaluator::posix_text_has_positional_reference(&masked)
+                || text_expands_variable(&masked)
+            {
+                reading.insert(uses.name.clone());
+            }
+        }
+        if reading.len() == before {
+            return reading;
+        }
+    }
+}
+
+/// Whether `text` expands a variable by name (`$x`, `${x}`, `${x:-y}`).
+fn text_expands_variable(text: &str) -> bool {
+    text.match_indices('$').any(|(index, _)| {
+        let after = &text.as_bytes()[index + 1..];
+        let after = after.strip_prefix(b"{").unwrap_or(after);
+        after
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    })
+}
+
+/// Whether something reads what the simple command `node` prints, up to
+/// `body`: a later pipe stage, or a command or process substitution.
+fn output_is_read<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    body: &std::ops::Range<usize>,
+) -> bool {
+    let mut child = node.clone();
+    while let Some(parent) = child.parent() {
+        if parent.range().start < body.start {
+            return false;
+        }
+        match parent.kind().as_ref() {
+            "command_substitution" | "process_substitution" => return true,
+            "pipeline" => {
+                let last = parent
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .last();
+                if last.is_none_or(|last| last.range() != child.range()) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        child = parent;
+    }
+    false
+}
+
+/// What a frame spells for a command substitution its body runs the same
+/// way in every frame: an unknown value, as the substitution's output is.
+const FRAME_SUBSTITUTION_OUTPUT: &str = "${DCG_FRAME_SUBSTITUTION_OUTPUT}";
+
+/// `body` with each outermost command substitution whose own text expands
+/// nothing (`$(date +%T)`) spelled as an unknown value. Such a substitution
+/// runs the same command in every call, and the command's own reading
+/// already judged it in the definition; repeating it in each frame would
+/// only multiply it past the substitution bound. A substitution that
+/// expands anything (`$(echo "$1")`) stays, and so does every one when the
+/// body cannot be parsed.
+fn frame_invariant_substitutions_unknown(body: &str) -> std::borrow::Cow<'_, str> {
+    let Ok(mut substitutions) = extract_posix_command_substitutions(body) else {
+        return std::borrow::Cow::Borrowed(body);
+    };
+    substitutions.sort_by_key(|substitution| substitution.start);
+    let mut out = String::new();
+    let mut copied = 0usize;
+    for substitution in &substitutions {
+        let outermost = !substitutions.iter().any(|other| {
+            let span = other.start..other.end;
+            span != (substitution.start..substitution.end)
+                && span.start <= substitution.start
+                && substitution.end <= span.end
+        });
+        if !outermost
+            || substitution.start < copied
+            || substitution.body.contains(['$', '`'])
+            || body.get(substitution.start..substitution.end).is_none()
+        {
+            continue;
+        }
+        out.push_str(&body[copied..substitution.start]);
+        out.push_str(FRAME_SUBSTITUTION_OUTPUT);
+        copied = substitution.end;
+    }
+    if copied == 0 {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    out.push_str(&body[copied..]);
+    std::borrow::Cow::Owned(out)
+}
+
 /// The bytes of every function definition in `command`.
 pub(crate) fn shell_function_definitions(command: &str) -> Vec<std::ops::Range<usize>> {
     shell_shadow_events(command)
@@ -9673,170 +9882,279 @@ pub(crate) fn shell_positional_events(command: &str) -> Option<Vec<PositionalEve
 /// `command` with each call of a function it defines replaced by the body
 /// that call runs, in a frame that binds the call's words as positional
 /// parameters: `f() { "$@"; }; f git reset --hard` reads as
-/// `f() { "$@"; }; ( set -- git reset --hard; "$@"; )`. Bash runs the body
-/// with those parameters, so the proven-variable view can splice them where
-/// the body uses them. The subshell keeps the frame from reaching later
-/// statements, and the caller's variables stay visible in it.
+/// `:; ( set -- git reset --hard; "$@"; )`. Bash runs the body with those
+/// parameters, so the proven-variable view can splice them where the body
+/// uses them. The subshell keeps the frame from reaching later statements,
+/// and the caller's variables stay visible in it.
 ///
-/// Only calls outside every definition are replaced; a call in a body runs
-/// when its function does, and the frame for that call replaces it on the
-/// next reading. The call's words are taken as written, before any data
-/// masking of the command name (`echo() { "$@"; }; echo git reset --hard`).
-/// A call's assignment words (`X=1 f ARGS`) run first in the frame, its
-/// redirections (`>/dev/null f ARGS`) apply to the frame, a quoted name
-/// (`\"f\"`, `\\f`) still runs the function, and `time [-p] [NAME=VALUE]... f
-/// ARGS` reads as the call it times. A body with no expansion and a
-/// definition the call cannot see (after it, in a child shell, removed) are
-/// left alone. `None` when nothing was replaced or the parse is incomplete.
-pub(crate) fn shell_function_frame_view(command: &str) -> Option<String> {
-    if !command.contains('$') || !(command.contains("()") || command.contains("function")) {
-        return None;
+/// A call in a body is read as a frame inside its caller's frame, up to
+/// `max_depth` frames deep, so each definition is spelled `:`: the
+/// command's own reading judged it, and what its calls run is in the frames.
+/// The call's words are taken as written, before any data masking of the
+/// command name (`echo() { "$@"; }; echo git reset --hard`). A call's
+/// assignment words (`X=1 f ARGS`) run first in the frame, its redirections
+/// (`>/dev/null f ARGS`) apply to the frame, a quoted name (`\"f\"`,
+/// `\\f`) still runs the function, and `time [-p] [NAME=VALUE]... f ARGS`
+/// reads as the call it times. A function whose body runs the same whatever
+/// its call's words ([`functions_read_in_frames`]), unless the call
+/// binds names, and a definition the call cannot see (after it, in a child
+/// shell, removed) are left alone. `None` when nothing was replaced or the
+/// parse is incomplete.
+pub(crate) fn shell_function_frame_view(
+    command: &str,
+    max_depth: usize,
+) -> Result<Option<String>, FrameViewTooLarge> {
+    if max_depth == 0
+        || !command.contains('$')
+        || !(command.contains("()") || command.contains("function"))
+    {
+        return Ok(None);
     }
     let definitions = shell_function_definitions(command);
     if definitions.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let ast = try_parse_shell_ast(command).ok()?;
-    let mut frames: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let reading = functions_read_in_frames(command);
+    let Ok(ast) = try_parse_shell_ast(command) else {
+        return Ok(None);
+    };
+    let mut calls = Vec::new();
     for node in ast.root().dfs() {
         if node.is_error() || node.is_missing() {
-            return None;
+            return Ok(None);
         }
-        if node.kind().as_ref() != "command" {
-            continue;
-        }
-        let call = node.range();
-        if definitions
-            .iter()
-            .any(|definition| definition.contains(&call.start))
-            || frames
-                .last()
-                .is_some_and(|(frame, _)| frame.end > call.start)
+        if node.kind().as_ref() == "command"
+            && let Some(call) = frame_call_site(command, &node)
         {
-            continue;
+            calls.push(call);
         }
-        let Some(name) = node.field("name") else {
-            continue;
-        };
-        // Assignment words before the name are in force while the body runs;
-        // a redirection applies to the whole call, wherever it is written.
-        let mut prefix = String::new();
-        let mut redirections = String::new();
-        let mut readable = true;
-        for child in node.children() {
-            if child.range().start >= name.range().start {
+    }
+    let reader = FrameReader {
+        command,
+        definitions: &definitions,
+        reading: &reading,
+        calls: &calls,
+        max_depth,
+    };
+    let mut budget = MAX_SUBSTITUTION_SOURCE_BYTES;
+    let (view, framed) = reader.render(0..command.len(), None, 0, &mut budget)?;
+    Ok(framed.then_some(view))
+}
+
+/// A frame view longer than [`MAX_SUBSTITUTION_SOURCE_BYTES`]: nested calls
+/// multiplied the bodies past what is read.
+#[derive(Debug)]
+pub(crate) struct FrameViewTooLarge;
+
+/// A simple command [`shell_function_frame_view`] may read as a frame: its
+/// bytes, the function name it runs, and the frame's parts.
+struct FrameCallSite {
+    range: std::ops::Range<usize>,
+    name: String,
+    /// Its assignment words, each ending in `; `.
+    prefix: String,
+    /// Its words after the name, each after a space.
+    arguments: String,
+    /// Its redirections, each after a space.
+    redirections: String,
+}
+
+/// The [`FrameCallSite`] of the simple command `node`, when it names a
+/// function statically and its words can be read.
+fn frame_call_site<D: ast_grep_core::Doc>(
+    command: &str,
+    node: &ast_grep_core::Node<'_, D>,
+) -> Option<FrameCallSite> {
+    let call = node.range();
+    let name = node.field("name")?;
+    // Assignment words before the name are in force while the body runs;
+    // a redirection applies to the whole call, wherever it is written.
+    let mut prefix = String::new();
+    let mut redirections = String::new();
+    for child in node.children() {
+        if child.range().start >= name.range().start {
+            break;
+        }
+        match child.kind().as_ref() {
+            "variable_assignment" => {
+                prefix.push_str(child.text().as_ref());
+                prefix.push_str("; ");
+            }
+            "file_redirect" => {
+                redirections.push(' ');
+                redirections.push_str(child.text().as_ref());
+            }
+            _ if child.is_named() => return None,
+            _ => {}
+        }
+    }
+    let mut name_end = name.range().end;
+    let mut name_text = name.text().into_owned();
+    // `time [-p] [NAME=VALUE]... f ARGS` runs the function `f`.
+    if name_text == "time" {
+        let rest = command.get(name_end..call.end)?;
+        let mut words = rest
+            .split_ascii_whitespace()
+            .map(|word| (word.as_ptr() as usize - rest.as_ptr() as usize, word));
+        let mut word = words.next();
+        if word.is_some_and(|(_, word)| word == "-p") {
+            word = words.next();
+        }
+        while let Some((_, assignment)) = word
+            && is_shell_env_assignment(assignment)
+        {
+            if assignment.contains(['\'', '"', '\\', '$', '`']) {
                 break;
             }
-            match child.kind().as_ref() {
-                "variable_assignment" => {
-                    prefix.push_str(child.text().as_ref());
-                    prefix.push_str("; ");
-                }
-                "file_redirect" => {
-                    redirections.push(' ');
-                    redirections.push_str(child.text().as_ref());
-                }
-                _ if child.is_named() => {
-                    readable = false;
-                    break;
-                }
-                _ => {}
-            }
+            prefix.push_str(assignment);
+            prefix.push_str("; ");
+            word = words.next();
         }
-        if !readable {
+        let (offset, word) = word?;
+        name_end += offset + word.len();
+        name_text = word.to_string();
+    }
+    // Quoting the name does not keep a function from running (`"f"`, `\f`).
+    let name = crate::normalize::decode_posix_literal_word(&name_text)
+        .map(std::borrow::Cow::into_owned)
+        .filter(|name| is_static_shell_name(name))?;
+    // The call's words, one per argument; its redirections move to the
+    // frame, and a heredoc leaves the call as written.
+    let mut arguments = String::new();
+    for child in node.children() {
+        if child.range().start < name_end {
             continue;
         }
-        let mut name_range = name.range();
-        let mut name_text = name.text().into_owned();
-        // `time [-p] [NAME=VALUE]... f ARGS` runs the function `f`.
-        if name_text == "time" {
-            let rest = command.get(name_range.end..call.end)?;
-            let mut words = rest
-                .split_ascii_whitespace()
-                .map(|word| (word.as_ptr() as usize - rest.as_ptr() as usize, word));
-            let mut word = words.next();
-            if word.is_some_and(|(_, word)| word == "-p") {
-                word = words.next();
+        match child.kind().as_ref() {
+            "file_redirect" | "herestring_redirect" => {
+                redirections.push(' ');
+                redirections.push_str(child.text().as_ref());
             }
-            while let Some((_, assignment)) = word
-                && is_shell_env_assignment(assignment)
+            "heredoc_redirect" => return None,
+            _ if child.is_named() => {
+                arguments.push(' ');
+                arguments.push_str(child.text().as_ref());
+            }
+            _ => {}
+        }
+    }
+    Some(FrameCallSite {
+        range: call,
+        name,
+        prefix,
+        arguments,
+        redirections,
+    })
+}
+
+/// What [`shell_function_frame_view`] reads frames from.
+struct FrameReader<'a> {
+    command: &'a str,
+    definitions: &'a [std::ops::Range<usize>],
+    reading: &'a std::collections::HashSet<String>,
+    /// Every readable call, in source order.
+    calls: &'a [FrameCallSite],
+    max_depth: usize,
+}
+
+impl FrameReader<'_> {
+    /// The bytes `range` of the command with each call there replaced by its
+    /// frame, and whether any was. At the top (`at` is `None`) each
+    /// definition is spelled `:`: the command's own reading judged it, and
+    /// every call it can run is a frame here. In a body, `at` is where the
+    /// outermost call runs, which decides the definitions a call in it can
+    /// see; a frame `depth` levels deep holds the bodies of its calls up to
+    /// `max_depth`.
+    fn render(
+        &self,
+        range: std::ops::Range<usize>,
+        at: Option<usize>,
+        depth: usize,
+        budget: &mut usize,
+    ) -> Result<(String, bool), FrameViewTooLarge> {
+        let command = self.command;
+        let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        let inner_definition = |offset: usize| {
+            self.definitions.iter().any(|definition| {
+                definition.start >= range.start
+                    && definition.end <= range.end
+                    && definition.contains(&offset)
+            })
+        };
+        for call in self.calls {
+            if call.range.start < range.start
+                || call.range.end > range.end
+                || inner_definition(call.range.start)
+                || replacements
+                    .last()
+                    .is_some_and(|(replaced, _)| replaced.end > call.range.start)
             {
-                if assignment.contains(['\'', '"', '\\', '$', '`']) {
-                    break;
-                }
-                prefix.push_str(assignment);
-                prefix.push_str("; ");
-                word = words.next();
+                continue;
             }
-            let Some((offset, word)) = word else {
+            let runs_at = at.unwrap_or(call.range.start);
+            let Some(body) = shell_function_body_before(command, runs_at, &call.name) else {
                 continue;
             };
-            let start = name_range.end + offset;
-            name_range = start..start + word.len();
-            name_text = word.to_string();
-        }
-        // Quoting the name does not keep a function from running (`"f"`, `\f`).
-        let Some(name_text) = crate::normalize::decode_posix_literal_word(&name_text)
-            .map(std::borrow::Cow::into_owned)
-            .filter(|name| is_static_shell_name(name))
-        else {
-            continue;
-        };
-        let Some(body) = shell_function_body_before(command, call.start, &name_text) else {
-            continue;
-        };
-        let body = command.get(body)?;
-        if !body.contains('$') {
-            continue;
-        }
-        let body = body
-            .strip_prefix('{')
-            .and_then(|inner| inner.strip_suffix('}'))
-            .unwrap_or(body);
-        // The call's words, one per argument; its redirections move to the
-        // frame, and a heredoc leaves the call as written.
-        let mut arguments = String::new();
-        for child in node.children() {
-            if child.range().start < name_range.end {
+            let Some(body_text) = command.get(body.clone()) else {
+                continue;
+            };
+            // A body is read in a frame when the call's words can change
+            // what it runs: it reads them, or the call binds names it may
+            // expand.
+            if !(self.reading.contains(&call.name)
+                || !call.prefix.is_empty() && body_text.contains('$'))
+            {
                 continue;
             }
-            match child.kind().as_ref() {
-                "file_redirect" | "herestring_redirect" => {
-                    redirections.push(' ');
-                    redirections.push_str(child.text().as_ref());
+            let body_text = if depth + 1 < self.max_depth {
+                self.render(body, Some(runs_at), depth + 1, budget)?.0
+            } else {
+                body_text.to_string()
+            };
+            let inner = body_text
+                .strip_prefix('{')
+                .and_then(|inner| inner.strip_suffix('}'))
+                .unwrap_or(&body_text);
+            let inner = frame_invariant_substitutions_unknown(inner);
+            // A space keeps `(` after `(` or `$(` from reading as `((`.
+            let frame = format!(
+                " ( {}set --{}; {inner}\n){}",
+                call.prefix, call.arguments, call.redirections
+            );
+            *budget = budget.checked_sub(frame.len()).ok_or(FrameViewTooLarge)?;
+            replacements.push((call.range.clone(), frame));
+        }
+        let framed = !replacements.is_empty();
+        if at.is_none() {
+            for definition in self.definitions {
+                let outermost = !self.definitions.iter().any(|other| {
+                    other != definition
+                        && other.start <= definition.start
+                        && definition.end <= other.end
+                });
+                let in_frame = replacements.iter().any(|(replaced, _)| {
+                    replaced.start <= definition.start && definition.end <= replaced.end
+                });
+                if outermost && !in_frame {
+                    replacements.push((definition.clone(), ":".to_string()));
                 }
-                "heredoc_redirect" => {
-                    readable = false;
-                    break;
-                }
-                _ if child.is_named() => {
-                    arguments.push(' ');
-                    arguments.push_str(child.text().as_ref());
-                }
-                _ => {}
             }
+            replacements.sort_by_key(|(replaced, _)| replaced.start);
         }
-        if !readable {
-            continue;
+        let mut out = String::with_capacity(range.len());
+        let mut copied = range.start;
+        for (replaced, text) in replacements {
+            out.push_str(
+                command
+                    .get(copied..replaced.start)
+                    .ok_or(FrameViewTooLarge)?,
+            );
+            out.push_str(&text);
+            copied = replaced.end;
         }
-        // A space keeps `(` after `(` or `$(` from reading as `((`.
-        frames.push((
-            call,
-            format!(" ( {prefix}set --{arguments}; {body}\n){redirections}"),
-        ));
+        out.push_str(command.get(copied..range.end).ok_or(FrameViewTooLarge)?);
+        Ok((out, framed))
     }
-    if frames.is_empty() {
-        return None;
-    }
-    let mut out = String::with_capacity(command.len() * 2);
-    let mut copied = 0usize;
-    for (call, frame) in frames {
-        out.push_str(command.get(copied..call.start)?);
-        out.push_str(&frame);
-        copied = call.end;
-    }
-    out.push_str(command.get(copied..)?);
-    Some(out)
 }
 
 /// A statement that can change what a bare command name runs, for
@@ -9862,20 +10180,26 @@ enum ShadowEventKind {
 
 /// The [`ShadowEvent`]s of `command` in source order, or `None` when the
 /// parser could not read all of it. The view asks once per use, so the
-/// last command's events are kept.
+/// events of the last few commands are kept.
 fn shell_shadow_events(command: &str) -> ShadowEvents {
     thread_local! {
-        static LAST: std::cell::RefCell<Option<(String, ShadowEvents)>> =
-            const { std::cell::RefCell::new(None) };
+        static RECENT: std::cell::RefCell<Vec<(String, ShadowEvents)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
-    LAST.with(|last| {
-        if let Some((cached, events)) = last.borrow().as_ref()
-            && cached == command
-        {
-            return std::rc::Rc::clone(events);
+    RECENT.with(|recent| {
+        let mut recent = recent.borrow_mut();
+        if let Some(index) = recent.iter().position(|(cached, _)| cached == command) {
+            let entry = recent.remove(index);
+            let events = std::rc::Rc::clone(&entry.1);
+            recent.push(entry);
+            return events;
         }
         let events = std::rc::Rc::new(read_shell_shadow_events(command));
-        *last.borrow_mut() = Some((command.to_string(), std::rc::Rc::clone(&events)));
+        // A command and the frame and proven views read beside it.
+        if recent.len() >= 4 {
+            recent.remove(0);
+        }
+        recent.push((command.to_string(), std::rc::Rc::clone(&events)));
         events
     })
 }

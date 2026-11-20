@@ -1,6 +1,7 @@
 //! Known positional arguments and variables that execute commands, tested
 //! through both hook protocols. Commands are scanned, never executed.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -361,4 +362,100 @@ fn calls_in_subshells_after_time_and_with_assignments_are_judged() {
             r#"f() { "$@"; }; time X=1 f make test"#,
         ],
     );
+}
+
+/// Harmless wrapper scripts from review round 4: logging and retry helpers
+/// called many times. A frame is read only for a function whose body reads
+/// its call's words, and only in the command and its frames, so these stay
+/// allowed (they were denied for too many substitutions, or ran out of the
+/// hook budget). A card form added to one is still denied.
+fn wrapper_scripts() -> Vec<String> {
+    const LOG: &str = "log() { printf \"[%s] %s\\n\" \"$(date +%T)\" \"$*\" >&2; }\n";
+    const RUN: &str = "run() { log \"+ $*\"; \"$@\"; }\n";
+    const STEPS: [&str; 8] = [
+        "make test",
+        "npm ci",
+        "cargo build --release",
+        "pytest -q tests/",
+        "go test ./...",
+        "ls -la",
+        "git status",
+        "git fetch origin",
+    ];
+    let mut scripts = Vec::new();
+    for lines in [8, 12, 16, 24] {
+        let mut script = format!("{LOG}{RUN}die() {{ log \"$*\"; exit 1; }}");
+        for line in 0..lines {
+            write!(
+                script,
+                "\nrun {} || die \"failed {line}\"",
+                STEPS[line % STEPS.len()]
+            )
+            .unwrap();
+        }
+        scripts.push(script);
+    }
+    let calls = |head: &str, call: &str| {
+        let mut script = head.to_string();
+        for index in 0..32 {
+            write!(script, "\n{call}{index}").unwrap();
+        }
+        script
+    };
+    scripts.push(calls(&format!("{LOG}{}", RUN.trim_end()), "run make t"));
+    scripts.push(calls(
+        "run() { echo \"[$(date +%T)] + $*\" >&2; \"$@\"; }",
+        "run make t",
+    ));
+    let mut no_parameters = "run() { echo \"[$(date +%T)] start\" >&2; make all; }".to_string();
+    for _ in 0..32 {
+        no_parameters.push_str("\nrun");
+    }
+    scripts.push(no_parameters);
+    let mut wrappers = String::new();
+    for index in 0..25 {
+        writeln!(
+            wrappers,
+            "f{index}() {{ local a=$1; shift; echo \"step {index} $a\"; \"$@\" || return 1; }}"
+        )
+        .unwrap();
+    }
+    wrappers.push_str("set -- make test");
+    for index in 0..25 {
+        write!(wrappers, "\nf{index} arg{index} ls -la \"$1\" \"$@\"").unwrap();
+    }
+    wrappers.push_str("\nfor x in \"$@\"; do echo \"$x\"; done");
+    scripts.push(wrappers);
+    scripts.push(
+        "set -euo pipefail\nlog() { echo \"[$(date +%H:%M:%S)] $*\"; }\n\
+         check() { if ! \"$@\"; then log \"FAILED: $*\"; return 1; fi; }\n\
+         log \"building\"\ncheck cargo build --release\ncheck cargo test --no-run\n\
+         log \"linting\"\ncheck cargo clippy -- -D warnings\ncheck cargo fmt --check\nlog \"done\""
+            .to_string(),
+    );
+    scripts.push(format!(
+        "log() {{ echo \"[$(date +%T)] $*\" >&2; }}\n{RUN}run git fetch origin\n\
+         run git status --short\nrun npm ci\nrun npm run build\nrun npm test\nlog done"
+    ));
+    scripts.push(
+        "retry() { local n=0; until \"$@\"; do n=$((n+1)); [ \"$n\" -ge 3 ] && return 1; \
+         sleep 2; done; }\nlog() { echo \"[$(date +%T)] $*\"; }\nlog start\n\
+         retry curl -fsS http://localhost:8080/health\n\
+         retry kubectl rollout status deploy/web\nlog ok"
+            .to_string(),
+    );
+    scripts
+}
+
+#[test]
+fn harmless_wrapper_scripts_stay_allowed_and_padding_hides_no_card_form() {
+    let scripts = wrapper_scripts();
+    let allowed: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    assert_both("allow", &allowed);
+    let padded: Vec<String> = scripts
+        .iter()
+        .map(|script| format!("{script}\nf() {{ \"$@\"; }}; f git reset --hard"))
+        .collect();
+    let padded: Vec<&str> = padded.iter().map(String::as_str).collect();
+    assert_both("deny", &padded);
 }
