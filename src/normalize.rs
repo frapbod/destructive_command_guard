@@ -4012,6 +4012,22 @@ pub(crate) fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHash
 
 /// Classify the byte before a possible line or block comment.
 fn powershell_comment_predecessor_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
+    // The `#` of a `<#` glued to a word (`a<#`) is text, like the `<`.
+    if index >= 2
+        && bytes[index - 1] == b'<'
+        && bytes.get(index) == Some(&b'#')
+        && powershell_byte_before_role(bytes, index - 1) == PowerShellHashRole::Literal
+    {
+        return PowerShellHashRole::Literal;
+    }
+    powershell_byte_before_role(bytes, index)
+}
+
+fn powershell_byte_before_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
+    if powershell_braced_variable_ends_at(bytes, index) {
+        // `${c}` ends a name, not a group: `${c}#x` is text like `$c#x`.
+        return PowerShellHashRole::Literal;
+    }
     if index == 0
         || bytes[index - 1].is_ascii_whitespace()
         || powershell_horizontal_space_ends_at(bytes, index)
@@ -4026,6 +4042,26 @@ fn powershell_comment_predecessor_role(bytes: &[u8], index: usize) -> PowerShell
         return PowerShellHashRole::Literal;
     }
     PowerShellHashRole::Ambiguous
+}
+
+/// Whether `bytes[..index]` ends with a braced variable, `${…}`.
+fn powershell_braced_variable_ends_at(bytes: &[u8], index: usize) -> bool {
+    index >= 3
+        && bytes[index - 1] == b'}'
+        && bytes[..index - 1]
+            .iter()
+            .rposition(|&byte| matches!(byte, b'{' | b'}'))
+            .is_some_and(|open| open > 0 && bytes[open] == b'{' && bytes[open - 1] == b'$')
+}
+
+/// Whether a `<#` at `index` opens a block comment, for a reader that does
+/// not track PowerShell's parse mode. Glued to a word (`a<#`, `$c<#`,
+/// `${c}<#`) it is text in argument mode. Where expression mode makes it a
+/// comment (`$c<#x#>=1`), the deny-only view of [`mask_powershell_comments`]
+/// reads it so.
+pub(crate) fn powershell_block_comment_opens_at(bytes: &[u8], index: usize) -> bool {
+    bytes.get(index..index + 2) == Some(b"<#")
+        && powershell_comment_predecessor_role(bytes, index) != PowerShellHashRole::Literal
 }
 
 fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
@@ -4797,6 +4833,7 @@ fn tokenize_powershell_with_comments(
     let mut masked: Option<Vec<u8>> = None;
     let mut i = 0usize;
     let mut literal_mode = false;
+    let mut parse = PowerShellParseState::default();
 
     while i < len {
         i = skip_powershell_horizontal_whitespace(bytes, i, len);
@@ -4822,6 +4859,8 @@ fn tokenize_powershell_with_comments(
         if let Some(end) = consume_raw_newline(bytes, i, len, &mut tokens) {
             // PowerShell's stop-parsing mode ends at the physical newline.
             literal_mode = false;
+            parse.end_command_word(None);
+            parse.start(true);
             i = end;
             continue;
         }
@@ -4847,12 +4886,15 @@ fn tokenize_powershell_with_comments(
 
         if !literal_mode {
             if let Some(end) = consume_powershell_separator(bytes, i, len, &mut tokens) {
+                parse.separator(bytes, i, end - i);
                 i = end;
                 continue;
             }
         } else if let Some(end) = powershell_pipeline_end(bytes, i, len) {
             i = push_raw_separator(&mut tokens, i, end);
             literal_mode = false;
+            parse.header = false;
+            parse.start(true);
             continue;
         }
 
@@ -4860,8 +4902,11 @@ fn tokenize_powershell_with_comments(
         i = if literal_mode {
             consume_powershell_literal_word(bytes, i, len)
         } else {
-            consume_powershell_word(bytes, i, len, read_comments)
+            consume_powershell_word(bytes, i, len, read_comments.then_some(&mut parse))
         };
+        if read_comments && !literal_mode {
+            parse.end_command_word(Some((bytes, i)));
+        }
 
         if start == i {
             // Defensive progress guarantee for malformed or future syntax.
@@ -5212,16 +5257,336 @@ fn consume_shell_escape(bytes: &[u8], i: usize, len: usize) -> usize {
     }
 }
 
-/// A `<#` inside a word starts a block comment when the byte before it would
-/// let a `#` start a line comment, including after an operator or closing
-/// quote. `a<#x#>` stays text.
-fn powershell_block_comment_starts_after(bytes: &[u8], i: usize) -> bool {
-    bytes.get(i..i + 2) == Some(b"<#")
-        && powershell_comment_predecessor_role(bytes, i) != PowerShellHashRole::Literal
+/// Whether PowerShell reads the next token as a command word or as an
+/// expression. It decides whether a `#` or `<#` glued to the token before it
+/// starts a comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellParseMode {
+    /// The first token of a statement or pipeline is next.
+    StatementStart,
+    /// A command name and its arguments: `a#x`, `$c#x` and `a<#x#>` are text.
+    Command,
+    /// An expression: every `#` and `<#` starts a comment.
+    Expression,
 }
 
-fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments: bool) -> usize {
+/// Parse mode for the comment view. `(` and `{` open a nested statement;
+/// their closer returns to the enclosing mode, or to an expression when the
+/// group itself began the statement (`(1)` and `{...}` are operands).
+#[derive(Debug)]
+struct PowerShellParseState {
+    mode: PowerShellParseMode,
+    /// At [`PowerShellParseMode::StatementStart`]: whether a statement, not
+    /// only a pipeline, starts here, so that a keyword is read as one. After
+    /// `|`, `&&`, `||` and inside `(...)` a keyword is a command name
+    /// (`echo a | return $c#x` keeps the `#`).
+    statement: bool,
+    /// Where the command word that began this statement started, while it
+    /// is being read.
+    command_start: Option<usize>,
+    /// A block statement keyword (`if`, `function`, `try`...) began this
+    /// statement and its body `{` has not opened yet. After that body a new
+    /// statement starts with no separator: `if (1) {} $c#x` is a comment.
+    header: bool,
+    enclosing: Vec<PowerShellParseFrame>,
+}
+
+/// What [`PowerShellParseState`] returns to when a group closes.
+#[derive(Debug)]
+struct PowerShellParseFrame {
+    mode: PowerShellParseMode,
+    statement: bool,
+    header: bool,
+}
+
+impl Default for PowerShellParseState {
+    fn default() -> Self {
+        Self::new(PowerShellParseMode::StatementStart)
+    }
+}
+
+impl PowerShellParseState {
+    fn new(mode: PowerShellParseMode) -> Self {
+        Self {
+            mode,
+            statement: true,
+            command_start: None,
+            header: false,
+            enclosing: Vec::new(),
+        }
+    }
+
+    fn start(&mut self, statement: bool) {
+        self.mode = PowerShellParseMode::StatementStart;
+        self.statement = statement;
+        self.command_start = None;
+    }
+
+    /// Open `(` or `{` (a statement body when `body`). Inside, `next` is the
+    /// mode and `statement` says whether statements start there.
+    fn open_group(&mut self, next: PowerShellParseMode, statement: bool, body: bool) {
+        self.end_command_word(None);
+        let frame = if body {
+            PowerShellParseFrame {
+                mode: PowerShellParseMode::StatementStart,
+                statement: true,
+                header: false,
+            }
+        } else {
+            PowerShellParseFrame {
+                mode: match self.mode {
+                    PowerShellParseMode::StatementStart => PowerShellParseMode::Expression,
+                    mode => mode,
+                },
+                statement: self.statement,
+                header: self.header,
+            }
+        };
+        self.enclosing.push(frame);
+        self.mode = next;
+        self.statement = statement;
+        self.header = false;
+    }
+
+    fn close_group(&mut self) {
+        let frame = self.enclosing.pop().unwrap_or(PowerShellParseFrame {
+            mode: PowerShellParseMode::StatementStart,
+            statement: true,
+            header: false,
+        });
+        self.mode = frame.mode;
+        self.statement = frame.statement;
+        self.header = frame.header;
+        self.command_start = None;
+        if self.header {
+            // A block statement's `(...)`: its body or, after `do {...}
+            // while (...)`, a new statement follows (`while (0) $c#x`).
+            self.start(true);
+        }
+    }
+
+    /// `;`, `|`, `||`, `&&`, `&` (call or background) and parentheses. `$(`
+    /// and `@(` hold statements; `(` holds one pipeline.
+    fn separator(&mut self, bytes: &[u8], i: usize, width: usize) {
+        match (bytes[i], width) {
+            (b'(', 1) => {
+                let statements = i > 0 && matches!(bytes[i - 1], b'$' | b'@');
+                self.open_group(PowerShellParseMode::StatementStart, statements, false);
+            }
+            (b')', 1) => self.close_group(),
+            // The call operator: a command name in argument mode follows
+            // (`& $c<#x#>` is one word). After a command, `&` runs it in
+            // the background and a new statement follows.
+            (b'&', 1) if self.mode == PowerShellParseMode::StatementStart => {
+                self.mode = PowerShellParseMode::Command;
+            }
+            (b';' | b'&', 1) => {
+                self.header = false;
+                self.start(true);
+            }
+            _ => {
+                self.header = false;
+                self.start(false);
+            }
+        }
+    }
+
+    /// The command word that began this statement ends at `end` (or has
+    /// ended, when `None`). A keyword sets how the token after it is read,
+    /// as pwsh 7.5's tokenizer does. `return`, `throw` and `exit` take a
+    /// pipeline (`return $c#x` is a comment, `return a#x` a word); `break`
+    /// and `continue` take a label and `class`, `enum` and `data` a name,
+    /// where even a bareword is an expression token (`break a#x` is a
+    /// comment). A block statement keyword waits for its body. The other
+    /// keywords' operands need `(` or `{`, so a glued comment after them is
+    /// a parse error and nothing runs.
+    fn end_command_word(&mut self, end: Option<(&[u8], usize)>) {
+        let Some(start) = self.command_start.take() else {
+            return;
+        };
+        if self.mode != PowerShellParseMode::Command {
+            return;
+        }
+        let Some((bytes, end)) = end else {
+            return;
+        };
+        let word = bytes[start..end].to_ascii_lowercase();
+        self.header = matches!(
+            word.as_slice(),
+            b"if"
+                | b"elseif"
+                | b"else"
+                | b"while"
+                | b"for"
+                | b"foreach"
+                | b"switch"
+                | b"do"
+                | b"try"
+                | b"catch"
+                | b"finally"
+                | b"trap"
+                | b"function"
+                | b"filter"
+                | b"workflow"
+                | b"configuration"
+                | b"class"
+                | b"enum"
+                | b"data"
+                | b"begin"
+                | b"process"
+                | b"end"
+                | b"clean"
+                | b"dynamicparam"
+                | b"parallel"
+                | b"sequence"
+        );
+        match word.as_slice() {
+            b"return" | b"throw" | b"exit" => self.start(false),
+            b"break" | b"continue" | b"class" | b"enum" | b"data" => {
+                self.mode = PowerShellParseMode::Expression;
+            }
+            _ => {}
+        }
+    }
+
+    /// Account for the unquoted byte at `i`, which the word scanner is about
+    /// to consume.
+    fn read(&mut self, bytes: &[u8], i: usize) {
+        let byte = bytes[i];
+        match byte {
+            b'{' => {
+                if self.mode == PowerShellParseMode::Command {
+                    self.end_command_word(Some((bytes, i)));
+                }
+                // `@{` is a hashtable: its keys and values are expressions.
+                if i > 0 && bytes[i - 1] == b'@' {
+                    self.open_group(PowerShellParseMode::Expression, false, false);
+                } else {
+                    let body = self.header;
+                    self.open_group(PowerShellParseMode::StatementStart, true, body);
+                }
+            }
+            b'}' => self.close_group(),
+            _ => match self.mode {
+                PowerShellParseMode::StatementStart => {
+                    self.header = false;
+                    self.mode = if powershell_starts_expression(bytes, i) {
+                        PowerShellParseMode::Expression
+                    } else {
+                        if self.statement {
+                            self.command_start = Some(i);
+                        }
+                        PowerShellParseMode::Command
+                    };
+                }
+                // The right side of `=`, `+=`, `??=`... is a new statement.
+                PowerShellParseMode::Expression if byte == b'=' => self.start(true),
+                _ => {}
+            },
+        }
+    }
+
+    /// Whether a `#` or `<#` at `i` starts a comment. `arg_start` is where
+    /// the current argument began; `quoted_end` is where a string that began
+    /// it closed.
+    fn comment_starts(
+        &self,
+        bytes: &[u8],
+        i: usize,
+        arg_start: usize,
+        quoted_end: Option<usize>,
+    ) -> bool {
+        let block = bytes.get(i..i + 2) == Some(b"<#");
+        if bytes[i] != b'#' && !block {
+            return false;
+        }
+        let role = powershell_comment_predecessor_role(bytes, i);
+        if role == PowerShellHashRole::Comment || self.mode != PowerShellParseMode::Command {
+            return true;
+        }
+        // In argument mode a word absorbs `#` (`a#x`, `$c#x`, `a'b'#x`), but
+        // a member access (`$c.p#x`, `(…).p#x`) or a string that began the
+        // argument (`'a'#x`) is an expression token, and the comment starts.
+        quoted_end == Some(i)
+            || powershell_member_access_ends_at(bytes, arg_start, i, quoted_end)
+            || (block && role == PowerShellHashRole::Ambiguous)
+    }
+}
+
+/// Whether PowerShell ends the text of `word`, a command argument, at a `#`,
+/// `<#`, `<` or `>` glued at `index`. It reads all four the same way: as text
+/// after a bareword or a variable (`a>x`, `$c<#`, `${c}#x`), and as a comment
+/// or an operator after a string that began the argument, a member access or
+/// a closing bracket (`'a'>x`, `$c.p>x`, `(1)>x`).
+pub(crate) fn powershell_argument_text_ends_at(word: &str, index: usize) -> bool {
+    let Some(prefix) = word.as_bytes().get(..index) else {
+        return false;
+    };
+    let mut probe = prefix.to_vec();
+    probe.push(b'#');
+    let mut parse = PowerShellParseState::new(PowerShellParseMode::Command);
+    consume_powershell_word(&probe, 0, probe.len(), Some(&mut parse)) == index
+}
+
+/// Whether the token starting at `i`, first in its statement, is an
+/// expression rather than a command name.
+fn powershell_starts_expression(bytes: &[u8], i: usize) -> bool {
+    match bytes[i] {
+        b'$' | b'@' | b'\'' | b'"' | b'[' | b'-' | b'+' | b'!' | b',' | b'0'..=b'9' => true,
+        b'.' => bytes.get(i + 1).is_some_and(u8::is_ascii_digit),
+        _ => false,
+    }
+}
+
+/// Whether `bytes[arg_start..index]` ends in a member access on a variable,
+/// a parenthesized expression or a string that began the argument (closed at
+/// `quoted_end`): `$c.p`, `${c}.p`, `$c[0].p`, `$c::p`, `(…).p`, `'a'.p`.
+/// `x$c.p` and `[int]::p` stay text in argument mode.
+fn powershell_member_access_ends_at(
+    bytes: &[u8],
+    arg_start: usize,
+    index: usize,
+    quoted_end: Option<usize>,
+) -> bool {
+    let is_name = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut j = index;
+    while j > arg_start && is_name(bytes[j - 1]) {
+        j -= 1;
+    }
+    if j == index {
+        return false;
+    }
+    if j > arg_start && bytes[j - 1] == b'.' {
+        j -= 1;
+    } else if j >= arg_start + 2 && bytes[j - 2..j] == *b"::" {
+        j -= 2;
+    } else {
+        return false;
+    }
+    let object = &bytes[arg_start..j];
+    match object.split_first() {
+        None => arg_start > 0 && bytes[arg_start - 1] == b')',
+        Some((b'$', rest)) => rest
+            .iter()
+            .all(|&byte| is_name(byte) || b":.[]{}?".contains(&byte)),
+        Some((b'\'' | b'"', _)) => quoted_end == Some(j),
+        Some(_) => false,
+    }
+}
+
+fn consume_powershell_word(
+    bytes: &[u8],
+    mut i: usize,
+    len: usize,
+    mut parse: Option<&mut PowerShellParseState>,
+) -> usize {
+    let read_comments = parse.is_some();
     let mut quote = PowerShellQuote::Unquoted;
+    // Where the current argument began (`a,$c.p` and `-x:$c.p` hold two),
+    // and where a string that began it closed.
+    let mut arg_start = i;
+    let mut quoted_end = None;
+    let mut quote_began_argument = false;
 
     while i < len {
         let byte = bytes[i];
@@ -5230,12 +5595,19 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments
                 if matches!(byte, b'\r' | b'\n')
                     || powershell_horizontal_space_len(bytes, i).is_some()
                     || powershell_separator_end(bytes, i, len).is_some()
-                    || (read_comments
-                        && byte == b'#'
-                        && powershell_hash_role(bytes, i) == PowerShellHashRole::Comment)
-                    || (read_comments && powershell_block_comment_starts_after(bytes, i))
+                    || parse
+                        .as_deref()
+                        .is_some_and(|parse| parse.comment_starts(bytes, i, arg_start, quoted_end))
                 {
                     break;
+                }
+                if let Some(parse) = parse.as_deref_mut() {
+                    parse.read(bytes, i);
+                    if byte == b',' || (byte == b':' && bytes[arg_start] == b'-') {
+                        arg_start = i + 1;
+                        quoted_end = None;
+                    }
+                    quote_began_argument = i == arg_start && matches!(byte, b'\'' | b'"');
                 }
                 match byte {
                     b'`' => i = consume_shell_escape(bytes, i, len),
@@ -5273,6 +5645,9 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments
                     } else {
                         quote = PowerShellQuote::Unquoted;
                         i += 1;
+                        if quote_began_argument {
+                            quoted_end = Some(i);
+                        }
                     }
                 } else {
                     i += 1;
@@ -5283,6 +5658,9 @@ fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize, read_comments
                 b'"' => {
                     quote = PowerShellQuote::Unquoted;
                     i += 1;
+                    if quote_began_argument {
+                        quoted_end = Some(i);
+                    }
                 }
                 _ => i += 1,
             },
@@ -5982,8 +6360,14 @@ fn normalize_command_word_token_in_dialect(token: &str, dialect: ShellDialect) -
         let head = &out[..redirection_idx];
         let tail = &out[redirection_idx..];
         let is_fd_redirect = head.chars().all(|c| c.is_ascii_digit());
+        // A `<#` glued to the command word stays in it. PowerShell keeps it
+        // in the name (`(a<#); git reset --hard` runs `a<#`, then git); a
+        // POSIX shell reads `<` with no target and runs nothing. A space
+        // would turn it into a block comment that hides the rest; the
+        // PowerShell pattern view also passes through this generic dialect.
+        let glued_block_comment = tail.starts_with("<#");
 
-        if !is_fd_redirect {
+        if !is_fd_redirect && !glued_block_comment {
             let mut normalized_head = head.to_string();
             if normalized_head.to_ascii_lowercase().ends_with(".exe") && normalized_head.len() > 4 {
                 normalized_head.truncate(normalized_head.len() - 4);
@@ -10574,6 +10958,208 @@ mod tests {
         let masked = mask_powershell_comments("echo a\u{3000}# it's\ngit reset --hard")
             .expect("comment is masked");
         assert!(masked.ends_with("\ngit reset --hard"), "{masked:?}");
+    }
+
+    /// Whether a `#` or `<#` glued to the token before it starts a comment
+    /// depends on PowerShell's parse mode, not on that byte alone. Each row
+    /// was measured with pwsh 7.5 (`scripts/shell-truth`).
+    #[test]
+    fn powershell_glued_comments_follow_the_parse_mode() {
+        let masked = |command: &str| mask_powershell_comments(command).unwrap_or_default();
+        // Expression mode: the comment starts.
+        for (command, expected) in [
+            ("$c<#x#>=iex 'y'", "$c     =iex 'y'"),
+            ("${c}<#x#>=iex 'y'", "${c}     =iex 'y'"),
+            ("$c.p<#x#>=iex 'y'", "$c.p     =iex 'y'"),
+            ("$global:c<#x#>=iex 'y'", "$global:c     =iex 'y'"),
+            ("[int]$c<#x#>=iex 'y'", "[int]$c     =iex 'y'"),
+            ("$c#'\nz", "$c  \nz"),
+            ("$c=1#'\nz", "$c=1  \nz"),
+            ("$c=$d#'\nz", "$c=$d  \nz"),
+            ("$c='a'#'\nz", "$c='a'  \nz"),
+            ("$c=[int]::MaxValue#'\nz", "$c=[int]::MaxValue  \nz"),
+            ("$c = $d -eq $e#'\nz", "$c = $d -eq $e  \nz"),
+            ("if(1){$c<#x#>=1}", "if(1){$c     =1}"),
+            ("if(0){}else{$c<#x#>=1}", "if(0){}else{$c     =1}"),
+            ("$h=@{a=1#'\n}", "$h=@{a=1  \n}"),
+            ("git status & $c<#x#>=1", "git status & $c     =1"),
+            // Argument mode, but a member access or a leading string is an
+            // expression token.
+            ("echo $c.p#'\nz", "echo $c.p  \nz"),
+            ("echo $c[0].p<#x#>z", "echo $c[0].p     z"),
+            ("echo ${c}.p#'\nz", "echo ${c}.p  \nz"),
+            ("echo $c::p#'\nz", "echo $c::p  \nz"),
+            ("echo ($c).p#'\nz", "echo ($c).p  \nz"),
+            ("echo a,$c.p#'\nz", "echo a,$c.p  \nz"),
+            ("echo -x:$c.p#'\nz", "echo -x:$c.p  \nz"),
+            ("echo 'a'#'\nz", "echo 'a'  \nz"),
+            ("echo 'a'.p#'\nz", "echo 'a'.p  \nz"),
+            ("echo \"a\".p<#x#>z", "echo \"a\".p     z"),
+            ("echo \"a\"#'\nz", "echo \"a\"  \nz"),
+            // A keyword that takes a pipeline, a label or a name.
+            ("return $c#'\nz", "return $c  \nz"),
+            ("Return -1#'\nz", "Return -1  \nz"),
+            ("exit $c#'\nz", "exit $c  \nz"),
+            ("return ,${c}#'\nz", "return ,${c}  \nz"),
+            ("return -not ${c}#'\nz", "return -not ${c}  \nz"),
+            ("return [int]${c}#'\nz", "return [int]${c}  \nz"),
+            ("$a = return $c#'\nz", "$a = return $c  \nz"),
+            ("$x = $(return $c#'\n)", "$x = $(return $c  \n)"),
+            (
+                "& { return ${c}<#x#>=iex 'y' }",
+                "& { return ${c}     =iex 'y' }",
+            ),
+            (
+                "function f { return $c<#x#>=1 }",
+                "function f { return $c     =1 }",
+            ),
+            (
+                "try { throw ${c}#'\n} catch {}",
+                "try { throw ${c}  \n} catch {}",
+            ),
+            (
+                "foreach ($i in 1) { break a#'\n}",
+                "foreach ($i in 1) { break a  \n}",
+            ),
+            ("data a#'\n{ 1 }", "data a  \n{ 1 }"),
+            ("class a#'\n{ }", "class a  \n{ }"),
+            // After a block statement a new statement starts.
+            ("if (1) { } $c#'\nz", "if (1) { } $c  \nz"),
+            ("if(1){}$c#'\nz", "if(1){}$c  \nz"),
+            ("if (1)\n{ } $c#'\nz", "if (1)\n{ } $c  \nz"),
+            ("if (0) { } else { } $c#'\nz", "if (0) { } else { } $c  \nz"),
+            ("function f($a) { } $c#'\nz", "function f($a) { } $c  \nz"),
+            ("try { } catch { } $c#'\nz", "try { } catch { } $c  \nz"),
+            ("do { } while (0) $c#'\nz", "do { } while (0) $c  \nz"),
+            ("class a { } $c#'\nz", "class a { } $c  \nz"),
+            (
+                "foreach ($i in 1) { } ${c}<#'#>; z",
+                "foreach ($i in 1) { } ${c}     ; z",
+            ),
+        ] {
+            assert_eq!(masked(command), expected, "{command:?}");
+        }
+        // Argument mode and command names: the word keeps the `#`.
+        for command in [
+            "echo a#x",
+            "echo a<#x#>b",
+            "echo $c#'\nz\n#'",
+            "echo $c<#'\nz\n#>'",
+            "echo ${c}#x",
+            "echo x${c}#y",
+            "echo ${c}<#'\nz\n#>'",
+            "echo 'a'b<#x#>",
+            "echo $global:c#x",
+            "echo x$c#y",
+            "echo x$c.p#y",
+            "echo $c-x#y",
+            "echo -x:$c#y",
+            "echo a,$c#y",
+            "echo a'b'#x",
+            "echo $c'a'#x",
+            "echo 1#x",
+            "echo 1.5#x",
+            "echo [int]::MaxValue#x",
+            "git#x status",
+            "$c = echo a#x",
+            "& {echo a#x}",
+            // A keyword only begins a statement: after `|`, `&&` or `(`, or
+            // as an argument, it is a command name or text.
+            "echo a | return $c#'\nz\n#'",
+            "(return $c#'\n); z\n#'",
+            "& { echo a && return $c#'\n}; z\n#'",
+            "& { echo return $c#'\n}; z\n#'",
+            "& { return$c#'\n}; z\n#'",
+            "Write-Output return${c}#x",
+            "& { exit a#'\n}; z\n#'",
+            "1 | foreach { } $c#'\nz\n#'",
+            // The call operators take a command name in argument mode.
+            "& $c<#'#>; z; #'",
+            ". ${c}#'\nz\n#'",
+            "$x = & $c#'\nz\n#'",
+            "& { } $c#'\nz\n#'",
+            // After a block statement a command name keeps its `#`.
+            "if (1) { } a#'\nz\n#'",
+            "function f { } a#'\nz\n#'",
+            // A `<#` glued to a command name inside `(...)` is text.
+            "ls (a<#); z",
+        ] {
+            assert!(
+                mask_powershell_comments(command).is_none(),
+                "{command:?}: {:?}",
+                mask_powershell_comments(command)
+            );
+        }
+    }
+
+    /// A `<#` glued to a command word stays in the word (pwsh 7.5 runs
+    /// `a<#`, then git, for `ls (a<#); git reset --hard`; bash and dash
+    /// reject `git<#x`). Splitting it off as a redirect would make it a block
+    /// comment; other glued redirects are still split off.
+    #[test]
+    fn glued_block_comment_stays_in_the_command_word() {
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            let normalized = |command| normalize_command_in_dialect(command, dialect);
+            assert_eq!(
+                normalized("ls (a<#); git reset --hard"),
+                "ls (a<#); git reset --hard"
+            );
+            assert_eq!(normalized("git>x status"), "git >x status");
+        }
+    }
+
+    /// PowerShell reads a `<` or `>` glued inside a command argument as it
+    /// reads a glued `#`: as text after a bareword or a variable, as an
+    /// operator after a string that began the argument, a member access or a
+    /// closing bracket. Each row was measured with pwsh 7.5
+    /// (`scripts/shell-truth`, `Write-Output <word>` and `Test-Path x`).
+    #[test]
+    fn powershell_glued_redirects_follow_the_argument_text() {
+        let at = |word: &str| word.find(['<', '>']).expect("operator");
+        for word in [
+            "'a'>x",
+            "\"a\">x",
+            "'a'>>x",
+            "$c.p>x",
+            "$d[0]>x",
+            "$d.Length>x",
+            "'a'.Length>x",
+            "{a}>x",
+            "a,'b'>x",
+            "-x:'a'>x",
+            "'a'<x",
+            "$c.p<x",
+        ] {
+            assert!(powershell_argument_text_ends_at(word, at(word)), "{word:?}");
+        }
+        for word in [
+            "a>x",
+            "a>>x",
+            "a<x",
+            "a<#",
+            "a'b'>x",
+            "a\"b\">x",
+            "'a'b>x",
+            "$d>x",
+            "${d}>x",
+            "$global:d>x",
+            "a$d>x",
+            "$d'b'>x",
+            "-a>x",
+            "-x:a>x",
+            "1.5>x",
+            "a.>x",
+            "a->x",
+            "a:>x",
+            "a=>x",
+            "a.b>x",
+            "*a>x",
+        ] {
+            assert!(
+                !powershell_argument_text_ends_at(word, at(word)),
+                "{word:?}"
+            );
+        }
     }
 
     #[test]

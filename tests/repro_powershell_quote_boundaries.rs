@@ -324,6 +324,231 @@ fn powershell_comments_do_not_hide_following_commands() {
     }
 }
 
+/// A `#` or `<#` glued to the token before it starts a comment in expression
+/// mode (`$c#x`, `$c=1#x`) and after a member access or a leading string in
+/// argument mode (`echo $c.p#x`, `echo 'a'#x`), but stays text in other
+/// argument words (`echo a#x`, `echo $c#x`, `echo ${c}#x`). A glued `<` or
+/// `>` follows the same rule, so `echo a<#` is text too. Every row was measured with
+/// sandboxed pwsh 7.5: each dangerous row ran `git reset --hard`, no harmless
+/// row did.
+#[test]
+fn powershell_glued_comments_follow_the_parse_mode() {
+    let dangerous = [
+        "$c#'\ngit reset --hard\n#'",
+        "${c}#'\ngit reset --hard\n#'",
+        "$c=1#'\ngit reset --hard\n#'",
+        "$c=$d#'\ngit reset --hard\n#'",
+        "$c = $d#'\ngit reset --hard\n#'",
+        "$c=@{}; $c.p#'\ngit reset --hard\n#'",
+        "$c='a'#'\ngit reset --hard\n#'",
+        "$c=[int]::MaxValue#'\ngit reset --hard\n#'",
+        "$c = $d -eq $e#'\ngit reset --hard\n#'",
+        "$h=@{a=1#'\n}; git reset --hard\n#'",
+        "$c<#x#> = iex 'git reset --hard'",
+        "if(1){$c<#x#> = iex 'git reset --hard'}",
+        "$c=@{p='V'}; Write-Output $c.p#'\ngit reset --hard\n#'",
+        "$c=@{p='V'}; Write-Output $c.p<#'#>; git reset --hard",
+        "Write-Output ($c).p#'\ngit reset --hard\n#'",
+        "Write-Output a,$c.p#'\ngit reset --hard\n#'",
+        "Write-Output 'a'#'\ngit reset --hard\n#'",
+        "Write-Output 'a'.Length#'\ngit reset --hard\n#'",
+        // A glued `<` is text after a bareword, so `<#` opens no comment.
+        "Write-Output a<#; git reset --hard",
+        "Write-Output a<# ; & {git reset --hard} #>",
+        "Write-Host a<#; git reset --hard",
+        "Write-Output a,b<#; git reset --hard",
+        "Write-Output -a<#; git reset --hard",
+        "Write-Output a><#; git reset --hard",
+        "Write-Output 'a'b<#; git reset --hard",
+        "Write-Output -a<# ; & {git reset --hard} #>",
+        "$c = Write-Output a<# ; & {git reset --hard} #>",
+        "Write-Output x; Write-Output a<# ; & {git reset --hard} #>",
+        "Write-Output ${c}<# ; & {git reset --hard} #>",
+        "Write-Output ${c}#; git reset --hard",
+        // With the comment masked, a glued assignment (PR #33's class).
+        "$c<#x#>=iex 'git reset --hard'",
+        "${c}<#x#>=iex 'git reset --hard'",
+        // A block glued after the `<#` text (PR #34's class).
+        "$l = Write-Output a<#{git reset --hard}; & $l[1]",
+        // In a ForEach-Object member call (PR #31's statement reader).
+        "$ExecutionContext.InvokeCommand | % InvokeScript a<#; $ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' #>",
+        "$ExecutionContext.InvokeCommand | % InvokeScript a<# ; & {git reset --hard} #>",
+        "$ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard' a<#",
+        "$ExecutionContext.InvokeCommand | % InvokeScript $c<# ; git reset --hard #>",
+        "$ExecutionContext.InvokeCommand | % InvokeScript 2>$null<# ; git reset --hard #> 'git status'",
+        "New-Object System.Management.Automation.Runspaces.Command a<#; $p=[powershell]::Create(); [void]$p.AddScript('git reset --hard'); $p.Invoke() #>",
+        // In Start-Process arguments (PR #36's parameter binder).
+        "Start-Process -RedirectStandardOutput o<#x -FilePath git -ArgumentList reset,--hard #>",
+        "Start-Process -Wait -RedirectStandardOutput o<#x git reset,--hard #>",
+        "Start-Process -Wait -RedirectStandardOutput $c<#x -FilePath git -ArgumentList reset,--hard #>",
+        "Start-Process -Wait -RedirectStandardOutput ${c}<#x -FilePath git -ArgumentList reset,--hard #>",
+        "Start-Process -Wait -RedirectStandardOutput o<x -FilePath git -ArgumentList reset,--hard",
+    ];
+    let harmless = [
+        "Write-Output $c#'\ngit reset --hard\n#'",
+        "Write-Output a#'\ngit reset --hard\n'",
+        "Write-Output a<#'\ngit reset --hard\n#>'",
+        "Write-Output $global:c#'\ngit reset --hard\n#'",
+        "Write-Output x$c.p#'\ngit reset --hard\n'",
+        "Write-Output -x:$c#'\ngit reset --hard\n'",
+        "Write-Output a,$c#'\ngit reset --hard\n'",
+        "git commit -m fix#1",
+        "$c=1#note",
+        "$c=@{p='V'}; $c.p#x",
+        "$c<#x#> = git status",
+        "[int]$c<#x#> = 1; git status",
+        "Write-Output x${c}#'\ngit reset --hard\n#'",
+        "Write-Output ${c}<#'\ngit reset --hard\n#>'",
+        "Write-Output a<#x#>b; git status",
+        "Write-Output a>x; git status",
+        "Write-Output a <# ; & {git reset --hard} #>",
+        "$c <#x#> = 1; & {git status}",
+        "$ExecutionContext.InvokeCommand | % InvokeScript 'git status' <# ; git reset --hard #>",
+        "Start-Process -Wait -RedirectStandardOutput o<#x -FilePath git -ArgumentList status #>",
+        "Start-Process -Wait -RedirectStandardOutput o<#x git status #>",
+        "Start-Process -Wait -RedirectStandardOutput o<x -FilePath git -ArgumentList status",
+        // Not listed: `… InvokeScript 'git status'<# ; git reset --hard #>`.
+        // pwsh runs only `git status`, but the engine-script reader keeps its
+        // older deny for a string with text glued after it; that denial is
+        // conservative and unchanged here.
+    ];
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        for command in dangerous {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+        for command in harmless {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Allow,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in dangerous {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+        for command in harmless {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
+/// The parse mode after a statement keyword and after a block statement.
+/// `return`, `throw` and `exit` take a pipeline and `break`, `continue`,
+/// `class`, `enum` and `data` a label or name, so a `#` or `<#` glued to the
+/// operand starts a comment; a block statement (`if`, `function`, `try`,
+/// `do … while (…)`) is followed by a new statement with no separator. Only
+/// at a statement start: after `|`, `&&` or `(` and as an argument the word
+/// is a command name. The call operators `&` and `.` take a command name in
+/// argument mode. Every row was measured with sandboxed pwsh 7.5: each
+/// dangerous row ran `git reset --hard`, no harmless row did.
+#[test]
+fn powershell_glued_comments_after_keywords_and_block_statements() {
+    let dangerous = [
+        "& { return ${c}<#x#>=iex 'git reset --hard' }",
+        "& { throw ${c}<#x#>=iex 'git reset --hard' }",
+        "& { exit ${c}<#x#>=iex 'git reset --hard' }",
+        "function f { return $c<#x#>=iex 'git reset --hard' }; f",
+        "& { return ${c}#'\n}; git reset --hard\n#'",
+        "& { return $c#'\n}; git reset --hard\n#'",
+        "& { return ${c}<#'#>}; git reset --hard; #'",
+        "& { return $c<#'#>}; git reset --hard; #'",
+        "try { throw ${c}#'\n} catch {}; git reset --hard\n#'",
+        "try { throw $c#'\n} catch {}; git reset --hard\n#'",
+        "try { throw $c<#'#>} catch {}; git reset --hard; #'",
+        "function f { return ${c}#'\n}; git reset --hard\n#'",
+        "1 | % { return ${c}#'\n}; git reset --hard\n#'",
+        "1 | % { return $c<#'#>}; git reset --hard; #'",
+        "foreach ($i in 1) { break ${c}#'\n}; git reset --hard\n#'",
+        "foreach ($i in 1) { continue ${c}#'\n}; git reset --hard\n#'",
+        "& { return ,${c}#'\n}; git reset --hard\n#'",
+        "& { return -not ${c}#'\n}; git reset --hard\n#'",
+        "& { return [int]${c}#'\n}; git reset --hard\n#'",
+        "& { return 1#'\n}; git reset --hard\n#'",
+        "& { Return ${c}#'\n}; git reset --hard\n#'",
+        "& { Return -1#'\n}; git reset --hard\n#'",
+        "& { $a = return $c#'\n}; git reset --hard\n#'",
+        "data a#'\n{ 1 }; git reset --hard\n#'",
+        "class a#'\n{ }; git reset --hard\n#'",
+        "enum a#'\n{ x }; git reset --hard\n#'",
+        "if (1) { } $c#'\ngit reset --hard\n#'",
+        "if(1){}$c#'\ngit reset --hard\n#'",
+        "if (1)\n{ } $c#'\ngit reset --hard\n#'",
+        "if (0) { } else { } $c#'\ngit reset --hard\n#'",
+        "function f { } $c#'\ngit reset --hard\n#'",
+        "try { } catch { } $c#'\ngit reset --hard\n#'",
+        "while (0) { } $c#'\ngit reset --hard\n#'",
+        "do { } while (0) $c#'\ngit reset --hard\n#'",
+        "class a { } $c#'\ngit reset --hard\n#'",
+        "foreach ($i in 1) { } ${c}<#'#>; git reset --hard; #'",
+        // A `<#` glued to a command name inside `(...)` is text.
+        "ls (a<#); git reset --hard",
+    ];
+    // Not listed: `& { return ${c}#x }`, `& { echo $c<#'#>}; …` and the like.
+    // pwsh rejects them (MissingEndCurlyBrace: the comment or a quoted word
+    // takes the `}`), so nothing runs, and dcg denies a block it cannot
+    // segment. Harmless rows are PowerShell readings only: a POSIX shell
+    // may read them otherwise, and Unknown denies what either reading runs.
+    let harmless = [
+        "Write-Output return${c}#x",
+        "echo a | return $c#'\ngit reset --hard\n#'",
+        "(return $c#'\n); git reset --hard\n#'",
+        ". ${c}#'\ngit reset --hard\n#'",
+        ". $c<#'#>; git reset --hard; #'",
+        "& $c<#'#>; git reset --hard; #'",
+        "$x = & $c#'\ngit reset --hard\n#'",
+        "& { } $c#'\ngit reset --hard\n#'",
+        "1 | foreach { } $c#'\ngit reset --hard\n#'",
+        "if (1) { } a#'\ngit reset --hard\n#'",
+        "function f { } a#'\ngit reset --hard\n#'",
+    ];
+    for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+        for command in dangerous {
+            assert_eq!(
+                decision_in(command, dialect),
+                EvaluationDecision::Deny,
+                "{dialect:?}: {command:?}"
+            );
+        }
+    }
+    for command in harmless {
+        assert_eq!(
+            decision_in(command, ShellDialect::PowerShell),
+            EvaluationDecision::Allow,
+            "{command:?}"
+        );
+    }
+    for protocol in [Protocol::Claude, Protocol::Codex] {
+        for command in dangerous {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "deny",
+                "{protocol:?}: {command:?}"
+            );
+        }
+        for command in harmless {
+            assert_eq!(
+                hook_decision(protocol, "PowerShell", command),
+                "allow",
+                "{protocol:?}: {command:?}"
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn powershell_comment_codex_bash_label() {
