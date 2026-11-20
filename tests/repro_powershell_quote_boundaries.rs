@@ -606,11 +606,11 @@ fn powershell_glued_comments_after_labels_param_blocks_and_in_lists() {
     ];
     // Harmless rows are PowerShell readings only (see above). A function
     // name glued to a comment, `using`, a splatted or
-    // dynamic member name, a later `param`, a label before a non-keyword
-    // and a method body's argument are parse errors or arguments, and
-    // nothing runs.
-    // Not listed: `$h=@{a=1;b=echo x#'` NL `}; git reset --hard` NL `#'`
-    // runs nothing in pwsh, but base and live dcg deny it as a block they
+    // dynamic member name, a later `param` and a label before a non-keyword
+    // are parse errors or arguments, and nothing runs.
+    // Not listed: `$h=@{a=1;b=echo x#'` NL `}; git reset --hard` NL `#'` and
+    // `class a { m() { echo a#'` NL `} }; git reset --hard` NL `#'` run
+    // nothing in pwsh, but base and live dcg deny them as blocks they
     // cannot segment; unchanged here. Not listed either:
     // `$h=@{a=1;b#'` NL `=2}; git reset --hard` NL `#'`. The key's `#'` is a
     // comment, but the hashtable then lacks its `=`, so pwsh runs nothing;
@@ -625,7 +625,6 @@ fn powershell_glued_comments_after_labels_param_blocks_and_in_lists() {
         "echo $c.p.$d<#'#>; git reset --hard; #'",
         "echo 1; param($a) $c#'\ngit reset --hard\n#'",
         ":a $c#'\ngit reset --hard\n#'",
-        "class a { m() { echo a#'\n} }; git reset --hard\n#'",
     ];
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
         for command in dangerous {
