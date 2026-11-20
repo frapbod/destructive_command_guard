@@ -8331,7 +8331,6 @@ const SINK_ANALYSIS_BOUNDS_RULE: &str = "heredoc.shell.analysis-bounds";
 /// Same pack as its sibling above: both say "analysis could not complete".
 const INCOMPLETE_ANALYSIS_RULE: &str = "heredoc.shell.incomplete-analysis";
 const POWERSHELL_IEX_RULE: &str = "heredoc.powershell.invoke-expression-dynamic";
-const POWERSHELL_SCRIPTBLOCK_RULE: &str = "heredoc.powershell.scriptblock-dynamic";
 const POWERSHELL_ENGINE_SCRIPT_RULE: &str = "heredoc.powershell.engine-script-dynamic";
 /// A PowerShell/cmd launcher assembled through escaping, control prefixes, or
 /// dynamic expansion that the envelope parser cannot statically verify
@@ -12516,78 +12515,6 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
     None
 }
 
-fn find_powershell_scriptblock_type_literal(command: &str, start: usize) -> Option<(usize, usize)> {
-    // One pass: each `[` is paired with the first `]` after it, which is
-    // shared by every `[` before that `]`, so it is found once; and a `[`
-    // with another `[` before its `]` holds a `[` in its name and is skipped
-    // without copying it. A run of unclosed `[` (`[[[…`, 60 KB) otherwise
-    // rescanned the rest of the command at each one.
-    let mut type_start = find_powershell_code_marker(command, "[", start)?;
-    let mut close: Option<usize> = None;
-    loop {
-        if close.is_none_or(|close| close <= type_start) {
-            // No `]` after this `[` means none after any later one either.
-            close = Some(type_start + 1 + command.get(type_start + 1..)?.find(']')?);
-        }
-        let close_at = close?;
-        let following = find_powershell_code_marker(command, "[", type_start + 1);
-        if following.is_none_or(|next| next > close_at) {
-            let normalized: String = command[type_start + 1..close_at]
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect();
-            if normalized.eq_ignore_ascii_case("scriptblock")
-                || normalized.eq_ignore_ascii_case("system.management.automation.scriptblock")
-            {
-                return Some((type_start, close_at + 1));
-            }
-        }
-        type_start = following?;
-    }
-}
-
-fn find_powershell_scriptblock_create(command: &str, start: usize) -> Option<(usize, usize)> {
-    let mut search_start = start;
-    while search_start < command.len() {
-        let (type_start, type_end) =
-            find_powershell_scriptblock_type_literal(command, search_start)?;
-        let mut index = type_end;
-        while command
-            .as_bytes()
-            .get(index)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            index += 1;
-        }
-        if command.as_bytes().get(index..index + 2) != Some(b"::") {
-            search_start = type_start + 1;
-            continue;
-        }
-        index += 2;
-        while command
-            .as_bytes()
-            .get(index)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            index += 1;
-        }
-        let Some(candidate) = command.get(index..index + "create".len()) else {
-            search_start = type_start + 1;
-            continue;
-        };
-        if candidate.eq_ignore_ascii_case("create")
-            && command
-                .as_bytes()
-                .get(index + "create".len())
-                .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(')
-        {
-            return Some((type_start, index + "create".len()));
-        }
-        search_start = type_start + 1;
-    }
-    None
-}
-
 fn local_powershell_prefix(prefix: &str) -> &str {
     prefix.rsplit([';', '\n', '|']).next().unwrap_or(prefix)
 }
@@ -12727,57 +12654,6 @@ fn powershell_brace_opener(command: &str, open: usize) -> PowerShellBraceOpener 
     }
 }
 
-/// `[scriptblock]::Create(…)` builds a block from a string. Like a literal
-/// block ([`powershell_script_block_bodies`]), the result can run anywhere
-/// later, so its source is judged where it is built.
-fn collect_powershell_scriptblock_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
-    let mut search_start = 0usize;
-    while let Some((marker_start, marker_end)) =
-        find_powershell_scriptblock_create(command, search_start)
-    {
-        if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
-            sinks.push(ExecutableTextSink::Unverified {
-                rule: SINK_ANALYSIS_BOUNDS_RULE,
-                reason: "command contains too many executable text sinks for bounded analysis",
-            });
-            return;
-        }
-        let mut open = marker_end;
-        while command
-            .as_bytes()
-            .get(open)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            open += 1;
-        }
-        if command.as_bytes().get(open) != Some(&b'(') {
-            search_start = open.max(marker_start + 1);
-            continue;
-        }
-        let Ok(close) = find_powershell_subexpression_close(command, open + 1) else {
-            sinks.push(ExecutableTextSink::Unverified {
-                rule: POWERSHELL_SCRIPTBLOCK_RULE,
-                reason: "ScriptBlock.Create has unbalanced source syntax",
-            });
-            return;
-        };
-        let expression = &command[open + 1..close];
-        match parse_static_powershell_source(expression) {
-            Ok(source) => sinks.push(ExecutableTextSink::Payload {
-                source,
-                dialect: ShellDialect::PowerShell,
-                context: "a ScriptBlock built from a string can run its PowerShell source",
-                nonlocal_filesystem: false,
-            }),
-            Err(()) => sinks.push(ExecutableTextSink::Unverified {
-                rule: POWERSHELL_SCRIPTBLOCK_RULE,
-                reason: "a ScriptBlock is built from source that dcg cannot statically verify",
-            }),
-        }
-        search_start = close + 1;
-    }
-}
-
 /// PowerShell engine methods that run their first argument, a string, as
 /// script: `InvokeScript` and `NewScriptBlock` of `$ExecutionContext.
 /// InvokeCommand` (also `$ExecutionContext.SessionState.InvokeCommand`),
@@ -12804,13 +12680,31 @@ const POWERSHELL_ENGINE_SCRIPT_METHODS: [&str; 6] = [
 /// matched by its last name segment, since `using namespace` can shorten it.
 const POWERSHELL_SCRIPT_COMMAND_TYPE: &str = "command";
 
-/// The sink a constructed type selects: [`POWERSHELL_SCRIPT_COMMAND_TYPE`]
-/// runs script, another named type does not, and a type that is not a static
-/// name (`$t`, `([type]$n)`, or no visible name) may be that type. A type
-/// literal or parenthesized type (`([…Command])`) names the type inside it,
-/// and an assembly qualification (`…Command, System.Management.Automation`,
-/// from the first `,` outside brackets) is not part of the name.
-fn powershell_constructed_type_sink(type_name: Option<&str>) -> Option<PowerShellEngineSink> {
+/// `[scriptblock]::Create` builds a block from its first argument, which can
+/// run anywhere later, so the source is judged where the block is built.
+/// `[scriptblock]` is the accelerator for the full name, matched by its last
+/// segment like [`POWERSHELL_SCRIPT_COMMAND_TYPE`].
+const POWERSHELL_SCRIPTBLOCK_TYPE: &str = "scriptblock";
+
+/// The static methods that run script only on one type, and that type:
+/// `[…Runspaces.Command]::new` and `[scriptblock]::Create`.
+const POWERSHELL_TYPED_SCRIPT_METHODS: [(&str, &str); 2] = [
+    ("new", POWERSHELL_SCRIPT_COMMAND_TYPE),
+    ("create", POWERSHELL_SCRIPTBLOCK_TYPE),
+];
+
+/// The sink a type selects for a method that runs script only on
+/// `script_type` ([`POWERSHELL_TYPED_SCRIPT_METHODS`], or `New-Object` of
+/// [`POWERSHELL_SCRIPT_COMMAND_TYPE`]): that type runs script, another named
+/// type does not, and a type that is not a static name (`$t`, `([type]$n)`,
+/// or no visible name) may be that type. A type literal or parenthesized type
+/// (`([…Command])`) names the type inside it, and an assembly qualification
+/// (`…Command, System.Management.Automation`, from the first `,` outside
+/// brackets) is not part of the name.
+fn powershell_typed_method_sink(
+    type_name: Option<&str>,
+    script_type: &str,
+) -> Option<PowerShellEngineSink> {
     let Some(mut name) = type_name.map(str::trim) else {
         return Some(PowerShellEngineSink::AnyMethod);
     };
@@ -12841,7 +12735,9 @@ fn powershell_constructed_type_sink(type_name: Option<&str>) -> Option<PowerShel
         })
         .unwrap_or(name.len());
     let name = name[..end].trim();
-    if name.is_empty()
+    // A type name starts with a letter; anything else before `::` is an
+    // index that holds the type in a value (`$a[0]::Create`).
+    if !name.starts_with(|first: char| first.is_alphabetic() || first == '_')
         || !name
             .chars()
             .all(|character| character.is_alphanumeric() || "_.+`[], =-".contains(character))
@@ -12850,7 +12746,7 @@ fn powershell_constructed_type_sink(type_name: Option<&str>) -> Option<PowerShel
     }
     name.rsplit('.')
         .next()
-        .is_some_and(|last| last.eq_ignore_ascii_case(POWERSHELL_SCRIPT_COMMAND_TYPE))
+        .is_some_and(|last| last.trim().eq_ignore_ascii_case(script_type))
         .then_some(PowerShellEngineSink::Script)
 }
 
@@ -12883,9 +12779,42 @@ fn powershell_spread_constructor_argument(argument: &str) -> Result<Option<&str>
 const MAX_POWERSHELL_SPREAD_GROUPS: usize = 8;
 
 /// The name inside a type literal that ends at `end` (`[a.b]` before `::`),
-/// or `None` when no bounded type literal ends there.
+/// also when only groups hold it (`( [a.b] )::`) and when block comments sit
+/// around it (`[a.b]<#c#>::`), or `None` when no bounded
+/// type literal ends there. A group holding anything else (`([t]$n)`,
+/// `(Get-T)`) is not a static name.
 fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
-    let before = command.get(..end)?;
+    // Block comments may sit between the type and `::` (`[t]<#c#>::`).
+    let mut before = trim_powershell_code_blank_end(command.get(..end)?);
+    // The first non-blank byte inside the group just read, which must open
+    // the next group or the type literal.
+    let mut group_start = None;
+    for _ in 0..MAX_POWERSHELL_SPREAD_GROUPS {
+        if !before.ends_with(')') {
+            break;
+        }
+        let mut depth = 0usize;
+        let open = before
+            .bytes()
+            .rev()
+            .take(MAX_POWERSHELL_MEMBER_NAME_SPELLING)
+            .position(|byte| {
+                match byte {
+                    b')' => depth += 1,
+                    b'(' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map(|offset| before.len() - 1 - offset)?;
+        if group_start.is_some_and(|start| start != open) {
+            return None;
+        }
+        // Blank space, including a backtick line continuation, and block
+        // comments may surround what the group holds.
+        group_start = Some(powershell_code_blank_end(before, open + 1));
+        before = trim_powershell_code_blank_end(&before[..before.len() - 1]);
+    }
     if !before.ends_with(']') {
         return None;
     }
@@ -12902,6 +12831,9 @@ fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
                 depth -= 1;
                 if depth == 0 {
                     let open = before.len() - 1 - offset;
+                    if group_start.is_some_and(|start| start != open) {
+                        return None;
+                    }
                     return before.get(open + 1..before.len() - 1);
                 }
             }
@@ -12916,10 +12848,17 @@ fn powershell_type_literal_before(command: &str, end: usize) -> Option<&str> {
 /// runs.
 const POWERSHELL_EXPAND_STRING_METHOD: &str = "expandstring";
 
-/// The longest member-name spelling read after a `.`: a quoted name or a
-/// parenthesized name expression. The real names are at most 20 characters;
-/// the bound keeps a run of `.(` or `.'` from rescanning the command.
+/// The longest member-name spelling read after a `.` in one pass: a quoted
+/// name or a parenthesized name expression. The real names are at most 20
+/// characters; the bound keeps a run of `.(` or `.'` from rescanning the
+/// command. A spelling that does not close within it is read again in the
+/// whole command, at most [`MAX_POWERSHELL_LONG_MEMBER_SPELLINGS`] times.
 const MAX_POWERSHELL_MEMBER_NAME_SPELLING: usize = 256;
+
+/// The most member-name spellings longer than
+/// [`MAX_POWERSHELL_MEMBER_NAME_SPELLING`] read in one command; past it the
+/// command is not verified.
+const MAX_POWERSHELL_LONG_MEMBER_SPELLINGS: usize = 8;
 
 /// The most method calls one command may hold that could run script text
 /// (named sinks and calls whose name is not static); past it the command is
@@ -12929,20 +12868,52 @@ const MAX_POWERSHELL_ENGINE_SCRIPT_CALLS: usize = 4 * MAX_EXECUTABLE_TEXT_SINKS;
 /// The member name that follows the `.` (or `?.`) ending at `after_dot`, and
 /// the byte after its spelling. PowerShell allows blank space and line
 /// breaks after the dot and spells the name bare, quoted (`.'InvokeScript'`),
-/// as a parenthesized expression (`.("Invoke" + "Script")`) or as a variable
-/// or subexpression (`.$n`, `.${n}`, `.$('x')`). A name whose value is not
-/// static is `None`: it may be any method.
+/// as a parenthesized expression (`.("Invoke" + "Script")`), as a script
+/// block's text (`.{InvokeScript}`) or as a variable or subexpression (`.$n`,
+/// `.${n}`, `.$('x')`). A name whose value is not static is `None`: it may be
+/// any method.
 fn powershell_member_name_after_dot(
     command: &str,
     after_dot: usize,
+    long_spellings: &mut usize,
 ) -> Option<(Option<String>, usize)> {
     let bytes = command.as_bytes();
-    let mut start = after_dot;
-    while let Some(character) = command.get(start..)?.chars().next() {
+    let start = powershell_blank_end(command, after_dot);
+    let mut window_end = command
+        .len()
+        .min(start.saturating_add(MAX_POWERSHELL_MEMBER_NAME_SPELLING));
+    while !command.is_char_boundary(window_end) {
+        window_end -= 1;
+    }
+    if let Some(member) = powershell_member_name_spelling(command, start, window_end) {
+        return Some(member);
+    }
+    // A quoted, grouped, here-string, block or `$( )`/`${ }` spelling the
+    // window cuts off is read in the whole command: dropping it would leave
+    // the call unjudged.
+    let delimited = match bytes.get(start) {
+        Some(b'\'' | b'"' | b'(' | b'@' | b'{') => true,
+        Some(b'$') => matches!(bytes.get(start + 1), Some(b'(' | b'{')),
+        _ => false,
+    };
+    if window_end == command.len() || !delimited {
+        return None;
+    }
+    *long_spellings += 1;
+    if *long_spellings > MAX_POWERSHELL_LONG_MEMBER_SPELLINGS {
+        return None;
+    }
+    powershell_member_name_spelling(command, start, command.len())
+}
+
+/// The byte after the blank space at `start`: whitespace, line breaks and
+/// backtick line continuations.
+fn powershell_blank_end(command: &str, mut start: usize) -> usize {
+    let bytes = command.as_bytes();
+    while let Some(character) = command.get(start..).and_then(|rest| rest.chars().next()) {
         if character.is_whitespace() {
             start += character.len_utf8();
         } else if character == '`' && matches!(bytes.get(start + 1), Some(b'\n' | b'\r')) {
-            // A backtick line continuation is blank space too.
             start += if bytes.get(start + 1..start + 3) == Some(b"\r\n") {
                 3
             } else {
@@ -12952,13 +12923,84 @@ fn powershell_member_name_after_dot(
             break;
         }
     }
-    let mut bounded_end = command
-        .len()
-        .min(start.saturating_add(MAX_POWERSHELL_MEMBER_NAME_SPELLING));
-    while !command.is_char_boundary(bounded_end) {
-        bounded_end -= 1;
+    start
+}
+
+/// `text` without the blank space at its end, as [`powershell_blank_end`]
+/// reads it.
+fn trim_powershell_blank_end(mut text: &str) -> &str {
+    loop {
+        if let Some(rest) = text
+            .strip_suffix("`\n")
+            .or_else(|| text.strip_suffix("`\r\n"))
+        {
+            text = rest;
+        } else if let Some(last) = text.chars().next_back().filter(|last| last.is_whitespace()) {
+            text = &text[..text.len() - last.len_utf8()];
+        } else {
+            return text;
+        }
     }
-    let bounded = &command[..bounded_end];
+}
+
+/// The most block comments read around a type literal before `::`.
+const MAX_POWERSHELL_TYPE_COMMENTS: usize = 8;
+
+/// The byte after the blank space and block comments at `start`
+/// ([`powershell_blank_end`]).
+fn powershell_code_blank_end(command: &str, mut start: usize) -> usize {
+    for _ in 0..MAX_POWERSHELL_TYPE_COMMENTS {
+        start = powershell_blank_end(command, start);
+        if !command[start..].starts_with("<#") {
+            break;
+        }
+        start = skip_powershell_block_comment(command, start);
+    }
+    powershell_blank_end(command, start)
+}
+
+/// `text` without the blank space and block comments at its end
+/// ([`trim_powershell_blank_end`]). A comment opens at the first `<#` after
+/// the `#>` before its own, searched within
+/// [`MAX_POWERSHELL_MEMBER_NAME_SPELLING`] bytes.
+fn trim_powershell_code_blank_end(mut text: &str) -> &str {
+    for _ in 0..MAX_POWERSHELL_TYPE_COMMENTS {
+        text = trim_powershell_blank_end(text);
+        let Some(body) = text.strip_suffix("#>") else {
+            return text;
+        };
+        let mut floor = body
+            .len()
+            .saturating_sub(MAX_POWERSHELL_MEMBER_NAME_SPELLING);
+        while !body.is_char_boundary(floor) {
+            floor -= 1;
+        }
+        let window = &body[floor..];
+        let after_close = window.rfind("#>").map_or(0, |close| close + 2);
+        let Some(open) = window[after_close..]
+            .find("<#")
+            .map(|open| floor + after_close + open)
+        else {
+            return text;
+        };
+        if skip_powershell_block_comment(text, open) != text.len() {
+            return text;
+        }
+        text = &text[..open];
+    }
+    trim_powershell_blank_end(text)
+}
+
+/// The member name spelled at `start` and the byte after its spelling,
+/// reading delimited spellings only up to `end`
+/// ([`powershell_member_name_after_dot`]).
+fn powershell_member_name_spelling(
+    command: &str,
+    start: usize,
+    end: usize,
+) -> Option<(Option<String>, usize)> {
+    let bytes = command.as_bytes();
+    let bounded = &command[..end];
     let word_end = |from: usize, extra: &[u8]| {
         bytes[from..]
             .iter()
@@ -12977,6 +13019,11 @@ fn powershell_member_name_after_dot(
                     match bounded.as_bytes().get(index)? {
                         b'`' => index = escape_sequence_end(bounded, index),
                         b'"' => break index + 1,
+                        // A `"` inside `$( … )` does not end the name.
+                        b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                            index =
+                                find_powershell_subexpression_close(bounded, index + 2).ok()? + 1;
+                        }
                         _ => index += 1,
                     }
                 }
@@ -12989,18 +13036,56 @@ fn powershell_member_name_after_dot(
                 end,
             ))
         }
-        b'(' => {
-            let close = find_powershell_subexpression_close(bounded, start + 1).ok()?;
-            let name = parse_static_powershell_source(&bounded[start + 1..close]).ok();
+        // An array expression names the member by its value, like a group
+        // (`.@('InvokeScript')`; `.@('a', 'b')` is not a static name).
+        b'(' | b'@' if bytes[start] == b'(' || bytes.get(start + 1) == Some(&b'(') => {
+            let open = start + usize::from(bytes[start] == b'@');
+            let close = find_powershell_subexpression_close(bounded, open + 1).ok()?;
+            let name = parse_static_powershell_source(&bounded[open + 1..close]).ok();
             Some((name, close + 1))
+        }
+        // A here-string names the member by its body: verbatim for `@'`, and
+        // for `@"` with its escapes decoded as in a `"…"` name. In `@"` a `$`
+        // may expand, so that name is not static whatever else the body
+        // holds; otherwise a body holding `"` names no member dcg looks for:
+        // the quote stays in the name, escaped or not.
+        b'@' => {
+            let (quote, content_start, end) = powershell_here_string_end(bounded, start)?;
+            let body = bounded[content_start..end - 2]
+                .strip_suffix('\n')
+                .map_or("", |body| body.strip_suffix('\r').unwrap_or(body));
+            let name = if quote == b'\'' {
+                Some(body.to_string())
+            } else if body.contains('$') {
+                None
+            } else if body.contains('"') {
+                Some(body.to_string())
+            } else {
+                parse_static_powershell_source(&format!("\"{body}\"")).ok()
+            };
+            Some((name, end))
+        }
+        // A script block names the member by its text, unchanged
+        // (`.{InvokeScript}`; `.{ InvokeScript }` names ` InvokeScript `).
+        b'{' => {
+            let close = find_powershell_script_block_close(bounded, start + 1)?;
+            Some((Some(bounded[start + 1..close].to_string()), close + 1))
         }
         b'$' => match bytes.get(start + 1) {
             Some(b'(') => {
                 let close = find_powershell_subexpression_close(bounded, start + 2).ok()?;
                 Some((None, close + 1))
             }
+            // A backtick escapes a `}` inside the braces (`${a`}b}`).
             Some(b'{') => {
-                let close = start + 2 + bounded.get(start + 2..)?.find('}')?;
+                let mut close = start + 2;
+                loop {
+                    match bounded.as_bytes().get(close)? {
+                        b'`' => close = escape_sequence_end(bounded, close),
+                        b'}' => break,
+                        _ => close += 1,
+                    }
+                }
                 Some((None, close + 1))
             }
             _ => {
@@ -13017,19 +13102,50 @@ fn powershell_member_name_after_dot(
     }
 }
 
+/// Whether `character` delimits a PowerShell string: the ASCII quotes and the
+/// typographic ones PowerShell reads as quotes.
+fn is_powershell_quote(character: char) -> bool {
+    matches!(character, '\'' | '"' | '\u{2018}'..='\u{201e}')
+}
+
 /// Whether the `.` at `dot` is member access on an expression (`$x.`,
-/// `$a.b.`, `(…).`, `[t]::m().`), not a dot inside a bareword argument
-/// (`Write-Output a.b`), which is text.
+/// `$a.b.`, `$ä.`, `${a}.`, `(…).`, `(…).b.`, `$a[0].b.`, `{}::`, `'a'.`,
+/// `$h.'a'::`, `.@'…'@.`, `$a<#c#>.b.`, `[t]::m().`), not a dot inside a
+/// bareword argument (`Write-Output a.b`), which is text.
 fn powershell_dot_follows_expression(command: &str, dot: usize) -> bool {
-    let before = &command.as_bytes()[..dot];
-    match before.last() {
-        Some(b')' | b']') => true,
-        Some(_) => before
-            .iter()
-            .rev()
-            .find(|&&byte| !(byte.is_ascii_alphanumeric() || b"_.:?{}".contains(&byte)))
-            .is_some_and(|&byte| byte == b'$'),
-        None => false,
+    // A block comment glued to the chain (`$a<#c#>.b.InvokeScript`,
+    // `$t<#c#>::Create`) reads as an expression, wherever the comment opens:
+    // a `<#` inside a string or name before it opens nothing, so its opening
+    // is not looked for. Bareword text with a glued comment
+    // (`Write-Output a<#c#>.InvokeScript`) is read the same way, which fails
+    // closed.
+    let before = trim_powershell_blank_end(&command[..dot]);
+    if before.ends_with("#>") {
+        return true;
+    }
+    // Walk back over the names and separators of the chain. PowerShell names
+    // may hold any letter, so every other character outside ASCII except
+    // blank space and quotes is read as a name character.
+    let Some((index, end)) = before.char_indices().rev().find(|&(_, character)| {
+        !(character.is_ascii_alphanumeric()
+            || matches!(character, '_' | '.' | ':' | '?')
+            || !(character.is_ascii()
+                || character.is_whitespace()
+                || is_powershell_quote(character)))
+    }) else {
+        return false;
+    };
+    match end {
+        // A variable, or the close of a group, call, index, braced variable,
+        // script block, hashtable or string.
+        '$' | ')' | ']' | '}' => true,
+        character if is_powershell_quote(character) => true,
+        // The close of a here-string.
+        '@' => before[..index].ends_with(is_powershell_quote),
+        // A glued block comment between parts of the chain, as above. A `>`
+        // that ends no comment is a redirection (`x >out.InvokeScript`).
+        '>' => before[..index].ends_with('#'),
+        _ => false,
     }
 }
 
@@ -13178,9 +13294,11 @@ fn powershell_method_invocation(rest: &str, method: &str) -> bool {
 }
 
 /// Engine methods that run a string as PowerShell script
-/// ([`POWERSHELL_ENGINE_SCRIPT_METHODS`], and `ExpandString`'s `$( … )`),
-/// called as `.Name(…)`, through the `.ForEach('Name', …)` intrinsic, or
-/// through `ForEach-Object Name …` ([`collect_powershell_member_cmdlet_sinks`]).
+/// ([`POWERSHELL_ENGINE_SCRIPT_METHODS`], [`POWERSHELL_TYPED_SCRIPT_METHODS`]
+/// on their type, and `ExpandString`'s `$( … )`), called as `.Name(…)` or
+/// `::Name(…)` with any spelling of the name, through the `.ForEach('Name',
+/// …)` intrinsic, or through `ForEach-Object Name …`
+/// ([`collect_powershell_member_cmdlet_sinks`]).
 /// A static first argument is judged as the source it runs; any other
 /// argument, or a reference to the method that is not a call here
 /// (`$m = $ic.InvokeScript; $m.Invoke(…)`), cannot be verified. A member
@@ -13188,6 +13306,7 @@ fn powershell_method_invocation(rest: &str, method: &str) -> bool {
 /// string argument is judged as source, and anything else is left alone.
 fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     let mut examined = 0usize;
+    let mut long_spellings = 0usize;
     // Instance (`.`) and static (`::`) member access, each searched once.
     let mut next_dot = find_powershell_code_marker(command, ".", 0);
     let mut next_static = find_powershell_code_marker(command, "::", 0);
@@ -13203,22 +13322,42 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
         } else {
             next_dot = find_powershell_code_marker(command, ".", after_dot);
         }
-        let Some((name, mut after_name)) = powershell_member_name_after_dot(command, after_dot)
-        else {
+        let member = powershell_member_name_after_dot(command, after_dot, &mut long_spellings);
+        if long_spellings > MAX_POWERSHELL_LONG_MEMBER_SPELLINGS {
+            sinks.push(ExecutableTextSink::Unverified {
+                rule: SINK_ANALYSIS_BOUNDS_RULE,
+                reason: "command contains too many long PowerShell member names for bounded analysis",
+            });
+            return;
+        }
+        let Some((name, mut after_name)) = member else {
             continue;
         };
         let intrinsic_foreach = !is_static
             && name
                 .as_deref()
                 .is_some_and(|name| name.eq_ignore_ascii_case("foreach"));
-        // `[…Runspaces.Command]::new('…', $true)`; a type held in a value
-        // (`$t::new(…)`) may be that type.
-        let constructor = is_static
-            && name
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case("new"));
-        let sink = if constructor {
-            powershell_constructed_type_sink(powershell_type_literal_before(command, dot))
+        // `[…Runspaces.Command]::new('…', $true)` and
+        // `[scriptblock]::Create('…')`; a type held in a value (`$t::new(…)`,
+        // `$t::Create(…)`) may be that type.
+        let script_type = name.as_deref().filter(|_| is_static).and_then(|name| {
+            POWERSHELL_TYPED_SCRIPT_METHODS
+                .iter()
+                .find(|(method, _)| name.eq_ignore_ascii_case(method))
+                .map(|(_, script_type)| *script_type)
+        });
+        let constructor = script_type == Some(POWERSHELL_SCRIPT_COMMAND_TYPE);
+        let type_before = || powershell_type_literal_before(command, dot);
+        let sink = if let Some(script_type) = script_type {
+            powershell_typed_method_sink(type_before(), script_type)
+        } else if is_static
+            && name.is_none()
+            && powershell_typed_method_sink(type_before(), POWERSHELL_SCRIPTBLOCK_TYPE)
+                == Some(PowerShellEngineSink::Script)
+        {
+            // `Create` is the ScriptBlock type's own static method, so a
+            // name that is not static (`[scriptblock]::$n(…)`) is taken as it.
+            Some(PowerShellEngineSink::Script)
         } else {
             powershell_engine_sink_for_name(name.as_deref())
                 .or_else(|| intrinsic_foreach.then_some(PowerShellEngineSink::AnyMethod))
@@ -13233,7 +13372,13 @@ fn collect_powershell_engine_script_sinks(command: &str, sinks: &mut Vec<Executa
             after_name += ".invoke".len();
         }
         let called = command.as_bytes().get(after_name) == Some(&b'(');
-        if sink == PowerShellEngineSink::AnyMethod && !called {
+        // A method whose name is not static and is not called here is
+        // mostly an ordinary member, and so is `new` on a type dcg cannot
+        // name; `Create` there (`$f = $t::Create`) may be the ScriptBlock one.
+        if sink == PowerShellEngineSink::AnyMethod
+            && !called
+            && script_type != Some(POWERSHELL_SCRIPTBLOCK_TYPE)
+        {
             continue;
         }
         // Each call reads its argument list once; the bound keeps nested or
@@ -13352,7 +13497,7 @@ fn powershell_group_value(
 /// hold blanks and commas, so its words are not read one by one: a member
 /// name is the group's static string value, and a type is that value or the
 /// type expression itself (`[…Command, System.Management.Automation]`), which
-/// [`powershell_constructed_type_sink`] reads. `None` is a name that is not
+/// [`powershell_typed_method_sink`] reads. `None` is a name that is not
 /// static.
 fn powershell_group_name(
     cmdlet: PowerShellMemberCmdlet,
@@ -14173,7 +14318,9 @@ fn collect_powershell_member_cmdlet_sinks(command: &str, sinks: &mut Vec<Executa
                 powershell_member_pattern_sink(name.as_deref())
             }
             // A type name that is not static may be that type.
-            PowerShellMemberCmdlet::NewObject => powershell_constructed_type_sink(name.as_deref()),
+            PowerShellMemberCmdlet::NewObject => {
+                powershell_typed_method_sink(name.as_deref(), POWERSHELL_SCRIPT_COMMAND_TYPE)
+            }
         };
         let Some(sink) = sink else {
             continue;
@@ -15408,7 +15555,6 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
-        collect_powershell_scriptblock_sinks(command, &mut sinks);
         collect_powershell_engine_script_sinks(command, &mut sinks);
         collect_powershell_member_cmdlet_sinks(command, &mut sinks);
     }
@@ -16981,10 +17127,6 @@ fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
         return true;
     }
 
-    if find_powershell_scriptblock_create(command, 0).is_some() {
-        return true;
-    }
-
     // Interpreter spellings beyond the trigger grammar, such as an internally
     // quoted executable, can still reach a launcher refusal or recursive
     // inspection before the deferred lookup (issue #599).
@@ -17013,6 +17155,7 @@ fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
         "eval ",
         "iex ",
         "invoke-expression",
+        "scriptblock",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -68462,46 +68605,6 @@ mod tests {
         }
     }
 
-    /// Fifth review: the `[scriptblock]` type-literal search rescanned the rest
-    /// of the command at every unclosed `[`, and copied the text up to a
-    /// shared `]` at every `[` before it; both are one pass now.
-    #[test]
-    fn scriptblock_type_literal_search_is_linear_and_keeps_its_answers() {
-        for (command, expected) in [
-            ("[scriptblock]::Create('x')", Some((0, 13))),
-            ("[ScriptBlock ]::Create('x')", Some((0, 14))),
-            ("[[scriptblock]", Some((1, 14))),
-            ("[a[scriptblock]", Some((2, 15))),
-            (
-                "[a] [System.Management.Automation.ScriptBlock]",
-                Some((4, 46)),
-            ),
-            ("'[scriptblock]' [x]", None),
-            ("[scriptblock", None),
-            ("[x] [y]", None),
-            ("", None),
-        ] {
-            assert_eq!(
-                find_powershell_scriptblock_type_literal(command, 0),
-                expected,
-                "{command:?}"
-            );
-        }
-        let started = std::time::Instant::now();
-        for command in [
-            "[".repeat(200_000),
-            format!("{}]", "[".repeat(200_000)),
-            format!("{}]", "[ ".repeat(100_000)),
-        ] {
-            assert_eq!(find_powershell_scriptblock_type_literal(&command, 0), None);
-        }
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
     /// Engine methods that run script text: each spelling of the member name
     /// is found, the first argument is the source, and a long run of `.(`,
     /// `.'`, blank space or type brackets is read in one bounded pass.
@@ -68582,11 +68685,129 @@ mod tests {
                 vec![POWERSHELL_ENGINE_SCRIPT_RULE],
             ),
             ("$x.ExpandString('a \"@ b')", vec!["@\"\na \"@ b\n\"@"]),
+            // `[scriptblock]::Create` by any spelling of the name, on the
+            // type by any spelling or held in a value.
+            ("[scriptblock]::Create('a')", vec!["a"]),
+            ("[ScriptBlock ]:: 'Create'('a')", vec!["a"]),
+            ("[scriptblock]::(\"Cre\" + \"ate\")('a')", vec!["a"]),
+            ("[scriptblock]::{Create}('a')", vec!["a"]),
+            ("[a.ScriptBlock, a.b]::Create.Invoke('a')", vec!["a"]),
+            ("$t::Create('a')", vec!["a"]),
+            ("$t::Create($a)", vec![]),
+            ("[scriptblock]::$n('a')", vec!["a"]),
+            ("[scriptblock]::$n($a)", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            ("$f = $t::Create", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            ("[IO.File]::$n($a)", vec![]),
+            (
+                "[scriptblock]::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "$f = [scriptblock]::'Create'",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("[IO.File]::Create('a')", vec![]),
+            ("[powershell]::Create()", vec![]),
+            ("[scriptblock]::{ Create }('a')", vec![]),
+            ("$x.{InvokeScript}('a')", vec!["a"]),
+            ("$x.{ InvokeScript }('a')", vec![]),
+            // A here-string or array expression names the member by its
+            // value (review round 1).
+            ("[scriptblock]::@'\nCreate\n'@('a')", vec!["a"]),
+            ("[scriptblock]::@\"\r\nCreate\r\n\"@('a')", vec!["a"]),
+            ("[scriptblock]::@('Create')('a')", vec!["a"]),
+            (
+                "[scriptblock]::@('Cre' + 'ate')($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "[scriptblock]::@'\nCreate\n'@.Invoke($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "[scriptblock]::@\"\n$n\n\"@($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("$x.@'\nInvokeScript\n'@('a')", vec!["a"]),
+            (
+                "$x.@('InvokeScript')($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("$x.@\"\n$n\n\"@($a)", vec![]),
+            ("$x.@('a', 'b')($a)", vec![]),
+            ("$x.@'\n\nInvokeScript\n'@('a')", vec![]),
+            ("$x.@'\nInvokeScript'@('a')", vec![]),
+            ("$x.@{}('a')", vec![]),
+            // A type literal held only by groups names that type; another
+            // group or an index holds the type in a value.
+            (
+                "([scriptblock])::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "( ( [scriptblock] ) )::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("([IO.File])::Create($a)", vec![]),
+            ("([IO.File])::Create('a')", vec![]),
+            ("([t]$n)::Create('a')", vec!["a"]),
+            ("([t]$n)::Create($a)", vec![]),
+            ("([scriptblock] + [x])::Create($a)", vec![]),
+            ("$a[0]::Create('a')", vec!["a"]),
+            ("$a[0]::new('a', 1)", vec!["a"]),
+            // Only `Create` taken as a value on a type dcg cannot name may
+            // be the script method; `new` there is an ordinary constructor.
+            ("$f = $t::new", vec![]),
+            ("$f = $t::@('Create')", vec![POWERSHELL_ENGINE_SCRIPT_RULE]),
+            // A `@"…"@` name decodes escapes; only `$` makes it dynamic, and a
+            // name holding `"` is no member dcg looks for (review round 2).
+            (
+                "$x.@\"\nInvoke`Script\n\"@($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "$f = $t::@\"\n`Create\n\"@",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            ("$x.@\"\nInvoke\"Script\n\"@('a')", vec![]),
+            ("[scriptblock]::@\"\nCre`ate\n\"@('a')", vec![]),
+            // Blank space around a grouped type includes a line continuation.
+            (
+                "(`\n[scriptblock])::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (
+                "( [scriptblock] `\r\n)::Create($a)",
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
         ] {
             assert_eq!(sources(command), expected, "{command:?}");
         }
+        // A spelling longer than the first reading window is read in the
+        // whole command, a bounded number of times (review round 2).
+        let blanks = " ".repeat(MAX_POWERSHELL_MEMBER_NAME_SPELLING);
+        for (command, expected) in [
+            (format!("[scriptblock]::({blanks}'Create')('a')"), vec!["a"]),
+            (format!("$x.\"{blanks}\"('a')"), vec![]),
+            (
+                format!("$x.({blanks}'InvokeScript')($a)"),
+                vec![POWERSHELL_ENGINE_SCRIPT_RULE],
+            ),
+            (format!("$x.({blanks}"), vec![]),
+            (
+                format!("$x.({blanks}'a')").repeat(MAX_POWERSHELL_LONG_MEMBER_SPELLINGS),
+                vec![],
+            ),
+            (
+                format!("$x.({blanks}'a')").repeat(MAX_POWERSHELL_LONG_MEMBER_SPELLINGS + 1),
+                vec![SINK_ANALYSIS_BOUNDS_RULE],
+            ),
+        ] {
+            assert_eq!(sources(&command), expected, "{command:?}");
+        }
         let started = std::time::Instant::now();
-        for command in [
+        let mut timings = Vec::new();
+        for (index, command) in [
             ".(".repeat(100_000),
             ".'".repeat(100_000),
             format!("$x.{}InvokeScript('a')", " ".repeat(200_000)),
@@ -68595,18 +68816,35 @@ mod tests {
             "$x.$n(".repeat(20_000),
             format!("{}]::new('a', 1)", "[".repeat(200_000)),
             "]::new('a', 1)".repeat(20_000),
+            format!("{}scriptblock]::Create('a')", "[".repeat(200_000)),
+            "[scriptblock]::{".repeat(50_000),
+            ".{".repeat(100_000),
             ".`\n".repeat(100_000),
+            "$x.@'\n'@".repeat(50_000),
+            ".@(".repeat(100_000),
+            format!("{}'\n'@('a')", "$x.@'\n".repeat(50_000)),
+            format!(
+                "{}[scriptblock]{}::Create($a)",
+                "(".repeat(200_000),
+                ")".repeat(200_000)
+            ),
+            "())::Create($a)".repeat(20_000),
             format!(
                 "[Command]::new.Invoke({}a{})",
                 "(".repeat(100_000),
                 ")".repeat(100_000)
             ),
-        ] {
-            let _ = sources(&command);
+        ]
+        .iter()
+        .enumerate()
+        {
+            let input_started = std::time::Instant::now();
+            let _ = sources(command);
+            timings.push((index, input_started.elapsed()));
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
+            "{:?}: {timings:?}",
             started.elapsed()
         );
     }

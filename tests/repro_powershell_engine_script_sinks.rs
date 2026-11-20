@@ -4,6 +4,7 @@
 //! `[powershell]::Create().AddScript`, a runspace's `CreatePipeline` and
 //! `CreateNestedPipeline`, a `Runspaces.Command` built with `isScript`,
 //! `Parser::ParseInput`, and the `$( … )` inside `ExpandString`'s text.
+//! `[scriptblock]::Create` is read the same way, by any spelling.
 //! dcg read their string argument as data, so
 //! `$ExecutionContext.InvokeCommand.InvokeScript("git reset --hard")` passed
 //! in the PowerShell dialect.
@@ -328,7 +329,192 @@ const RUNS_IT: &[&str] = &[
     "if (($ExecutionContext.InvokeCommand | % InvokeScript 'git reset --hard') -eq $null) { 'n' }",
     "@($ExecutionContext.InvokeCommand | % -MemberName InvokeScript -ArgumentList 'git reset --hard') -match 'x'",
     "($c = New-Object System.Management.Automation.Runspaces.Command 'git reset --hard', $true) -ne $null; $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // `[scriptblock]::Create` by another spelling of the name (quoted,
+    // computed, a script block's text, `.Invoke`, the method taken as a
+    // value), of the type, or with the type held in a value (card
+    // t_222650ea; runner p/t1.out, t2.out). `.{Name}` names other engine
+    // methods too.
+    "[scriptblock]::Create.Invoke('git reset --hard').Invoke()",
+    "$f=[scriptblock]::Create; $f.Invoke('git reset --hard').Invoke()",
+    "[scriptblock]::'Create'('git reset --hard').Invoke()",
+    "[scriptblock]::(\"Cre\"+\"ate\")('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $t::Create('git reset --hard').Invoke()",
+    "[scriptblock]::\"Create\"('git reset --hard').Invoke()",
+    "$n='Create'; [scriptblock]::$n('git reset --hard').Invoke()",
+    "[Management.Automation.ScriptBlock]::Create('git reset --hard').Invoke()",
+    "using namespace System.Management.Automation\n[ScriptBlock]::Create('git reset --hard').Invoke()",
+    "([type]'scriptblock')::Create('git reset --hard').Invoke()",
+    "[scriptblock]::Create.Invoke(('git ' + 'reset --hard')).Invoke()",
+    "[scriptblock]::'Create'.Invoke('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $t::'Create'('git reset --hard').Invoke()",
+    "$sb=[scriptblock]::(\"Create\")('git reset --hard'); & $sb",
+    "[scriptblock]::Create.Invoke('git reset --hard')|% Invoke",
+    "[System.Management.Automation.ScriptBlock, System.Management.Automation]::Create('git reset --hard').Invoke()",
+    "[scriptblock]::$('Create')('git reset --hard').Invoke()",
+    "[scriptblock]::Create.Invoke(\"git reset --hard\").InvokeReturnAsIs()",
+    "[scriptblock]::\n Create('git reset --hard').Invoke()",
+    "[scriptblock]::`\nCreate('git reset --hard').Invoke()",
+    "& ([scriptblock]::'Create'('git reset --hard'))",
+    "$t=[type]'scriptblock'; $t::Create('git reset --hard').Invoke()",
+    "$t='scriptblock' -as [type]; $t::Create('git reset --hard').Invoke()",
+    "[scriptblock]::Create.Invoke.Invoke('git reset --hard').Invoke()",
+    "$m=[scriptblock]::'Create'; & { $m.Invoke('git reset --hard').Invoke() }",
+    "[ScriptBlock]::CREATE.invoke('git reset --hard').Invoke()",
+    "[scriptblock]::{Create}('git reset --hard').Invoke()",
+    "[System.Management.Automation.ScriptBlock]::'Create'('git reset --hard') | % Invoke",
+    "$ExecutionContext.InvokeCommand.{InvokeScript}('git reset --hard')",
+    "[scriptblock]::{Create}.Invoke('git reset --hard').Invoke()",
+    "[powershell]::{Create}().AddScript('git reset --hard').Invoke()",
+    "[scriptblock]:: 'Create'('git reset --hard').Invoke()",
+    "[ScriptBlock]::('Create')('git reset --hard')|% Invoke",
+    "[scriptblock]::Create('git reset --hard').Ast.GetScriptBlock().Invoke()",
+    "[System.Management.Automation.ScriptBlock]::Create.Invoke('git reset --hard') | % Invoke",
+    "$x=[scriptblock]; ($x)::Create('git reset --hard').Invoke()",
+    "[scriptblock]::Create.Invoke(@('git reset --hard')).Invoke()",
+    "([scriptblock]::Create).Invoke('git reset --hard').Invoke()",
+    "[scriptblock]::'Create'.Invoke.Invoke('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $f=$t::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$n='Create'; $t=[scriptblock]; $t::$n('git reset --hard').Invoke()",
+    // A here-string or array expression as the name, here and for the
+    // engine methods; a type literal held only by groups; a type in an
+    // index (review round 1; runner rv/truth.out, rv/truth2.out,
+    // p2/n-truth.out).
+    "[scriptblock]::@'\nCreate\n'@('git reset --hard').Invoke()",
+    "[scriptblock]::@\"\nCreate\n\"@('git reset --hard').Invoke()",
+    "[scriptblock]::@('Create')('git reset --hard').Invoke()",
+    "[scriptblock]::@('Cre'+'ate')('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $t::@'\nCreate\n'@('git reset --hard').Invoke()",
+    "[scriptblock]::@'\nCreate\n'@.Invoke('git reset --hard').Invoke()",
+    "$f=[scriptblock]::@('Create'); $f.Invoke('git reset --hard').Invoke()",
+    "$n='Create'; [scriptblock]::@\"\n$n\n\"@('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.@'\nInvokeScript\n'@('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.@('InvokeScript')('git reset --hard')",
+    "[powershell]::Create().@\"\nAddScript\n\"@('git reset --hard').Invoke()",
+    "$a='git reset --hard'; ([scriptblock])::Create($a).Invoke()",
+    "([scriptblock])::Create('git reset --hard').Invoke()",
+    "$a='git reset --hard'; ( ( [scriptblock] ) )::Create($a).Invoke()",
+    "$a='git reset --hard'; ([System.Management.Automation.ScriptBlock])::Create($a).Invoke()",
+    "$a=@([scriptblock]); $a[0]::Create('git reset --hard').Invoke()",
+    // A `@"…"@` name decodes its escapes, and a line continuation is blank
+    // space in the group around a type (review round 2; runner
+    // rv2/truth.out, rv2/truth2.out, rv2/truth3.out).
+    "$a='git reset --hard'; $ExecutionContext.InvokeCommand.@\"\nInvoke`Script\n\"@($a)",
+    "[scriptblock]::@\"\n`Create\n\"@('git reset --hard').Invoke()",
+    "$a='git reset --hard'; [scriptblock]::@\"\n`Create\n\"@($a).Invoke()",
+    "$t=[scriptblock]; $f=$t::@\"\n`Create\n\"@; $f.Invoke('git reset --hard').Invoke()",
+    "$a='git reset --hard'; (`\n[scriptblock])::Create($a).Invoke()",
+    // Review round 3 (runner rv3/truth.out, rv3/truth2.out, p4/k-truth.out):
+    // a `$` in a `@"…"@` name is not static even beside a `"`; block
+    // comments before `::`; an escaped `}` in a `${…}` name; and a `"` inside
+    // the `$( … )` of a `"…"` name.
+    "[scriptblock]::@\"\n$(\"Create\")\n\"@('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.@\"\n$(\"InvokeScript\")\n\"@('git reset --hard')",
+    "$t=[scriptblock]; $t::@\"\n$(\"Create\")\n\"@('git reset --hard').Invoke()",
+    "$a='git reset --hard'; [scriptblock]<#c#>::Create($a).Invoke()",
+    "$a='git reset --hard'; [scriptblock]<#c#>::'Create'($a).Invoke()",
+    "$a='git reset --hard'; [System.Management.Automation.ScriptBlock]<#c#>::Create($a).Invoke()",
+    "$a='git reset --hard'; $f=[scriptblock]<#c#>::Create; $f.Invoke($a).Invoke()",
+    "$a='git reset --hard'; ([scriptblock])<#c#>::Create($a).Invoke()",
+    "$a='git reset --hard'; [scriptblock]<#a#><#b#>::Create($a).Invoke()",
+    "$a='git reset --hard'; [scriptblock]<# x <# y #>::Create($a).Invoke()",
+    "$a='git reset --hard'; ([scriptblock]<#c#>)<#d#>::Create($a).Invoke()",
+    "$a='git reset --hard'; (<#c#>[scriptblock]<#d#>)::Create($a).Invoke()",
+    "${a`}b}='InvokeScript'; $ExecutionContext.InvokeCommand.${a`}b}('git reset --hard')",
+    "$t=[scriptblock]; ${a`}b}='Create'; $t::${a`}b}('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.\"$(\"InvokeScript\")\"('git reset --hard')",
+    "$ExecutionContext.InvokeCommand.\"$(\"Invoke\"+\"Script\")\"('git reset --hard')",
+    // Review round 4 (runner rv4/truth.out, rv4/truth2.out, p5/w-truth.out):
+    // the method taken as a value on a member chain that starts at a group,
+    // index, braced variable, hashtable or script block.
+    "$t=[scriptblock]; $f=(gv t).Value::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$s=[scriptblock]; $f=(gv s).Value::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$f=(@{a=[scriptblock]}).a::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$f={}::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$m=(Get-Variable ExecutionContext).Value.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+    "$ic=$ExecutionContext.InvokeCommand; $m=(gv ic).Value.InvokeScript; $m.Invoke('git reset --hard')",
+    "${i c}=$ExecutionContext.InvokeCommand; $m=${i c}.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=@{b=[scriptblock]}}; $f=$h['a'].b::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$f=@{a=[scriptblock]}.a::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$a=@($ExecutionContext.InvokeCommand); $m=$a[0].InvokeScript; $m.Invoke('git reset --hard')",
+    "$m=(gv ExecutionContext).Value.InvokeCommand.InvokeScript; & { $m.Invoke('git reset --hard') }",
+    // Review round 5 (runner rv5/truth.out, rv5/truth2.out, p7/truth.out):
+    // the method taken as a value on a chain that holds a quoted or
+    // here-string member name, a name with letters outside ASCII, or a block
+    // comment between its parts.
+    "$m=$ExecutionContext.'InvokeCommand'.InvokeScript; $m.Invoke('git reset --hard')",
+    "$m=$ExecutionContext.\"InvokeCommand\".InvokeScript; $m.Invoke('git reset --hard')",
+    "$m=$ExecutionContext.@'\nInvokeCommand\n'@.InvokeScript; $m.Invoke('git reset --hard')",
+    "$p='InvokeCommand'; $m=$ExecutionContext.\"$p\".InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=[scriptblock]}; $f=$h.'a'::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$m=$ExecutionContext.‘InvokeCommand’.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=[scriptblock]}; $f=$h.“a”::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$ä=[scriptblock]; $f=$ä::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$ö=$ExecutionContext.InvokeCommand; $m=$ö.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{ä=[scriptblock]}; $f=$h.ä::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$m=$ExecutionContext<#c#>.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=[scriptblock]}; $f=$h<#c#>.a::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$m=$ExecutionContext.'InvokeCommand'<#c#>.InvokeScript; $m.Invoke('git reset --hard')",
+    "$m=$ExecutionContext<#a#><#b#>.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+    "$h=@{a=[scriptblock]}; $f=$h.@\"\na\n\"@::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$h=@{'ä'=[scriptblock]}; $f=$h.'ä'<#c#>::Create; $f.Invoke('git reset --hard').Invoke()",
+    "$ä=@{b=$ExecutionContext.InvokeCommand}; $m=$ä.b.InvokeScript; & { $m.Invoke('git reset --hard') }",
+    // Review round 7 (runner rv7/truth2.out, rv7/truth3.out): a comment
+    // glued to the chain after a `<#` that opens no comment, in a string,
+    // here-string, bareword or braced name earlier in the statement.
+    "$a = 'x y<#', $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$a = 'x y<#', $ExecutionContext.InvokeCommand<#c#>.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$a = \"x y<#\", $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$a = @'\nx y<#\n'@, $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$m = 'x y<#' ? $ExecutionContext<#c#>.InvokeCommand.InvokeScript : 0; $m.Invoke('git reset --hard')",
+    "$m = $(Write-Output 'x y<#' | Out-Null; $ExecutionContext<#c#>.InvokeCommand.InvokeScript); $m.Invoke('git reset --hard')",
+    "$m = (Write-Output a<#) ? $ExecutionContext<#c#>.InvokeCommand.InvokeScript : 0; $m.Invoke('git reset --hard')",
+    "$t=[scriptblock]; $f = 'x y<#', $t<#c#>::Create; $f[1].Invoke('git reset --hard').Invoke()",
+    "$h=@{a=[scriptblock]}; $f = 'x y<#', $h<#c#>.a::Create; $f[1].Invoke('git reset --hard').Invoke()",
+    "$t=[scriptblock]; $f = 'x y<#' ? $t<#c#>::Create : 0; $f.Invoke('git reset --hard').Invoke()",
+    "$a = ${a <#}, $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
+    "$a = <#a#>'x y<#', $ExecutionContext<#c#>.InvokeCommand.InvokeScript; $a[1].Invoke('git reset --hard')",
 ];
+
+/// Name spellings longer than dcg's first reading window (review round 2;
+/// runner rv2/truth.out, rv2/truth3.out): the rows that ran `git reset
+/// --hard` in sandboxed PowerShell 7.5, and their twins that ran `git
+/// status`. `SP` is 300 blanks, `XS` 300 `x` and `CS` 300 `c`.
+fn long_spelling_rows() -> (Vec<String>, Vec<String>) {
+    let expand = |row: &str| {
+        row.replace("SP", &" ".repeat(300))
+            .replace("XS", &"x".repeat(300))
+            .replace("CS", &"c".repeat(300))
+    };
+    let runs_it = [
+        "[scriptblock]::(SP'Create')('git reset --hard').Invoke()",
+        "[scriptblock]::@(SP'Create')('git reset --hard').Invoke()",
+        "[scriptblock]::$(SP'Create')('git reset --hard').Invoke()",
+        "[scriptblock]::@'SP\nCreate\n'@('git reset --hard').Invoke()",
+        "${XS}='Create'; [scriptblock]::${XS}('git reset --hard').Invoke()",
+        "[scriptblock]::(<#CS#>'Create')('git reset --hard').Invoke()",
+        "$ExecutionContext.InvokeCommand.(SP'InvokeScript')('git reset --hard')",
+        "[scriptblock]::('Cre'+SP'ate')('git reset --hard').Invoke()",
+        "[scriptblock]::\"$(SP'Create')\"('git reset --hard').Invoke()",
+        "[scriptblock]::@\"\n$(SP'Create')\n\"@('git reset --hard').Invoke()",
+        // Review round 6 (runner rv6/truth.out, rv6/truth2.out): a block
+        // comment glued to the chain whose opening lies before the window.
+        "$m=$ExecutionContext<#XS#>.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+        "$m=$ExecutionContext.InvokeCommand<#XS#>.InvokeScript; $m.Invoke('git reset --hard')",
+        "$t=[scriptblock]; $f=$t<#XS#>::Create; $f.Invoke('git reset --hard').Invoke()",
+        "$h=@{a=[scriptblock]}; $f=$h<#XS#>.a::Create; $f.Invoke('git reset --hard').Invoke()",
+        "$m=$ExecutionContext<#XS<#y#>.InvokeCommand.InvokeScript; $m.Invoke('git reset --hard')",
+        "$m=$ExecutionContext.InvokeCommand<#XS<#y#>.InvokeScript; $m.Invoke('git reset --hard')",
+        "$t=[scriptblock]; $f=$t<#XS<#y#>::Create; $f.Invoke('git reset --hard').Invoke()",
+    ];
+    let harmless = [
+        "[scriptblock]::(SP'Create')('git status').Invoke()",
+        "[scriptblock]::\"$(SP'Create')\"('git status').Invoke()",
+    ];
+    (
+        runs_it.iter().map(|row| expand(row)).collect(),
+        harmless.iter().map(|row| expand(row)).collect(),
+    )
+}
 
 /// None of these ran `git reset --hard` in sandboxed PowerShell 7.5.
 const HARMLESS: &[&str] = &[
@@ -460,6 +646,57 @@ const HARMLESS: &[&str] = &[
     "Get-ChildItem | ForEach-Object { $_ | % Name }",
     "if (($ExecutionContext.InvokeCommand | % InvokeScript 'git status') -eq $null) { 'n' }",
     "$h = @{ n = (Get-ChildItem | % Name) -join ',' }; $h.n",
+    // Their `git status` twins, other types' `Create`, a script block name
+    // with blank space, and text naming the method (card t_222650ea).
+    "[scriptblock]::Create.Invoke('git status').Invoke()",
+    "[scriptblock]::'Create'('git status').Invoke()",
+    "$t=[scriptblock]; $t::Create('git status').Invoke()",
+    "[scriptblock]::(\"Cre\"+\"ate\")('git status').Invoke()",
+    "$n='Create'; [scriptblock]::$n('git status').Invoke()",
+    "[scriptblock]::Create.Invoke('Write-Output ok').Invoke()",
+    "$x = [IO.File]::Create('a.txt'); $x.Dispose()",
+    "Write-Output \"[scriptblock]::'Create'('git reset --hard')\"",
+    "Write-Output '[scriptblock]::Create.Invoke(\"git reset --hard\")'",
+    "[Management.Automation.ScriptBlock]::Create('git status').Invoke()",
+    "[System.Management.Automation.ScriptBlock, System.Management.Automation]::Create('git status').Invoke()",
+    "[scriptblock]::'Create'.Invoke('git status').Invoke()",
+    "[scriptblock]::Create.Invoke(\"git status\").InvokeReturnAsIs()",
+    "[System.IO.Directory]::CreateDirectory('x') | Out-Null",
+    "[powershell]::Create().AddCommand('Get-Date').Invoke() | Out-Null",
+    "[scriptblock]::{Create}('git status').Invoke()",
+    "$ExecutionContext.InvokeCommand.{InvokeScript}('git status')",
+    "$x=[IO.File]; $x::Create('a.txt').Dispose()",
+    "[scriptblock]::Create('git status').Invoke()",
+    // Twins of the round 1 review rows, and `new` taken as a value on a
+    // type held in a value, which is an ordinary constructor.
+    "[scriptblock]::@'\nCreate\n'@('git status').Invoke()",
+    "[scriptblock]::@('Create')('git status').Invoke()",
+    "([scriptblock])::Create('git status').Invoke()",
+    "$a='git status'; ([IO.Path])::Combine($a, 'b') | Out-Null",
+    "$a=@([IO.Path]); $a[0]::Combine('git status','b') | Out-Null",
+    "$ExecutionContext.InvokeCommand.@'\nInvokeScript\n'@('git status')",
+    "$ExecutionContext.InvokeCommand.@('InvokeScript')('git status')",
+    "[powershell]::Create().@\"\nAddScript\n\"@('git status').Invoke()",
+    "$t=[Text.StringBuilder]; $f = $t::new; $f.Invoke().Append('x') | Out-Null",
+    "$t=[scriptblock]; $f = $t::new; $f.OverloadDefinitions | Out-Null",
+    // Twins of the review round 3 rows; each ran `git status`.
+    "[scriptblock]::@\"\n$(\"Create\")\n\"@('git status').Invoke()",
+    "$ExecutionContext.InvokeCommand.@\"\n$(\"InvokeScript\")\n\"@('git status')",
+    "[scriptblock]<#c#>::Create('git status').Invoke()",
+    "$ExecutionContext.InvokeCommand.\"$(\"InvokeScript\")\"('git status')",
+    // Bareword text that names an engine method is not a member taken as a
+    // value (review round 4; runner p5/w-truth.out).
+    "Write-Output InvokeCommand.InvokeScript",
+    "Write-Output Widget::Create",
+    "Write-Output a.b.InvokeScript; git status",
+    // A quoted string is an expression even as an argument, and a word
+    // after blank space, a redirection or a name outside ASCII is text
+    // (review round 5; runner rv5/truth.out, p7/truth.out). A comment glued
+    // to a bareword before an engine method name reads as an expression: a
+    // listed cost (review round 7).
+    "Write-Output 'abc'.Length; git status",
+    "Write-Output x >out.InvokeScript; git status",
+    "Write-Output ä.InvokeScript; git status",
 ];
 
 /// Harmless in PowerShell 7.5 too. The Unknown dialect denies these on base
@@ -514,6 +751,25 @@ const HARMLESS_IN_POWERSHELL: &[&str] = &[
     // twin (review round 9): Unknown denies these on base 53c84977 too.
     "\"Files: $((Get-ChildItem | % Name) -join ', ')\"",
     "$c=New-Object System.Management.Automation.Runspaces.Command('git status', $true); $ps=[powershell]::Create(); [void]$ps.Commands.AddCommand($c); [void]$ps.Invoke()",
+    // Another type's `Create`, `Create` that is not a static member, and
+    // script block names that are not `Create` (card t_222650ea): Unknown
+    // denies these on base 6740afcb too.
+    "[IO.File]::Create('git reset --hard').Dispose()",
+    "[Text.Encoding]::UTF8.GetBytes('git reset --hard').Length",
+    "$t=[scriptblock]; $t.Create('git reset --hard').Invoke()",
+    "[scriptblock]::{ Create }('git reset --hard').Invoke()",
+    "$ExecutionContext.InvokeCommand.{ InvokeScript }('git reset --hard')",
+    "[scriptblock]::{Cre`ate}('git reset --hard').Invoke()",
+    "[scriptblock]::{$n}('git reset --hard').Invoke()",
+    // Twin of the round 2 `@"…"@` escape rows: Unknown's POSIX reading
+    // takes the backtick as command substitution.
+    "[scriptblock]::@\"\n`Create\n\"@('git status').Invoke()",
+    // Twins of the review round 3 `${a`}b}` rows; each ran `git status`.
+    // Unknown's POSIX reading takes the `${…}` as a substitution it cannot
+    // verify, on base f9b376a2 too.
+    "${a`}b}='InvokeScript'; $ExecutionContext.InvokeCommand.${a`}b}('git status')",
+    "$t=[scriptblock]; ${a`}b}='Create'; $t::${a`}b}('git status').Invoke()",
+    "${a`}b}='Create'; [scriptblock]::${a`}b}('git status').Invoke()",
 ];
 
 fn dcg_binary() -> std::path::PathBuf {
@@ -634,15 +890,25 @@ fn decision_in(command: &str, dialect: ShellDialect) -> EvaluationDecision {
 /// The PowerShell tool label, in both hook formats.
 #[test]
 fn powershell_tool_judges_engine_script_methods() {
+    let (long_runs_it, long_harmless) = long_spelling_rows();
     for protocol in [Protocol::Claude, Protocol::Codex] {
-        for command in RUNS_IT {
+        for command in RUNS_IT
+            .iter()
+            .copied()
+            .chain(long_runs_it.iter().map(String::as_str))
+        {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "deny",
                 "{protocol:?}: {command:?}"
             );
         }
-        for command in HARMLESS.iter().chain(HARMLESS_IN_POWERSHELL) {
+        for command in HARMLESS
+            .iter()
+            .chain(HARMLESS_IN_POWERSHELL)
+            .copied()
+            .chain(long_harmless.iter().map(String::as_str))
+        {
             assert_eq!(
                 hook_decision(protocol, "PowerShell", command),
                 "allow",
@@ -657,7 +923,12 @@ fn powershell_tool_judges_engine_script_methods() {
 #[cfg(windows)]
 #[test]
 fn codex_bash_label_on_windows_judges_engine_script_methods() {
-    for command in RUNS_IT {
+    let (long_runs_it, _) = long_spelling_rows();
+    for command in RUNS_IT
+        .iter()
+        .copied()
+        .chain(long_runs_it.iter().map(String::as_str))
+    {
         assert_eq!(
             hook_decision(Protocol::Codex, "Bash", command),
             "deny",
@@ -668,15 +939,24 @@ fn codex_bash_label_on_windows_judges_engine_script_methods() {
 
 #[test]
 fn powershell_and_unknown_dialects_judge_engine_script_methods() {
+    let (long_runs_it, long_harmless) = long_spelling_rows();
     for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
-        for command in RUNS_IT {
+        for command in RUNS_IT
+            .iter()
+            .copied()
+            .chain(long_runs_it.iter().map(String::as_str))
+        {
             assert_eq!(
                 decision_in(command, dialect),
                 EvaluationDecision::Deny,
                 "{dialect:?}: {command:?}"
             );
         }
-        for command in HARMLESS {
+        for command in HARMLESS
+            .iter()
+            .copied()
+            .chain(long_harmless.iter().map(String::as_str))
+        {
             assert_eq!(
                 decision_in(command, dialect),
                 EvaluationDecision::Allow,
