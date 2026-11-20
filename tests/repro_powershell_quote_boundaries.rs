@@ -604,16 +604,18 @@ fn powershell_glued_comments_after_labels_param_blocks_and_in_lists() {
         "class a { [int]$p#'\n}; git reset --hard\n#'",
         "class a { hidden $p#'\n}; git reset --hard\n#'",
     ];
-    // Harmless rows are PowerShell readings only (see above). A key glued to
-    // a comment, a function name glued to one, `using`, a splatted or
+    // Harmless rows are PowerShell readings only (see above). A function
+    // name glued to a comment, `using`, a splatted or
     // dynamic member name, a later `param`, a label before a non-keyword
     // and a method body's argument are parse errors or arguments, and
     // nothing runs.
     // Not listed: `$h=@{a=1;b=echo x#'` NL `}; git reset --hard` NL `#'`
     // runs nothing in pwsh, but base and live dcg deny it as a block they
-    // cannot segment; unchanged here.
+    // cannot segment; unchanged here. Not listed either:
+    // `$h=@{a=1;b#'` NL `=2}; git reset --hard` NL `#'`. The key's `#'` is a
+    // comment, but the hashtable then lacks its `=`, so pwsh runs nothing;
+    // reading the comment reveals the reset (fail-closed).
     let harmless = [
-        "$h=@{a=1;b#'\n=2}; git reset --hard\n#'",
         "function a#'\n{ }; git reset --hard\n#'",
         "filter a#'\n{ }; git reset --hard\n#'",
         "function a<#'#> { }; git reset --hard; #'",

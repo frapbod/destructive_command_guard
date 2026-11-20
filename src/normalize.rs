@@ -11176,10 +11176,7 @@ mod tests {
         }
         // The second view keeps the older reading of `${c}#` as a comment.
         let braced = mask_powershell_comments_after_braced_variables;
-        assert_eq!(
-            braced("echo ${c}#x; z").as_deref(),
-            Some("echo ${c}     ")
-        );
+        assert_eq!(braced("echo ${c}#x; z").as_deref(), Some("echo ${c}     "));
         assert_eq!(braced("echo $c#x; z"), None);
         assert_eq!(braced("${c}#x"), None);
         // Argument mode and command names: the word keeps the `#`.
