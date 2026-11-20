@@ -500,6 +500,10 @@ fn powershell_glued_comments_after_keywords_and_block_statements() {
         // A `<#` glued to a command name inside `(...)` is text.
         "ls (a<#); git reset --hard",
     ];
+    // Not listed: `. ${c}#'` NL `git reset --hard` NL `#'`. pwsh reads the
+    // word after `.` as a command name and runs nothing, but the second
+    // comment view keeps the older reading of `${c}#` as a comment, so it
+    // stays denied as on base (conservative).
     // Not listed: `& { return ${c}#x }`, `& { echo $c<#'#>}; …` and the like.
     // pwsh rejects them (MissingEndCurlyBrace: the comment or a quoted word
     // takes the `}`), so nothing runs, and dcg denies a block it cannot
@@ -509,7 +513,6 @@ fn powershell_glued_comments_after_keywords_and_block_statements() {
         "Write-Output return${c}#x",
         "echo a | return $c#'\ngit reset --hard\n#'",
         "(return $c#'\n); git reset --hard\n#'",
-        ". ${c}#'\ngit reset --hard\n#'",
         ". $c<#'#>; git reset --hard; #'",
         "& $c<#'#>; git reset --hard; #'",
         "$x = & $c#'\ngit reset --hard\n#'",
@@ -601,12 +604,15 @@ fn powershell_glued_comments_after_labels_param_blocks_and_in_lists() {
         "class a { [int]$p#'\n}; git reset --hard\n#'",
         "class a { hidden $p#'\n}; git reset --hard\n#'",
     ];
-    // Harmless rows are PowerShell readings only (see above). The value
-    // after `=` is a statement, so `echo x#'` keeps the `#`; a key glued to
-    // a comment, a function name glued to one, `using` and a splatted or
-    // dynamic member name are parse errors or arguments, and nothing runs.
+    // Harmless rows are PowerShell readings only (see above). A key glued to
+    // a comment, a function name glued to one, `using`, a splatted or
+    // dynamic member name, a later `param`, a label before a non-keyword
+    // and a method body's argument are parse errors or arguments, and
+    // nothing runs.
+    // Not listed: `$h=@{a=1;b=echo x#'` NL `}; git reset --hard` NL `#'`
+    // runs nothing in pwsh, but base and live dcg deny it as a block they
+    // cannot segment; unchanged here.
     let harmless = [
-        "$h=@{a=1;b=echo x#'\n}; git reset --hard\n#'",
         "$h=@{a=1;b#'\n=2}; git reset --hard\n#'",
         "function a#'\n{ }; git reset --hard\n#'",
         "filter a#'\n{ }; git reset --hard\n#'",
