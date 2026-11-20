@@ -4143,6 +4143,10 @@ struct WindowsLauncherEnvelope {
 enum WindowsLauncherParse {
     NotLauncher,
     Envelope(WindowsLauncherEnvelope),
+    /// A launcher whose payload has more than one reading (cmd's quote
+    /// handling after `/C`, [`cmd_switch_command_readings`]): every one is
+    /// judged, and deny wins.
+    Envelopes(Vec<WindowsLauncherEnvelope>),
     Unverified(String),
 }
 
@@ -5252,16 +5256,24 @@ pub(crate) fn powershell_host_may_run_inline(
 
 /// Whether cmd.exe given `arguments` (decoded argv words) runs command
 /// text, as [`parse_cmd_launcher`] reads it: an exact `/C` or `/K` reached
-/// past switches that run nothing (`/D`, `/Q`, `/S`, `/E:…`, …). Any other
-/// word before it (`/configure`, `/VERYSILENT`, `/R`, a value dcg cannot
-/// read) gives `false`: the launcher would fail closed on that argv, not on
-/// code cmd runs. `Start-Process` uses this to decide whether a program it
-/// cannot name may be cmd for its argument list.
+/// past switches that run nothing (`/D`, `/Q`, `/S`, `/E:…`, …) and past
+/// words that are not switches (`foo /c …`, which the launcher reads on
+/// past). A `/` word that is not such a switch (`/configure`, `/VERYSILENT`,
+/// `/R`, `/v:on/c`) gives `false`: the launcher would fail closed on that
+/// argv, not on code cmd runs, and installer argument lists start with such
+/// words. Unlike the launcher, a run switch inside a word that does not
+/// start with `/` (`foo/c`, `C:/repo/x`) is not read here: in an argument
+/// list of a program dcg cannot name it is far more often a path than cmd's
+/// switch. `Start-Process` uses this to decide whether a program it cannot
+/// name may be cmd for its argument list.
 pub(crate) fn cmd_host_may_run_inline(arguments: &[String]) -> bool {
     for argument in arguments {
         let option = argument.to_ascii_lowercase();
         if matches!(option.as_str(), "/c" | "/k") {
             return true;
+        }
+        if !option.starts_with('/') {
+            continue;
         }
         if !cmd_switch_is_non_executing(&option) {
             return false;
@@ -5457,11 +5469,17 @@ fn cmd_word_has_variable(word: &str) -> bool {
     })
 }
 
+/// Whether `option` (lower case) is a cmd switch that runs nothing. A value
+/// switch (`/E:`, `/F:`, `/V:`) whose value holds a run switch (`/v:on/c`)
+/// is not: cmd looks for `/` switches anywhere on its command line (ReactOS
+/// cmd's `Initialize`), so the `/c` there may start the command.
 fn cmd_switch_is_non_executing(option: &str) -> bool {
     matches!(option, "/d" | "/q" | "/a" | "/u" | "/s" | "/?")
-        || ["/e:", "/f:", "/v:"]
-            .iter()
-            .any(|prefix| option.starts_with(prefix))
+        || ["/e:", "/f:", "/v:"].iter().any(|prefix| {
+            option
+                .strip_prefix(prefix)
+                .is_some_and(|value| !cmd_text_has_run_switch(value))
+        })
 }
 
 /// Under [`NativeArgv::Msys`] the switches read as `cmd_host_switch` reads
@@ -5528,18 +5546,31 @@ fn parse_cmd_launcher(
                     "cmd {option} has no statically inspectable payload"
                 ));
             };
-            return match validate_launcher_payload_with(
-                command,
-                ShellDialect::Cmd,
-                max_payload_bytes,
-                expansions,
-            ) {
-                Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
+            let mut envelopes = Vec::new();
+            for command in cmd_switch_command_readings(&command) {
+                match validate_launcher_payload_with(
                     command,
-                    dialect: ShellDialect::Cmd,
-                    launcher: if option == "/c" { "cmd /c" } else { "cmd /k" },
-                }),
-                Err(reason) => WindowsLauncherParse::Unverified(reason),
+                    ShellDialect::Cmd,
+                    max_payload_bytes,
+                    expansions,
+                ) {
+                    Ok(command) => {
+                        let envelope = WindowsLauncherEnvelope {
+                            command,
+                            dialect: ShellDialect::Cmd,
+                            launcher: if option == "/c" { "cmd /c" } else { "cmd /k" },
+                        };
+                        if !envelopes.contains(&envelope) {
+                            envelopes.push(envelope);
+                        }
+                    }
+                    Err(reason) => return WindowsLauncherParse::Unverified(reason),
+                }
+            }
+            return if envelopes.len() == 1 {
+                WindowsLauncherParse::Envelope(envelopes.remove(0))
+            } else {
+                WindowsLauncherParse::Envelopes(envelopes)
             };
         }
         if cmd_word_has_variable(&option) {
@@ -5551,16 +5582,89 @@ fn parse_cmd_launcher(
             ));
         }
         if !cmd_switch_is_non_executing(&option) {
+            // A run switch glued to another switch (`/v:on/c`, `/d/c`) is
+            // not modeled: it fails closed.
+            if option.get(1..).is_some_and(cmd_text_has_run_switch) {
+                return WindowsLauncherParse::Unverified(format!(
+                    "cmd may read a /C, /K or /R switch inside {raw:?}"
+                ));
+            }
             if option.starts_with('/') {
                 return WindowsLauncherParse::Unverified(format!(
                     "cmd host switch {raw:?} is unknown"
                 ));
             }
-            return WindowsLauncherParse::NotLauncher;
+            // A word that is not a switch does not end cmd's switches: cmd
+            // looks for a `/` switch anywhere on its command line (ReactOS
+            // cmd's `Initialize` scans every `/`), so `cmd foo /c git reset
+            // --hard` runs git there. Windows cmd.exe either does the same
+            // or runs nothing from its command line, so the reading goes on
+            // to a later `/c`. A redirection the outer shell left in the
+            // words (`cmd 2>nul /c dir`, `cmd 2> nul /c dir`) is not cmd's
+            // argv. A switch inside the word (`foo/c`) is not modeled: it
+            // fails closed.
+            if let Some(operator) = cmd_redirection_operator(raw) {
+                index += if operator.len() == raw.len() { 2 } else { 1 };
+                continue;
+            }
+            if cmd_text_has_run_switch(raw) || cmd_text_has_run_switch(&option) {
+                return WindowsLauncherParse::Unverified(format!(
+                    "cmd may read a /C, /K or /R switch inside {raw:?}"
+                ));
+            }
         }
         index += 1;
     }
     WindowsLauncherParse::NotLauncher
+}
+
+/// The redirection operator a raw word starts with (`>`, `>>`, `<`, after
+/// an optional stream number: `2>nul`, `2>`), if any.
+fn cmd_redirection_operator(raw: &str) -> Option<&str> {
+    let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = &raw[digits..];
+    let operator = if rest.starts_with(">>") {
+        2
+    } else if rest.starts_with(['>', '<']) {
+        1
+    } else {
+        return None;
+    };
+    Some(&raw[..digits + operator])
+}
+
+/// Whether `text` holds `/C`, `/K` or `/R` (any case), the switches after
+/// which cmd runs the rest of its command line.
+fn cmd_text_has_run_switch(text: &str) -> bool {
+    text.as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'/' && matches!(pair[1].to_ascii_lowercase(), b'c' | b'k' | b'r'))
+}
+
+/// The command texts cmd.exe may run for `command`, the text after its `/C`
+/// or `/K` switch.
+///
+/// When that text starts with a quote (after blanks), cmd removes that quote
+/// and the last quote and runs the rest (`cmd /?`; ReactOS cmd's
+/// `GetCmdLineCommand`): `cmd /c '"git reset --hard"'` in PowerShell hands
+/// cmd `"git reset --hard"`, and cmd runs `git reset --hard`. It keeps both
+/// quotes only without `/S`, with exactly two quotes, whitespace and no
+/// special character between them, and when the quoted text names an
+/// executable file (`"C:\Program Files\x\y.exe" arg`). A lone leading quote
+/// is removed too. Whether a file exists is not known here, nor exactly how
+/// the outer program quoted cmd's command line, so both texts are read: as
+/// written and with the quotes removed. Deny wins.
+fn cmd_switch_command_readings(command: &str) -> Vec<String> {
+    let command = command.trim_start();
+    let mut readings = vec![command.to_string()];
+    if let Some(rest) = command.strip_prefix('"') {
+        let stripped = match rest.rfind('"') {
+            Some(last) => format!("{}{}", &rest[..last], &rest[last + 1..]),
+            None => rest.to_string(),
+        };
+        readings.push(stripped);
+    }
+    readings
 }
 
 fn cmd_control_envelope(
@@ -6215,6 +6319,12 @@ fn parse_cmd_control_command_at_depth(
                 Some(WindowsLauncherParse::Unverified(reason)) => {
                     return Some(WindowsLauncherParse::Unverified(reason));
                 }
+                // Only a `cmd /c` launcher has several readings.
+                Some(WindowsLauncherParse::Envelopes(_)) => {
+                    return Some(WindowsLauncherParse::Unverified(
+                        "cmd control group has more than one reading".to_string(),
+                    ));
+                }
                 Some(WindowsLauncherParse::NotLauncher) | None => {}
             }
         }
@@ -6232,6 +6342,11 @@ fn parse_cmd_control_command_at_depth(
             }
             Some(WindowsLauncherParse::Unverified(reason)) => {
                 return Some(WindowsLauncherParse::Unverified(reason));
+            }
+            Some(WindowsLauncherParse::Envelopes(_)) => {
+                return Some(WindowsLauncherParse::Unverified(
+                    "cmd control command has more than one reading".to_string(),
+                ));
             }
             Some(WindowsLauncherParse::NotLauncher) | None
                 if reorder_cmd_leading_redirections(segment).is_some() =>
@@ -6502,14 +6617,21 @@ fn push_embedded_cmd_call_envelopes(
         let mut read_call = |call: &str| {
             let mut launcher = false;
             for &argv in readings {
-                if let WindowsLauncherParse::Envelope(envelope) = parse_windows_launcher_segment_as(
+                let parsed = match parse_windows_launcher_segment_as(
                     &without_cr(call),
                     dialect,
                     argv,
                     LauncherExpansions::AsWritten,
                     max_payload_bytes,
                 ) {
-                    launcher = true;
+                    WindowsLauncherParse::Envelope(envelope) => vec![envelope],
+                    WindowsLauncherParse::Envelopes(readings) => readings,
+                    WindowsLauncherParse::NotLauncher | WindowsLauncherParse::Unverified(_) => {
+                        continue;
+                    }
+                };
+                launcher = true;
+                for envelope in parsed {
                     if !envelopes.contains(&envelope) {
                         envelopes.push(envelope);
                     }
@@ -6731,6 +6853,7 @@ fn windows_launcher_envelopes(
         {
             return match control {
                 WindowsLauncherParse::Envelope(envelope) => Ok((vec![envelope], true)),
+                WindowsLauncherParse::Envelopes(envelopes) => Ok((envelopes, true)),
                 WindowsLauncherParse::Unverified(reason) => Err(reason),
                 WindowsLauncherParse::NotLauncher => Ok((Vec::new(), false)),
             };
@@ -6839,6 +6962,14 @@ fn windows_launcher_envelopes(
                             segment_envelopes.push(envelope);
                         }
                     }
+                    WindowsLauncherParse::Envelopes(readings) => {
+                        launcher_reading = true;
+                        for envelope in readings {
+                            if !segment_envelopes.contains(&envelope) {
+                                segment_envelopes.push(envelope);
+                            }
+                        }
+                    }
                     WindowsLauncherParse::Unverified(reason) => {
                         launcher_reading = true;
                         unverified = Some(reason);
@@ -6885,6 +7016,13 @@ fn windows_launcher_envelopes(
             WindowsLauncherParse::Envelope(envelope) => {
                 if !envelopes.contains(&envelope) {
                     envelopes.push(envelope);
+                }
+            }
+            WindowsLauncherParse::Envelopes(readings) => {
+                for envelope in readings {
+                    if !envelopes.contains(&envelope) {
+                        envelopes.push(envelope);
+                    }
                 }
             }
             WindowsLauncherParse::Unverified(reason) => {
@@ -69411,6 +69549,83 @@ mod windows_redirection_free_view_tests {
                 windows_redirection_free_view(command, dialect),
                 None,
                 "{dialect:?} {command:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cmd_switch_quote_tests {
+    use super::*;
+
+    #[test]
+    fn a_leading_quote_and_the_last_quote_are_also_read_removed() {
+        for (payload, readings) in [
+            (
+                r#""git reset --hard""#,
+                &[r#""git reset --hard""#, "git reset --hard"][..],
+            ),
+            (r#"  "a b" c"#, &[r#""a b" c"#, "a b c"]),
+            (r#""a" "b & c""#, &[r#""a" "b & c""#, r#"a" "b & c"#]),
+            (r#""a b"#, &[r#""a b"#, "a b"]),
+            (r#"echo "a b""#, &[r#"echo "a b""#]),
+            ("ver", &["ver"]),
+        ] {
+            assert_eq!(
+                cmd_switch_command_readings(payload),
+                readings,
+                "{payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_payload_gives_both_readings_as_envelopes() {
+        let WindowsLauncherParse::Envelopes(envelopes) = parse_windows_launcher_segment(
+            r#"cmd /c '"git reset --hard"'"#,
+            ShellDialect::PowerShell,
+            1024,
+        ) else {
+            panic!("expected two readings");
+        };
+        let commands: Vec<&str> = envelopes.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(commands, [r#""git reset --hard""#, "git reset --hard"]);
+    }
+
+    #[test]
+    fn switches_after_a_word_that_is_not_a_switch_are_still_read() {
+        for (segment, dialect, payload) in [
+            (
+                "cmd foo /c git reset --hard",
+                ShellDialect::PowerShell,
+                "git reset --hard",
+            ),
+            ("cmd foo /K dir", ShellDialect::PowerShell, "dir"),
+            ("cmd /d foo /c ver", ShellDialect::Posix, "ver"),
+            ("cmd 2>nul /c dir", ShellDialect::Cmd, "dir"),
+            ("cmd 2> nul /c dir", ShellDialect::Cmd, "dir"),
+        ] {
+            let WindowsLauncherParse::Envelope(envelope) =
+                parse_windows_launcher_segment(segment, dialect, 1024)
+            else {
+                panic!("{segment:?} was not read as a cmd launcher");
+            };
+            assert_eq!(envelope.command, payload, "{segment:?}");
+        }
+        for segment in ["cmd foo/r dir", "cmd foo/c dir", "cmd foo /x /c dir"] {
+            assert!(
+                matches!(
+                    parse_windows_launcher_segment(segment, ShellDialect::PowerShell, 1024),
+                    WindowsLauncherParse::Unverified(_)
+                ),
+                "{segment:?}"
+            );
+        }
+        for segment in ["cmd foo", "cmd foo bar", "cmd /d foo"] {
+            assert_eq!(
+                parse_windows_launcher_segment(segment, ShellDialect::PowerShell, 1024),
+                WindowsLauncherParse::NotLauncher,
+                "{segment:?}"
             );
         }
     }

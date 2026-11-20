@@ -1212,6 +1212,7 @@ fn derived_program(text: &str, value: &Value) -> Option<String> {
 ///
 /// - It may be a shell, when that shell's own reader reaches its command
 ///   text: cmd at an exact `/C` or `/K` past switches that run nothing
+///   and words that are not switches
 ///   ([`crate::evaluator::cmd_host_may_run_inline`]); PowerShell at
 ///   `-Command`, an `-EncodedCommand` that decodes, or a command string
 ///   ([`crate::evaluator::powershell_host_may_run_inline`]); sh always
@@ -2082,7 +2083,8 @@ mod tests {
     }
 
     /// A cmd.exe line runs a command only at an exact `/C` or `/K` reached
-    /// past switches that run nothing; a PowerShell line only at `-Command`,
+    /// past switches that run nothing and words that are not switches; a
+    /// PowerShell line only at `-Command`,
     /// a decodable `-EncodedCommand` or a 5.1 command string.
     #[test]
     fn shell_command_gates() {
@@ -2092,6 +2094,8 @@ mod tests {
         assert!(cmd("/S /K dir"));
         assert!(cmd("/Q /C git reset --hard"));
         assert!(cmd("/d /e:on /v:off /c dir"));
+        assert!(cmd("foo /c git reset --hard"));
+        assert!(cmd("/d x.y /k dir"));
         for line in [
             "/S /D=C:\\Tools",
             "/quiet /norestart",
@@ -2106,6 +2110,10 @@ mod tests {
             "/reset",
             "/R",
             "/s/c dir",
+            "/v:on/c dir",
+            "/S /D=C:\\Tools /c x",
+            "install C:/repo/x",
+            "foo/c dir",
             "/d %DCG_START_PROCESS_ARGUMENT%",
             "",
         ] {

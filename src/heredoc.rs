@@ -166,8 +166,11 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     // `cmd.exe /c ...`). The /c (run-then-exit) and /k (run-then-stay) switches run an
     // arbitrary inner command line that Tier 2 extracts and re-evaluates. A
     // possible closing quote of a quoted program name (`"cmd.exe" /c`) is
-    // allowed before the switches, as for PowerShell above.
-    r#"(?i)\bcmd(?:\.exe)?\b["']?(?:\s+/[A-Za-z]+)*\s+/[ck]\b"#,
+    // allowed before the switches, as for PowerShell above. cmd looks for
+    // its switches anywhere on its command line, so any words may come
+    // before `/c` (`cmd foo /c …`, `cmd /v:on /c …`), and the switch may be
+    // glued to the end of one (`cmd /v:on/c …`); Tier 2 reads cmd's argv.
+    r#"(?i)\bcmd(?:\.exe)?\b["']?(?:\s+[^\s;|&()]+)*?\s+[^\s;|&()]*?/[ck]\b"#,
     // PowerShell Invoke-Expression / its `iex` alias: executes a string as code. Tier 2
     // extracts the quoted argument and re-evaluates it.
     r"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b",
@@ -1829,10 +1832,16 @@ static INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::ne
 /// group 3 = unquoted rest-of-line. The inner command line is re-evaluated by the
 /// full pipeline, so `cmd /c "del /s /q C:\src"` is blocked like the bare `del`.
 /// A quoted program name (`"cmd.exe" /c …`, `& 'C:\…\cmd.exe' /c …`) ends in
-/// its closing quote, as in the inline shell patterns above.
+/// its closing quote, as in the inline shell patterns above. cmd looks for
+/// its `/` switches anywhere on its command line (ReactOS cmd's
+/// `Initialize`), so the words before `/c` may be anything the outer shell
+/// keeps in the call (`cmd foo /c …`, `cmd /v:on /c …`, `cmd 2>nul /c …`),
+/// and the switch may end a word (`cmd /v:on/c …`, `cmd foo/c …`). The
+/// first `/c` or `/k` is taken; the launcher reader
+/// (`evaluator::parse_cmd_launcher`) judges cmd's argv.
 static CMD_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\bcmd(?:\.exe)?\b['"]?(?:\s+/[A-Za-z]+)*\s+/[ck]\s+(?:"([^"]*)"|'([^']*)'|([^\n]+))"#,
+        r#"(?i)\bcmd(?:\.exe)?\b['"]?(?:\s+[^\s;|&()]+)*?\s+[^\s;|&()]*?/[ck]\s+(?:"([^"]*)"|'([^']*)'|([^\n]+))"#,
     )
     .expect("cmd inline script regex compiles")
 });
