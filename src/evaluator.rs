@@ -41897,9 +41897,9 @@ fn exec_sink_pack_verdict(
     // A sink call whose command is a name bound to a string literal is an
     // indirect command like the recovery's below: it is judged only for a
     // program proven to run (a replaced first `node -e` program does not),
-    // under the same proof. That proof exists for Python and JavaScript; Ruby,
-    // Perl and PHP run every `-e`/`-r` program they are given, so theirs
-    // need none.
+    // under the same proof. That proof exists for Python and JavaScript; Ruby
+    // and Perl run every `-e` program they are given and PHP takes one `-r`,
+    // so theirs need none.
     let proof_language = matches!(
         content.language,
         crate::heredoc::ScriptLanguage::Python

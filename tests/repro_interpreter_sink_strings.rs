@@ -218,6 +218,30 @@ EOF"#,
     );
 }
 
+/// A name's value is an indirect command, like the #544 recovery's: it is
+/// judged only in a program that runs. A later `-e` replaces Node's first
+/// program; Ruby and Perl run every `-e` they are given (Node 25, Ruby 2.6
+/// and Perl 5.34 on macOS, printing).
+#[test]
+fn a_string_held_in_a_variable_counts_only_where_the_program_runs() {
+    assert_all(
+        &[
+            r#"node -e 'const c="git checkout -- a.txt"; require("child_process").execSync(c)' -e 'console.log(1)'"#,
+        ],
+        // The CLI's Unknown dialect also reads program text as shell.
+        &[ShellDialect::Posix],
+        EvaluationDecision::Allow,
+    );
+    assert_all(
+        &[
+            r#"ruby -e 'c="git checkout -- a.txt"; system(c)' -e 'puts 1'"#,
+            r#"perl -e 'my $c="git checkout -- a.txt"; system($c);' -e 'print 1'"#,
+        ],
+        &POSIX,
+        EvaluationDecision::Deny,
+    );
+}
+
 /// The language's own interpolation is an unknown value where the shell
 /// reads it: inside the shell's single quotes it can complete a command name
 /// (`'gi${x}t'`), and it may be empty.
