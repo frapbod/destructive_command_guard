@@ -4428,6 +4428,16 @@ pub(crate) fn powershell_values_as_cmd_variables(
     raw: &str,
     in_double_quotes: bool,
 ) -> Cow<'_, str> {
+    powershell_values_replaced(raw, in_double_quotes, POWERSHELL_VALUE_AS_CMD_VARIABLE)
+}
+
+/// [`powershell_values_as_cmd_variables`] with each value replaced by
+/// `replacement`.
+fn powershell_values_replaced<'a>(
+    raw: &'a str,
+    in_double_quotes: bool,
+    replacement: &str,
+) -> Cow<'a, str> {
     if !raw.contains('$') {
         return Cow::Borrowed(raw);
     }
@@ -4487,7 +4497,7 @@ pub(crate) fn powershell_values_as_cmd_variables(
                     }
                 };
                 output.push_str(&raw[copied..index]);
-                output.push_str(POWERSHELL_VALUE_AS_CMD_VARIABLE);
+                output.push_str(replacement);
                 copied = end;
                 index = end;
             }
@@ -12230,9 +12240,14 @@ fn partition_stage_argv(argv: &[String]) -> (Vec<String>, bool) {
     (clean, has_stdin_redirect)
 }
 
-/// If the argv of a consumer names a bare stdin-reading Windows shell
-/// (`cmd`, `powershell`, `pwsh` with no `/c`, `-Command`, `-File`, script, …),
-/// return the source kind it would execute its stdin as.
+/// If the argv of a consumer names a stdin-reading shell, return the source
+/// kind it would execute its stdin as: a bare Windows shell (`cmd`,
+/// `powershell`, `pwsh` with no `/c`, `-Command`, `-File`, script, …), or a
+/// POSIX shell or `wsl` that reads its program from stdin. Git for Windows puts
+/// `sh` and `bash` on PATH, and `bash.exe` in System32 is WSL's, so
+/// `echo 'git reset --hard' | sh` runs `git reset --hard` from cmd and
+/// PowerShell too (pwsh 7.5 with /bin/sh: `scripts/shell-truth`). The POSIX
+/// consumer's options are read as the POSIX reading reads them.
 fn dialect_stdin_reading_shell(argv: &[String]) -> Option<PipelineShellInputMode> {
     let exe = cmd_executable_basename(argv.first()?);
     let rest = &argv[1..];
@@ -12242,8 +12257,143 @@ fn dialect_stdin_reading_shell(argv: &[String]) -> Option<PipelineShellInputMode
             rest,
             PowerShellHost::from_executable(&exe),
         )),
+        "wsl" => Some(wsl_pipeline_input_mode(rest)),
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "dash" => {
+            Some(pipeline_shell_input_mode(&posix_command_from_argv(argv)))
+        }
         _ => None,
     }
+}
+
+/// How `wsl.exe` uses the input piped into it. With no command it starts the
+/// distribution's default shell, which reads its commands from that input. A
+/// command line (after the options, or after `--`) runs through that shell's
+/// `-c`, like an ssh remote command; `-e`/`--exec` runs its argv directly. An
+/// option this reading does not know (the management commands among them)
+/// is unverified.
+fn wsl_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
+    let command_line = |words: &[String]| {
+        if words.is_empty() {
+            return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
+        }
+        match remote_shell_payload_input_mode(&words.join(" "), 0) {
+            PipelineShellInputMode::NotShell => PipelineShellInputMode::DoesNotReadStdin,
+            mode => mode,
+        }
+    };
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "-d" | "--distribution" | "--distribution-id" | "-u" | "--user" | "--cd"
+            | "--shell-type" => {
+                if args.get(index + 1).is_none() {
+                    return PipelineShellInputMode::Unverified;
+                }
+                index += 2;
+            }
+            "--system" => index += 1,
+            "-e" | "--exec" => {
+                let program = &args[index + 1..];
+                if program.is_empty() {
+                    return PipelineShellInputMode::Unverified;
+                }
+                return match pipeline_shell_input_mode_at_depth(
+                    &posix_command_from_argv(program),
+                    1,
+                ) {
+                    PipelineShellInputMode::NotShell => PipelineShellInputMode::DoesNotReadStdin,
+                    mode => mode,
+                };
+            }
+            "--" => return command_line(&args[index + 1..]),
+            _ if argument.starts_with('-') => return PipelineShellInputMode::Unverified,
+            _ => return command_line(&args[index..]),
+        }
+    }
+    command_line(&[])
+}
+
+/// The text a PowerShell producer stage writes to a POSIX shell's standard
+/// input, as that shell reads it, for the producers PowerShell computes
+/// differently from a POSIX shell: a string expression (`'a' + "b"`, a lone
+/// quoted or here-string) and `echo`/`write`/`Write-Output`. PowerShell
+/// expands each value (`$x`, `${x}`, `$env:X`, `$( … )`, a splat) before
+/// the shell starts and writes each object on its own line, so
+/// `echo "git reset --hard $PWD" | sh` hands sh `git reset --hard <path>`.
+/// Each value is left as an unknown value of the shell where it lands
+/// ([`crate::heredoc::posix_source_with_marked_values`], the reading of a
+/// value a parent POSIX shell substitutes). `None` for any other producer:
+/// the caller reads it as before ([`static_producer_source`]).
+fn powershell_producer_posix_source(producer: &str) -> Option<IndirectInputSource> {
+    const MARK: char = crate::heredoc::OUTER_VALUE_MARK;
+    if let Ok(text) = parse_static_powershell_source(producer) {
+        return Some(IndirectInputSource::StaticProducer(text));
+    }
+    let tokens = tokenize_for_shell_dialect(producer, ShellDialect::PowerShell);
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(producer))
+        .collect();
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let (first, rest) = words.split_first()?;
+    let objects =
+        if rest.is_empty() && matches!(first.as_bytes().first(), Some(b'\'' | b'"' | b'@')) {
+            &words[..]
+        } else if decoder
+            .decode(first, ShellTokenRole::Syntax)
+            .is_some_and(|name| {
+                ["echo", "write", "write-output"]
+                    .iter()
+                    .any(|writer| name.eq_ignore_ascii_case(writer))
+            })
+        {
+            rest
+        } else {
+            return None;
+        };
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return Some(IndirectInputSource::Unverified(
+            "PowerShell computes the producer's output at run time".to_string(),
+        ));
+    }
+    let mut mark = [0; 4];
+    let mark: &str = MARK.encode_utf8(&mut mark);
+    let mut lines = Vec::with_capacity(objects.len());
+    for raw in objects {
+        if raw.contains(MARK) {
+            return Some(IndirectInputSource::Unverified(
+                "producer holds dcg's value marker".to_string(),
+            ));
+        }
+        if powershell_argument_is_list(raw) {
+            lines.push(mark.to_string());
+            continue;
+        }
+        let marked = powershell_values_replaced(raw, false, mark);
+        let Some(decoded) = decoder.decode(&marked, ShellTokenRole::Syntax) else {
+            return Some(IndirectInputSource::Unverified(
+                "PowerShell producer could not be decoded".to_string(),
+            ));
+        };
+        lines.push(decoded.into_owned());
+    }
+    let text = lines.join("\n");
+    if text.contains(MARK) && text.replace(MARK, "").trim().is_empty() {
+        return Some(IndirectInputSource::Unverified(
+            "the producer's whole output is a PowerShell value".to_string(),
+        ));
+    }
+    Some(IndirectInputSource::StaticProducer(
+        if text.contains(MARK) {
+            crate::heredoc::posix_source_with_marked_values(&text)
+        } else {
+            text
+        },
+    ))
 }
 
 /// Executing-sink coverage for the cmd and PowerShell dialects that mirrors the
@@ -12324,13 +12474,12 @@ fn collect_dialect_pipeline_stdin_sinks(
                     .get(stages[index - 1].0.clone())
                     .map(str::trim)
                     .unwrap_or_default();
-                push_executable_input_source_at(
-                    static_producer_source(producer),
-                    kind,
-                    consumer_span,
-                    false,
-                    sinks,
-                );
+                let source = (dialect == ShellDialect::PowerShell
+                    && kind == PipelineSourceKind::PosixShell)
+                    .then(|| powershell_producer_posix_source(producer))
+                    .flatten()
+                    .unwrap_or_else(|| static_producer_source(producer));
+                push_executable_input_source_at(source, kind, consumer_span, false, sinks);
             }
             PipelineShellInputMode::Unverified => {
                 sinks.push(ExecutableTextSink::Unverified {
@@ -15398,11 +15547,19 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         collect_powershell_member_cmdlet_sinks(command, &mut sinks);
     }
     // Native cmd/PowerShell pipeline stdin-consumer coverage (bd-1o5h): a
-    // statically-known producer piped into a bare stdin-reading `cmd`/`pwsh`
-    // runs the piped bytes as commands. Only meaningful on the Windows
-    // dialects; the POSIX/Unknown pipe path is the bash-AST collector above.
-    if matches!(dialect, ShellDialect::Cmd | ShellDialect::PowerShell) {
-        collect_dialect_pipeline_stdin_sinks(command, dialect, &mut sinks);
+    // statically-known producer piped into a stdin-reading `cmd`/`pwsh` or
+    // POSIX shell runs the piped bytes as commands. The bash-AST collector
+    // above reads the POSIX pipe; Unknown also reads the pipe as PowerShell,
+    // which computes its producer's text differently (a Codex `Bash` payload
+    // on Windows runs in PowerShell: `echo "git reset --hard $PWD" | sh`).
+    match dialect {
+        ShellDialect::Cmd | ShellDialect::PowerShell => {
+            collect_dialect_pipeline_stdin_sinks(command, dialect, &mut sinks);
+        }
+        ShellDialect::Unknown => {
+            collect_dialect_pipeline_stdin_sinks(command, ShellDialect::PowerShell, &mut sinks);
+        }
+        ShellDialect::Posix => {}
     }
     sinks
 }
