@@ -17923,7 +17923,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         adopt_alternate_reading(&mut result, alternate, command);
     }
     // Deny-only PowerShell views; each keeps the original tokenizer's
-    // decisions and grants intact. One reads comment and smart-quote syntax.
+    // decisions and grants intact. One reads comment and smart-quote syntax
+    // and braced variable names (`${a'b}`).
     // The others read what PowerShell runs as an assignment's value: a value
     // in command mode starts its own statement in place (`$c=iex '…'` reads
     // as `$c;iex '…'`), and any other value is read as its own command
